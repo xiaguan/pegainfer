@@ -19,7 +19,7 @@
 
 ## What is this?
 
-pegainfer is a from-scratch LLM inference engine written in Rust with hand-written CUDA kernels. It currently runs [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) at **~249 tokens/sec** on a single GPU.
+pegainfer is a from-scratch LLM inference engine written in Rust with hand-written CUDA kernels. It currently runs [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) at **~70 tokens/sec** on a single GPU.
 
 The goal is not to replace vLLM or TensorRT-LLM — it's to understand every layer of the inference stack by building it from the ground up, and to explore what a Rust-native inference engine can look like.
 
@@ -123,9 +123,9 @@ Measured on RTX 5070 Ti, Qwen3-4B, BF16:
 
 | Metric | Value |
 |--------|-------|
-| TTFT (prompt_len=9) | ~33 ms |
-| TPOT | ~4 ms/token |
-| Throughput | ~249 tokens/sec |
+| TTFT (prompt_len=4) | ~17 ms |
+| TPOT | ~14 ms/token |
+| Throughput | ~70 tokens/sec |
 
 Profiling traces are written to `traces/` in Chrome Trace JSON format — open with [Perfetto UI](https://ui.perfetto.dev).
 
