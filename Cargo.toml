@@ -1,0 +1,41 @@
+[package]
+name = "rust-llm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokenizers = "0.22"
+safetensors = "0.7"
+anyhow = "1.0"
+ndarray = "0.16"
+half = { version = "2.4", features = ["num-traits"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+cudarc = { version = "0.18", features = [
+    "cuda-version-from-build-system",
+    "cublas",
+    "cuda-12080",
+    "f16",
+] }
+log = "0.4"
+logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
+colored = "3"
+fastrace = { version = "0.7.16", features = ["enable"] }
+clap = { version = "4.5.57", features = ["derive"] }
+
+[features]
+reference = []
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+base64 = "0.22"
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false
