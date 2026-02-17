@@ -4,14 +4,14 @@ use std::time::Instant;
 use fastrace::prelude::*;
 use log::info;
 
-use rust_llm::model::Qwen3Model;
-use rust_llm::tokenizer::Tokenizer;
-use rust_llm::trace_reporter::FileReporter;
+use pegainfer::model::Qwen3Model;
+use pegainfer::tokenizer::Tokenizer;
+use pegainfer::trace_reporter::FileReporter;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 fn init_logging() {
-    rust_llm::logging::init_stderr("info");
+    pegainfer::logging::init_stderr("info");
 }
 
 fn init_tracing() -> PathBuf {

@@ -1185,6 +1185,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pegainfer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "cc",
+ "clap",
+ "colored",
+ "criterion",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "logforth",
+ "ndarray",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1445,31 +1470,6 @@ name = "rtrb"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad8388ea1a9e0ea807e442e8263a699e7edcb320ecbcd21b4fa8ff859acce3ba"
-
-[[package]]
-name = "rust-llm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "cc",
- "clap",
- "colored",
- "criterion",
- "cudarc",
- "fastrace",
- "half",
- "log",
- "logforth",
- "ndarray",
- "safetensors",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
- "uuid",
-]
 
 [[package]]
 name = "rustversion"

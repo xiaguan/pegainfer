@@ -1,5 +1,5 @@
 [package]
-name = "rust-llm"
+name = "pegainfer"
 version = "0.1.0"
 edition = "2024"
 

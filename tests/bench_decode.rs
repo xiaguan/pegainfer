@@ -6,15 +6,15 @@
 //!
 //!   nsys stats decode_trace.nsys-rep
 
-use rust_llm::model::Qwen3Model;
-use rust_llm::tokenizer::Tokenizer;
+use pegainfer::model::Qwen3Model;
+use pegainfer::tokenizer::Tokenizer;
 use std::time::Instant;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 #[test]
 fn bench_decode_steps() {
-    rust_llm::logging::init_stderr("warn");
+    pegainfer::logging::init_stderr("warn");
 
     let tokenizer = Tokenizer::from_file(MODEL_PATH).expect("Failed to load tokenizer");
     let model = Qwen3Model::from_safetensors(MODEL_PATH).expect("Failed to load model");

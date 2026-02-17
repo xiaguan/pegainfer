@@ -20,7 +20,7 @@ pub enum LogOutput {
 /// Configuration for logging initialization.
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
-    /// Log level filter (e.g., "info", "debug", "info,rust_llm=debug").
+    /// Log level filter (e.g., "info", "debug", "info,pegainfer=debug").
     /// Falls back to RUST_LOG environment variable if set.
     pub level: String,
     /// Output destination.

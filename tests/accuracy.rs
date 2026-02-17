@@ -1,7 +1,7 @@
-//! Accuracy tests comparing rust-llm outputs against HuggingFace Transformers golden data
+//! Accuracy tests comparing pegainfer outputs against HuggingFace Transformers golden data
 
 use anyhow::Result;
-use rust_llm::model::Qwen3Model;
+use pegainfer::model::Qwen3Model;
 use serde::Deserialize;
 use std::fs;
 
@@ -163,9 +163,9 @@ fn test_accuracy_case(golden_path: &str, model_path: &str) -> Result<()> {
 
     // Load model and run inference
     let model = Qwen3Model::from_safetensors(model_path)?;
-    println!("  Running rust-llm inference...");
+    println!("  Running pegainfer inference...");
     let rust_logits = model.forward_logits(&golden.prompt_tokens)?;
-    println!("  Got rust-llm logits: {} values", rust_logits.len());
+    println!("  Got pegainfer logits: {} values", rust_logits.len());
 
     assert_eq!(
         rust_logits.len(),
@@ -195,7 +195,7 @@ fn test_accuracy_case(golden_path: &str, model_path: &str) -> Result<()> {
 fn test_accuracy_minimal() -> Result<()> {
     test_accuracy_case(
         "../golden_data/minimal.json",
-        "../rust-llm/models/Qwen3-4B",
+        "../pegainfer/models/Qwen3-4B",
     )
 }
 
@@ -204,7 +204,7 @@ fn test_accuracy_minimal() -> Result<()> {
 fn test_accuracy_short_en() -> Result<()> {
     test_accuracy_case(
         "../golden_data/short_en.json",
-        "../rust-llm/models/Qwen3-4B",
+        "../pegainfer/models/Qwen3-4B",
     )
 }
 
@@ -213,7 +213,7 @@ fn test_accuracy_short_en() -> Result<()> {
 fn test_accuracy_medium_en() -> Result<()> {
     test_accuracy_case(
         "../golden_data/medium_en.json",
-        "../rust-llm/models/Qwen3-4B",
+        "../pegainfer/models/Qwen3-4B",
     )
 }
 
@@ -222,7 +222,7 @@ fn test_accuracy_medium_en() -> Result<()> {
 fn test_accuracy_long_en() -> Result<()> {
     test_accuracy_case(
         "../golden_data/long_en.json",
-        "../rust-llm/models/Qwen3-4B",
+        "../pegainfer/models/Qwen3-4B",
     )
 }
 
@@ -231,7 +231,7 @@ fn test_accuracy_long_en() -> Result<()> {
 fn test_accuracy_multilingual() -> Result<()> {
     test_accuracy_case(
         "../golden_data/multilingual.json",
-        "../rust-llm/models/Qwen3-4B",
+        "../pegainfer/models/Qwen3-4B",
     )
 }
 
@@ -239,7 +239,7 @@ fn test_accuracy_multilingual() -> Result<()> {
 #[test]
 #[ignore] // Requires GPU
 fn test_accuracy_all() -> Result<()> {
-    let model_path = "../rust-llm/models/Qwen3-4B";
+    let model_path = "../pegainfer/models/Qwen3-4B";
 
     let test_cases = vec![
         ("../golden_data/minimal.json", "minimal"),

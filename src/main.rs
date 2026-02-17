@@ -7,17 +7,17 @@ use clap::Parser;
 use fastrace::local::LocalSpan;
 use fastrace::prelude::*;
 use log::{error, info};
-use rust_llm::model::Qwen3Model;
-use rust_llm::logging;
-use rust_llm::tokenizer::Tokenizer;
-use rust_llm::trace_reporter::FileReporter;
+use pegainfer::model::Qwen3Model;
+use pegainfer::logging;
+use pegainfer::tokenizer::Tokenizer;
+use pegainfer::trace_reporter::FileReporter;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 #[derive(Parser)]
-#[command(name = "rust-llm", about = "Qwen3 GPU inference server")]
+#[command(name = "pegainfer", about = "Qwen3 GPU inference server")]
 struct Args {
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
