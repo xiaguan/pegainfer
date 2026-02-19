@@ -7,10 +7,13 @@ use std::fs;
 use std::time::Instant;
 use log::{debug, info};
 
+use rand::rngs::StdRng;
+
 use crate::qwen3_config::Config;
 use crate::tensor::*;
 use crate::ops;
 use crate::kv_cache::KVCache;
+use crate::sampler::{self, SamplingParams};
 use crate::weight_loader::*;
 
 /// Attention layer weights
@@ -254,21 +257,18 @@ impl Qwen3Model {
 
     #[fastrace::trace(name = "predict_next_token")]
     fn predict_next_token(&self, hidden_states: &[DeviceVec]) -> Result<u32> {
-        // Final norm - use LAST hidden state for prediction
+        let logits = self.compute_logits(hidden_states)?;
+        ops::argmax(&self.ctx, &logits)
+    }
+
+    fn compute_logits(&self, hidden_states: &[DeviceVec]) -> Result<DeviceVec> {
         let last_hidden = ops::rms_norm(
             &self.ctx,
             hidden_states.last().unwrap(),
             &self.norm,
             self.config.rms_norm_eps,
         )?;
-
-        // LM head: logits = embed_tokens @ hidden (tied weights)
-        let logits = ops::linear(&self.ctx, &last_hidden, &self.embed_tokens)?;
-
-        // Argmax on GPU
-        let next_token = ops::argmax(&self.ctx, &logits)?;
-
-        Ok(next_token)
+        ops::linear(&self.ctx, &last_hidden, &self.embed_tokens)
     }
 
     fn forward_layer(
@@ -418,22 +418,19 @@ impl Qwen3Model {
 
     #[fastrace::trace(name = "predict_next_token_batch")]
     fn predict_next_token_batch(&self, hidden: &HiddenStates) -> Result<u32> {
-        // Extract last token's hidden state
-        let last_hidden = ops::extract_vec(&self.ctx, hidden, hidden.seq_len - 1)?;
+        let logits = self.compute_logits_batch(hidden)?;
+        ops::argmax(&self.ctx, &logits)
+    }
 
-        // Final norm
+    fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {
+        let last_hidden = ops::extract_vec(&self.ctx, hidden, hidden.seq_len - 1)?;
         let normed = ops::rms_norm(
             &self.ctx,
             &last_hidden,
             &self.norm,
             self.config.rms_norm_eps,
         )?;
-
-        // LM head: logits = embed_tokens @ hidden (tied weights)
-        let logits = ops::linear(&self.ctx, &normed, &self.embed_tokens)?;
-
-        // Argmax on GPU
-        ops::argmax(&self.ctx, &logits)
+        ops::linear(&self.ctx, &normed, &self.embed_tokens)
     }
 
     fn forward_layer_batch(
@@ -528,8 +525,28 @@ impl Qwen3Model {
         Ok(hidden)
     }
 
+    fn select_token(
+        &self,
+        logits: &DeviceVec,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<u32> {
+        if params.is_greedy() {
+            ops::argmax(&self.ctx, logits)
+        } else {
+            let logits_f32 = logits.to_host(&self.ctx)?;
+            Ok(sampler::sample(&logits_f32, params, rng))
+        }
+    }
+
     /// Generate tokens
-    pub fn generate(&self, prompt_tokens: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+    pub fn generate(
+        &self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<Vec<u32>> {
         let _span = LocalSpan::enter_with_local_parent("generate")
             .with_properties(|| [
                 ("prompt_len", prompt_tokens.len().to_string()),
@@ -547,7 +564,11 @@ impl Qwen3Model {
         let next_token = {
             let _span = LocalSpan::enter_with_local_parent("prefill")
                 .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
-            self.forward_batch(&tokens, &mut kv_cache)?
+            let start_pos = kv_cache.len();
+            let hidden = self.get_embeddings_batch(&tokens)?;
+            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
+            let logits = self.compute_logits_batch(&hidden)?;
+            self.select_token(&logits, params, rng)?
         };
 
         let ttft = ttft_start.elapsed();
@@ -568,7 +589,11 @@ impl Qwen3Model {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
                     .with_property(|| ("step", i.to_string()));
-                self.forward(&[*tokens.last().unwrap()], &mut kv_cache)?
+                let start_pos = kv_cache.len();
+                let mut hidden_states = self.get_embeddings(&[*tokens.last().unwrap()])?;
+                hidden_states = self.process_all_layers(hidden_states, start_pos, &mut kv_cache)?;
+                let logits = self.compute_logits(&hidden_states)?;
+                self.select_token(&logits, params, rng)?
             };
 
             if next_token == self.config.eos_token_id {

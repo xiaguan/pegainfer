@@ -8,3 +8,4 @@ pub mod weight_loader;
 pub mod logging;
 pub mod tokenizer;
 pub mod trace_reporter;
+pub mod sampler;
