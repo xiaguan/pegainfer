@@ -5,8 +5,11 @@ use fastrace::prelude::*;
 use log::info;
 
 use pegainfer::model::Qwen3Model;
+use pegainfer::sampler::SamplingParams;
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -51,6 +54,9 @@ fn test_e2e_generation() {
         ("Write a Python function to reverse a string", 80),
     ];
 
+    let mut rng = StdRng::seed_from_u64(42);
+    let greedy = SamplingParams::default();
+
     for (prompt, max_tokens) in &cases {
         info!("=== Test: \"{}\" ===", prompt);
 
@@ -62,7 +68,7 @@ fn test_e2e_generation() {
 
         let start = Instant::now();
         let output_tokens = model
-            .generate(&prompt_tokens, *max_tokens)
+            .generate(&prompt_tokens, *max_tokens, &greedy, &mut rng)
             .expect("Generation failed");
         let elapsed = start.elapsed();
 

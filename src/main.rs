@@ -9,8 +9,11 @@ use fastrace::prelude::*;
 use log::{error, info};
 use pegainfer::model::Qwen3Model;
 use pegainfer::logging;
+use pegainfer::sampler::SamplingParams;
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -31,6 +34,7 @@ struct Args {
 struct AppState {
     model: Qwen3Model,
     tokenizer: Tokenizer,
+    rng: StdRng,
 }
 
 // OpenAI-compatible /v1/completions request
@@ -39,10 +43,9 @@ struct CompletionRequest {
     model: Option<String>,
     prompt: String,
     max_tokens: Option<usize>,
-    #[allow(dead_code)]
     temperature: Option<f32>,
-    #[allow(dead_code)]
     top_p: Option<f32>,
+    top_k: Option<i32>,
     #[allow(dead_code)]
     n: Option<usize>,
     #[allow(dead_code)]
@@ -89,7 +92,7 @@ async fn completions(
         prompt_len, max_tokens
     );
 
-    let state = state.lock().await;
+    let mut state = state.lock().await;
 
     // Set up trace root span (no-op if no reporter is configured)
     let root = Span::root("request", SpanContext::random());
@@ -111,10 +114,15 @@ async fn completions(
     };
 
     // Generate (GPU)
+    let sampling_params = SamplingParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_k: req.top_k.unwrap_or(-1),
+        top_p: req.top_p.unwrap_or(1.0),
+    };
     let output_tokens = {
-        state
-            .model
-            .generate(&prompt_tokens, max_tokens)
+        let s = &mut *state;
+        s.model
+            .generate(&prompt_tokens, max_tokens, &sampling_params, &mut s.rng)
             .map_err(|e| {
                 error!("Generation error: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -200,7 +208,8 @@ async fn main() {
     let model = Qwen3Model::from_safetensors(MODEL_PATH).expect("Failed to load model");
     info!("Model loaded: elapsed_ms={}", start.elapsed().as_millis());
 
-    let state = Arc::new(Mutex::new(AppState { model, tokenizer }));
+    let rng = StdRng::seed_from_u64(42);
+    let state = Arc::new(Mutex::new(AppState { model, tokenizer, rng }));
 
     let app = Router::new()
         .route("/v1/completions", post(completions))
