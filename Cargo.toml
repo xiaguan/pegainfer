@@ -26,6 +26,8 @@ colored = "3"
 fastrace = { version = "0.7.16", features = ["enable"] }
 clap = { version = "4.5.57", features = ["derive"] }
 rand = "0.10"
+tokio-stream = "0.1"
+futures-util = "0.3"
 
 [features]
 reference = []

@@ -623,4 +623,86 @@ impl Qwen3Model {
 
         Ok(tokens)
     }
+
+    /// Like `generate`, but sends each new token through `tx` as it's produced.
+    /// The caller receives tokens via the corresponding `mpsc::Receiver`.
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+        tx: tokio::sync::mpsc::Sender<u32>,
+    ) -> Result<()> {
+        let _span = LocalSpan::enter_with_local_parent("generate_streaming")
+            .with_properties(|| [
+                ("prompt_len", prompt_tokens.len().to_string()),
+                ("max_new_tokens", max_new_tokens.to_string()),
+            ]);
+
+        let mut tokens = prompt_tokens.to_vec();
+        let mut kv_cache = KVCache::new(
+            self.config.num_hidden_layers,
+            self.config.num_key_value_heads,
+        );
+
+        // Prefill
+        let ttft_start = Instant::now();
+        let next_token = {
+            let _span = LocalSpan::enter_with_local_parent("prefill")
+                .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
+            let start_pos = kv_cache.len();
+            let hidden = self.get_embeddings_batch(&tokens)?;
+            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
+            let logits = self.compute_logits_batch(&hidden)?;
+            self.select_token(&logits, params, rng)?
+        };
+
+        let ttft = ttft_start.elapsed();
+        info!("TTFT: {:.2}ms (prompt_len={})", ttft.as_secs_f64() * 1000.0, prompt_tokens.len());
+
+        tokens.push(next_token);
+        if tx.blocking_send(next_token).is_err() {
+            return Ok(()); // receiver dropped, client disconnected
+        }
+
+        // Decode
+        let tpot_start = Instant::now();
+        let mut generated_count = 0;
+        for i in 1..max_new_tokens {
+            let next_token = {
+                let _span = LocalSpan::enter_with_local_parent("decode_step")
+                    .with_property(|| ("step", i.to_string()));
+                let start_pos = kv_cache.len();
+                let mut hidden_states = self.get_embeddings(&[*tokens.last().unwrap()])?;
+                hidden_states = self.process_all_layers(hidden_states, start_pos, &mut kv_cache)?;
+                let logits = self.compute_logits(&hidden_states)?;
+                self.select_token(&logits, params, rng)?
+            };
+
+            if next_token == self.config.eos_token_id {
+                break;
+            }
+
+            tokens.push(next_token);
+            generated_count += 1;
+
+            if tx.blocking_send(next_token).is_err() {
+                return Ok(()); // receiver dropped
+            }
+        }
+
+        if generated_count > 0 {
+            let tpot_total = tpot_start.elapsed();
+            let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
+            info!(
+                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
+                tpot_avg * 1000.0, generated_count,
+                tpot_total.as_secs_f64() * 1000.0,
+                generated_count as f64 / tpot_total.as_secs_f64()
+            );
+        }
+
+        Ok(())
+    }
 }
