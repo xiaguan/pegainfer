@@ -36,10 +36,14 @@ struct Args {
     trace_output_path: Option<PathBuf>,
 }
 
-struct AppState {
+struct ModelState {
     model: Qwen3Model,
-    tokenizer: Tokenizer,
     rng: StdRng,
+}
+
+struct AppState {
+    model: Mutex<ModelState>,
+    tokenizer: Tokenizer,
 }
 
 // OpenAI-compatible /v1/completions request
@@ -109,7 +113,7 @@ fn now_secs() -> u64 {
 }
 
 async fn completions(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, StatusCode> {
     let max_tokens = req.max_tokens.unwrap_or(16);
@@ -123,8 +127,6 @@ async fn completions(
         stream,
     );
 
-    let mut state_guard = state.lock().await;
-
     let root = Span::root("request", SpanContext::random());
     let _guard = root.set_local_parent();
     LocalSpan::add_properties(|| {
@@ -136,7 +138,7 @@ async fn completions(
 
     let prompt_tokens = {
         let _span = LocalSpan::enter_with_local_parent("tokenize_encode");
-        state_guard
+        state
             .tokenizer
             .encode(&req.prompt)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -148,6 +150,9 @@ async fn completions(
         top_p: req.top_p.unwrap_or(1.0),
     };
 
+    // Drop non-Send span guard before any .await boundary
+    drop(_guard);
+
     if stream {
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
         let created = now_secs();
@@ -156,11 +161,8 @@ async fn completions(
         let state_clone = state.clone();
         let prompt_tokens_clone = prompt_tokens.clone();
 
-        // Drop guard so spawn_blocking can re-acquire the lock
-        drop(state_guard);
-
         tokio::task::spawn_blocking(move || {
-            let mut guard = state_clone.blocking_lock();
+            let mut guard = state_clone.model.blocking_lock();
             let s = &mut *guard;
             let result = s.model.generate_streaming(
                 &prompt_tokens_clone,
@@ -174,16 +176,17 @@ async fn completions(
             }
         });
 
-        // Build tokenizer for decoding in the stream
-        let tokenizer = Tokenizer::from_file(MODEL_PATH)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let state_for_decode = state.clone();
 
         // TODO: Buffer incomplete subword/UTF-8 sequences before sending SSE events.
         // BPE tokens can be word fragments (e.g. "un" + "belie" + "vable"); byte-level
         // tokens may decode to invalid UTF-8 (�). Hold partial text until it forms
         // complete characters, similar to mini-sglang's find_printable_text approach.
         let stream = ReceiverStream::new(rx).map(move |token_id| {
-            let text = tokenizer.decode(&[token_id]).unwrap_or_default();
+            let text = state_for_decode.tokenizer.decode(&[token_id]).unwrap_or_else(|e| {
+                log::warn!("Failed to decode token {}: {}", token_id, e);
+                "\u{FFFD}".to_string()
+            });
             let chunk = StreamChunk {
                 id: request_id.clone(),
                 object: "text_completion",
@@ -209,32 +212,38 @@ async fn completions(
 
         Ok(Sse::new(full_stream).into_response())
     } else {
-        // Non-streaming path (unchanged)
+        // Non-streaming path: run blocking GPU work on spawn_blocking
         let request_start = Instant::now();
-        let output_tokens = {
-            let s = &mut *state_guard;
+        let prompt_len = prompt_tokens.len();
+        let state_clone = state.clone();
+
+        let output_tokens = tokio::task::spawn_blocking(move || {
+            let mut guard = state_clone.model.blocking_lock();
+            let s = &mut *guard;
             s.model
                 .generate(&prompt_tokens, max_tokens, &sampling_params, &mut s.rng)
-                .map_err(|e| {
-                    error!("Generation error: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        };
+        })
+        .await
+        .map_err(|e| {
+            error!("Task join error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            error!("Generation error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-        let new_tokens = &output_tokens[prompt_tokens.len()..];
-        let generated_text = {
-            let _span = LocalSpan::enter_with_local_parent("tokenize_decode");
-            state_guard
-                .tokenizer
-                .decode(new_tokens)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        };
+        let new_tokens = &output_tokens[prompt_len..];
+        let generated_text = state
+            .tokenizer
+            .decode(new_tokens)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let total_time = request_start.elapsed();
         info!(
             "Request completed: total_time={:.2}ms, prompt_tokens={}, completion_tokens={}",
             total_time.as_secs_f64() * 1000.0,
-            prompt_tokens.len(),
+            prompt_len,
             new_tokens.len()
         );
 
@@ -250,7 +259,7 @@ async fn completions(
                 finish_reason: "length".to_string(),
             }],
             usage: Usage {
-                prompt_tokens: prompt_tokens.len(),
+                prompt_tokens: prompt_len,
                 completion_tokens: new_tokens.len(),
                 total_tokens: output_tokens.len(),
             },
@@ -287,7 +296,10 @@ async fn main() {
     info!("Model loaded: elapsed_ms={}", start.elapsed().as_millis());
 
     let rng = StdRng::seed_from_u64(42);
-    let state = Arc::new(Mutex::new(AppState { model, tokenizer, rng }));
+    let state = Arc::new(AppState {
+        model: Mutex::new(ModelState { model, rng }),
+        tokenizer,
+    });
 
     let app = Router::new()
         .route("/v1/completions", post(completions))
