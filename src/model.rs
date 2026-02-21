@@ -757,14 +757,14 @@ impl Qwen3Model {
         max_new_tokens: usize,
         params: &SamplingParams,
         rng: &mut StdRng,
-        tx: tokio::sync::mpsc::Sender<u32>,
+        tx: tokio::sync::mpsc::UnboundedSender<u32>,
     ) -> Result<()> {
         let _ = self.generate_streaming_with_callback(
             prompt_tokens,
             max_new_tokens,
             params,
             rng,
-            |token_id| tx.blocking_send(token_id).is_ok(),
+            |token_id| tx.send(token_id).is_ok(),
         )?;
         Ok(())
     }

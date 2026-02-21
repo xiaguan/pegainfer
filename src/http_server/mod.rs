@@ -13,7 +13,7 @@ use futures_util::stream;
 use log::{error, info};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::sampler::SamplingParams;
 use crate::server_engine::{CompleteRequest, ServerEngine};
@@ -69,7 +69,7 @@ async fn completions(
     if stream {
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
         let created = now_secs();
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         let state_clone = state.clone();
         tokio::task::spawn_blocking(move || {
@@ -79,7 +79,7 @@ async fn completions(
             }
         });
 
-        let stream = ReceiverStream::new(rx).map(move |delta| {
+        let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
             let chunk = StreamChunk::from_delta(&request_id, created, &model_name, delta);
             let json = serde_json::to_string(&chunk).unwrap();
             Ok::<_, Infallible>(Event::default().data(json))

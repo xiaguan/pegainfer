@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::Qwen3Model;
 use crate::sampler::SamplingParams;
@@ -49,7 +49,11 @@ pub struct StreamDelta {
 pub trait ServerEngine: Send {
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
 
-    fn complete_stream(&mut self, req: CompleteRequest, tx: Sender<StreamDelta>) -> Result<()>;
+    fn complete_stream(
+        &mut self,
+        req: CompleteRequest,
+        tx: UnboundedSender<StreamDelta>,
+    ) -> Result<()>;
 }
 
 pub struct RealServerEngine {
@@ -102,7 +106,11 @@ impl ServerEngine for RealServerEngine {
         })
     }
 
-    fn complete_stream(&mut self, req: CompleteRequest, tx: Sender<StreamDelta>) -> Result<()> {
+    fn complete_stream(
+        &mut self,
+        req: CompleteRequest,
+        tx: UnboundedSender<StreamDelta>,
+    ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
 
         // TODO: Buffer incomplete subword/UTF-8 sequences before sending deltas.
@@ -116,7 +124,7 @@ impl ServerEngine for RealServerEngine {
                     log::warn!("Failed to decode token {}: {}", token_id, e);
                     "\u{FFFD}".to_string()
                 });
-                tx.blocking_send(StreamDelta {
+                tx.send(StreamDelta {
                     text_delta,
                     finish_reason: None,
                 })
@@ -134,7 +142,7 @@ impl ServerEngine for RealServerEngine {
             FinishReason::Length
         };
 
-        let _ = tx.blocking_send(StreamDelta {
+        let _ = tx.send(StreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
         });
