@@ -53,6 +53,13 @@ pub struct Qwen3Model {
     pub sin_cache: Vec<DeviceVec>,
 }
 
+/// Streaming generation summary for transport layers.
+pub struct StreamingStats {
+    pub emitted_tokens: usize,
+    pub hit_eos: bool,
+    pub consumer_dropped: bool,
+}
+
 impl Qwen3Model {
     pub fn from_safetensors(model_path: &str) -> Result<Self> {
         info!("Loading model from: {}", model_path);
@@ -633,16 +640,20 @@ impl Qwen3Model {
         Ok(tokens)
     }
 
-    /// Like `generate`, but sends each new token through `tx` as it's produced.
-    /// The caller receives tokens via the corresponding `mpsc::Receiver`.
-    pub fn generate_streaming(
+    /// Like `generate`, but invokes `on_token` for each new token.
+    ///
+    /// Return `false` from `on_token` to stop generation early (e.g. client disconnected).
+    pub fn generate_streaming_with_callback<F>(
         &self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         params: &SamplingParams,
         rng: &mut StdRng,
-        tx: tokio::sync::mpsc::Sender<u32>,
-    ) -> Result<()> {
+        mut on_token: F,
+    ) -> Result<StreamingStats>
+    where
+        F: FnMut(u32) -> bool,
+    {
         let _span =
             LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
                 [
@@ -677,13 +688,19 @@ impl Qwen3Model {
         );
 
         tokens.push(next_token);
-        if tx.blocking_send(next_token).is_err() {
-            return Ok(()); // receiver dropped, client disconnected
+        let mut emitted_tokens = 1usize;
+        if !on_token(next_token) {
+            return Ok(StreamingStats {
+                emitted_tokens,
+                hit_eos: false,
+                consumer_dropped: true,
+            });
         }
 
         // Decode
         let tpot_start = Instant::now();
         let mut generated_count = 0;
+        let mut hit_eos = false;
         for i in 1..max_new_tokens {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
@@ -696,14 +713,20 @@ impl Qwen3Model {
             };
 
             if next_token == self.config.eos_token_id {
+                hit_eos = true;
                 break;
             }
 
             tokens.push(next_token);
             generated_count += 1;
+            emitted_tokens += 1;
 
-            if tx.blocking_send(next_token).is_err() {
-                return Ok(()); // receiver dropped
+            if !on_token(next_token) {
+                return Ok(StreamingStats {
+                    emitted_tokens,
+                    hit_eos: false,
+                    consumer_dropped: true,
+                });
             }
         }
 
@@ -719,6 +742,30 @@ impl Qwen3Model {
             );
         }
 
+        Ok(StreamingStats {
+            emitted_tokens,
+            hit_eos,
+            consumer_dropped: false,
+        })
+    }
+
+    /// Like `generate`, but sends each new token through `tx` as it's produced.
+    /// The caller receives tokens via the corresponding `mpsc::Receiver`.
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+        tx: tokio::sync::mpsc::Sender<u32>,
+    ) -> Result<()> {
+        let _ = self.generate_streaming_with_callback(
+            prompt_tokens,
+            max_new_tokens,
+            params,
+            rng,
+            |token_id| tx.blocking_send(token_id).is_ok(),
+        )?;
         Ok(())
     }
 }
