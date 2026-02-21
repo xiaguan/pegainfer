@@ -117,7 +117,9 @@ pub fn init(config: LoggingConfig) {
         let mut builder = logforth::starter_log::builder();
 
         // Parse filter from string using EnvFilterBuilder
-        let filter = logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str).build();
+        let filter =
+            logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
+                .build();
 
         match (output, colored) {
             (LogOutput::Stdout, true) => {

@@ -2,18 +2,18 @@
 
 use anyhow::Result;
 use fastrace::local::LocalSpan;
+use log::{debug, info};
 use safetensors::SafeTensors;
 use std::fs;
 use std::time::Instant;
-use log::{debug, info};
 
 use rand::rngs::StdRng;
 
-use crate::qwen3_config::Config;
-use crate::tensor::*;
-use crate::ops;
 use crate::kv_cache::KVCache;
+use crate::ops;
+use crate::qwen3_config::Config;
 use crate::sampler::{self, SamplingParams};
+use crate::tensor::*;
 use crate::weight_loader::*;
 
 /// Attention layer weights
@@ -54,7 +54,7 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-        pub fn from_safetensors(model_path: &str) -> Result<Self> {
+    pub fn from_safetensors(model_path: &str) -> Result<Self> {
         info!("Loading model from: {}", model_path);
         info!("Initializing GPU");
         let ctx = DeviceContext::new()?;
@@ -73,16 +73,17 @@ impl Qwen3Model {
         let shards: Vec<SafeTensors> = shard_data
             .iter()
             .map(|d| {
-                SafeTensors::deserialize(d)
-                    .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+                SafeTensors::deserialize(d).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
             })
             .collect::<Result<_>>()?;
 
         info!("Loading embeddings to GPU");
-        let embed_tokens =
-            load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
+        let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
 
-        info!("Loading layers to GPU: num_layers={}", config.num_hidden_layers);
+        info!(
+            "Loading layers to GPU: num_layers={}",
+            config.num_hidden_layers
+        );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
@@ -386,7 +387,9 @@ impl Qwen3Model {
 
         // Copy token IDs to GPU
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-        let token_ids_gpu = self.ctx.stream
+        let token_ids_gpu = self
+            .ctx
+            .stream
             .clone_htod(&token_ids_i32)
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
@@ -547,11 +550,12 @@ impl Qwen3Model {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> Result<Vec<u32>> {
-        let _span = LocalSpan::enter_with_local_parent("generate")
-            .with_properties(|| [
+        let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
+            [
                 ("prompt_len", prompt_tokens.len().to_string()),
                 ("max_new_tokens", max_new_tokens.to_string()),
-            ]);
+            ]
+        });
 
         // Process prompt and measure TTFT
         let ttft_start = Instant::now();
@@ -607,11 +611,16 @@ impl Qwen3Model {
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
             let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            LocalSpan::add_properties(|| [
-                ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
-                ("generated_tokens", generated_count.to_string()),
-                ("tok_per_sec", format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64())),
-            ]);
+            LocalSpan::add_properties(|| {
+                [
+                    ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
+                    ("generated_tokens", generated_count.to_string()),
+                    (
+                        "tok_per_sec",
+                        format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
+                    ),
+                ]
+            });
             info!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
                 tpot_avg * 1000.0,
@@ -634,11 +643,13 @@ impl Qwen3Model {
         rng: &mut StdRng,
         tx: tokio::sync::mpsc::Sender<u32>,
     ) -> Result<()> {
-        let _span = LocalSpan::enter_with_local_parent("generate_streaming")
-            .with_properties(|| [
-                ("prompt_len", prompt_tokens.len().to_string()),
-                ("max_new_tokens", max_new_tokens.to_string()),
-            ]);
+        let _span =
+            LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
+                [
+                    ("prompt_len", prompt_tokens.len().to_string()),
+                    ("max_new_tokens", max_new_tokens.to_string()),
+                ]
+            });
 
         let mut tokens = prompt_tokens.to_vec();
         let mut kv_cache = KVCache::new(
@@ -659,7 +670,11 @@ impl Qwen3Model {
         };
 
         let ttft = ttft_start.elapsed();
-        info!("TTFT: {:.2}ms (prompt_len={})", ttft.as_secs_f64() * 1000.0, prompt_tokens.len());
+        info!(
+            "TTFT: {:.2}ms (prompt_len={})",
+            ttft.as_secs_f64() * 1000.0,
+            prompt_tokens.len()
+        );
 
         tokens.push(next_token);
         if tx.blocking_send(next_token).is_err() {
@@ -697,7 +712,8 @@ impl Qwen3Model {
             let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
             info!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0, generated_count,
+                tpot_avg * 1000.0,
+                generated_count,
                 tpot_total.as_secs_f64() * 1000.0,
                 generated_count as f64 / tpot_total.as_secs_f64()
             );

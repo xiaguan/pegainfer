@@ -128,8 +128,14 @@ pub fn fused_mlp(
     // Dimensions check
     assert_eq!(gate_proj.cols, x.len, "gate_proj cols != x len");
     assert_eq!(up_proj.cols, x.len, "up_proj cols != x len");
-    assert_eq!(gate_proj.rows, up_proj.rows, "gate and up must have same output dim");
-    assert_eq!(down_proj.cols, gate_proj.rows, "down_proj cols != intermediate_size");
+    assert_eq!(
+        gate_proj.rows, up_proj.rows,
+        "gate and up must have same output dim"
+    );
+    assert_eq!(
+        down_proj.cols, gate_proj.rows,
+        "down_proj cols != intermediate_size"
+    );
 
     let hidden_size = x.len;
     let intermediate_size = gate_proj.rows;
@@ -481,11 +487,7 @@ pub fn rms_norm_batch(
 }
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
-pub fn add_batch(
-    ctx: &DeviceContext,
-    a: &HiddenStates,
-    b: &HiddenStates,
-) -> Result<HiddenStates> {
+pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
     assert_eq!(a.hidden_dim, b.hidden_dim);
     assert_eq!(a.seq_len, b.seq_len);
     let n = a.hidden_dim * a.seq_len;

@@ -60,7 +60,10 @@ pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> u3
 
     // Softmax
     let max_logit = candidates[0].1;
-    let mut probs: Vec<f32> = candidates.iter().map(|(_, l)| (l - max_logit).exp()).collect();
+    let mut probs: Vec<f32> = candidates
+        .iter()
+        .map(|(_, l)| (l - max_logit).exp())
+        .collect();
     let sum: f32 = probs.iter().sum();
     for p in &mut probs {
         *p /= sum;
@@ -104,8 +107,8 @@ pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     #[test]
     fn test_greedy_defaults() {
@@ -204,7 +207,11 @@ mod tests {
     #[test]
     fn test_single_logit() {
         let logits = vec![42.0];
-        let params = SamplingParams { temperature: 1.0, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 0);
     }
@@ -213,7 +220,11 @@ mod tests {
     #[should_panic(expected = "empty logits")]
     fn test_empty_logits_panics() {
         let logits: Vec<f32> = vec![];
-        let params = SamplingParams { temperature: 1.0, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         sample(&logits, &params, &mut rng);
     }
@@ -221,7 +232,11 @@ mod tests {
     #[test]
     fn test_negative_logits_argmax() {
         let logits = vec![-10.0, -5.0, -20.0, -1.0];
-        let params = SamplingParams { temperature: 0.0, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 3); // -1.0 is largest
     }
@@ -233,7 +248,11 @@ mod tests {
         logits[0] = 5.0;
         logits[1] = 4.0;
         logits[2] = 3.0;
-        let params = SamplingParams { temperature: 1.0, top_k: 3, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
@@ -249,18 +268,33 @@ mod tests {
     fn test_low_temperature_concentrates() {
         // Very low temperature → almost always picks argmax
         let logits = vec![1.0, 2.0, 10.0, 3.0];
-        let params = SamplingParams { temperature: 0.01, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 0.01,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         let n = 500;
-        let count_argmax = (0..n).filter(|_| sample(&logits, &params, &mut rng) == 2).count();
-        assert!(count_argmax == n, "t=0.01: expected all argmax, got {}/{}", count_argmax, n);
+        let count_argmax = (0..n)
+            .filter(|_| sample(&logits, &params, &mut rng) == 2)
+            .count();
+        assert!(
+            count_argmax == n,
+            "t=0.01: expected all argmax, got {}/{}",
+            count_argmax,
+            n
+        );
     }
 
     #[test]
     fn test_high_temperature_spreads() {
         // Very high temperature → nearly uniform, all 4 tokens should appear
         let logits = vec![1.0, 2.0, 3.0, 4.0];
-        let params = SamplingParams { temperature: 100.0, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 100.0,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         let mut counts = [0u32; 4];
         let n = 2000;
@@ -269,15 +303,24 @@ mod tests {
         }
         // Each token should appear at least 15% of the time (uniform = 25%)
         for (i, &c) in counts.iter().enumerate() {
-            assert!(c > (n as u32) * 15 / 100,
-                "token {} appeared only {}/{} times, expected ~25%", i, c, n);
+            assert!(
+                c > (n as u32) * 15 / 100,
+                "token {} appeared only {}/{} times, expected ~25%",
+                i,
+                c,
+                n
+            );
         }
     }
 
     #[test]
     fn test_equal_logits_uniform() {
         let logits = vec![0.0; 5];
-        let params = SamplingParams { temperature: 1.0, top_k: -1, top_p: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(42);
         let mut counts = [0u32; 5];
         let n = 2000;
@@ -286,8 +329,13 @@ mod tests {
         }
         // Each should appear at least 10% (uniform = 20%)
         for (i, &c) in counts.iter().enumerate() {
-            assert!(c > (n as u32) * 10 / 100,
-                "token {} appeared only {}/{} times, expected ~20%", i, c, n);
+            assert!(
+                c > (n as u32) * 10 / 100,
+                "token {} appeared only {}/{} times, expected ~20%",
+                i,
+                c,
+                n
+            );
         }
     }
 
@@ -298,11 +346,19 @@ mod tests {
         // softmax(10,9,1) ≈ [0.731, 0.269, 0.0007] → cumsum > 0.5 at idx=0
         // so top_p=0.5 keeps only token 0
         let logits = vec![10.0, 9.0, 1.0, 0.0, 0.0];
-        let params = SamplingParams { temperature: 1.0, top_k: 3, top_p: 0.5 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 0.5,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         for _ in 0..50 {
             let t = sample(&logits, &params, &mut rng);
-            assert!(t == 0, "expected only token 0 with top_k=3 + top_p=0.5, got {}", t);
+            assert!(
+                t == 0,
+                "expected only token 0 with top_k=3 + top_p=0.5, got {}",
+                t
+            );
         }
     }
 
@@ -310,7 +366,11 @@ mod tests {
     fn test_top_p_small_picks_top_only() {
         // top_p just above 0 — only the single highest-probability token survives
         let logits = vec![3.0, 1.0, 2.0, 1.0];
-        let params = SamplingParams { temperature: 1.0, top_k: -1, top_p: 0.01 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 0.01,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         for _ in 0..50 {
             assert_eq!(sample(&logits, &params, &mut rng), 0);

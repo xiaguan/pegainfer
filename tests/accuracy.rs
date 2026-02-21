@@ -182,9 +182,9 @@ fn test_accuracy_case(golden_path: &str, model_path: &str) -> Result<()> {
         &rust_logits,
         &golden_logits,
         &golden.name,
-        0.8,      // max_abs_diff threshold (worst: 0.75 on minimal)
-        0.12,     // mean_abs_diff threshold (worst: 0.111 on minimal)
-        0.9997,   // cosine_similarity threshold (worst: 0.99976 on medium_en)
+        0.8,    // max_abs_diff threshold (worst: 0.75 on minimal)
+        0.12,   // mean_abs_diff threshold (worst: 0.111 on minimal)
+        0.9997, // cosine_similarity threshold (worst: 0.99976 on medium_en)
     );
 
     Ok(())

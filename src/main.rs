@@ -15,8 +15,8 @@ use pegainfer::model::Qwen3Model;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -177,7 +177,6 @@ async fn completions(
         });
 
         let state_for_decode = state.clone();
-
         // TODO: Buffer incomplete subword/UTF-8 sequences before sending SSE events.
         // BPE tokens can be word fragments (e.g. "un" + "belie" + "vable"); byte-level
         // tokens may decode to invalid UTF-8 (�). Hold partial text until it forms
