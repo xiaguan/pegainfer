@@ -37,58 +37,35 @@ pub fn linear(ctx: &DeviceContext, x: &DeviceVec, weight: &DeviceMatrix) -> Resu
     Ok(y)
 }
 
-/// Batched QKV projection: (q, k, v) = (Wq@x, Wk@x, Wv@x)
-/// Supports GQA where K/V may have different dimensions than Q
-pub fn linear_qkv_batched(
+/// RMSNorm into pre-allocated output buffer
+pub fn rms_norm_into(
     ctx: &DeviceContext,
     x: &DeviceVec,
-    wq: &DeviceMatrix,
-    wk: &DeviceMatrix,
-    wv: &DeviceMatrix,
-) -> Result<(DeviceVec, DeviceVec, DeviceVec)> {
-    assert_eq!(wq.cols, x.len, "Wq cols {} != x len {}", wq.cols, x.len);
-    assert_eq!(wk.cols, x.len, "Wk cols {} != x len {}", wk.cols, x.len);
-    assert_eq!(wv.cols, x.len, "Wv cols {} != x len {}", wv.cols, x.len);
-    assert_eq!(
-        wk.rows, wv.rows,
-        "Wk rows {} != Wv rows {}",
-        wk.rows, wv.rows
-    );
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(x.len, out.len);
 
-    let mut q = DeviceVec::zeros(ctx, wq.rows)?;
-    let mut k = DeviceVec::zeros(ctx, wk.rows)?;
-    let mut v = DeviceVec::zeros(ctx, wv.rows)?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    {
-        let (wq_ptr, _gq) = wq.data.device_ptr(&ctx.stream);
-        let (wk_ptr, _gk) = wk.data.device_ptr(&ctx.stream);
-        let (wv_ptr, _gv) = wv.data.device_ptr(&ctx.stream);
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (q_ptr, _goq) = q.data.device_ptr_mut(&ctx.stream);
-        let (k_ptr, _gok) = k.data.device_ptr_mut(&ctx.stream);
-        let (v_ptr, _gov) = v.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::gemv_batched_qkv_cuda(
-                wq_ptr as *const ffi::Half,
-                wk_ptr as *const ffi::Half,
-                wv_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                q_ptr as *mut ffi::Half,
-                k_ptr as *mut ffi::Half,
-                v_ptr as *mut ffi::Half,
-                wq.rows as i32, // Mq (Q output dimension)
-                wk.rows as i32, // Mk (K/V output dimension)
-                wq.cols as i32, // K (input dimension)
-                ctx.stream.cu_stream(),
-            );
-        }
+    unsafe {
+        ffi::rms_norm_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
     }
 
-    Ok((q, k, v))
+    Ok(())
 }
 
-/// RMSNorm
+/// RMSNorm (allocating)
 pub fn rms_norm(
     ctx: &DeviceContext,
     x: &DeviceVec,
@@ -96,36 +73,19 @@ pub fn rms_norm(
     eps: f32,
 ) -> Result<DeviceVec> {
     let mut out = DeviceVec::zeros(ctx, x.len)?;
-
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::rms_norm_cuda(
-                x_ptr as *const ffi::Half,
-                w_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.len as i32,
-                eps,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
+    rms_norm_into(ctx, x, weight, eps, &mut out)?;
     Ok(out)
 }
 
-/// Fully fused MLP: gate_proj @ x + up_proj @ x + SiLU + down_proj
-pub fn fused_mlp(
+/// Fully fused MLP into pre-allocated output buffer
+pub fn fused_mlp_into(
     ctx: &DeviceContext,
     x: &DeviceVec,
     gate_proj: &DeviceMatrix,
     up_proj: &DeviceMatrix,
     down_proj: &DeviceMatrix,
-) -> Result<DeviceVec> {
-    // Dimensions check
+    out: &mut DeviceVec,
+) -> Result<()> {
     assert_eq!(gate_proj.cols, x.len, "gate_proj cols != x len");
     assert_eq!(up_proj.cols, x.len, "up_proj cols != x len");
     assert_eq!(
@@ -136,32 +96,43 @@ pub fn fused_mlp(
         down_proj.cols, gate_proj.rows,
         "down_proj cols != intermediate_size"
     );
+    assert_eq!(down_proj.rows, out.len, "down_proj rows != out len");
 
     let hidden_size = x.len;
     let intermediate_size = gate_proj.rows;
-    let mut out = DeviceVec::zeros(ctx, down_proj.rows)?;
 
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (gate_ptr, _gg) = gate_proj.data.device_ptr(&ctx.stream);
-        let (up_ptr, _gu) = up_proj.data.device_ptr(&ctx.stream);
-        let (down_ptr, _gd) = down_proj.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (gate_ptr, _gg) = gate_proj.data.device_ptr(&ctx.stream);
+    let (up_ptr, _gu) = up_proj.data.device_ptr(&ctx.stream);
+    let (down_ptr, _gd) = down_proj.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-        unsafe {
-            ffi::fused_mlp_cuda(
-                x_ptr as *const ffi::Half,
-                gate_ptr as *const ffi::Half,
-                up_ptr as *const ffi::Half,
-                down_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                hidden_size as i32,
-                intermediate_size as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
+    unsafe {
+        ffi::fused_mlp_cuda(
+            x_ptr as *const ffi::Half,
+            gate_ptr as *const ffi::Half,
+            up_ptr as *const ffi::Half,
+            down_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            hidden_size as i32,
+            intermediate_size as i32,
+            ctx.stream.cu_stream(),
+        );
     }
 
+    Ok(())
+}
+
+/// Fully fused MLP (allocating)
+pub fn fused_mlp(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    gate_proj: &DeviceMatrix,
+    up_proj: &DeviceMatrix,
+    down_proj: &DeviceMatrix,
+) -> Result<DeviceVec> {
+    let mut out = DeviceVec::zeros(ctx, down_proj.rows)?;
+    fused_mlp_into(ctx, x, gate_proj, up_proj, down_proj, &mut out)?;
     Ok(out)
 }
 
@@ -195,7 +166,27 @@ pub fn rope(
     Ok(out)
 }
 
-/// Element-wise add
+/// Element-wise add in-place: a += b
+pub fn add_inplace(ctx: &DeviceContext, a: &mut DeviceVec, b: &DeviceVec) -> Result<()> {
+    assert_eq!(a.len, b.len);
+
+    let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+
+    unsafe {
+        ffi::add_cuda(
+            a_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *mut ffi::Half,
+            a.len as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Element-wise add (allocating)
 pub fn add(ctx: &DeviceContext, a: &DeviceVec, b: &DeviceVec) -> Result<DeviceVec> {
     assert_eq!(a.len, b.len);
     let mut out = DeviceVec::zeros(ctx, a.len)?;
@@ -219,25 +210,35 @@ pub fn add(ctx: &DeviceContext, a: &DeviceVec, b: &DeviceVec) -> Result<DeviceVe
     Ok(out)
 }
 
-/// Embedding lookup
-pub fn embedding(ctx: &DeviceContext, embed: &DeviceMatrix, token_id: u32) -> Result<DeviceVec> {
-    let mut out = DeviceVec::zeros(ctx, embed.cols)?;
+/// Embedding lookup into pre-allocated output buffer
+pub fn embedding_into(
+    ctx: &DeviceContext,
+    embed: &DeviceMatrix,
+    token_id: u32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(embed.cols, out.len);
 
-    {
-        let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-        unsafe {
-            ffi::embedding_cuda(
-                embed_ptr as *const ffi::Half,
-                token_id as i32,
-                out_ptr as *mut ffi::Half,
-                embed.cols as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
+    unsafe {
+        ffi::embedding_cuda(
+            embed_ptr as *const ffi::Half,
+            token_id as i32,
+            out_ptr as *mut ffi::Half,
+            embed.cols as i32,
+            ctx.stream.cu_stream(),
+        );
     }
 
+    Ok(())
+}
+
+/// Embedding lookup (allocating)
+pub fn embedding(ctx: &DeviceContext, embed: &DeviceMatrix, token_id: u32) -> Result<DeviceVec> {
+    let mut out = DeviceVec::zeros(ctx, embed.cols)?;
+    embedding_into(ctx, embed, token_id, &mut out)?;
     Ok(out)
 }
 
@@ -356,6 +357,68 @@ pub fn attention_weighted_sum(
 /// - rms_eps: RMSNorm epsilon
 ///
 /// 返回: attention 输出 (num_qheads * head_dim,)
+/// Fused GQA Attention into pre-allocated output buffer
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_into(
+    ctx: &DeviceContext,
+    q_full: &DeviceVec,
+    k_full: &DeviceVec,
+    v_full: &DeviceVec,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut DeviceVec,
+    num_qheads: usize,
+    num_kvheads: usize,
+    head_dim: usize,
+    current_pos: usize,
+    seq_len: usize,
+    scale: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
+    let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
+    let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+    let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_gqa_attention_single_token(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            k_cache_ptr as *mut ffi::Half,
+            v_cache_ptr as *mut ffi::Half,
+            out_ptr as *mut ffi::Half,
+            num_qheads as i32,
+            num_kvheads as i32,
+            (num_qheads / num_kvheads) as i32,
+            head_dim as i32,
+            current_pos as i32,
+            seq_len as i32,
+            scale,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Fused GQA Attention (allocating)
+#[allow(clippy::too_many_arguments)]
 pub fn fused_attention(
     ctx: &DeviceContext,
     q_full: &DeviceVec,
@@ -375,46 +438,12 @@ pub fn fused_attention(
     scale: f32,
     rms_eps: f32,
 ) -> Result<DeviceVec> {
-    // 输出tensor
     let mut output = DeviceVec::zeros(ctx, num_qheads * head_dim)?;
-
-    {
-        let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
-        let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
-        let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
-        let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-        let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
-        let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-        let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-        let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::fused_gqa_attention_single_token(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                v_ptr as *const ffi::Half,
-                q_norm_ptr as *const ffi::Half,
-                k_norm_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                k_cache_ptr as *mut ffi::Half,
-                v_cache_ptr as *mut ffi::Half,
-                out_ptr as *mut ffi::Half,
-                num_qheads as i32,
-                num_kvheads as i32,
-                (num_qheads / num_kvheads) as i32,
-                head_dim as i32,
-                current_pos as i32,
-                seq_len as i32,
-                scale,
-                rms_eps,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
+    fused_attention_into(
+        ctx, q_full, k_full, v_full, q_norm_weight, k_norm_weight, cos_cache, sin_cache, k_cache,
+        v_cache, &mut output, num_qheads, num_kvheads, head_dim, current_pos, seq_len, scale,
+        rms_eps,
+    )?;
     Ok(output)
 }
 

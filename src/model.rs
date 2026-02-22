@@ -2,13 +2,14 @@
 
 use anyhow::Result;
 use fastrace::local::LocalSpan;
-use log::{debug, info};
+use log::info;
 use safetensors::SafeTensors;
 use std::fs;
 use std::time::Instant;
 
 use rand::rngs::StdRng;
 
+use crate::decode_buffers::DecodeBuffers;
 use crate::kv_cache::KVCache;
 use crate::ops;
 use crate::qwen3_config::Config;
@@ -190,202 +191,22 @@ impl Qwen3Model {
         })
     }
 
-    /// Forward pass for a single token
-    #[fastrace::trace(name = "forward")]
-    pub fn forward(&self, token_ids: &[u32], kv_cache: &mut KVCache) -> Result<u32> {
-        LocalSpan::add_property(|| ("num_tokens", token_ids.len().to_string()));
-        debug!("forward: num_tokens={}", token_ids.len());
-        let start_pos = kv_cache.len();
-
-        let mut hidden_states = self.get_embeddings(token_ids)?;
-        hidden_states = self.process_all_layers(hidden_states, start_pos, kv_cache)?;
-        let next_token = self.predict_next_token(&hidden_states)?;
-
-        Ok(next_token)
-    }
-
-    /// Forward pass returning final logits (for accuracy testing)
-    ///
-    /// Similar to `forward()`, but returns the full logits vector instead of argmax.
-    /// Used for numerical validation against reference implementations.
+    /// Forward pass returning final logits (for accuracy testing).
     pub fn forward_logits(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         let mut kv_cache = KVCache::new(
             self.config.num_hidden_layers,
             self.config.num_key_value_heads,
         );
         let start_pos = kv_cache.len();
-
-        let mut hidden_states = self.get_embeddings(token_ids)?;
-        hidden_states = self.process_all_layers(hidden_states, start_pos, &mut kv_cache)?;
-
-        // Final norm - use LAST hidden state for prediction
-        let last_hidden = ops::rms_norm(
-            &self.ctx,
-            hidden_states.last().unwrap(),
-            &self.norm,
-            self.config.rms_norm_eps,
-        )?;
-
-        // LM head: logits = embed_tokens @ hidden (tied weights)
-        let logits = ops::linear(&self.ctx, &last_hidden, &self.embed_tokens)?;
-
-        // Copy to host as f32
+        let hidden = self.get_embeddings_batch(token_ids)?;
+        let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
+        let logits = self.compute_logits_batch(&hidden)?;
         logits.to_host(&self.ctx)
     }
 
-    #[fastrace::trace(name = "get_embeddings")]
-    fn get_embeddings(&self, token_ids: &[u32]) -> Result<Vec<DeviceVec>> {
-        debug!("get_embeddings: num_tokens={}", token_ids.len());
-        token_ids
-            .iter()
-            .map(|&id| ops::embedding(&self.ctx, &self.embed_tokens, id))
-            .collect::<Result<Vec<_>>>()
-    }
-
-    #[fastrace::trace(name = "process_all_layers")]
-    fn process_all_layers(
-        &self,
-        mut hidden_states: Vec<DeviceVec>,
-        start_pos: usize,
-        kv_cache: &mut KVCache,
-    ) -> Result<Vec<DeviceVec>> {
-        let num_tokens = hidden_states.len();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden_states =
-                self.forward_layer(layer_idx, layer, &hidden_states, start_pos, kv_cache)?;
-        }
-
-        // Increment sequence length AFTER all layers processed
-        for _ in 0..num_tokens {
-            kv_cache.increment_seq_len();
-        }
-
-        Ok(hidden_states)
-    }
-
-    #[fastrace::trace(name = "predict_next_token")]
-    fn predict_next_token(&self, hidden_states: &[DeviceVec]) -> Result<u32> {
-        let logits = self.compute_logits(hidden_states)?;
-        ops::argmax(&self.ctx, &logits)
-    }
-
-    fn compute_logits(&self, hidden_states: &[DeviceVec]) -> Result<DeviceVec> {
-        let last_hidden = ops::rms_norm(
-            &self.ctx,
-            hidden_states.last().unwrap(),
-            &self.norm,
-            self.config.rms_norm_eps,
-        )?;
-        ops::linear(&self.ctx, &last_hidden, &self.embed_tokens)
-    }
-
-    fn forward_layer(
-        &self,
-        layer_idx: usize,
-        layer: &TransformerBlock,
-        hidden_states: &[DeviceVec],
-        start_pos: usize,
-        kv_cache: &mut KVCache,
-    ) -> Result<Vec<DeviceVec>> {
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-
-        // Initialize cache on first use
-        kv_cache.init_if_needed(&self.ctx, head_dim)?;
-
-        let mut outputs = Vec::with_capacity(hidden_states.len());
-
-        for (i, h) in hidden_states.iter().enumerate() {
-            let pos = start_pos + i;
-
-            let normed = ops::rms_norm(
-                &self.ctx,
-                h,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-            )?;
-
-            let (q, k, v) = ops::linear_qkv_batched(
-                &self.ctx,
-                &normed,
-                &layer.attention.q_proj,
-                &layer.attention.k_proj,
-                &layer.attention.v_proj,
-            )?;
-
-            // Use pos (start_pos + i) for current position, not kv_cache.seq_len()
-            // This is critical for prefill phase where we process multiple tokens
-            let current_pos = pos;
-            let seq_len = pos + 1;
-            let scale = 1.0 / (head_dim as f32).sqrt();
-
-            let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-
-            let attn_concat = ops::fused_attention(
-                &self.ctx,
-                &q,
-                &k,
-                &v,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache[pos],
-                &self.sin_cache[pos],
-                k_cache_layer,
-                v_cache_layer,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                current_pos,
-                seq_len,
-                scale,
-                self.config.rms_norm_eps,
-            )?;
-
-            let attn_output = ops::linear(&self.ctx, &attn_concat, &layer.attention.o_proj)?;
-            let h = ops::add(&self.ctx, h, &attn_output)?;
-
-            let normed = ops::rms_norm(
-                &self.ctx,
-                &h,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-            )?;
-
-            // MLP: fully fused (gate_proj @ x + up_proj @ x + SiLU + down_proj)
-            let mlp_out = ops::fused_mlp(
-                &self.ctx,
-                &normed,
-                &layer.mlp.gate_proj,
-                &layer.mlp.up_proj,
-                &layer.mlp.down_proj,
-            )?;
-            let h = ops::add(&self.ctx, &h, &mlp_out)?;
-
-            outputs.push(h);
-        }
-
-        Ok(outputs)
-    }
-
     // ============================================================
-    // Batched forward path (prefill optimization)
+    // Batched forward path (prefill)
     // ============================================================
-
-    /// Batched forward pass: process all tokens with GEMM instead of per-token GEMV.
-    /// Returns the predicted next token (argmax of last position's logits).
-    #[fastrace::trace(name = "forward_batch")]
-    pub fn forward_batch(&self, token_ids: &[u32], kv_cache: &mut KVCache) -> Result<u32> {
-        LocalSpan::add_property(|| ("num_tokens", token_ids.len().to_string()));
-        debug!("forward_batch: num_tokens={}", token_ids.len());
-        let start_pos = kv_cache.len();
-
-        let hidden = self.get_embeddings_batch(token_ids)?;
-        let hidden = self.process_all_layers_batch(hidden, start_pos, kv_cache)?;
-        let next_token = self.predict_next_token_batch(&hidden)?;
-
-        Ok(next_token)
-    }
 
     #[fastrace::trace(name = "get_embeddings_batch")]
     fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
@@ -424,12 +245,6 @@ impl Qwen3Model {
         }
 
         Ok(hidden)
-    }
-
-    #[fastrace::trace(name = "predict_next_token_batch")]
-    fn predict_next_token_batch(&self, hidden: &HiddenStates) -> Result<u32> {
-        let logits = self.compute_logits_batch(hidden)?;
-        ops::argmax(&self.ctx, &logits)
     }
 
     fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {
@@ -549,6 +364,119 @@ impl Qwen3Model {
         }
     }
 
+    // ============================================================
+    // Zero-allocation decode path (pre-allocated buffers)
+    // ============================================================
+
+    /// Single decode step using pre-allocated buffers. Zero GPU allocation.
+    pub fn decode_one_token(
+        &self,
+        token_id: u32,
+        kv_cache: &mut KVCache,
+        bufs: &mut DecodeBuffers,
+    ) -> Result<()> {
+        // 1. Embedding → bufs.hidden
+        ops::embedding_into(&self.ctx, &self.embed_tokens, token_id, &mut bufs.hidden)?;
+
+        // 2. 36 layers
+        let start_pos = kv_cache.len();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.decode_layer(layer_idx, layer, start_pos, kv_cache, bufs)?;
+        }
+        kv_cache.increment_seq_len();
+
+        // 3. Final norm → bufs.normed
+        ops::rms_norm_into(
+            &self.ctx,
+            &bufs.hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        )?;
+
+        // 4. LM Head → bufs.logits
+        ops::gemv(&self.ctx, &self.embed_tokens, &bufs.normed, &mut bufs.logits)?;
+
+        Ok(())
+    }
+
+    fn decode_layer(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        start_pos: usize,
+        kv_cache: &mut KVCache,
+        bufs: &mut DecodeBuffers,
+    ) -> Result<()> {
+        let pos = start_pos;
+        let seq_len = pos + 1;
+        let scale = 1.0 / (self.config.head_dim as f32).sqrt();
+        let eps = self.config.rms_norm_eps;
+
+        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
+
+        // Input RMSNorm: hidden → normed
+        ops::rms_norm_into(&self.ctx, &bufs.hidden, &layer.input_layernorm, eps, &mut bufs.normed)?;
+
+        // QKV projection: normed → q, k, v (3× gemv)
+        ops::gemv(&self.ctx, &layer.attention.q_proj, &bufs.normed, &mut bufs.q)?;
+        ops::gemv(&self.ctx, &layer.attention.k_proj, &bufs.normed, &mut bufs.k)?;
+        ops::gemv(&self.ctx, &layer.attention.v_proj, &bufs.normed, &mut bufs.v)?;
+
+        // Fused Attention: q,k,v + KV cache → attn_out
+        let (k_cache, v_cache) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        ops::fused_attention_into(
+            &self.ctx,
+            &bufs.q,
+            &bufs.k,
+            &bufs.v,
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.cos_cache[pos],
+            &self.sin_cache[pos],
+            k_cache,
+            v_cache,
+            &mut bufs.attn_out,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            pos,
+            seq_len,
+            scale,
+            eps,
+        )?;
+
+        // O projection: attn_out → attn_proj
+        ops::gemv(&self.ctx, &layer.attention.o_proj, &bufs.attn_out, &mut bufs.attn_proj)?;
+
+        // Residual: hidden += attn_proj
+        ops::add_inplace(&self.ctx, &mut bufs.hidden, &bufs.attn_proj)?;
+
+        // Post-attention RMSNorm: hidden → normed
+        ops::rms_norm_into(
+            &self.ctx,
+            &bufs.hidden,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
+
+        // Fused MLP: normed → mlp_out
+        ops::fused_mlp_into(
+            &self.ctx,
+            &bufs.normed,
+            &layer.mlp.gate_proj,
+            &layer.mlp.up_proj,
+            &layer.mlp.down_proj,
+            &mut bufs.mlp_out,
+        )?;
+
+        // Residual: hidden += mlp_out
+        ops::add_inplace(&self.ctx, &mut bufs.hidden, &bufs.mlp_out)?;
+
+        Ok(())
+    }
+
     /// Generate tokens
     pub fn generate(
         &self,
@@ -571,6 +499,7 @@ impl Qwen3Model {
             self.config.num_hidden_layers,
             self.config.num_key_value_heads,
         );
+        let mut bufs = DecodeBuffers::new(&self.ctx, &self.config)?;
 
         let next_token = {
             let _span = LocalSpan::enter_with_local_parent("prefill")
@@ -593,18 +522,15 @@ impl Qwen3Model {
             prompt_tokens.len()
         );
 
-        // Generate new tokens and measure TPOT
+        // Generate new tokens using pre-allocated buffers
         let tpot_start = Instant::now();
         let mut generated_count = 0;
         for i in 1..max_new_tokens {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
                     .with_property(|| ("step", i.to_string()));
-                let start_pos = kv_cache.len();
-                let mut hidden_states = self.get_embeddings(&[*tokens.last().unwrap()])?;
-                hidden_states = self.process_all_layers(hidden_states, start_pos, &mut kv_cache)?;
-                let logits = self.compute_logits(&hidden_states)?;
-                self.select_token(&logits, params, rng)?
+                self.decode_one_token(*tokens.last().unwrap(), &mut kv_cache, &mut bufs)?;
+                self.select_token(&bufs.logits, params, rng)?
             };
 
             if next_token == self.config.eos_token_id {
@@ -667,6 +593,7 @@ impl Qwen3Model {
             self.config.num_hidden_layers,
             self.config.num_key_value_heads,
         );
+        let mut bufs = DecodeBuffers::new(&self.ctx, &self.config)?;
 
         // Prefill
         let ttft_start = Instant::now();
@@ -697,7 +624,7 @@ impl Qwen3Model {
             });
         }
 
-        // Decode
+        // Decode using pre-allocated buffers
         let tpot_start = Instant::now();
         let mut generated_count = 0;
         let mut hit_eos = false;
@@ -705,11 +632,8 @@ impl Qwen3Model {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
                     .with_property(|| ("step", i.to_string()));
-                let start_pos = kv_cache.len();
-                let mut hidden_states = self.get_embeddings(&[*tokens.last().unwrap()])?;
-                hidden_states = self.process_all_layers(hidden_states, start_pos, &mut kv_cache)?;
-                let logits = self.compute_logits(&hidden_states)?;
-                self.select_token(&logits, params, rng)?
+                self.decode_one_token(*tokens.last().unwrap(), &mut kv_cache, &mut bufs)?;
+                self.select_token(&bufs.logits, params, rng)?
             };
 
             if next_token == self.config.eos_token_id {

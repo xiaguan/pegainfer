@@ -1,3 +1,4 @@
+pub mod decode_buffers;
 pub mod ffi;
 pub mod http_server;
 pub mod kv_cache;
