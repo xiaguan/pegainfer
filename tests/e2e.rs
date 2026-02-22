@@ -111,7 +111,9 @@ fn test_e2e_generation() {
         // Run generation in a background thread, measure delta arrival on main thread.
         std::thread::scope(|s| {
             s.spawn(|| {
-                engine.complete_stream(req, tx).expect("complete_stream() failed");
+                engine
+                    .complete_stream(req, tx)
+                    .expect("complete_stream() failed");
             });
 
             let mut deltas: Vec<StreamDelta> = Vec::new();

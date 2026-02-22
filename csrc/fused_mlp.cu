@@ -158,21 +158,16 @@ __global__ void fused_mlp_output_kernel(
 
 extern "C" {
 void fused_mlp_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *gate_proj, const __nv_bfloat16 *up_proj,
-                    const __nv_bfloat16 *down_proj, __nv_bfloat16 *out, int hidden_size,
-                    int intermediate_size, cudaStream_t stream) {
-  __nv_bfloat16 *d_act;
-  cudaMallocAsync(&d_act, intermediate_size * sizeof(__nv_bfloat16), stream);
-
+                    const __nv_bfloat16 *down_proj, __nv_bfloat16 *act, __nv_bfloat16 *out,
+                    int hidden_size, int intermediate_size, cudaStream_t stream) {
   // Phase 1: Compute gate, up, and activation
   int inter_blocks = (intermediate_size + FUSED_MLP_INTER_PER_BLOCK - 1) / FUSED_MLP_INTER_PER_BLOCK;
   fused_mlp_intermediate_kernel<<<inter_blocks, FUSED_MLP_TILE, 0, stream>>>(
-      x, gate_proj, up_proj, d_act, intermediate_size, hidden_size);
+      x, gate_proj, up_proj, act, intermediate_size, hidden_size);
 
   // Phase 2: Down projection
   int out_blocks = (hidden_size + FUSED_MLP_OUT_PER_BLOCK - 1) / FUSED_MLP_OUT_PER_BLOCK;
   fused_mlp_output_kernel<<<out_blocks, FUSED_MLP_TILE, 0, stream>>>(
-      d_act, down_proj, out, hidden_size, intermediate_size);
-
-  cudaFreeAsync(d_act, stream);
+      act, down_proj, out, hidden_size, intermediate_size);
 }
 }

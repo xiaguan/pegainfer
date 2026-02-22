@@ -66,4 +66,10 @@ impl KVCache {
     pub fn increment_seq_len(&mut self) {
         self.seq_len += 1;
     }
+
+    /// Reset sequence length to 0 for reuse across requests.
+    /// Keeps allocated buffers (stable GPU pointers for CUDA Graph replay).
+    pub fn reset(&mut self) {
+        self.seq_len = 0;
+    }
 }

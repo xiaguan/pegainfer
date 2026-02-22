@@ -373,4 +373,190 @@ void fused_gqa_attention_single_token(
     );
 }
 
+// ============================================================================
+// Decode variant — reads current_pos/seq_len from decode_meta device buffer.
+// cos/sin cache are base pointers; kernel computes offset from current_pos.
+// All pointer args are stable across calls → CUDA Graph safe.
+// ============================================================================
+__global__ void fused_gqa_attention_decode_kernel(
+    const __nv_bfloat16* __restrict__ q_full,
+    const __nv_bfloat16* __restrict__ k_full,
+    const __nv_bfloat16* __restrict__ v_full,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache_base,
+    const __nv_bfloat16* __restrict__ sin_cache_base,
+    const int* __restrict__ decode_meta,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ output,
+    int num_qheads,
+    int num_kvheads,
+    int gqa_ratio,
+    int head_dim,
+    int max_seq_len,
+    float scale,
+    float rms_eps
+) {
+    // Read dynamic values from device buffer
+    int current_pos = decode_meta[1];
+    int seq_len = decode_meta[2];
+
+    int kv_head_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    __shared__ __nv_bfloat16 smem_k[TILE_SIZE * HEAD_DIM];
+    __shared__ __nv_bfloat16 smem_v[TILE_SIZE * HEAD_DIM];
+    __shared__ __nv_bfloat16 smem_q[HEAD_DIM];
+    __shared__ float smem_scores[TILE_SIZE];
+    __shared__ float warp_partial[NUM_WARPS * (TILE_SIZE + 1)];
+    __shared__ float smem_scratch[NUM_WARPS];
+    __shared__ float smem_rms[2];
+    __shared__ float smem_running_max;
+    __shared__ float smem_running_sum;
+
+    int cache_base_offset = kv_head_idx * max_seq_len * head_dim;
+
+    // Compute cos/sin pointer for this position
+    const __nv_bfloat16* cos_cache = cos_cache_base + current_pos * head_dim;
+    const __nv_bfloat16* sin_cache = sin_cache_base + current_pos * head_dim;
+
+    // Phase 1: K head — slice → norm → rope → write to global cache
+    __nv_bfloat16 k_elem = k_full[kv_head_idx * head_dim + tid];
+
+    float k_sq = __bfloat162float(k_elem);
+    k_sq = k_sq * k_sq;
+    float k_sq_sum = warp_reduce_sum(k_sq);
+
+    if (lane_id == 0) {
+        smem_scratch[warp_id] = k_sq_sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS; i++) {
+            total += smem_scratch[i];
+        }
+        smem_rms[1] = 1.0f / sqrtf(total / head_dim + rms_eps);
+    }
+    __syncthreads();
+
+    __nv_bfloat16 k_normed = rms_norm_elem(k_elem, smem_rms[1], k_norm_weight[tid]);
+
+    int half_dim = head_dim / 2;
+    smem_k[tid] = k_normed;
+    __syncthreads();
+
+    if (tid < half_dim) {
+        __nv_bfloat16 k_lo = smem_k[tid];
+        __nv_bfloat16 k_hi = smem_k[tid + half_dim];
+
+        apply_rope_pair(k_lo, k_hi, cos_cache[tid], sin_cache[tid]);
+
+        int cache_offset = cache_base_offset + current_pos * head_dim;
+        k_cache[cache_offset + tid] = k_lo;
+        k_cache[cache_offset + tid + half_dim] = k_hi;
+    }
+    __syncthreads();
+
+    // Phase 2: V head — slice → write to global cache
+    __nv_bfloat16 v_elem = v_full[kv_head_idx * head_dim + tid];
+    v_cache[cache_base_offset + current_pos * head_dim + tid] = v_elem;
+    __syncthreads();
+
+    // Phase 3: Loop over all Q heads for this KV head
+    for (int q = 0; q < gqa_ratio; q++) {
+        int q_head_idx = kv_head_idx * gqa_ratio + q;
+        if (q_head_idx >= num_qheads) break;
+
+        __nv_bfloat16 q_elem = q_full[q_head_idx * head_dim + tid];
+
+        float q_sq = __bfloat162float(q_elem);
+        q_sq = q_sq * q_sq;
+        float q_sq_sum = warp_reduce_sum(q_sq);
+
+        if (lane_id == 0) {
+            smem_scratch[warp_id] = q_sq_sum;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int i = 0; i < NUM_WARPS; i++) {
+                total += smem_scratch[i];
+            }
+            smem_rms[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
+        }
+        __syncthreads();
+
+        __nv_bfloat16 q_normed = rms_norm_elem(q_elem, smem_rms[0], q_norm_weight[tid]);
+
+        smem_q[tid] = q_normed;
+        __syncthreads();
+
+        if (tid < half_dim) {
+            __nv_bfloat16 q_lo = smem_q[tid];
+            __nv_bfloat16 q_hi = smem_q[tid + half_dim];
+
+            apply_rope_pair(q_lo, q_hi, cos_cache[tid], sin_cache[tid]);
+
+            smem_q[tid] = q_lo;
+            smem_q[tid + half_dim] = q_hi;
+        }
+        __syncthreads();
+
+        tiled_attention(
+            smem_q,
+            k_cache + cache_base_offset,
+            v_cache + cache_base_offset,
+            smem_k, smem_v,
+            smem_scores, warp_partial, smem_scratch,
+            smem_running_max, smem_running_sum,
+            output, q_head_idx,
+            seq_len, max_seq_len, head_dim, scale,
+            tid, warp_id, lane_id
+        );
+        __syncthreads();
+    }
+}
+
+void fused_gqa_attention_decode(
+    const __nv_bfloat16* q_full,
+    const __nv_bfloat16* k_full,
+    const __nv_bfloat16* v_full,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache_base,
+    const __nv_bfloat16* sin_cache_base,
+    const int* decode_meta,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    __nv_bfloat16* output,
+    int num_qheads,
+    int num_kvheads,
+    int gqa_ratio,
+    int head_dim,
+    float scale,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int num_blocks = num_kvheads;
+    int threads_per_block = head_dim;
+    int max_seq_len = 4096;
+
+    fused_gqa_attention_decode_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
+        q_full, k_full, v_full,
+        q_norm_weight, k_norm_weight,
+        cos_cache_base, sin_cache_base,
+        decode_meta,
+        k_cache, v_cache,
+        output,
+        num_qheads, num_kvheads, gqa_ratio, head_dim,
+        max_seq_len, scale, rms_eps
+    );
+}
+
 } // extern "C"

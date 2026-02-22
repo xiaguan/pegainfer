@@ -121,15 +121,25 @@ unsafe extern "C" {
         gate_proj: *const Half,
         up_proj: *const Half,
         down_proj: *const Half,
+        act: *mut Half,
         out: *mut Half,
         hidden_size: i32,
         intermediate_size: i32,
         stream: CUstream,
     );
 
+    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
+    pub fn embedding_decode_cuda(
+        embed: *const Half,
+        decode_meta: *const i32,
+        out: *mut Half,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+
     pub fn cublas_init();
 
-    // Fused GQA Attention (single token generation)
+    // Fused GQA Attention — prefill variant (scalar pos/seq_len, per-position cos/sin)
     pub fn fused_gqa_attention_single_token(
         q_full: *const Half,
         k_full: *const Half,
@@ -147,6 +157,28 @@ unsafe extern "C" {
         head_dim: i32,
         current_pos: i32,
         seq_len: i32,
+        scale: f32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Fused GQA Attention — decode variant (reads pos/seq_len from decode_meta, base cos/sin)
+    pub fn fused_gqa_attention_decode(
+        q_full: *const Half,
+        k_full: *const Half,
+        v_full: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache_base: *const Half,
+        sin_cache_base: *const Half,
+        decode_meta: *const i32,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        num_qheads: i32,
+        num_kvheads: i32,
+        gqa_ratio: i32,
+        head_dim: i32,
         scale: f32,
         rms_eps: f32,
         stream: CUstream,

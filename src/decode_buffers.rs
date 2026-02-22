@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 
+use cudarc::driver::CudaSlice;
+
 use crate::qwen3_config::Config;
 use crate::tensor::{DeviceContext, DeviceVec};
 
@@ -23,12 +25,16 @@ pub struct DecodeBuffers {
     pub attn_out: DeviceVec,
     /// O projection output (hidden_size)
     pub attn_proj: DeviceVec,
+    /// Fused MLP intermediate activation (intermediate_size)
+    pub mlp_act: DeviceVec,
     /// Fused MLP output (hidden_size)
     pub mlp_out: DeviceVec,
     /// Current hidden state, persists across layers (hidden_size)
     pub hidden: DeviceVec,
     /// LM head logits (vocab_size)
     pub logits: DeviceVec,
+    /// Decode metadata on GPU: [token_id, current_pos, seq_len] as i32
+    pub decode_meta: CudaSlice<i32>,
 }
 
 impl DecodeBuffers {
@@ -44,9 +50,14 @@ impl DecodeBuffers {
             v: DeviceVec::zeros(ctx, kv_dim)?,
             attn_out: DeviceVec::zeros(ctx, q_dim)?,
             attn_proj: DeviceVec::zeros(ctx, h)?,
+            mlp_act: DeviceVec::zeros(ctx, config.intermediate_size)?,
             mlp_out: DeviceVec::zeros(ctx, h)?,
             hidden: DeviceVec::zeros(ctx, h)?,
             logits: DeviceVec::zeros(ctx, config.vocab_size)?,
+            decode_meta: ctx
+                .stream
+                .alloc_zeros(3)
+                .map_err(|e| anyhow::anyhow!("Alloc decode_meta failed: {}", e))?,
         })
     }
 }

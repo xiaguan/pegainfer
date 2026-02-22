@@ -17,7 +17,18 @@ impl DeviceContext {
     pub fn new() -> Result<Self> {
         let ctx =
             CudaContext::new(0).map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
-        let stream = ctx.default_stream();
+
+        // Disable multi-stream event tracking before creating streams.
+        // We use a single compute stream, so no cross-stream synchronization is needed.
+        // This avoids stream.wait(event) calls that break CUDA Graph capture.
+        // SAFETY: We only use one stream for all GPU work.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA stream: {}", e))?;
 
         // Initialize cuBLAS handle
         unsafe {
@@ -74,6 +85,30 @@ impl DeviceVec {
             .clone_dtoh(&self.data)
             .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
         Ok(host_f16.iter().map(|x| x.to_f32()).collect())
+    }
+}
+
+/// An immutable view into a sub-range of a DeviceVec.
+/// Borrows the parent's CudaSlice without copying.
+pub struct DeviceVecView<'a> {
+    pub data: cudarc::driver::CudaView<'a, bf16>,
+    pub len: usize,
+}
+
+impl DeviceVec {
+    /// Create an immutable sub-view: elements [offset..offset+len).
+    pub fn view(&self, offset: usize, len: usize) -> DeviceVecView<'_> {
+        assert!(
+            offset + len <= self.len,
+            "view out of bounds: {}+{} > {}",
+            offset,
+            len,
+            self.len
+        );
+        DeviceVecView {
+            data: self.data.slice(offset..offset + len),
+            len,
+        }
     }
 }
 

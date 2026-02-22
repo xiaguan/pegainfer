@@ -20,7 +20,7 @@ fn bench_decode_steps() {
     pegainfer::logging::init_stderr("warn");
 
     let tokenizer = Tokenizer::from_file(MODEL_PATH).expect("Failed to load tokenizer");
-    let model = Qwen3Model::from_safetensors(MODEL_PATH).expect("Failed to load model");
+    let mut model = Qwen3Model::from_safetensors(MODEL_PATH).expect("Failed to load model");
 
     let prompt = "Tell me a story";
     let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");

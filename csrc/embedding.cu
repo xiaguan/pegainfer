@@ -1,11 +1,24 @@
 #include "common.cuh"
 
 // Embedding lookup: out = embed[token_id]
+// token_id passed as scalar (for prefill compatibility)
 __global__ void
 embedding_kernel(const __nv_bfloat16 *__restrict__ embed, // (vocab_size, hidden_size)
                  int token_id, __nv_bfloat16 *__restrict__ out, int hidden_size) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < hidden_size) {
+    out[idx] = embed[token_id * hidden_size + idx];
+  }
+}
+
+// Embedding lookup reading token_id from device buffer (CUDA Graph safe)
+__global__ void
+embedding_meta_kernel(const __nv_bfloat16 *__restrict__ embed,
+                      const int *__restrict__ decode_meta,
+                      __nv_bfloat16 *__restrict__ out, int hidden_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < hidden_size) {
+    int token_id = decode_meta[0];
     out[idx] = embed[token_id * hidden_size + idx];
   }
 }
@@ -30,6 +43,14 @@ void embedding_cuda(const __nv_bfloat16 *embed, int token_id, __nv_bfloat16 *out
   int block_size = 256;
   int num_blocks = (hidden_size + block_size - 1) / block_size;
   embedding_kernel<<<num_blocks, block_size, 0, stream>>>(embed, token_id, out, hidden_size);
+}
+
+void embedding_decode_cuda(const __nv_bfloat16 *embed, const int *decode_meta,
+                            __nv_bfloat16 *out, int hidden_size,
+                            cudaStream_t stream) {
+  int block_size = 256;
+  int num_blocks = (hidden_size + block_size - 1) / block_size;
+  embedding_meta_kernel<<<num_blocks, block_size, 0, stream>>>(embed, decode_meta, out, hidden_size);
 }
 
 void embedding_batched_cuda(const __nv_bfloat16 *embed, const int *token_ids,

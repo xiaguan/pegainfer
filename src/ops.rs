@@ -84,6 +84,7 @@ pub fn fused_mlp_into(
     gate_proj: &DeviceMatrix,
     up_proj: &DeviceMatrix,
     down_proj: &DeviceMatrix,
+    act: &mut DeviceVec,
     out: &mut DeviceVec,
 ) -> Result<()> {
     assert_eq!(gate_proj.cols, x.len, "gate_proj cols != x len");
@@ -97,6 +98,7 @@ pub fn fused_mlp_into(
         "down_proj cols != intermediate_size"
     );
     assert_eq!(down_proj.rows, out.len, "down_proj rows != out len");
+    assert_eq!(act.len, gate_proj.rows, "act len != intermediate_size");
 
     let hidden_size = x.len;
     let intermediate_size = gate_proj.rows;
@@ -105,6 +107,7 @@ pub fn fused_mlp_into(
     let (gate_ptr, _gg) = gate_proj.data.device_ptr(&ctx.stream);
     let (up_ptr, _gu) = up_proj.data.device_ptr(&ctx.stream);
     let (down_ptr, _gd) = down_proj.data.device_ptr(&ctx.stream);
+    let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
     unsafe {
@@ -113,6 +116,7 @@ pub fn fused_mlp_into(
             gate_ptr as *const ffi::Half,
             up_ptr as *const ffi::Half,
             down_ptr as *const ffi::Half,
+            act_ptr as *mut ffi::Half,
             out_ptr as *mut ffi::Half,
             hidden_size as i32,
             intermediate_size as i32,
@@ -131,8 +135,9 @@ pub fn fused_mlp(
     up_proj: &DeviceMatrix,
     down_proj: &DeviceMatrix,
 ) -> Result<DeviceVec> {
+    let mut act = DeviceVec::zeros(ctx, gate_proj.rows)?;
     let mut out = DeviceVec::zeros(ctx, down_proj.rows)?;
-    fused_mlp_into(ctx, x, gate_proj, up_proj, down_proj, &mut out)?;
+    fused_mlp_into(ctx, x, gate_proj, up_proj, down_proj, &mut act, &mut out)?;
     Ok(out)
 }
 
@@ -240,6 +245,32 @@ pub fn embedding(ctx: &DeviceContext, embed: &DeviceMatrix, token_id: u32) -> Re
     let mut out = DeviceVec::zeros(ctx, embed.cols)?;
     embedding_into(ctx, embed, token_id, &mut out)?;
     Ok(out)
+}
+
+/// Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
+pub fn embedding_decode_into(
+    ctx: &DeviceContext,
+    embed: &DeviceMatrix,
+    decode_meta: &cudarc::driver::CudaSlice<i32>,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(embed.cols, out.len);
+
+    let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
+    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::embedding_decode_cuda(
+            embed_ptr as *const ffi::Half,
+            meta_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            embed.cols as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Argmax — returns the index of the maximum element
@@ -358,6 +389,8 @@ pub fn attention_weighted_sum(
 ///
 /// 返回: attention 输出 (num_qheads * head_dim,)
 /// Fused GQA Attention into pre-allocated output buffer
+/// Fused GQA Attention into pre-allocated output buffer.
+/// cos_pos/sin_pos: RoPE values for the current position (head_dim elements).
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention_into(
     ctx: &DeviceContext,
@@ -366,8 +399,8 @@ pub fn fused_attention_into(
     v_full: &DeviceVec,
     q_norm_weight: &DeviceVec,
     k_norm_weight: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    cos_pos: &DeviceVecView<'_>,
+    sin_pos: &DeviceVecView<'_>,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     output: &mut DeviceVec,
@@ -384,8 +417,8 @@ pub fn fused_attention_into(
     let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
     let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
     let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gcos) = cos_pos.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gsin) = sin_pos.data.device_ptr(&ctx.stream);
     let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
     let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
@@ -426,8 +459,8 @@ pub fn fused_attention(
     v_full: &DeviceVec,
     q_norm_weight: &DeviceVec,
     k_norm_weight: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    cos_pos: &DeviceVecView<'_>,
+    sin_pos: &DeviceVecView<'_>,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     num_qheads: usize,
@@ -440,11 +473,87 @@ pub fn fused_attention(
 ) -> Result<DeviceVec> {
     let mut output = DeviceVec::zeros(ctx, num_qheads * head_dim)?;
     fused_attention_into(
-        ctx, q_full, k_full, v_full, q_norm_weight, k_norm_weight, cos_cache, sin_cache, k_cache,
-        v_cache, &mut output, num_qheads, num_kvheads, head_dim, current_pos, seq_len, scale,
+        ctx,
+        q_full,
+        k_full,
+        v_full,
+        q_norm_weight,
+        k_norm_weight,
+        cos_pos,
+        sin_pos,
+        k_cache,
+        v_cache,
+        &mut output,
+        num_qheads,
+        num_kvheads,
+        head_dim,
+        current_pos,
+        seq_len,
+        scale,
         rms_eps,
     )?;
     Ok(output)
+}
+
+/// Fused GQA Attention for decode — reads pos/seq_len from decode_meta (CUDA Graph safe).
+/// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
+/// decode_meta: [token_id, current_pos, seq_len] on GPU.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_decode_into(
+    ctx: &DeviceContext,
+    q_full: &DeviceVec,
+    k_full: &DeviceVec,
+    v_full: &DeviceVec,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache_base: &DeviceVec,
+    sin_cache_base: &DeviceVec,
+    decode_meta: &cudarc::driver::CudaSlice<i32>,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut DeviceVec,
+    num_qheads: usize,
+    num_kvheads: usize,
+    head_dim: usize,
+    scale: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
+    let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gcos) = cos_cache_base.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gsin) = sin_cache_base.data.device_ptr(&ctx.stream);
+    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
+    let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+    let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_gqa_attention_decode(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            meta_ptr as *const i32,
+            k_cache_ptr as *mut ffi::Half,
+            v_cache_ptr as *mut ffi::Half,
+            out_ptr as *mut ffi::Half,
+            num_qheads as i32,
+            num_kvheads as i32,
+            (num_qheads / num_kvheads) as i32,
+            head_dim as i32,
+            scale,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
 }
 
 // ============================================================

@@ -9,6 +9,10 @@ use std::time::Instant;
 
 use rand::rngs::StdRng;
 
+use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+
 use crate::decode_buffers::DecodeBuffers;
 use crate::kv_cache::KVCache;
 use crate::ops;
@@ -16,6 +20,16 @@ use crate::qwen3_config::Config;
 use crate::sampler::{self, SamplingParams};
 use crate::tensor::*;
 use crate::weight_loader::*;
+
+/// CUDA Graph state for decode path.
+/// First decode call captures the graph; subsequent calls replay it.
+struct CudaGraphState {
+    graph: Option<CudaGraph>,
+}
+
+// SAFETY: CudaGraph contains raw CUDA pointers that are not Send by default.
+// We only access the graph from the single inference thread that owns the model.
+unsafe impl Send for CudaGraphState {}
 
 /// Attention layer weights
 pub struct Attention {
@@ -49,9 +63,13 @@ pub struct Qwen3Model {
     pub embed_tokens: DeviceMatrix,
     pub layers: Vec<TransformerBlock>,
     pub norm: DeviceVec,
-    // RoPE cache on GPU - precomputed for all positions
-    pub cos_cache: Vec<DeviceVec>, // [position] -> (head_dim,)
-    pub sin_cache: Vec<DeviceVec>,
+    // RoPE cache on GPU - contiguous buffer [max_seq_len * head_dim]
+    pub cos_cache: DeviceVec,
+    pub sin_cache: DeviceVec,
+    // Persistent decode state (reused across generate calls for CUDA Graph replay)
+    decode_bufs: Option<DecodeBuffers>,
+    kv_cache: Option<KVCache>,
+    graph_state: CudaGraphState,
 }
 
 /// Streaming generation summary for transport layers.
@@ -188,6 +206,9 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
+            decode_bufs: None,
+            kv_cache: None,
+            graph_state: CudaGraphState { graph: None },
         })
     }
 
@@ -301,6 +322,9 @@ impl Qwen3Model {
 
             let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
 
+            let cos_pos = self.cos_cache.view(pos * head_dim, head_dim);
+            let sin_pos = self.sin_cache.view(pos * head_dim, head_dim);
+
             let attn_out = ops::fused_attention(
                 &self.ctx,
                 &q_i,
@@ -308,8 +332,8 @@ impl Qwen3Model {
                 &v_i,
                 &layer.attention.q_norm,
                 &layer.attention.k_norm,
-                &self.cos_cache[pos],
-                &self.sin_cache[pos],
+                &cos_pos,
+                &sin_pos,
                 k_cache_layer,
                 v_cache_layer,
                 num_heads,
@@ -369,23 +393,76 @@ impl Qwen3Model {
     // ============================================================
 
     /// Single decode step using pre-allocated buffers. Zero GPU allocation.
-    pub fn decode_one_token(
+    /// With CUDA Graph: first call captures, subsequent calls replay.
+    fn decode_one_token(
         &self,
         token_id: u32,
         kv_cache: &mut KVCache,
         bufs: &mut DecodeBuffers,
+        graph_state: &mut CudaGraphState,
     ) -> Result<()> {
-        // 1. Embedding → bufs.hidden
-        ops::embedding_into(&self.ctx, &self.embed_tokens, token_id, &mut bufs.hidden)?;
+        let pos = kv_cache.len();
+        let seq_len = pos + 1;
 
-        // 2. 36 layers
-        let start_pos = kv_cache.len();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.decode_layer(layer_idx, layer, start_pos, kv_cache, bufs)?;
+        // Ensure KV cache is initialized (no-op after first call)
+        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
+
+        // Upload decode metadata to GPU (outside graph — values change each step)
+        self.ctx
+            .stream
+            .memcpy_htod(
+                &[token_id as i32, pos as i32, seq_len as i32],
+                &mut bufs.decode_meta,
+            )
+            .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
+
+        match &graph_state.graph {
+            Some(graph) => {
+                // Replay captured graph
+                graph
+                    .launch()
+                    .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
+            }
+            None => {
+                // First call: capture the kernel sequence into a graph
+                info!("Capturing CUDA Graph for decode path...");
+                self.ctx
+                    .stream
+                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                    .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
+
+                self.decode_kernels(kv_cache, bufs)?;
+
+                graph_state.graph = self
+                    .ctx
+                    .stream
+                    .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                    .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
+                info!("CUDA Graph captured successfully");
+            }
         }
-        kv_cache.increment_seq_len();
 
-        // 3. Final norm → bufs.normed
+        kv_cache.increment_seq_len();
+        Ok(())
+    }
+
+    /// Pure kernel sequence for decode — no CPU-GPU sync, no allocation.
+    /// Called during graph capture and also replayed via CUDA Graph.
+    fn decode_kernels(&self, kv_cache: &mut KVCache, bufs: &mut DecodeBuffers) -> Result<()> {
+        // 1. Embedding (reads token_id from decode_meta[0])
+        ops::embedding_decode_into(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.decode_meta,
+            &mut bufs.hidden,
+        )?;
+
+        // 2. All transformer layers
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.decode_layer(layer_idx, layer, kv_cache, bufs)?;
+        }
+
+        // 3. Final norm
         ops::rms_norm_into(
             &self.ctx,
             &bufs.hidden,
@@ -394,8 +471,13 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // 4. LM Head → bufs.logits
-        ops::gemv(&self.ctx, &self.embed_tokens, &bufs.normed, &mut bufs.logits)?;
+        // 4. LM Head
+        ops::gemv(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.normed,
+            &mut bufs.logits,
+        )?;
 
         Ok(())
     }
@@ -404,50 +486,72 @@ impl Qwen3Model {
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
-        start_pos: usize,
         kv_cache: &mut KVCache,
         bufs: &mut DecodeBuffers,
     ) -> Result<()> {
-        let pos = start_pos;
-        let seq_len = pos + 1;
         let scale = 1.0 / (self.config.head_dim as f32).sqrt();
         let eps = self.config.rms_norm_eps;
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
         // Input RMSNorm: hidden → normed
-        ops::rms_norm_into(&self.ctx, &bufs.hidden, &layer.input_layernorm, eps, &mut bufs.normed)?;
+        ops::rms_norm_into(
+            &self.ctx,
+            &bufs.hidden,
+            &layer.input_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
 
         // QKV projection: normed → q, k, v (3× gemv)
-        ops::gemv(&self.ctx, &layer.attention.q_proj, &bufs.normed, &mut bufs.q)?;
-        ops::gemv(&self.ctx, &layer.attention.k_proj, &bufs.normed, &mut bufs.k)?;
-        ops::gemv(&self.ctx, &layer.attention.v_proj, &bufs.normed, &mut bufs.v)?;
+        ops::gemv(
+            &self.ctx,
+            &layer.attention.q_proj,
+            &bufs.normed,
+            &mut bufs.q,
+        )?;
+        ops::gemv(
+            &self.ctx,
+            &layer.attention.k_proj,
+            &bufs.normed,
+            &mut bufs.k,
+        )?;
+        ops::gemv(
+            &self.ctx,
+            &layer.attention.v_proj,
+            &bufs.normed,
+            &mut bufs.v,
+        )?;
 
-        // Fused Attention: q,k,v + KV cache → attn_out
+        // Fused Attention (decode variant): reads pos/seq_len from decode_meta
         let (k_cache, v_cache) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-        ops::fused_attention_into(
+        ops::fused_attention_decode_into(
             &self.ctx,
             &bufs.q,
             &bufs.k,
             &bufs.v,
             &layer.attention.q_norm,
             &layer.attention.k_norm,
-            &self.cos_cache[pos],
-            &self.sin_cache[pos],
+            &self.cos_cache,
+            &self.sin_cache,
+            &bufs.decode_meta,
             k_cache,
             v_cache,
             &mut bufs.attn_out,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             self.config.head_dim,
-            pos,
-            seq_len,
             scale,
             eps,
         )?;
 
         // O projection: attn_out → attn_proj
-        ops::gemv(&self.ctx, &layer.attention.o_proj, &bufs.attn_out, &mut bufs.attn_proj)?;
+        ops::gemv(
+            &self.ctx,
+            &layer.attention.o_proj,
+            &bufs.attn_out,
+            &mut bufs.attn_proj,
+        )?;
 
         // Residual: hidden += attn_proj
         ops::add_inplace(&self.ctx, &mut bufs.hidden, &bufs.attn_proj)?;
@@ -468,6 +572,7 @@ impl Qwen3Model {
             &layer.mlp.gate_proj,
             &layer.mlp.up_proj,
             &layer.mlp.down_proj,
+            &mut bufs.mlp_act,
             &mut bufs.mlp_out,
         )?;
 
@@ -477,9 +582,36 @@ impl Qwen3Model {
         Ok(())
     }
 
+    /// Take decode buffers from self, lazily allocating on first use.
+    fn take_decode_bufs(&mut self) -> Result<DecodeBuffers> {
+        match self.decode_bufs.take() {
+            Some(bufs) => Ok(bufs),
+            None => DecodeBuffers::new(&self.ctx, &self.config),
+        }
+    }
+
+    /// Take KV cache from self, lazily creating on first use. Resets seq_len for new request.
+    fn take_kv_cache(&mut self) -> KVCache {
+        match self.kv_cache.take() {
+            Some(mut kv) => {
+                kv.reset();
+                kv
+            }
+            None => KVCache::new(
+                self.config.num_hidden_layers,
+                self.config.num_key_value_heads,
+            ),
+        }
+    }
+
+    /// Take graph state from self, leaving a fresh empty state.
+    fn take_graph_state(&mut self) -> CudaGraphState {
+        std::mem::replace(&mut self.graph_state, CudaGraphState { graph: None })
+    }
+
     /// Generate tokens
     pub fn generate(
-        &self,
+        &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         params: &SamplingParams,
@@ -495,11 +627,7 @@ impl Qwen3Model {
         // Process prompt and measure TTFT
         let ttft_start = Instant::now();
         let mut tokens = prompt_tokens.to_vec();
-        let mut kv_cache = KVCache::new(
-            self.config.num_hidden_layers,
-            self.config.num_key_value_heads,
-        );
-        let mut bufs = DecodeBuffers::new(&self.ctx, &self.config)?;
+        let mut kv_cache = self.take_kv_cache();
 
         let next_token = {
             let _span = LocalSpan::enter_with_local_parent("prefill")
@@ -522,14 +650,23 @@ impl Qwen3Model {
             prompt_tokens.len()
         );
 
-        // Generate new tokens using pre-allocated buffers
+        // Take persistent decode state from self (avoids borrow conflicts)
+        let mut bufs = self.take_decode_bufs()?;
+        let mut graph_state = self.take_graph_state();
+
+        // Generate new tokens using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();
         let mut generated_count = 0;
         for i in 1..max_new_tokens {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
                     .with_property(|| ("step", i.to_string()));
-                self.decode_one_token(*tokens.last().unwrap(), &mut kv_cache, &mut bufs)?;
+                self.decode_one_token(
+                    *tokens.last().unwrap(),
+                    &mut kv_cache,
+                    &mut bufs,
+                    &mut graph_state,
+                )?;
                 self.select_token(&bufs.logits, params, rng)?
             };
 
@@ -540,6 +677,11 @@ impl Qwen3Model {
             tokens.push(next_token);
             generated_count += 1;
         }
+
+        // Put persistent state back for next generate call
+        self.decode_bufs = Some(bufs);
+        self.kv_cache = Some(kv_cache);
+        self.graph_state = graph_state;
 
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
@@ -570,7 +712,7 @@ impl Qwen3Model {
     ///
     /// Return `false` from `on_token` to stop generation early (e.g. client disconnected).
     pub fn generate_streaming_with_callback<F>(
-        &self,
+        &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         params: &SamplingParams,
@@ -589,11 +731,7 @@ impl Qwen3Model {
             });
 
         let mut tokens = prompt_tokens.to_vec();
-        let mut kv_cache = KVCache::new(
-            self.config.num_hidden_layers,
-            self.config.num_key_value_heads,
-        );
-        let mut bufs = DecodeBuffers::new(&self.ctx, &self.config)?;
+        let mut kv_cache = self.take_kv_cache();
 
         // Prefill
         let ttft_start = Instant::now();
@@ -617,6 +755,7 @@ impl Qwen3Model {
         tokens.push(next_token);
         let mut emitted_tokens = 1usize;
         if !on_token(next_token) {
+            self.kv_cache = Some(kv_cache);
             return Ok(StreamingStats {
                 emitted_tokens,
                 hit_eos: false,
@@ -624,7 +763,11 @@ impl Qwen3Model {
             });
         }
 
-        // Decode using pre-allocated buffers
+        // Take persistent decode state from self
+        let mut bufs = self.take_decode_bufs()?;
+        let mut graph_state = self.take_graph_state();
+
+        // Decode using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();
         let mut generated_count = 0;
         let mut hit_eos = false;
@@ -632,7 +775,12 @@ impl Qwen3Model {
             let next_token = {
                 let _span = LocalSpan::enter_with_local_parent("decode_step")
                     .with_property(|| ("step", i.to_string()));
-                self.decode_one_token(*tokens.last().unwrap(), &mut kv_cache, &mut bufs)?;
+                self.decode_one_token(
+                    *tokens.last().unwrap(),
+                    &mut kv_cache,
+                    &mut bufs,
+                    &mut graph_state,
+                )?;
                 self.select_token(&bufs.logits, params, rng)?
             };
 
@@ -646,6 +794,9 @@ impl Qwen3Model {
             emitted_tokens += 1;
 
             if !on_token(next_token) {
+                self.decode_bufs = Some(bufs);
+                self.kv_cache = Some(kv_cache);
+                self.graph_state = graph_state;
                 return Ok(StreamingStats {
                     emitted_tokens,
                     hit_eos: false,
@@ -653,6 +804,11 @@ impl Qwen3Model {
                 });
             }
         }
+
+        // Put persistent state back for next generate call
+        self.decode_bufs = Some(bufs);
+        self.kv_cache = Some(kv_cache);
+        self.graph_state = graph_state;
 
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
@@ -676,7 +832,7 @@ impl Qwen3Model {
     /// Like `generate`, but sends each new token through `tx` as it's produced.
     /// The caller receives tokens via the corresponding `mpsc::Receiver`.
     pub fn generate_streaming(
-        &self,
+        &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         params: &SamplingParams,

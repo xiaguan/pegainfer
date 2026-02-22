@@ -94,40 +94,40 @@ pub fn load_tensor_2d(
     DeviceMatrix::from_host(ctx, &data, shape[0], shape[1])
 }
 
+/// Precompute RoPE cos/sin cache as contiguous GPU buffers.
+/// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
 pub fn precompute_rope(
     ctx: &DeviceContext,
     head_dim: usize,
     max_seq_len: usize,
     theta: f32,
-) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+) -> Result<(DeviceVec, DeviceVec)> {
     let half_dim = head_dim / 2;
 
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / head_dim as f32))
         .collect();
 
-    let mut cos_cache = Vec::with_capacity(max_seq_len);
-    let mut sin_cache = Vec::with_capacity(max_seq_len);
+    let total = max_seq_len * head_dim;
+    let mut cos_host = vec![bf16::ZERO; total];
+    let mut sin_host = vec![bf16::ZERO; total];
 
     for pos in 0..max_seq_len {
-        let mut cos_data = vec![bf16::ZERO; head_dim];
-        let mut sin_data = vec![bf16::ZERO; head_dim];
-
+        let base = pos * head_dim;
         for i in 0..half_dim {
             let freq = pos as f32 * inv_freq[i];
             let cos_val = bf16::from_f32(freq.cos());
             let sin_val = bf16::from_f32(freq.sin());
             // Half-split layout: [cos(0)..cos(63), cos(0)..cos(63)]
-            // Matches HF rotate_half pairing (i, i+half_dim)
-            cos_data[i] = cos_val;
-            cos_data[i + half_dim] = cos_val;
-            sin_data[i] = sin_val;
-            sin_data[i + half_dim] = sin_val;
+            cos_host[base + i] = cos_val;
+            cos_host[base + i + half_dim] = cos_val;
+            sin_host[base + i] = sin_val;
+            sin_host[base + i + half_dim] = sin_val;
         }
-
-        cos_cache.push(DeviceVec::from_host(ctx, &cos_data)?);
-        sin_cache.push(DeviceVec::from_host(ctx, &sin_data)?);
     }
+
+    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;
+    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?;
 
     Ok((cos_cache, sin_cache))
 }

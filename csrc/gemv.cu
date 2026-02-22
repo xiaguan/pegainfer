@@ -1,20 +1,62 @@
 #include "common.cuh"
 #include <cublas_v2.h>
 
-// Simple GEMV: y = A @ x (row-major matrix)
-// Each thread computes one output element
-__global__ void gemv_kernel(const __nv_bfloat16 *__restrict__ A, // (M, K) row-major
-                            const __nv_bfloat16 *__restrict__ x, // (K,)
-                            __nv_bfloat16 *__restrict__ y,       // (M,)
-                            int M, int K) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row < M) {
+// ============================================================================
+// Hand-written GEMV: y = A @ x (row-major matrix)
+// Each block processes GEMV_ROWS_PER_BLOCK rows.
+// 256 threads stride over K, shared-memory reduction to final dot product.
+// BF16 inputs, FP32 accumulators, BF16 output.
+// Graph-capture safe (no cuBLAS workspace allocation).
+// ============================================================================
+#define GEMV_BLOCK 256
+#define GEMV_ROWS_PER_BLOCK 4
+
+__global__ void gemv_handwritten_kernel(
+    const __nv_bfloat16 *__restrict__ A, // (M, K) row-major
+    const __nv_bfloat16 *__restrict__ x, // (K,)
+    __nv_bfloat16 *__restrict__ y,       // (M,)
+    int M, int K) {
+
+  int row_base = blockIdx.x * GEMV_ROWS_PER_BLOCK;
+  int tid = threadIdx.x;
+
+  __shared__ float tile_red[GEMV_ROWS_PER_BLOCK][GEMV_BLOCK];
+
+  // Each thread accumulates partial dot products for GEMV_ROWS_PER_BLOCK rows
+  #pragma unroll
+  for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
+    int row = row_base + r;
     float sum = 0.0f;
-    const __nv_bfloat16 *A_row = A + row * K;
-    for (int k = 0; k < K; k++) {
-      sum += __bfloat162float(A_row[k]) * __bfloat162float(x[k]);
+    if (row < M) {
+      const __nv_bfloat16 *A_row = A + row * K;
+      for (int k = tid; k < K; k += GEMV_BLOCK) {
+        sum += __bfloat162float(A_row[k]) * __bfloat162float(x[k]);
+      }
     }
-    y[row] = __float2bfloat16(sum);
+    tile_red[r][tid] = sum;
+  }
+  __syncthreads();
+
+  // Shared memory reduction
+  for (int stride = GEMV_BLOCK / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      #pragma unroll
+      for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
+        tile_red[r][tid] += tile_red[r][tid + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  // Thread 0 writes final results
+  if (tid == 0) {
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
+      int row = row_base + r;
+      if (row < M) {
+        y[row] = __float2bfloat16(tile_red[r][0]);
+      }
+    }
   }
 }
 
@@ -70,60 +112,23 @@ void cublas_destroy() {
   }
 }
 
-void gemv_naive_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
-                     cudaStream_t stream) {
-  int block_size = 256;
-  int num_blocks = (M + block_size - 1) / block_size;
-  gemv_kernel<<<num_blocks, block_size, 0, stream>>>(A, x, y, M, K);
-}
-
-void gemv_cublas_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
-                      cudaStream_t stream) {
-  const float h_alpha = 1.0f;
-  const float h_beta = 0.0f;
-
-  cublasSetStream(g_cublas_handle, stream);
-  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               M, 1, K,
-               &h_alpha,
-               A, CUDA_R_16BF, K,
-               x, CUDA_R_16BF, K,
-               &h_beta,
-               y, CUDA_R_16BF, M,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-}
 
 void gemv_batched_qkv_cuda(const __nv_bfloat16 *Wq, const __nv_bfloat16 *Wk, const __nv_bfloat16 *Wv,
                            const __nv_bfloat16 *x, __nv_bfloat16 *q_out, __nv_bfloat16 *k_out,
                            __nv_bfloat16 *v_out, int Mq, int Mk, int K,
                            cudaStream_t stream) {
-  const float h_alpha = 1.0f;
-  const float h_beta = 0.0f;
+  int blocks_q = (Mq + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+  int blocks_k = (Mk + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
 
-  cublasSetStream(g_cublas_handle, stream);
-
-  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               Mq, 1, K, &h_alpha,
-               Wq, CUDA_R_16BF, K, x, CUDA_R_16BF, K,
-               &h_beta, q_out, CUDA_R_16BF, Mq,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               Mk, 1, K, &h_alpha,
-               Wk, CUDA_R_16BF, K, x, CUDA_R_16BF, K,
-               &h_beta, k_out, CUDA_R_16BF, Mk,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               Mk, 1, K, &h_alpha,
-               Wv, CUDA_R_16BF, K, x, CUDA_R_16BF, K,
-               &h_beta, v_out, CUDA_R_16BF, Mk,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  gemv_handwritten_kernel<<<blocks_q, GEMV_BLOCK, 0, stream>>>(Wq, x, q_out, Mq, K);
+  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, 0, stream>>>(Wk, x, k_out, Mk, K);
+  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, 0, stream>>>(Wv, x, v_out, Mk, K);
 }
 
 void gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
                cudaStream_t stream) {
-  gemv_cublas_cuda(A, x, y, M, K, stream);
+  int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+  gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, 0, stream>>>(A, x, y, M, K);
 }
 
 // General GEMM: Y = W @ X where W is [M, K] row-major, X is [K, N] col-major, Y is [M, N] col-major
