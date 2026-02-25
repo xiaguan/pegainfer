@@ -781,7 +781,6 @@ mod tests {
         let x = DeviceVec::from_host(&ctx, &x_data)?;
         let y = linear(&ctx, &x, &a)?;
 
-        ctx.sync()?;
         let result = y.to_host(&ctx)?;
         assert!(
             (result[0] - 14.0).abs() < 0.1,
@@ -809,12 +808,21 @@ mod tests {
         let w = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 1.0, 1.0, 1.0]))?;
         let out = rms_norm(&ctx, &x, &w, 1e-6)?;
 
-        ctx.sync()?;
         let result = out.to_host(&ctx)?;
 
-        let rms = (7.5f32 + 1e-6).sqrt();
-        assert!((result[0] - 1.0 / rms).abs() < 0.01);
-        assert!((result[1] - 2.0 / rms).abs() < 0.01);
+        let rms = (7.5_f32 + 1e-6).sqrt();
+        assert!(
+            (result[0] - 1.0 / rms).abs() < 0.01,
+            "Expected {}, got {}",
+            1.0 / rms,
+            result[0]
+        );
+        assert!(
+            (result[1] - 2.0 / rms).abs() < 0.01,
+            "Expected {}, got {}",
+            2.0 / rms,
+            result[1]
+        );
 
         Ok(())
     }
@@ -830,13 +838,28 @@ mod tests {
         let sin = DeviceVec::from_host(&ctx, &bf16_vec(&[0.0, 0.0, 0.0, 0.0]))?;
         let out = rope(&ctx, &x, &cos, &sin)?;
 
-        ctx.sync()?;
         let result = out.to_host(&ctx)?;
 
-        assert!((result[0] - 1.0).abs() < 0.01);
-        assert!((result[1] - 0.0).abs() < 0.01);
-        assert!((result[2] - 1.0).abs() < 0.01);
-        assert!((result[3] - 0.0).abs() < 0.01);
+        assert!(
+            (result[0] - 1.0).abs() < 0.01,
+            "Expected 1.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 0.0).abs() < 0.01,
+            "Expected 0.0, got {}",
+            result[1]
+        );
+        assert!(
+            (result[2] - 1.0).abs() < 0.01,
+            "Expected 1.0, got {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 0.0).abs() < 0.01,
+            "Expected 0.0, got {}",
+            result[3]
+        );
 
         Ok(())
     }
@@ -853,7 +876,6 @@ mod tests {
 
         let scores = attention_scores(&ctx, &q, &k_cache, 2, 2, 1.0)?;
 
-        ctx.sync()?;
         let result = scores.to_host(&ctx)?;
 
         assert!(
@@ -881,7 +903,6 @@ mod tests {
 
         let out = attention_weighted_sum(&ctx, &weights, &v_cache, 2, 2)?;
 
-        ctx.sync()?;
         let result = out.to_host(&ctx)?;
 
         assert!(
