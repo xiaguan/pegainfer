@@ -58,17 +58,38 @@ fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
 }
 
 fn detect_sm_targets() -> Vec<String> {
+    // read the CUDA_SM or PEGAINFER_CUDA_SM environment variable for manual override
+    if let Ok(env) = std::env::var("PEGAINFER_CUDA_SM").or_else(|_| std::env::var("CUDA_SM")) {
+        // Support comma-separated list of SMs in the environment variable.
+        let mut sms = Vec::new();
+        for token in env.split(',') {
+            if let Some(sm) = parse_sm_token(token) {
+                sms.push(sm);
+            } else {
+                print!(
+                    "cargo:warning=Invalid SM token '{}' in CUDA_SM environment variable, skipping.",
+                    token
+                );
+            }
+        }
+        if !sms.is_empty() {
+            return sms;
+        }
+        print!(
+            "cargo:warning=No valid SM tokens found in CUDA_SM environment variable '{}', falling back to auto-detection.",
+            env
+        );
+    }
+
     if let Some(sms) = sm_targets_from_nvidia_smi() {
         return sms;
     }
 
     // Fallback: build for Ampere (bf16 baseline) when GPU detection is unavailable.
-    let fallback = vec!["80".to_string()];
-    println!(
-        "cargo:warning=Failed to detect GPU SM, fallback to sm_{} (set PEGAINFER_CUDA_SM to override)",
-        fallback[0]
+    print!(
+        "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set PEGAINFER_CUDA_SM/CUDA_SM environment variable to override."
     );
-    fallback
+    panic!("GPU detection failed");
 }
 
 fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
