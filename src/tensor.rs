@@ -142,6 +142,28 @@ impl DeviceMatrix {
             cols,
         })
     }
+
+    pub fn from_safetensors(
+        ctx: &DeviceContext,
+        data: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let slice;
+        unsafe{
+            let ptr = data.as_ptr() as *const bf16;
+            slice = std::slice::from_raw_parts(ptr, rows * cols);
+        }
+        let gpu_data = ctx
+            .stream
+            .clone_htod(slice)
+            .map_err(|e| anyhow!("H2D copy failed: {}", e))?;
+        Ok(Self {
+            data: gpu_data,
+            rows,
+            cols,
+        })
+    }
 }
 
 /// Batched hidden states: seq_len vectors of dim hidden_dim, stored contiguously.

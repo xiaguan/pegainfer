@@ -86,12 +86,7 @@ pub fn load_tensor_2d(
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let shape = tensor.shape();
-    let data: Vec<bf16> = tensor
-        .data()
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-        .collect();
-    DeviceMatrix::from_host(ctx, &data, shape[0], shape[1])
+    DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.
