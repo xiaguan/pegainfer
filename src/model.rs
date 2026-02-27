@@ -31,6 +31,19 @@ struct CudaGraphState {
 // We only access the graph from the single inference thread that owns the model.
 unsafe impl Send for CudaGraphState {}
 
+#[derive(Clone, Copy, Debug)]
+pub struct ModelRuntimeConfig {
+    pub enable_cuda_graph: bool,
+}
+
+impl Default for ModelRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enable_cuda_graph: true,
+        }
+    }
+}
+
 /// Attention layer weights
 pub struct Attention {
     pub q_proj: DeviceMatrix,
@@ -70,6 +83,7 @@ pub struct Qwen3Model {
     decode_bufs: Option<DecodeBuffers>,
     kv_cache: Option<KVCache>,
     graph_state: CudaGraphState,
+    enable_cuda_graph: bool,
 }
 
 /// Streaming generation summary for transport layers.
@@ -81,6 +95,13 @@ pub struct StreamingStats {
 
 impl Qwen3Model {
     pub fn from_safetensors(model_path: &str) -> Result<Self> {
+        Self::from_safetensors_with_runtime(model_path, ModelRuntimeConfig::default())
+    }
+
+    pub fn from_safetensors_with_runtime(
+        model_path: &str,
+        runtime: ModelRuntimeConfig,
+    ) -> Result<Self> {
         info!("Loading model from: {}", model_path);
         info!("Initializing GPU");
         let ctx = DeviceContext::new()?;
@@ -197,6 +218,11 @@ impl Qwen3Model {
 
         ctx.sync()?;
         info!("GPU model loaded successfully");
+        if runtime.enable_cuda_graph {
+            info!("Decode path CUDA Graph is enabled");
+        } else {
+            info!("Decode path CUDA Graph is disabled");
+        }
 
         Ok(Self {
             ctx,
@@ -209,6 +235,7 @@ impl Qwen3Model {
             decode_bufs: None,
             kv_cache: None,
             graph_state: CudaGraphState { graph: None },
+            enable_cuda_graph: runtime.enable_cuda_graph,
         })
     }
 
@@ -415,6 +442,12 @@ impl Qwen3Model {
                 &mut bufs.decode_meta,
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
+
+        if !self.enable_cuda_graph {
+            self.decode_kernels(kv_cache, bufs)?;
+            kv_cache.increment_seq_len();
+            return Ok(());
+        }
 
         match &graph_state.graph {
             Some(graph) => {
