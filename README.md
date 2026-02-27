@@ -60,6 +60,9 @@ cargo build --release
 # Run inference server on port 8000
 cargo run --release
 
+# Disable CUDA Graph capture/replay on decode path
+cargo run --release -- --cuda-graph=false
+
 # Run tests
 cargo test --release
 ```

@@ -3,7 +3,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::model::Qwen3Model;
+use crate::model::{ModelRuntimeConfig, Qwen3Model};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
@@ -62,10 +62,32 @@ pub struct RealServerEngine {
     rng: StdRng,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct EngineOptions {
+    pub enable_cuda_graph: bool,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            enable_cuda_graph: true,
+        }
+    }
+}
+
 impl RealServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
+        Self::load_with_options(model_path, seed, EngineOptions::default())
+    }
+
+    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(model_path)?;
-        let model = Qwen3Model::from_safetensors(model_path)?;
+        let model = Qwen3Model::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph: options.enable_cuda_graph,
+            },
+        )?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
             model,

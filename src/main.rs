@@ -5,7 +5,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::server_engine::RealServerEngine;
+use pegainfer::server_engine::{EngineOptions, RealServerEngine};
 use pegainfer::trace_reporter::FileReporter;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -16,6 +16,10 @@ struct Args {
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     port: u16,
+
+    /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to disable)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    cuda_graph: bool,
 
     /// Enable request tracing and write trace JSON files to this directory
     #[arg(long)]
@@ -40,7 +44,15 @@ async fn main() {
     info!("=== Rust LLM Server - Qwen3 (GPU) ===");
     info!("Loading engine...");
     let start = Instant::now();
-    let engine = RealServerEngine::load(MODEL_PATH, 42).expect("Failed to load engine");
+    info!("Runtime options: cuda_graph={}", args.cuda_graph);
+    let engine = RealServerEngine::load_with_options(
+        MODEL_PATH,
+        42,
+        EngineOptions {
+            enable_cuda_graph: args.cuda_graph,
+        },
+    )
+    .expect("Failed to load engine");
     info!(
         "Engine loaded: elapsed_ms={}, vocab_size={}",
         start.elapsed().as_millis(),
