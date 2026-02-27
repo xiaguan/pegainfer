@@ -65,6 +65,21 @@ impl DeviceVec {
         })
     }
 
+    pub fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
+        if data.len() % 2 != 0 {
+            return Err(anyhow!(
+                "Data length must be even for bf16: got {} bytes",
+                data.len()
+            ));
+        }
+        let len = data.len() / 2;
+        // NOTE: This assumes a little-endian host. Safetensors are little-endian.
+        // On a big-endian machine, this will be incorrect. A full solution would
+        // involve byte-swapping.
+        let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), len) };
+        Self::from_host(ctx, slice)
+    }
+
     /// Create zeroed tensor
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let gpu_data: CudaSlice<bf16> = ctx
@@ -142,6 +157,35 @@ impl DeviceMatrix {
             cols,
         })
     }
+
+    pub fn from_safetensors(
+        ctx: &DeviceContext,
+        data: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if data.len() != rows * cols * std::mem::size_of::<bf16>() {
+            return Err(anyhow!(
+                "Data length mismatch: expected {} bytes, got {} bytes",
+                rows * cols * std::mem::size_of::<bf16>(),
+                data.len()
+            ));
+        }
+        // NOTE: This assumes a little-endian host. Safetensors are little-endian.
+        // On a big-endian machine, this will be incorrect. A full solution would
+        // involve byte-swapping.
+        let slice =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), rows * cols) };
+        let gpu_data = ctx
+            .stream
+            .clone_htod(slice)
+            .map_err(|e| anyhow!("H2D copy failed: {}", e))?;
+        Ok(Self {
+            data: gpu_data,
+            rows,
+            cols,
+        })
+    }
 }
 
 /// Batched hidden states: seq_len vectors of dim hidden_dim, stored contiguously.
@@ -165,5 +209,90 @@ impl HiddenStates {
             hidden_dim,
             seq_len,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {
+        let host = ctx
+            .stream
+            .clone_dtoh(&matrix.data)
+            .expect("D2H copy failed");
+        ctx.sync().expect("CUDA sync failed");
+        host
+    }
+
+    #[test]
+    fn test_device_matrix_from_host_roundtrip() {
+        let ctx = DeviceContext::new().expect("Failed to create CUDA context");
+        let rows = 2;
+        let cols = 3;
+        let host = vec![
+            bf16::from_f32(-1.5),
+            bf16::from_f32(0.0),
+            bf16::from_f32(2.25),
+            bf16::from_f32(7.0),
+            bf16::from_f32(-3.0),
+            bf16::from_f32(0.5),
+        ];
+
+        let matrix =
+            DeviceMatrix::from_host(&ctx, &host, rows, cols).expect("from_host should succeed");
+
+        assert_eq!(matrix.rows, rows);
+        assert_eq!(matrix.cols, cols);
+
+        let got = copy_matrix_to_host(&ctx, &matrix);
+        assert_eq!(got.len(), host.len());
+        for (idx, (actual, expected)) in got.iter().zip(host.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "roundtrip mismatch at index {}",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_device_matrix_from_safetensors_matches_from_host() {
+        let ctx = DeviceContext::new().expect("Failed to create CUDA context");
+        let rows = 3;
+        let cols = 2;
+        let host = vec![
+            bf16::from_f32(-8.0),
+            bf16::from_f32(-0.25),
+            bf16::from_f32(1.0),
+            bf16::from_f32(3.5),
+            bf16::from_f32(9.0),
+            bf16::from_f32(10.75),
+        ];
+        let safetensor_bytes: Vec<u8> = host
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
+
+        let from_host =
+            DeviceMatrix::from_host(&ctx, &host, rows, cols).expect("from_host should succeed");
+        let from_safetensors = DeviceMatrix::from_safetensors(&ctx, &safetensor_bytes, rows, cols)
+            .expect("from_safetensors should succeed");
+
+        assert_eq!(from_safetensors.rows, from_host.rows);
+        assert_eq!(from_safetensors.cols, from_host.cols);
+
+        let host_out = copy_matrix_to_host(&ctx, &from_host);
+        let safetensors_out = copy_matrix_to_host(&ctx, &from_safetensors);
+        assert_eq!(host_out.len(), safetensors_out.len());
+        for (idx, (a, b)) in host_out.iter().zip(safetensors_out.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "from_safetensors/from_host mismatch at index {}",
+                idx
+            );
+        }
     }
 }
