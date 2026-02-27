@@ -70,12 +70,7 @@ pub fn load_tensor_1d(
     name: &str,
 ) -> Result<DeviceVec> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let data: Vec<bf16> = tensor
-        .data()
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-        .collect();
-    DeviceVec::from_host(ctx, &data)
+    DeviceVec::from_safetensors(ctx, tensor.data())
 }
 
 pub fn load_tensor_2d(

@@ -65,6 +65,21 @@ impl DeviceVec {
         })
     }
 
+    pub fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
+        if data.len() % 2 != 0 {
+            return Err(anyhow!(
+                "Data length must be even for bf16: got {} bytes",
+                data.len()
+            ));
+        }
+        let len = data.len() / 2;
+        // NOTE: This assumes a little-endian host. Safetensors are little-endian.
+        // On a big-endian machine, this will be incorrect. A full solution would
+        // involve byte-swapping.
+        let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), len) };
+        Self::from_host(ctx, slice)
+    }
+
     /// Create zeroed tensor
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let gpu_data: CudaSlice<bf16> = ctx
