@@ -89,9 +89,13 @@ __global__ void fused_mlp_intermediate_kernel(
     for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
       int inter_idx = inter_base + r;
       if (inter_idx < intermediate_size) {
-        float g = gate_acc[r];
+        // Match HF: GEMV outputs are bf16, silu output is bf16, then bf16 × bf16
+        __nv_bfloat16 gate_bf16 = __float2bfloat16(gate_acc[r]);
+        float g = __bfloat162float(gate_bf16);
         float silu_g = g / (1.0f + expf(-g));
-        float result = silu_g * up_acc[r];
+        __nv_bfloat16 silu_bf16 = __float2bfloat16(silu_g);
+        __nv_bfloat16 up_bf16 = __float2bfloat16(up_acc[r]);
+        float result = __bfloat162float(silu_bf16) * __bfloat162float(up_bf16);
         act[inter_idx] = __float2bfloat16(result);
       }
     }

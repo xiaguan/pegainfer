@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fastrace::prelude::*;
 use log::info;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use pegainfer::sampler::SamplingParams;
@@ -12,6 +14,33 @@ use pegainfer::server_engine::{
 use pegainfer::trace_reporter::FileReporter;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const TEST_DATA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/Qwen3-4B.json");
+
+// ── Test data types ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TestData {
+    cases: Vec<TestCase>,
+}
+
+#[derive(Deserialize)]
+struct TestCase {
+    #[allow(dead_code)]
+    name: String,
+    prompt: String,
+    max_new_tokens: usize,
+    output: String,
+}
+
+fn load_test_cases() -> Vec<TestCase> {
+    let content = std::fs::read_to_string(TEST_DATA_PATH)
+        .unwrap_or_else(|e| panic!("Failed to read {TEST_DATA_PATH}: {e}"));
+    let data: TestData =
+        serde_json::from_str(&content).expect("Failed to parse test data JSON");
+    data.cases
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 fn init_logging() {
     pegainfer::logging::init_stderr("info");
@@ -44,29 +73,35 @@ fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelt
     deltas
 }
 
+// ── Test ─────────────────────────────────────────────────────────────────
+
 #[test]
 fn test_e2e_generation() {
     init_logging();
     let trace_dir = init_tracing();
+    let test_cases = load_test_cases();
 
     info!("Loading engine...");
     let start = Instant::now();
     let mut engine = RealServerEngine::load(MODEL_PATH, 42).expect("Failed to load engine");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
-    let cases: &[(&str, usize)] = &[
-        ("Tell me a story", 100),
-        ("My name is", 100),
-        ("What is 2 + 2?", 30),
-        ("今天天气真好", 50),
-        ("请介绍一下中国的首都", 50),
-        ("Write a Python function to reverse a string", 80),
-    ];
+    // Build expected-output lookup from JSON
+    let expected: HashMap<&str, &str> = test_cases
+        .iter()
+        .map(|tc| (tc.prompt.as_str(), tc.output.as_str()))
+        .collect();
+
+    // Derive (prompt, max_tokens) from JSON — single source of truth
+    let cases: Vec<(&str, usize)> = test_cases
+        .iter()
+        .map(|tc| (tc.prompt.as_str(), tc.max_new_tokens))
+        .collect();
 
     // ── 1. Non-streaming correctness ──────────────────────────────────────
 
-    info!("=== Phase 1: Non-streaming ===");
-    for &(prompt, max_tokens) in cases {
+    info!("=== Phase 1: Non-streaming correctness ===");
+    for &(prompt, max_tokens) in &cases {
         info!("--- complete: \"{}\" ---", prompt);
         let root = Span::root("complete", SpanContext::random());
         let _guard = root.set_local_parent();
@@ -94,12 +129,21 @@ fn test_e2e_generation() {
         if out.usage.completion_tokens >= max_tokens {
             assert_eq!(out.finish_reason, FinishReason::Length);
         }
+
+        // Greedy output must match HF Transformers reference
+        let exp = expected[prompt];
+        assert_eq!(
+            out.text, exp,
+            "greedy output mismatch for: \"{}\"\n  got:      {:?}\n  expected: {:?}",
+            prompt, out.text, exp
+        );
+        info!("  PASS: matches reference");
     }
 
     // ── 2. Streaming correctness + TTFT/TPOT ────────────────────────────
 
     info!("=== Phase 2: Streaming ===");
-    for &(prompt, max_tokens) in cases {
+    for &(prompt, max_tokens) in &cases {
         info!("--- stream: \"{}\" ---", prompt);
         let root = Span::root("stream", SpanContext::random());
         let _guard = root.set_local_parent();
@@ -187,7 +231,7 @@ fn test_e2e_generation() {
     // ── 3. Streaming / non-streaming consistency (greedy → deterministic) ─
 
     info!("=== Phase 3: Consistency ===");
-    for &(prompt, max_tokens) in cases {
+    for &(prompt, max_tokens) in &cases {
         info!("--- consistency: \"{}\" ---", prompt);
 
         let non_stream = engine

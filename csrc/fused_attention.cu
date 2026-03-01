@@ -29,7 +29,9 @@ __device__ __forceinline__ __nv_bfloat16 rms_norm_elem(
     float rms_inv,
     __nv_bfloat16 weight
 ) {
-    float val = __bfloat162float(x) * rms_inv * __bfloat162float(weight);
+    // Match HF: round normalized value to bf16 before weight multiply
+    __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(x) * rms_inv);
+    float val = __bfloat162float(normed) * __bfloat162float(weight);
     return __float2bfloat16(val);
 }
 

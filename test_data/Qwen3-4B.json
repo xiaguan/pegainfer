@@ -1,0 +1,42 @@
+{
+  "model_name": "Qwen3-4B",
+  "engine": "pegainfer",
+  "cases": [
+    {
+      "name": "tell_story",
+      "prompt": "Tell me a story",
+      "max_new_tokens": 50,
+      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and has a lot"
+    },
+    {
+      "name": "my_name",
+      "prompt": "My name is",
+      "max_new_tokens": 50,
+      "output": " Xiaoyu, and I am a student in the School of Economics and Management at Tsinghua University. I am currently studying a major in International Business. I have a strong interest in the field of international trade and have been involved in various activities"
+    },
+    {
+      "name": "math",
+      "prompt": "What is 2 + 2?",
+      "max_new_tokens": 30,
+      "output": " Also, can you explain how to solve it step by step?\n\n2 + 2 equals 4. To solve this, you start with the number"
+    },
+    {
+      "name": "chinese_weather",
+      "prompt": "今天天气真好",
+      "max_new_tokens": 50,
+      "output": "，阳光明媚，适合户外活动。我决定去公园散步。公园里有各种各样的花，有玫瑰、郁金香、菊花，还有各种各样的树木，比如松树、梧桐树、银杏树。我"
+    },
+    {
+      "name": "chinese_capital",
+      "prompt": "请介绍一下中国的首都",
+      "max_new_tokens": 50,
+      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国华北地区，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京的地理位置非常优越，地处华北平原的北部边缘，东临渤海湾"
+    },
+    {
+      "name": "python_code",
+      "prompt": "Write a Python function to reverse a string",
+      "max_new_tokens": 50,
+      "output": ". But the function should not use any built-in string reversal functions or methods (like [::-1], reversed(), or [::-1] in slicing). Also, the function should not use any loops (for, while, etc.) and must be"
+    }
+  ]
+}

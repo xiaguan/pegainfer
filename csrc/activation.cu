@@ -12,6 +12,7 @@ __global__ void silu_kernel(const __nv_bfloat16 *__restrict__ x,
 }
 
 // SiLU + element-wise multiply: out[i] = silu(gate[i]) * up[i]
+// Match HF: silu output is rounded to bf16 before multiplying with up
 __global__ void silu_mul_kernel(const __nv_bfloat16 *__restrict__ gate,
                                 const __nv_bfloat16 *__restrict__ up,
                                 __nv_bfloat16 *__restrict__ out, int n) {
@@ -19,7 +20,8 @@ __global__ void silu_mul_kernel(const __nv_bfloat16 *__restrict__ gate,
   if (idx < n) {
     float g = __bfloat162float(gate[idx]);
     float silu_g = g / (1.0f + expf(-g));
-    float result = silu_g * __bfloat162float(up[idx]);
+    __nv_bfloat16 silu_bf16 = __float2bfloat16(silu_g);
+    float result = __bfloat162float(silu_bf16) * __bfloat162float(up[idx]);
     out[idx] = __float2bfloat16(result);
   }
 }

@@ -30,9 +30,10 @@ __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
   float rms = sqrtf(shared[0] / n + eps);
   float inv_rms = 1.0f / rms;
 
-  // Normalize and scale
+  // Normalize and scale (match HF: round normalized to bf16 before weight multiply)
   for (int i = tid; i < n; i += stride) {
-    float val = __bfloat162float(x[i]) * inv_rms * __bfloat162float(weight[i]);
+    __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(x[i]) * inv_rms);
+    float val = __bfloat162float(normed) * __bfloat162float(weight[i]);
     out[i] = __float2bfloat16(val);
   }
 }
@@ -65,8 +66,10 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   float rms = sqrtf(shared[0] / hidden_dim + eps);
   float inv_rms = 1.0f / rms;
 
+  // Match HF: round normalized to bf16 before weight multiply
   for (int i = tid; i < hidden_dim; i += stride) {
-    float val = __bfloat162float(x_vec[i]) * inv_rms * __bfloat162float(weight[i]);
+    __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(x_vec[i]) * inv_rms);
+    float val = __bfloat162float(normed) * __bfloat162float(weight[i]);
     out_vec[i] = __float2bfloat16(val);
   }
 }

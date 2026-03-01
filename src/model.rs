@@ -472,6 +472,13 @@ impl Qwen3Model {
                     .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
                     .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
                 info!("CUDA Graph captured successfully");
+
+                // Capture only records — kernels don't execute. Launch to actually compute.
+                if let Some(ref graph) = graph_state.graph {
+                    graph
+                        .launch()
+                        .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
+                }
             }
         }
 
