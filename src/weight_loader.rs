@@ -121,3 +121,29 @@ pub fn precompute_rope(
 
     Ok((cos_cache, sin_cache))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QWEN3_4B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+    const QWEN3_8B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
+
+    #[test]
+    fn test_load_shard_info_for_tied_qwen3_4b() {
+        let (shards, weight_map) = load_shard_info(QWEN3_4B_PATH).unwrap();
+
+        assert_eq!(shards.len(), 3);
+        assert!(weight_map.contains_key("model.embed_tokens.weight"));
+        assert!(!weight_map.contains_key("lm_head.weight"));
+    }
+
+    #[test]
+    fn test_load_shard_info_for_untied_qwen3_8b() {
+        let (shards, weight_map) = load_shard_info(QWEN3_8B_PATH).unwrap();
+
+        assert_eq!(shards.len(), 5);
+        assert!(weight_map.contains_key("model.embed_tokens.weight"));
+        assert!(weight_map.contains_key("lm_head.weight"));
+    }
+}

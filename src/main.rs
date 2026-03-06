@@ -8,11 +8,15 @@ use pegainfer::logging;
 use pegainfer::server_engine::{EngineOptions, RealServerEngine};
 use pegainfer::trace_reporter::FileReporter;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 #[derive(Parser)]
 #[command(name = "pegainfer", about = "Qwen3 GPU inference server")]
 struct Args {
+    /// Model directory containing config, tokenizer, and safetensor shards
+    #[arg(long, default_value = DEFAULT_MODEL_PATH)]
+    model_path: PathBuf,
+
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     port: u16,
@@ -44,9 +48,15 @@ async fn main() {
     info!("=== Rust LLM Server - Qwen3 (GPU) ===");
     info!("Loading engine...");
     let start = Instant::now();
-    info!("Runtime options: cuda_graph={}", args.cuda_graph);
+    info!(
+        "Runtime options: model_path={}, cuda_graph={}",
+        args.model_path.display(),
+        args.cuda_graph
+    );
     let engine = RealServerEngine::load_with_options(
-        MODEL_PATH,
+        args.model_path
+            .to_str()
+            .expect("Model path must be valid UTF-8"),
         42,
         EngineOptions {
             enable_cuda_graph: args.cuda_graph,

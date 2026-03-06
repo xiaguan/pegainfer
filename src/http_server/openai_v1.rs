@@ -26,12 +26,6 @@ impl CompletionRequest {
     pub(super) fn stream_or_default(&self) -> bool {
         self.stream.unwrap_or(false)
     }
-
-    pub(super) fn model_or_default(&self) -> String {
-        self.model
-            .clone()
-            .unwrap_or_else(|| "qwen3-4b-gpu".to_string())
-    }
 }
 
 #[derive(Debug, Serialize)]

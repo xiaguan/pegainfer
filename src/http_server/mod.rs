@@ -10,7 +10,7 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use fastrace::local::LocalSpan;
 use fastrace::prelude::*;
 use futures_util::stream;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -36,8 +36,21 @@ async fn completions(
 ) -> Result<Response, StatusCode> {
     let max_tokens = req.max_tokens_or_default();
     let stream = req.stream_or_default();
-    let model_name = req.model_or_default();
+    let requested_model = req.model.clone();
+    let loaded_model = {
+        let guard = state.engine.lock().await;
+        guard.model_id().to_string()
+    };
     let prompt_len = req.prompt.len();
+
+    if let Some(ref requested_model) = requested_model
+        && requested_model != &loaded_model
+    {
+        warn!(
+            "Request model '{}' does not match loaded model '{}'; using loaded model",
+            requested_model, loaded_model
+        );
+    }
 
     info!(
         "Received request: prompt_len={}, max_tokens={}, stream={}",
@@ -80,7 +93,7 @@ async fn completions(
         });
 
         let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
-            let chunk = StreamChunk::from_delta(&request_id, created, &model_name, delta);
+            let chunk = StreamChunk::from_delta(&request_id, created, &loaded_model, delta);
             let json = serde_json::to_string(&chunk).unwrap();
             Ok::<_, Infallible>(Event::default().data(json))
         });
@@ -114,7 +127,7 @@ async fn completions(
             output.usage.completion_tokens
         );
 
-        let response = CompletionResponse::from_output(model_name, now_secs(), output);
+        let response = CompletionResponse::from_output(loaded_model, now_secs(), output);
         Ok(Json(response).into_response())
     }
 }
@@ -127,4 +140,113 @@ pub fn build_app(engine: Box<dyn ServerEngine>) -> Router {
     Router::new()
         .route("/v1/completions", post(completions))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anyhow::Result;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    use crate::server_engine::{CompleteOutput, FinishReason, StreamDelta, Usage};
+
+    struct MockEngine {
+        model_id: String,
+    }
+
+    impl MockEngine {
+        fn new(model_id: &str) -> Self {
+            Self {
+                model_id: model_id.to_string(),
+            }
+        }
+    }
+
+    impl ServerEngine for MockEngine {
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+
+        fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+            Ok(CompleteOutput {
+                text: format!("ok:{}", req.prompt),
+                finish_reason: FinishReason::Length,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+        }
+
+        fn complete_stream(
+            &mut self,
+            _req: CompleteRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        ) -> Result<()> {
+            let _ = tx.send(StreamDelta {
+                text_delta: "ok".to_string(),
+                finish_reason: None,
+            });
+            let _ = tx.send(StreamDelta {
+                text_delta: String::new(),
+                finish_reason: Some(FinishReason::Stop),
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_response_uses_loaded_model_id() {
+        let app = build_app(Box::new(MockEngine::new("Qwen3-4B")));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-8b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["model"], "Qwen3-4B");
+        assert_eq!(payload["choices"][0]["text"], "ok:hello");
+    }
+
+    #[tokio::test]
+    async fn streaming_response_uses_loaded_model_id() {
+        let app = build_app(Box::new(MockEngine::new("Qwen3-8B")));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1,"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            payload.contains(r#""model":"Qwen3-8B""#),
+            "payload={payload}"
+        );
+        assert!(
+            !payload.contains(r#""model":"qwen3-4b""#),
+            "payload={payload}"
+        );
+        assert!(payload.contains("[DONE]"));
+    }
 }

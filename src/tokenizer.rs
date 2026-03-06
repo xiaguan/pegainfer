@@ -1,8 +1,28 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokenizers::Tokenizer as HfTokenizer;
+use tokenizers::tokenizer::{
+    DecodeStream as HfDecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper,
+    PostProcessorWrapper, PreTokenizerWrapper,
+};
+
+type InnerDecodeStream<'a> = HfDecodeStream<
+    'a,
+    ModelWrapper,
+    NormalizerWrapper,
+    PreTokenizerWrapper,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
 
 pub struct Tokenizer {
     inner: HfTokenizer,
+}
+
+pub struct IncrementalDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    inner: InnerDecodeStream<'a>,
+    token_ids: Vec<u32>,
+    emitted_text: String,
 }
 
 impl Tokenizer {
@@ -27,8 +47,49 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("Decode error: {}", e))
     }
 
+    pub fn incremental_decoder(&self) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tokenizer: self,
+            inner: self.inner.decode_stream(true),
+            token_ids: Vec::new(),
+            emitted_text: String::new(),
+        }
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
+    }
+}
+
+impl<'a> IncrementalDecoder<'a> {
+    pub fn step(&mut self, token_id: u32) -> Result<Option<String>> {
+        self.token_ids.push(token_id);
+        let chunk = self
+            .inner
+            .step(token_id)
+            .map_err(|e| anyhow!("Streaming decode error for token {}: {}", token_id, e))?;
+
+        if let Some(ref text) = chunk {
+            self.emitted_text.push_str(text);
+        }
+
+        Ok(chunk)
+    }
+
+    pub fn finish(&mut self) -> Result<Option<String>> {
+        let decoded = self.tokenizer.decode(&self.token_ids)?;
+        let suffix = decoded.strip_prefix(&self.emitted_text).ok_or_else(|| {
+            anyhow!(
+                "Streaming decoder state mismatch: emitted text is not a prefix of final decode"
+            )
+        })?;
+
+        if suffix.is_empty() {
+            Ok(None)
+        } else {
+            self.emitted_text.push_str(suffix);
+            Ok(Some(suffix.to_string()))
+        }
     }
 }
 
@@ -68,5 +129,25 @@ mod tests {
         let decoded = tokenizer.decode(&ids).unwrap();
 
         assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn test_incremental_decode_matches_full_decode_for_chinese() {
+        let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
+        let text = "北京，简称“京”，是中国的首都。";
+        let ids = tokenizer.encode(text).unwrap();
+
+        let mut decoder = tokenizer.incremental_decoder();
+        let mut streamed = String::new();
+        for id in ids.iter().copied() {
+            if let Some(chunk) = decoder.step(id).unwrap() {
+                streamed.push_str(&chunk);
+            }
+        }
+        if let Some(tail) = decoder.finish().unwrap() {
+            streamed.push_str(&tail);
+        }
+
+        assert_eq!(streamed, tokenizer.decode(&ids).unwrap());
     }
 }
