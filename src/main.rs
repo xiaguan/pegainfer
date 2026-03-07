@@ -15,13 +15,13 @@ const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qw
 #[derive(Parser)]
 #[command(name = "pegainfer", about = "Qwen3/3.5 GPU inference server")]
 struct Args {
+    /// Model directory containing config, tokenizer, and safetensor shards
+    #[arg(long, default_value = DEFAULT_MODEL_PATH)]
+    model_path: PathBuf,
+
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     port: u16,
-
-    /// Path to the model directory
-    #[arg(long)]
-    model_path: Option<String>,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to disable)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -47,14 +47,20 @@ async fn main() {
         info!("Tracing enabled: output_dir={}", trace_path.display());
     }
 
-    let model_path = args.model_path.as_deref().unwrap_or(DEFAULT_MODEL_PATH);
+    let model_path = args
+        .model_path
+        .to_str()
+        .expect("Model path must be valid UTF-8");
     let model_type = detect_model_type(model_path).expect("Failed to detect model type");
 
     info!("=== Rust LLM Server - {} (GPU) ===", model_type);
-    info!("Model path: {}", model_path);
     info!("Loading engine...");
     let start = Instant::now();
-    info!("Runtime options: cuda_graph={}", args.cuda_graph);
+    info!(
+        "Runtime options: model_path={}, cuda_graph={}",
+        args.model_path.display(),
+        args.cuda_graph
+    );
 
     let options = EngineOptions {
         enable_cuda_graph: args.cuda_graph,

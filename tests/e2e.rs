@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,26 @@ use pegainfer::server_engine::{
 };
 use pegainfer::trace_reporter::FileReporter;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
-const TEST_DATA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/Qwen3-4B.json");
+const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
 
+fn get_model_path() -> String {
+    let model_path =
+        std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string());
+    info!("Using model path: {}", model_path);
+    model_path
+}
+
+fn get_test_data_path(model_path: &str) -> PathBuf {
+    let model_name = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path);
+    let test_data_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_data")
+        .join(format!("{model_name}.json"));
+    info!("Using test data path: {}", test_data_path.display());
+    test_data_path
+}
 // ── Test data types ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -32,11 +50,10 @@ struct TestCase {
     output: String,
 }
 
-fn load_test_cases() -> Vec<TestCase> {
-    let content = std::fs::read_to_string(TEST_DATA_PATH)
-        .unwrap_or_else(|e| panic!("Failed to read {TEST_DATA_PATH}: {e}"));
-    let data: TestData =
-        serde_json::from_str(&content).expect("Failed to parse test data JSON");
+fn load_test_cases(test_data_path: &Path) -> Vec<TestCase> {
+    let content = std::fs::read_to_string(test_data_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", test_data_path.display()));
+    let data: TestData = serde_json::from_str(&content).expect("Failed to parse test data JSON");
     data.cases
 }
 
@@ -79,11 +96,13 @@ fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelt
 fn test_e2e_generation() {
     init_logging();
     let trace_dir = init_tracing();
-    let test_cases = load_test_cases();
+    let model_path = get_model_path();
+    let test_data_path = get_test_data_path(&model_path);
+    let test_cases = load_test_cases(&test_data_path);
 
     info!("Loading engine...");
     let start = Instant::now();
-    let mut engine = RealServerEngine::load(MODEL_PATH, 42).expect("Failed to load engine");
+    let mut engine = RealServerEngine::load(&model_path, 42).expect("Failed to load engine");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON

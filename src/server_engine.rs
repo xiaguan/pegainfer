@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::Path;
 
 use anyhow::Result;
 use rand::SeedableRng;
@@ -49,6 +50,8 @@ pub struct StreamDelta {
 }
 
 pub trait ServerEngine: Send {
+    fn model_id(&self) -> &str;
+
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
 
     fn complete_stream(
@@ -182,12 +185,17 @@ impl GenerativeModel for Qwen35Model {
 // ============================================================================
 
 pub struct GenericServerEngine<M: GenerativeModel> {
+    model_id: String,
     model: M,
     tokenizer: Tokenizer,
     rng: StdRng,
 }
 
 impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let output_tokens =
@@ -220,27 +228,42 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
+        let mut decoder = self.tokenizer.incremental_decoder();
+        let mut decode_error = None;
 
         let stats = self.model.generate_streaming_with_callback(
             &prompt_tokens,
             req.max_tokens,
             &req.sampling,
             &mut self.rng,
-            |token_id| {
-                let text_delta = self.tokenizer.decode(&[token_id]).unwrap_or_else(|e| {
-                    log::warn!("Failed to decode token {}: {}", token_id, e);
-                    "\u{FFFD}".to_string()
-                });
-                tx.send(StreamDelta {
-                    text_delta,
-                    finish_reason: None,
-                })
-                .is_ok()
+            |token_id| match decoder.step(token_id) {
+                Ok(Some(text_delta)) => tx
+                    .send(StreamDelta {
+                        text_delta,
+                        finish_reason: None,
+                    })
+                    .is_ok(),
+                Ok(None) => true,
+                Err(err) => {
+                    decode_error = Some(err);
+                    false
+                }
             },
         )?;
 
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
+
         if stats.consumer_dropped {
             return Ok(());
+        }
+
+        if let Some(text_delta) = decoder.finish()? {
+            let _ = tx.send(StreamDelta {
+                text_delta,
+                finish_reason: None,
+            });
         }
 
         let finish_reason = if stats.hit_eos {
@@ -262,6 +285,14 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
 // Public engine constructors
 // ============================================================================
 
+fn model_id_from_path(model_path: &str) -> String {
+    Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path)
+        .to_string()
+}
+
 pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
 
@@ -280,6 +311,7 @@ impl RealServerEngine {
         )?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
+            model_id: model_id_from_path(model_path),
             model,
             tokenizer,
             rng,
@@ -300,6 +332,7 @@ impl Qwen35ServerEngine {
         )?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
+            model_id: model_id_from_path(model_path),
             model,
             tokenizer,
             rng,

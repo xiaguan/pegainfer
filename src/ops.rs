@@ -544,7 +544,12 @@ pub struct PrefillAttnScratch {
 }
 
 impl PrefillAttnScratch {
-    pub fn new(ctx: &DeviceContext, num_q_heads: usize, total_seq: usize, seq_len: usize) -> Result<Self> {
+    pub fn new(
+        ctx: &DeviceContext,
+        num_q_heads: usize,
+        total_seq: usize,
+        seq_len: usize,
+    ) -> Result<Self> {
         let capacity = num_q_heads * total_seq * seq_len;
         let scores_fp32: CudaSlice<f32> = unsafe {
             ctx.stream
@@ -556,7 +561,11 @@ impl PrefillAttnScratch {
                 .alloc::<half::bf16>(capacity)
                 .map_err(|e| anyhow!("softmax alloc failed: {}", e))?
         };
-        Ok(Self { scores_fp32, softmax_bf16, capacity })
+        Ok(Self {
+            scores_fp32,
+            softmax_bf16,
+            capacity,
+        })
     }
 }
 

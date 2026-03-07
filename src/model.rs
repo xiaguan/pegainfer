@@ -76,6 +76,7 @@ pub struct Qwen3Model {
     pub ctx: DeviceContext,
     pub config: Config,
     pub embed_tokens: DeviceMatrix,
+    lm_head: Option<DeviceMatrix>,
     pub layers: Vec<TransformerBlock>,
     pub norm: DeviceVec,
     // RoPE cache on GPU - contiguous buffer [max_seq_len * head_dim]
@@ -128,6 +129,18 @@ impl Qwen3Model {
 
         info!("Loading embeddings to GPU");
         let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
+        let lm_head = if config.tie_word_embeddings {
+            info!("Using tied input/output embeddings");
+            None
+        } else {
+            info!("Loading untied LM head to GPU");
+            Some(load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                config.lm_head_tensor_name(),
+            )?)
+        };
 
         info!(
             "Loading layers to GPU: num_layers={}",
@@ -230,6 +243,7 @@ impl Qwen3Model {
             ctx,
             config,
             embed_tokens,
+            lm_head,
             layers,
             norm,
             cos_cache,
@@ -297,8 +311,13 @@ impl Qwen3Model {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_batch(
-                layer_idx, layer, &hidden, start_pos, kv_cache,
-                &mut scratch, &mut attn_output,
+                layer_idx,
+                layer,
+                &hidden,
+                start_pos,
+                kv_cache,
+                &mut scratch,
+                &mut attn_output,
             )?;
         }
 
@@ -318,7 +337,11 @@ impl Qwen3Model {
             &self.norm,
             self.config.rms_norm_eps,
         )?;
-        ops::linear(&self.ctx, &normed, &self.embed_tokens)
+        ops::linear(&self.ctx, &normed, self.output_projection())
+    }
+
+    fn output_projection(&self) -> &DeviceMatrix {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
     fn forward_layer_batch(
@@ -540,7 +563,7 @@ impl Qwen3Model {
         // 4. LM Head (normed already computed by last fused_add_rms_norm)
         ops::gemv(
             &self.ctx,
-            &self.embed_tokens,
+            self.output_projection(),
             &bufs.normed,
             &mut bufs.logits,
         )?;
@@ -694,12 +717,7 @@ impl Qwen3Model {
             // Avoids batch GEMM overhead, ~580 temp allocations, and non-fused MLP.
             let _span = LocalSpan::enter_with_local_parent("prefill_decode")
                 .with_property(|| ("prompt_tokens", "1".to_string()));
-            self.decode_one_token(
-                prompt_tokens[0],
-                &mut kv_cache,
-                &mut bufs,
-                &mut graph_state,
-            )?;
+            self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
             self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
         } else {
             // Multi-token prompt: batch prefill (GEMM)
@@ -713,7 +731,6 @@ impl Qwen3Model {
         };
 
         let ttft = ttft_start.elapsed();
-        tokens.push(next_token);
 
         LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
 
@@ -722,6 +739,17 @@ impl Qwen3Model {
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
         );
+
+        if self.config.is_stop_token(next_token) {
+            self.kv_cache = Some(kv_cache);
+            return Ok(tokens);
+        }
+
+        tokens.push(next_token);
+
+        // Take persistent decode state from self (avoids borrow conflicts)
+        let mut bufs = self.take_decode_bufs()?;
+        let mut graph_state = self.take_graph_state();
 
         // Generate new tokens using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();
@@ -739,7 +767,7 @@ impl Qwen3Model {
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
             };
 
-            if next_token == self.config.eos_token_id {
+            if self.config.is_stop_token(next_token) {
                 break;
             }
 
@@ -811,12 +839,7 @@ impl Qwen3Model {
         let next_token = if prompt_tokens.len() == 1 {
             let _span = LocalSpan::enter_with_local_parent("prefill_decode")
                 .with_property(|| ("prompt_tokens", "1".to_string()));
-            self.decode_one_token(
-                prompt_tokens[0],
-                &mut kv_cache,
-                &mut bufs,
-                &mut graph_state,
-            )?;
+            self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
             self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
         } else {
             let _span = LocalSpan::enter_with_local_parent("prefill")
@@ -834,6 +857,15 @@ impl Qwen3Model {
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
         );
+
+        if self.config.is_stop_token(next_token) {
+            self.kv_cache = Some(kv_cache);
+            return Ok(StreamingStats {
+                emitted_tokens: 0,
+                hit_eos: true,
+                consumer_dropped: false,
+            });
+        }
 
         tokens.push(next_token);
         let mut emitted_tokens = 1usize;
@@ -865,7 +897,7 @@ impl Qwen3Model {
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
             };
 
-            if next_token == self.config.eos_token_id {
+            if self.config.is_stop_token(next_token) {
                 hit_eos = true;
                 break;
             }
