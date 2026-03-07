@@ -1,4 +1,5 @@
 pub mod decode_buffers;
+pub mod decode_buffers35;
 pub mod ffi;
 pub mod http_server;
 pub mod kv_cache;
@@ -6,6 +7,9 @@ pub mod logging;
 pub mod model;
 pub mod ops;
 pub mod qwen3_config;
+pub mod qwen35_config;
+pub mod qwen35_model;
+pub mod recurrent_state;
 pub mod sampler;
 pub mod server_engine;
 pub mod tensor;

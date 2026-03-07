@@ -5,13 +5,15 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::server_engine::{EngineOptions, RealServerEngine};
+use pegainfer::server_engine::{
+    EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, detect_model_type,
+};
 use pegainfer::trace_reporter::FileReporter;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 #[derive(Parser)]
-#[command(name = "pegainfer", about = "Qwen3 GPU inference server")]
+#[command(name = "pegainfer", about = "Qwen3/3.5 GPU inference server")]
 struct Args {
     /// Model directory containing config, tokenizer, and safetensor shards
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
@@ -45,7 +47,13 @@ async fn main() {
         info!("Tracing enabled: output_dir={}", trace_path.display());
     }
 
-    info!("=== Rust LLM Server - Qwen3 (GPU) ===");
+    let model_path = args
+        .model_path
+        .to_str()
+        .expect("Model path must be valid UTF-8");
+    let model_type = detect_model_type(model_path).expect("Failed to detect model type");
+
+    info!("=== Rust LLM Server - {} (GPU) ===", model_type);
     info!("Loading engine...");
     let start = Instant::now();
     info!(
@@ -53,23 +61,32 @@ async fn main() {
         args.model_path.display(),
         args.cuda_graph
     );
-    let engine = RealServerEngine::load_with_options(
-        args.model_path
-            .to_str()
-            .expect("Model path must be valid UTF-8"),
-        42,
-        EngineOptions {
-            enable_cuda_graph: args.cuda_graph,
-        },
-    )
-    .expect("Failed to load engine");
+
+    let options = EngineOptions {
+        enable_cuda_graph: args.cuda_graph,
+    };
+
+    let (app, vocab_size) = match model_type {
+        ModelType::Qwen35 => {
+            let engine = Qwen35ServerEngine::load_with_options(model_path, 42, options)
+                .expect("Failed to load Qwen3.5 engine");
+            let vs = engine.vocab_size();
+            (build_app(Box::new(engine)), vs)
+        }
+        ModelType::Qwen3 => {
+            let engine = RealServerEngine::load_with_options(model_path, 42, options)
+                .expect("Failed to load Qwen3 engine");
+            let vs = engine.vocab_size();
+            (build_app(Box::new(engine)), vs)
+        }
+    };
+
     info!(
         "Engine loaded: elapsed_ms={}, vocab_size={}",
         start.elapsed().as_millis(),
-        engine.vocab_size()
+        vocab_size
     );
 
-    let app = build_app(Box::new(engine));
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);
 

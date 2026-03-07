@@ -942,6 +942,348 @@ pub fn write_vec(
     Ok(())
 }
 
+// ============================================================
+// Qwen3.5 ops
+// ============================================================
+
+/// (1+weight) RMSNorm into pre-allocated output buffer (Gemma/Qwen3.5 style)
+pub fn rms_norm_offset_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(x.len, out.len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Fused add + (1+weight) RMSNorm: hidden += residual; out = rms_norm_offset(hidden, weight)
+pub fn fused_add_rms_norm_offset_into(
+    ctx: &DeviceContext,
+    hidden: &mut DeviceVec,
+    residual: &DeviceVec,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(hidden.len, residual.len);
+    assert_eq!(hidden.len, out.len);
+
+    let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_add_rms_norm_offset_cuda(
+            h_ptr as *mut ffi::Half,
+            r_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            hidden.len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Per-head RMSNorm with F32 weight + SiLU gate multiplication.
+/// x: [num_heads * head_dim], weight: [head_dim] f32, gate: [num_heads * head_dim]
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    weight: &CudaSlice<f32>,
+    gate: &DeviceVec,
+    out: &mut DeviceVec,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    assert_eq!(x.len, num_heads * head_dim);
+    assert_eq!(gate.len, x.len);
+    assert_eq!(out.len, x.len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_gated_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const f32,
+            g_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_heads as i32,
+            head_dim as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Causal depthwise conv1d decode (single step).
+/// Updates conv_state in-place. Applies SiLU activation.
+pub fn conv1d_decode_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    conv_weight: &DeviceVec,
+    conv_state: &mut DeviceVec,
+    out: &mut DeviceVec,
+    kernel_size: usize,
+) -> Result<()> {
+    let num_channels = x.len;
+    assert_eq!(out.len, num_channels);
+    assert_eq!(conv_weight.len, num_channels * kernel_size);
+    assert_eq!(conv_state.len, num_channels * (kernel_size - 1));
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_decode_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            s_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            kernel_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Gated delta rule recurrent decode (single step).
+/// qkv: [q_dim + k_dim + v_dim] after conv1d+SiLU
+/// b_proj, a_proj: [num_value_heads] bf16 (from gemv)
+/// state: [num_value_heads * key_dim * val_dim] f32 (updated in-place)
+/// output: [num_value_heads * val_dim] bf16
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_rule_decode_into(
+    ctx: &DeviceContext,
+    qkv: &DeviceVec,
+    b_proj: &DeviceVec,
+    a_proj: &DeviceVec,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    output: &mut DeviceVec,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> Result<()> {
+    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gated_delta_rule_decode_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            s_ptr as *mut f32,
+            o_ptr as *mut ffi::Half,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            key_dim as i32,
+            val_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Fused GQA Attention HD256 — decode variant (reads pos/seq_len from decode_meta).
+/// q_full: interleaved [head0_q(256), head0_gate(256), head1_q(256), ...] = [num_qheads * 2 * 256]
+/// Output already gated: output *= sigmoid(gate).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_hd256_decode_into(
+    ctx: &DeviceContext,
+    q_full: &DeviceVec,
+    k_full: &DeviceVec,
+    v_full: &DeviceVec,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache_base: &DeviceVec,
+    sin_cache_base: &DeviceVec,
+    decode_meta: &CudaSlice<i32>,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut DeviceVec,
+    num_qheads: usize,
+    num_kvheads: usize,
+    rotary_dim: usize,
+    scale: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache_base.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache_base.data.device_ptr(&ctx.stream);
+    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
+    let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+    let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_gqa_attention_hd256_decode(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            meta_ptr as *const i32,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_qheads as i32,
+            num_kvheads as i32,
+            (num_qheads / num_kvheads) as i32,
+            rotary_dim as i32,
+            scale,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Fused GQA Attention HD256 — single token variant (scalar pos/seq_len, for prefill).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_hd256_single_token_into(
+    ctx: &DeviceContext,
+    q_full: &DeviceVec,
+    k_full: &DeviceVec,
+    v_full: &DeviceVec,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_pos: &DeviceVecView<'_>,
+    sin_pos: &DeviceVecView<'_>,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut DeviceVec,
+    num_qheads: usize,
+    num_kvheads: usize,
+    current_pos: usize,
+    seq_len: usize,
+    rotary_dim: usize,
+    scale: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_pos.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_pos.data.device_ptr(&ctx.stream);
+    let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+    let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_gqa_attention_hd256_single_token(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_qheads as i32,
+            num_kvheads as i32,
+            (num_qheads / num_kvheads) as i32,
+            current_pos as i32,
+            seq_len as i32,
+            rotary_dim as i32,
+            scale,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Causal depthwise conv1d prefill (parallel over sequence).
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_prefill_into(
+    ctx: &DeviceContext,
+    x_seq: &DeviceVec,
+    conv_weight: &DeviceVec,
+    conv_state: &mut DeviceVec,
+    out_seq: &mut DeviceVec,
+    num_channels: usize,
+    seq_len: usize,
+    kernel_size: usize,
+) -> Result<()> {
+    assert_eq!(x_seq.len, num_channels * seq_len);
+    assert_eq!(out_seq.len, num_channels * seq_len);
+
+    let (x_ptr, _gx) = x_seq.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out_seq.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_prefill_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            s_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            seq_len as i32,
+            kernel_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

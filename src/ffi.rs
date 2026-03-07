@@ -229,4 +229,125 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     );
+
+    // ========================================================================
+    // Qwen3.5 kernels
+    // ========================================================================
+
+    // (1+weight) RMSNorm — Qwen3.5 / Gemma style
+    pub fn rms_norm_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // Fused add + (1+weight) RMSNorm
+    pub fn fused_add_rms_norm_offset_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // Per-head RMSNorm with F32 weight + SiLU gate
+    pub fn rms_norm_gated_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // Causal depthwise conv1d decode (single step)
+    pub fn conv1d_decode_cuda(
+        x: *const Half,
+        conv_weight: *const Half,
+        conv_state: *mut Half,
+        out: *mut Half,
+        num_channels: i32,
+        kernel_size: i32,
+        stream: CUstream,
+    );
+
+    // Causal depthwise conv1d prefill (parallel over sequence)
+    pub fn conv1d_prefill_cuda(
+        x_seq: *const Half,
+        conv_weight: *const Half,
+        conv_state: *mut Half,
+        out_seq: *mut Half,
+        num_channels: i32,
+        seq_len: i32,
+        kernel_size: i32,
+        stream: CUstream,
+    );
+
+    // Gated delta rule recurrent decode (single step)
+    pub fn gated_delta_rule_decode_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state: *mut f32,
+        output: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        stream: CUstream,
+    );
+
+    // Fused GQA attention HD256 — decode variant (reads pos/seq_len from decode_meta)
+    pub fn fused_gqa_attention_hd256_decode(
+        q_full: *const Half,
+        k_full: *const Half,
+        v_full: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache_base: *const Half,
+        sin_cache_base: *const Half,
+        decode_meta: *const i32,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        num_qheads: i32,
+        num_kvheads: i32,
+        gqa_ratio: i32,
+        rotary_dim: i32,
+        scale: f32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Fused GQA attention HD256 — single token variant (scalar pos/seq_len)
+    pub fn fused_gqa_attention_hd256_single_token(
+        q_full: *const Half,
+        k_full: *const Half,
+        v_full: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        num_qheads: i32,
+        num_kvheads: i32,
+        gqa_ratio: i32,
+        current_pos: i32,
+        seq_len: i32,
+        rotary_dim: i32,
+        scale: f32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
 }
