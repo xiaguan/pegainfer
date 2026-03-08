@@ -1,4 +1,4 @@
-use cudarc::driver::sys::CUstream;
+use cudarc::driver::sys::{CUresult, CUstream};
 
 // Half type (16-bit float) - same layout as CUDA half
 pub type Half = u16;
@@ -61,7 +61,7 @@ unsafe extern "C" {
         out: *mut Half,
         n: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub fn embedding_cuda(
         embed: *const Half,

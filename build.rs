@@ -226,7 +226,7 @@ fn compile_triton_aot_silu(cuda_path: &str, out_dir: &Path, sm_targets: &[String
         .expect("generated Triton source should have a parent directory")
         .join("triton_silu_mul_wrapper.c");
     let wrapper_src = format!(
-        "#include <cuda.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nvoid silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    CUresult result = {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n    if (result != CUDA_SUCCESS) {{\n        const char* err = NULL;\n        cuGetErrorString(result, &err);\n        fprintf(stderr, \"silu_mul_triton_aot_cuda failed: %s\\n\", err ? err : \"unknown\");\n        abort();\n    }}\n}}\n",
+        "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nCUresult silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n}}\n",
         func = func_name
     );
     std::fs::write(&wrapper_path, wrapper_src).expect("failed to write Triton wrapper source");
