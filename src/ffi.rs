@@ -55,6 +55,14 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn silu_mul_triton_aot_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    );
+
     pub fn embedding_cuda(
         embed: *const Half,
         token_id: i32,
