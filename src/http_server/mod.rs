@@ -9,15 +9,14 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use fastrace::local::LocalSpan;
 use fastrace::prelude::*;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use tokio::sync::Mutex;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::sampler::SamplingParams;
 use crate::server_engine::{CompleteRequest, ServerEngine};
-use openai_v1::{CompletionRequest, CompletionResponse, StreamChunk};
+use openai_v1::{CompletionRequest, CompletionResponse, StreamChunk, StreamUsageChunk};
 
 struct AppState {
     engine: Mutex<Box<dyn ServerEngine>>,
@@ -36,6 +35,7 @@ async fn completions(
 ) -> Result<Response, StatusCode> {
     let max_tokens = req.max_tokens_or_default();
     let stream = req.stream_or_default();
+    let include_usage = req.include_usage_or_default();
     let requested_model = req.model.clone();
     let loaded_model = {
         let guard = state.engine.lock().await;
@@ -92,10 +92,24 @@ async fn completions(
             }
         });
 
-        let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
+        let stream = UnboundedReceiverStream::new(rx).flat_map(move |delta| {
+            let usage = delta.usage;
+            let is_terminal = delta.finish_reason.is_some();
+
             let chunk = StreamChunk::from_delta(&request_id, created, &loaded_model, delta);
-            let json = serde_json::to_string(&chunk).unwrap();
-            Ok::<_, Infallible>(Event::default().data(json))
+            let mut events = vec![Ok::<_, Infallible>(
+                Event::default().data(serde_json::to_string(&chunk).unwrap()),
+            )];
+
+            if include_usage && is_terminal && let Some(usage) = usage {
+                let usage_chunk =
+                    StreamUsageChunk::from_usage(&request_id, created, &loaded_model, usage);
+                events.push(Ok(Event::default().data(
+                    serde_json::to_string(&usage_chunk).unwrap(),
+                )));
+            }
+
+            stream::iter(events)
         });
 
         let done_stream =
@@ -190,10 +204,16 @@ mod tests {
             let _ = tx.send(StreamDelta {
                 text_delta: "ok".to_string(),
                 finish_reason: None,
+                usage: None,
             });
             let _ = tx.send(StreamDelta {
                 text_delta: String::new(),
                 finish_reason: Some(FinishReason::Stop),
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                }),
             });
             Ok(())
         }
@@ -248,5 +268,26 @@ mod tests {
             "payload={payload}"
         );
         assert!(payload.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn streaming_response_includes_usage_when_requested() {
+        let app = build_app(Box::new(MockEngine::new("Qwen3-4B")));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1,"stream":true,"stream_options":{"include_usage":true}}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(payload.contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#), "payload={payload}");
     }
 }

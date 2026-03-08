@@ -14,8 +14,14 @@ pub(super) struct CompletionRequest {
     #[allow(dead_code)]
     pub(super) n: Option<usize>,
     pub(super) stream: Option<bool>,
+    pub(super) stream_options: Option<StreamOptions>,
     #[allow(dead_code)]
     pub(super) stop: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StreamOptions {
+    pub(super) include_usage: Option<bool>,
 }
 
 impl CompletionRequest {
@@ -25,6 +31,13 @@ impl CompletionRequest {
 
     pub(super) fn stream_or_default(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    pub(super) fn include_usage_or_default(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|options| options.include_usage)
+            .unwrap_or(false)
     }
 }
 
@@ -113,6 +126,36 @@ impl StreamChunk {
                     .finish_reason
                     .map(|reason| reason.as_openai_str().to_string()),
             }],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct StreamUsageChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    usage: Usage,
+}
+
+impl StreamUsageChunk {
+    pub(super) fn from_usage(
+        request_id: &str,
+        created: u64,
+        model: &str,
+        usage: crate::server_engine::Usage,
+    ) -> Self {
+        Self {
+            id: request_id.to_string(),
+            object: "text_completion",
+            created,
+            model: model.to_string(),
+            usage: Usage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            },
         }
     }
 }

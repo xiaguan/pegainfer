@@ -747,9 +747,7 @@ impl Qwen3Model {
 
         tokens.push(next_token);
 
-        // Take persistent decode state from self (avoids borrow conflicts)
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
+        // Reuse the decode state and captured CUDA graph from the first token.
 
         // Generate new tokens using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();

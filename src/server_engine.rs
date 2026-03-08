@@ -38,6 +38,7 @@ pub struct CompleteOutput {
     pub usage: Usage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -47,6 +48,7 @@ pub struct Usage {
 pub struct StreamDelta {
     pub text_delta: String,
     pub finish_reason: Option<FinishReason>,
+    pub usage: Option<Usage>,
 }
 
 pub trait ServerEngine: Send {
@@ -241,6 +243,7 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
                     .send(StreamDelta {
                         text_delta,
                         finish_reason: None,
+                        usage: None,
                     })
                     .is_ok(),
                 Ok(None) => true,
@@ -263,6 +266,7 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             let _ = tx.send(StreamDelta {
                 text_delta,
                 finish_reason: None,
+                usage: None,
             });
         }
 
@@ -275,6 +279,11 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         let _ = tx.send(StreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
+            usage: Some(Usage {
+                prompt_tokens: prompt_tokens.len(),
+                completion_tokens: stats.emitted_tokens,
+                total_tokens: prompt_tokens.len() + stats.emitted_tokens,
+            }),
         });
 
         Ok(())
