@@ -834,11 +834,17 @@ pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Res
     Ok(out)
 }
 
-/// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
-pub fn silu_mul_batch(
+fn silu_mul_batch_with(
     ctx: &DeviceContext,
     gate: &HiddenStates,
     up: &HiddenStates,
+    kernel: unsafe extern "C" fn(
+        *const ffi::Half,
+        *const ffi::Half,
+        *mut ffi::Half,
+        i32,
+        cudarc::driver::sys::CUstream,
+    ),
 ) -> Result<HiddenStates> {
     assert_eq!(gate.hidden_dim, up.hidden_dim);
     assert_eq!(gate.seq_len, up.seq_len);
@@ -851,7 +857,7 @@ pub fn silu_mul_batch(
         let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            ffi::silu_mul_cuda(
+            kernel(
                 g_ptr as *const ffi::Half,
                 u_ptr as *const ffi::Half,
                 out_ptr as *mut ffi::Half,
@@ -862,6 +868,62 @@ pub fn silu_mul_batch(
     }
 
     Ok(out)
+}
+
+fn silu_mul_batch_with_result(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+    kernel: unsafe extern "C" fn(
+        *const ffi::Half,
+        *const ffi::Half,
+        *mut ffi::Half,
+        i32,
+        cudarc::driver::sys::CUstream,
+    ) -> cudarc::driver::sys::CUresult,
+) -> Result<HiddenStates> {
+    assert_eq!(gate.hidden_dim, up.hidden_dim);
+    assert_eq!(gate.seq_len, up.seq_len);
+    let n = gate.hidden_dim * gate.seq_len;
+    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
+
+    {
+        let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+        let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+        let result = unsafe {
+            kernel(
+                g_ptr as *const ffi::Half,
+                u_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                n as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+
+        result.result()?;
+    }
+
+    Ok(out)
+}
+
+/// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
+pub fn silu_mul_batch(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+) -> Result<HiddenStates> {
+    silu_mul_batch_with_result(ctx, gate, up, ffi::silu_mul_triton_aot_cuda)
+}
+
+#[doc(hidden)]
+pub fn silu_mul_batch_cuda_ref(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+) -> Result<HiddenStates> {
+    silu_mul_batch_with(ctx, gate, up, ffi::silu_mul_cuda)
 }
 
 /// Batched embedding lookup

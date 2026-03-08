@@ -41,6 +41,7 @@ Model type is auto-detected from `config.json` — just point `--model-path` at 
 - Rust (2024 edition)
 - CUDA Toolkit (nvcc, cuBLAS)
 - A CUDA-capable GPU (SM target auto-detected at build time)
+- Python 3 with Triton installed for build-time AOT kernel generation
 
 ### Download a Model
 
@@ -56,8 +57,12 @@ huggingface-cli download Qwen/Qwen3.5-4B --local-dir models/Qwen3.5-4B
 ```bash
 export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+export PEGAINFER_TRITON_PYTHON=/path/to/python-with-triton
 
-# Build (compiles CUDA kernels via build.rs, auto-detects GPU SM target)
+# If `nvidia-smi` is unavailable in your build environment, set the target SM explicitly.
+# Example: export PEGAINFER_CUDA_SM=120
+
+# Build (compiles CUDA kernels plus the default Triton AOT `silu_mul` replacement)
 cargo build --release
 
 # Start server (defaults to Qwen3-4B on port 8000)
@@ -72,6 +77,14 @@ cargo run --release -- --cuda-graph=false
 # Enable performance tracing (Chrome Trace JSON → open with Perfetto UI)
 cargo run --release -- --trace-output-path traces/
 ```
+
+### Triton AOT Notes
+
+- `silu_mul` is the first default-on Triton AOT replacement; the rest of the kernel stack still builds from `csrc/`.
+- Triton is used at build time only. Runtime stays in Rust + CUDA via the generated C wrapper.
+- Generated Triton artifacts live under Cargo `OUT_DIR`, typically `target/release/build/pegainfer-*/out/triton_aot/silu_mul/`.
+- `PEGAINFER_CUDA_SM` now doubles as the explicit Triton AOT target when GPU auto-detection is unavailable during build.
+- If Triton Python setup or GPU SM detection fails, see `tools/triton/README.md` for the exact environment variables and validation commands.
 
 ### Try it
 
@@ -162,6 +175,7 @@ Tokenize → Embedding → N × TransformerBlock → RMSNorm → LM Head → Sam
 
 ```
 src/
+├── bin/triton_silu_smoke.rs # Focused Triton-vs-CUDA silu_mul validation binary
 ├── main.rs              # CLI + HTTP server startup (axum)
 ├── http_server/         # OpenAI-compatible /v1/completions (streaming + non-streaming)
 ├── server_engine.rs     # ServerEngine trait, model type detection, engine loading
@@ -193,6 +207,11 @@ csrc/
 ├── conv1d.cu                # Conv1d for linear attention (Qwen3.5)
 ├── gated_delta_rule.cu      # Gated Delta Rule recurrence (Qwen3.5)
 └── sampling.cu              # GPU argmax, top-k/top-p sampling
+
+tools/triton/
+├── gen_silu_mul_aot.py      # Triton AOT generator entrypoint for silu_mul
+├── silu_mul_kernel.py       # Triton kernel definition for silu_mul
+└── README.md                # Setup, failure modes, and validation commands
 ```
 
 ### Key Design Decisions
