@@ -1,6 +1,6 @@
 //! GPU operations on device tensors.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
