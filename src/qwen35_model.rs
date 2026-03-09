@@ -638,6 +638,7 @@ impl Qwen35Model {
         recurrent: &mut RecurrentState,
     ) -> Result<DeviceVec> {
         let seq_len = token_ids.len();
+        anyhow::ensure!(seq_len > 0, "prefill_forward requires at least one token");
         let c = &self.config;
 
         kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
@@ -959,6 +960,7 @@ impl Qwen35Model {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> Result<Vec<u32>> {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         let ttft_start = Instant::now();
         let mut tokens = prompt_tokens.to_vec();
 
@@ -1047,6 +1049,7 @@ impl Qwen35Model {
     where
         F: FnMut(u32) -> bool,
     {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         let mut tokens = prompt_tokens.to_vec();
 
         let mut kv_cache = self.take_kv_cache();

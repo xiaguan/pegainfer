@@ -42,6 +42,10 @@ async fn completions(
         guard.model_id().to_string()
     };
     let prompt_len = req.prompt.len();
+    if req.prompt.trim().is_empty() {
+        warn!("Rejecting empty prompt request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     if let Some(ref requested_model) = requested_model
         && requested_model != &loaded_model
@@ -296,5 +300,21 @@ mod tests {
                 .contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#),
             "payload={payload}"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_empty_prompt() {
+        let app = build_app(Box::new(MockEngine::new("Qwen3-4B")));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"   ","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

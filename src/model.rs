@@ -696,6 +696,7 @@ impl Qwen3Model {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> Result<Vec<u32>> {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
             [
                 ("prompt_len", prompt_tokens.len().to_string()),
@@ -817,6 +818,7 @@ impl Qwen3Model {
     where
         F: FnMut(u32) -> bool,
     {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         let _span =
             LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
                 [

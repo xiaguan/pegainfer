@@ -391,7 +391,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         "cargo:warning=Using Triton AOT as the default path for silu_mul, add, and embedding; extract/write vector copies now use cudarc device memcpy"
     );
     println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
-        println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
+    println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
