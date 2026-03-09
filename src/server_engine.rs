@@ -11,23 +11,23 @@ use crate::qwen35_model::Qwen35Model;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
-/// If `text` ends with any of `stops`, return the text with that suffix removed.
-/// Prefers the longest matching stop when several match at the end.
-fn strip_stop_suffix(text: &str, stops: &[String]) -> Option<String> {
-    let mut best: Option<(usize, &str)> = None;
+/// Truncate at the first occurrence of any stop string (OpenAI-compatible).
+/// Returns the prefix of `text` up to (but not including) the earliest stop.
+fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
+    let mut earliest = None::<usize>;
     for s in stops {
         let s = s.as_str();
         if s.is_empty() {
             continue;
         }
-        if text.ends_with(s) {
-            let len: usize = s.len();
-            if best.map_or(true, |(l, _)| len > l) {
-                best = Some((len, s));
-            }
+        if let Some(pos) = text.find(s) {
+            earliest = Some(match earliest {
+                None => pos,
+                Some(e) => std::cmp::min(e, pos),
+            });
         }
     }
-    best.map(|(len, _)| text[..text.len() - len].to_string())
+    earliest.map(|pos| text[..pos].to_string())
 }
 
 /// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
@@ -265,8 +265,8 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             FinishReason::Stop
         };
         if let Some(ref stops) = req.stop {
-            if let Some(stripped) = strip_stop_suffix(&text, stops) {
-                text = stripped;
+            if let Some(truncated) = truncate_at_first_stop(&text, stops) {
+                text = truncated;
                 finish_reason = FinishReason::Stop;
             }
         }
@@ -354,37 +354,40 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             return Err(err);
         }
 
-        if stats.consumer_dropped {
+        // Only skip terminal delta when client actually dropped; stop-sequence stop is intentional.
+        if stats.consumer_dropped && !stopped_by_stop_sequence.get() {
             return Ok(());
         }
 
-        if let Some(text_delta) = decoder.finish()? {
-            if let Some(ref stop_list) = stops {
-                let new_full = decoder.emitted_text().to_string();
-                if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
-                    if !to_send.is_empty() {
-                        let _ = tx.send(StreamDelta {
-                            text_delta: to_send,
-                            finish_reason: None,
-                            usage: None,
-                        });
+        if !stopped_by_stop_sequence.get() {
+            if let Some(text_delta) = decoder.finish()? {
+                if let Some(ref stop_list) = stops {
+                    let new_full = decoder.emitted_text().to_string();
+                    if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
+                        if !to_send.is_empty() {
+                            let _ = tx.send(StreamDelta {
+                                text_delta: to_send,
+                                finish_reason: None,
+                                usage: None,
+                            });
+                        }
+                    } else {
+                        let to_send = &new_full[sent_len..];
+                        if !to_send.is_empty() {
+                            let _ = tx.send(StreamDelta {
+                                text_delta: to_send.to_string(),
+                                finish_reason: None,
+                                usage: None,
+                            });
+                        }
                     }
                 } else {
-                    let to_send = &new_full[sent_len..];
-                    if !to_send.is_empty() {
-                        let _ = tx.send(StreamDelta {
-                            text_delta: to_send.to_string(),
-                            finish_reason: None,
-                            usage: None,
-                        });
-                    }
+                    let _ = tx.send(StreamDelta {
+                        text_delta: text_delta,
+                        finish_reason: None,
+                        usage: None,
+                    });
                 }
-            } else {
-                let _ = tx.send(StreamDelta {
-                    text_delta: text_delta,
-                    finish_reason: None,
-                    usage: None,
-                });
             }
         }
 
@@ -473,16 +476,36 @@ impl Qwen35ServerEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_stop_suffix, truncate_at_stop};
+    use super::{truncate_at_first_stop, truncate_at_stop};
 
     #[test]
-    fn test_strip_stop_suffix() {
-        let stops: Vec<String> = vec!["\n".into(), "END".into()];
-        assert_eq!(strip_stop_suffix("hello\n", &stops), Some("hello".to_string()));
-        assert_eq!(strip_stop_suffix("hello\n\n", &stops), Some("hello\n".to_string()));
-        assert_eq!(strip_stop_suffix("helloEND", &stops), Some("hello".to_string()));
-        assert_eq!(strip_stop_suffix("hello", &stops), None);
-        assert_eq!(strip_stop_suffix("", &stops), None);
+    fn test_truncate_at_first_stop() {
+        let stops: Vec<String> = vec!["\n\n".into(), "END".into()];
+        assert_eq!(
+            truncate_at_first_stop("4\n\nand more", &stops),
+            Some("4".to_string())
+        );
+        assert_eq!(
+            truncate_at_first_stop("helloEND", &stops),
+            Some("hello".to_string())
+        );
+        assert_eq!(truncate_at_first_stop("hello", &stops), None);
+        assert_eq!(truncate_at_first_stop("", &stops), None);
+        // Earliest stop wins
+        assert_eq!(
+            truncate_at_first_stop("a\n\nbEND", &stops),
+            Some("a".to_string())
+        );
+        let stops_nl: Vec<String> = vec!["\n".into()];
+        assert_eq!(
+            truncate_at_first_stop("hello\nworld", &stops_nl),
+            Some("hello".to_string())
+        );
+        // Stop at beginning -> empty prefix
+        assert_eq!(
+            truncate_at_first_stop("ab", &vec!["ab".to_string()]),
+            Some("".to_string())
+        );
     }
 
     #[test]
