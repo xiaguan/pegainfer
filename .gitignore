@@ -1,3 +1,6 @@
 /target
 /traces
 /models
+/CODEX_WORKLOG.md
+/tools/triton/.venv/
+/tools/triton/__pycache__/

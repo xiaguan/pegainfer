@@ -33,7 +33,13 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn add_cuda(a: *const Half, b: *const Half, out: *mut Half, n: i32, stream: CUstream);
+    pub fn add_cuda(
+        a: *const Half,
+        b: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     pub fn fused_add_rms_norm_cuda(
         hidden: *mut Half,
@@ -42,16 +48,6 @@ unsafe extern "C" {
         out: *mut Half,
         n: i32,
         eps: f32,
-        stream: CUstream,
-    );
-
-    pub fn copy_cuda(src: *const Half, dst: *mut Half, n: i32, stream: CUstream);
-
-    pub fn silu_mul_cuda(
-        gate: *const Half,
-        up: *const Half,
-        out: *mut Half,
-        n: i32,
         stream: CUstream,
     );
 
@@ -69,7 +65,7 @@ unsafe extern "C" {
         out: *mut Half,
         hidden_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub fn embedding_batched_cuda(
         embed: *const Half,
@@ -78,7 +74,7 @@ unsafe extern "C" {
         hidden_size: i32,
         seq_len: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
 
@@ -165,7 +161,7 @@ unsafe extern "C" {
         out: *mut Half,
         hidden_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub fn cublas_init();
 

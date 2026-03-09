@@ -300,9 +300,7 @@ __global__ void gpu_sample_kernel(
 
 extern "C" {
 void argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
-  int block_size = 256;
-  int shared_mem = block_size * (sizeof(float) + sizeof(int));
-  argmax_kernel<<<1, block_size, shared_mem, stream>>>(x, out, n);
+  argmax_kernel<<<1, SAMPLE_BLOCK, SAMPLE_BLOCK * (sizeof(float) + sizeof(int)), stream>>>(x, out, n);
 }
 
 void gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, int *output,

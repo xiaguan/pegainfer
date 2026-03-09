@@ -335,10 +335,8 @@ impl RealServerEngine {
 impl Qwen35ServerEngine {
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(model_path)?;
-        let model = Qwen35Model::from_safetensors_with_options(
-            model_path,
-            options.enable_cuda_graph,
-        )?;
+        let model =
+            Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
             model_id: model_id_from_path(model_path),

@@ -1,7 +1,7 @@
 /// Generate greedy reference outputs from our own Qwen3.5 engine.
 /// Run with: cargo test -r --test gen_test_data_35 -- --nocapture
 use pegainfer::sampler::SamplingParams;
-use pegainfer::server_engine::{EngineOptions, Qwen35ServerEngine, ServerEngine, CompleteRequest};
+use pegainfer::server_engine::{CompleteRequest, EngineOptions, Qwen35ServerEngine, ServerEngine};
 use serde::Serialize;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -25,9 +25,13 @@ fn generate_qwen35_test_data() {
     pegainfer::logging::init_stderr("info");
 
     let mut engine = Qwen35ServerEngine::load_with_options(
-        MODEL_PATH, 42,
-        EngineOptions { enable_cuda_graph: false },
-    ).expect("Failed to load engine");
+        MODEL_PATH,
+        42,
+        EngineOptions {
+            enable_cuda_graph: false,
+        },
+    )
+    .expect("Failed to load engine");
 
     let prompts: Vec<(&str, &str, usize)> = vec![
         // English
@@ -35,8 +39,16 @@ fn generate_qwen35_test_data() {
         ("capital_france", "The capital of France is", 30),
         ("quick_fox", "The quick brown fox", 50),
         ("tell_story", "Tell me a story", 50),
-        ("python_prime", "Write a Python function to check if a number is prime.", 80),
-        ("quantum_simple", "Explain quantum computing in simple terms.", 80),
+        (
+            "python_prime",
+            "Write a Python function to check if a number is prime.",
+            80,
+        ),
+        (
+            "quantum_simple",
+            "Explain quantum computing in simple terms.",
+            80,
+        ),
         // Math
         ("math_add", "What is 2+2?", 30),
         ("math_multiply", "What is 12 times 15?", 30),
@@ -51,13 +63,18 @@ fn generate_qwen35_test_data() {
     let mut cases = Vec::new();
     for (name, prompt, max_tokens) in &prompts {
         eprintln!("\n--- {name}: \"{prompt}\" (max_tokens={max_tokens}) ---");
-        let out = engine.complete(CompleteRequest {
-            prompt: prompt.to_string(),
-            max_tokens: *max_tokens,
-            sampling: SamplingParams::default(),
-        }).expect("complete() failed");
+        let out = engine
+            .complete(CompleteRequest {
+                prompt: prompt.to_string(),
+                max_tokens: *max_tokens,
+                sampling: SamplingParams::default(),
+            })
+            .expect("complete() failed");
 
-        eprintln!("  tokens: {}, finish: {:?}", out.usage.completion_tokens, out.finish_reason);
+        eprintln!(
+            "  tokens: {}, finish: {:?}",
+            out.usage.completion_tokens, out.finish_reason
+        );
         let preview: String = out.text.chars().take(80).collect();
         eprintln!("  output: {:?}", preview);
 

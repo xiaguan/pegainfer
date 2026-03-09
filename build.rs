@@ -2,6 +2,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+struct TritonKernelSpec {
+    artifact_dir: &'static str,
+    kernel_path: &'static str,
+    kernel_name: &'static str,
+    signature: &'static str,
+    grid: &'static str,
+    out_name: &'static str,
+    num_warps: u32,
+    num_stages: u32,
+}
+
 fn parse_sm_token(raw: &str) -> Option<String> {
     let token = raw.trim().trim_matches('"');
     if token.is_empty() {
@@ -40,8 +51,6 @@ fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // To support multi-GPU systems with different SMs, we can build for all detected SMs.
-    // Use a BTreeSet to deduplicate and sort SM targets.
     let mut sms = BTreeSet::new();
     for line in stdout.lines() {
         let cap = line.split(',').next().unwrap_or(line).trim();
@@ -58,9 +67,7 @@ fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
 }
 
 fn detect_sm_targets() -> Vec<String> {
-    // read the CUDA_SM or PEGAINFER_CUDA_SM environment variable for manual override
     if let Ok(env) = std::env::var("PEGAINFER_CUDA_SM").or_else(|_| std::env::var("CUDA_SM")) {
-        // Support comma-separated list of SMs in the environment variable.
         let mut sms = Vec::new();
         for token in env.split(',') {
             if let Some(sm) = parse_sm_token(token) {
@@ -85,7 +92,6 @@ fn detect_sm_targets() -> Vec<String> {
         return sms;
     }
 
-    // Fallback: build for Ampere (bf16 baseline) when GPU detection is unavailable.
     print!(
         "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set PEGAINFER_CUDA_SM/CUDA_SM environment variable to override."
     );
@@ -111,6 +117,22 @@ fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
     args
 }
 
+fn probe_triton_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import triton"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn find_triton_python() -> Result<String, String> {
     if let Ok(candidate) = std::env::var("PEGAINFER_TRITON_PYTHON") {
         let candidate = candidate.trim();
@@ -119,44 +141,30 @@ fn find_triton_python() -> Result<String, String> {
                 "PEGAINFER_TRITON_PYTHON is set but empty. See tools/triton/README.md.".to_string(),
             );
         }
-
-        let output = Command::new(candidate)
-            .args(["-c", "import triton"])
-            .output()
-            .map_err(|err| {
-                format!(
-                    "failed to spawn PEGAINFER_TRITON_PYTHON=`{candidate}`: {err}. See tools/triton/README.md."
-                )
-            })?;
-
-        if output.status.success() {
-            return Ok(candidate.to_string());
-        }
-
-        return Err(format!(
-            "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. stdout: {} stderr: {} See tools/triton/README.md.",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        ));
+        return probe_triton_python(candidate).map_err(|message| {
+            format!(
+                "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See tools/triton/README.md."
+            )
+        });
     }
 
+    let local_venv = PathBuf::from("tools/triton/.venv/bin/python");
     let mut diagnostics = Vec::new();
-    for candidate in ["python3", "python"] {
-        match Command::new(candidate)
-            .args(["-c", "import triton"])
-            .output()
-        {
-            Ok(output) if output.status.success() => return Ok(candidate.to_string()),
-            Ok(output) => diagnostics.push(format!(
-                "{candidate}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-            Err(err) => diagnostics.push(format!("{candidate}: {err}")),
+    let mut candidates = Vec::new();
+    if local_venv.exists() {
+        candidates.push(local_venv.to_string_lossy().to_string());
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    for candidate in candidates {
+        match probe_triton_python(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(message) => diagnostics.push(message),
         }
     }
 
     Err(format!(
-        "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON or ensure `python3 -c 'import triton'` works. Probe results: {}. See tools/triton/README.md.",
+        "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON, bootstrap tools/triton/.venv, or ensure `python3 -c 'import triton'` works. Probe results: {}. See tools/triton/README.md.",
         diagnostics.join(" | ")
     ))
 }
@@ -170,33 +178,54 @@ fn triton_target(sm_targets: &[String]) -> String {
 
     if sm_targets.len() > 1 {
         println!(
-            "cargo:warning=Triton AOT currently emits a single cubin for silu_mul; using highest detected target sm_{max_sm}. Set PEGAINFER_CUDA_SM to pin one target explicitly."
+            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. Set PEGAINFER_CUDA_SM to pin one target explicitly."
         );
     }
 
     format!("cuda:{max_sm}:32")
 }
 
-fn generate_triton_silu_artifacts(out_dir: &Path, triton_target: &str) -> (String, PathBuf) {
-    let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
-    let kernel_path = PathBuf::from("tools/triton/silu_mul_kernel.py");
-    let generator_path = PathBuf::from("tools/triton/gen_silu_mul_aot.py");
-    let artifact_dir = out_dir.join("triton_aot").join("silu_mul");
+fn generate_triton_artifacts(
+    python: &str,
+    out_dir: &Path,
+    triton_target: &str,
+    spec: &TritonKernelSpec,
+) -> (String, PathBuf) {
+    let generator_path = PathBuf::from("tools/triton/gen_triton_aot.py");
+    let artifact_dir = out_dir.join("triton_aot").join(spec.artifact_dir);
 
-    let output = Command::new(&python)
+    let output = Command::new(python)
         .arg(&generator_path)
         .arg("--kernel-path")
-        .arg(&kernel_path)
+        .arg(spec.kernel_path)
+        .arg("--kernel-name")
+        .arg(spec.kernel_name)
+        .arg("--signature")
+        .arg(spec.signature)
+        .arg("--grid")
+        .arg(spec.grid)
+        .arg("--out-name")
+        .arg(spec.out_name)
         .arg("--out-dir")
         .arg(&artifact_dir)
         .arg("--target")
         .arg(triton_target)
+        .arg("--num-warps")
+        .arg(spec.num_warps.to_string())
+        .arg("--num-stages")
+        .arg(spec.num_stages.to_string())
         .output()
-        .unwrap_or_else(|err| panic!("failed to run Triton AOT generator for silu_mul: {err}"));
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to run Triton AOT generator for {}: {err}",
+                spec.kernel_name
+            )
+        });
 
     if !output.status.success() {
         panic!(
-            "Triton AOT generator failed. stdout: {} stderr: {}",
+            "Triton AOT generator failed for {}. stdout: {} stderr: {}",
+            spec.kernel_name,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim(),
         );
@@ -218,32 +247,152 @@ fn generate_triton_silu_artifacts(out_dir: &Path, triton_target: &str) -> (Strin
     (func_name, c_path)
 }
 
-fn compile_triton_aot_silu(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
-    let triton_target = triton_target(sm_targets);
-    let (func_name, generated_c) = generate_triton_silu_artifacts(out_dir, &triton_target);
+fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> PathBuf {
     let wrapper_path = generated_c
         .parent()
         .expect("generated Triton source should have a parent directory")
-        .join("triton_silu_mul_wrapper.c");
-    let wrapper_src = format!(
-        "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nCUresult silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n}}\n",
-        func = func_name
-    );
+        .join(file_name);
     std::fs::write(&wrapper_path, wrapper_src).expect("failed to write Triton wrapper source");
+    wrapper_path
+}
 
-    cc::Build::new()
+fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+    let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
+    let triton_target = triton_target(sm_targets);
+    let mut generated_sources = Vec::new();
+
+    let silu_spec = TritonKernelSpec {
+        artifact_dir: "silu_mul",
+        kernel_path: "tools/triton/silu_mul_kernel.py",
+        kernel_name: "silu_mul_kernel",
+        signature: "*bf16,*bf16,*bf16,i32,256",
+        grid: "(n_elements + 255) / 256,1,1",
+        out_name: "triton_silu_mul",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (silu_func, silu_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &silu_spec);
+    let silu_wrapper = write_wrapper(
+        &silu_c,
+        "triton_silu_mul_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nCUresult silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n}}\n",
+            func = silu_func
+        ),
+    );
+    generated_sources.push(silu_c);
+    generated_sources.push(silu_wrapper);
+
+    let add_spec = TritonKernelSpec {
+        artifact_dir: "add",
+        kernel_path: "tools/triton/basic_kernels.py",
+        kernel_name: "add_kernel",
+        signature: "*bf16,*bf16,*bf16,i32,256",
+        grid: "(n_elements + 255) / 256,1,1",
+        out_name: "triton_add",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (add_func, add_c) = generate_triton_artifacts(&python, out_dir, &triton_target, &add_spec);
+    let add_wrapper = write_wrapper(
+        &add_c,
+        "triton_add_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, int32_t n_elements);\n\nCUresult add_cuda(const uint16_t* a, const uint16_t* b, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)a, (CUdeviceptr)b, (CUdeviceptr)out, (int32_t)n);\n}}\n",
+            func = add_func
+        ),
+    );
+    generated_sources.push(add_c);
+    generated_sources.push(add_wrapper);
+
+    let embedding_spec = TritonKernelSpec {
+        artifact_dir: "embedding",
+        kernel_path: "tools/triton/basic_kernels.py",
+        kernel_name: "embedding_kernel",
+        signature: "*bf16,i32,*bf16,i32,256",
+        grid: "(hidden_size + 255) / 256,1,1",
+        out_name: "triton_embedding",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (embedding_func, embedding_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_spec);
+    let embedding_wrapper = write_wrapper(
+        &embedding_c,
+        "triton_embedding_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, int32_t token_id, CUdeviceptr out, int32_t hidden_size);\n\nCUresult embedding_cuda(const uint16_t* embed, int token_id, uint16_t* out, int hidden_size, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (int32_t)token_id, (CUdeviceptr)out, (int32_t)hidden_size);\n}}\n",
+            func = embedding_func
+        ),
+    );
+    generated_sources.push(embedding_c);
+    generated_sources.push(embedding_wrapper);
+
+    let embedding_decode_spec = TritonKernelSpec {
+        artifact_dir: "embedding_decode",
+        kernel_path: "tools/triton/basic_kernels.py",
+        kernel_name: "embedding_decode_kernel",
+        signature: "*bf16,*i32,*bf16,i32,256",
+        grid: "(hidden_size + 255) / 256,1,1",
+        out_name: "triton_embedding_decode",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (embedding_decode_func, embedding_decode_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_decode_spec);
+    let embedding_decode_wrapper = write_wrapper(
+        &embedding_decode_c,
+        "triton_embedding_decode_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr decode_meta, CUdeviceptr out, int32_t hidden_size);\n\nCUresult embedding_decode_cuda(const uint16_t* embed, const int* decode_meta, uint16_t* out, int hidden_size, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)decode_meta, (CUdeviceptr)out, (int32_t)hidden_size);\n}}\n",
+            func = embedding_decode_func
+        ),
+    );
+    generated_sources.push(embedding_decode_c);
+    generated_sources.push(embedding_decode_wrapper);
+
+    let embedding_batched_spec = TritonKernelSpec {
+        artifact_dir: "embedding_batched",
+        kernel_path: "tools/triton/basic_kernels.py",
+        kernel_name: "embedding_batched_kernel",
+        signature: "*bf16,*i32,*bf16,i32,i32,256",
+        grid: "(hidden_size * seq_len + 255) / 256,1,1",
+        out_name: "triton_embedding_batched",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (embedding_batched_func, embedding_batched_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_batched_spec);
+    let embedding_batched_wrapper = write_wrapper(
+        &embedding_batched_c,
+        "triton_embedding_batched_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr token_ids, CUdeviceptr out, int32_t hidden_size, int32_t seq_len);\n\nCUresult embedding_batched_cuda(const uint16_t* embed, const int* token_ids, uint16_t* out, int hidden_size, int seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)token_ids, (CUdeviceptr)out, (int32_t)hidden_size, (int32_t)seq_len);\n}}\n",
+            func = embedding_batched_func
+        ),
+    );
+    generated_sources.push(embedding_batched_c);
+    generated_sources.push(embedding_batched_wrapper);
+
+    let mut build = cc::Build::new();
+    build
         .cuda(false)
         .include(format!("{}/include", cuda_path))
         .flag("-std=c11")
-        .warnings(false)
-        .file(&generated_c)
-        .file(&wrapper_path)
-        .compile("triton_kernels_aot");
+        .warnings(false);
+    for source in &generated_sources {
+        build.file(source);
+    }
+    build.compile("triton_kernels_aot");
 
     println!("cargo:rustc-link-lib=cuda");
-    println!("cargo:warning=Using Triton AOT as the default silu_mul path");
+    println!(
+        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, and embedding; extract/write vector copies now use cudarc device memcpy"
+    );
+    println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
+    println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
-    println!("cargo:rerun-if-changed=tools/triton/gen_silu_mul_aot.py");
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
 
@@ -265,14 +414,18 @@ fn main() {
             .join(",")
     );
 
-    // Discover all .cu files in csrc/
+    let replaced_cuda_files = BTreeSet::from(["activation.cu", "elementwise.cu", "embedding.cu"]);
+
     let csrc_dir = Path::new("csrc");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
         .expect("Failed to read csrc/ directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("cu") {
+            let file_name = path.file_name()?.to_str()?;
+            if path.extension().and_then(|e| e.to_str()) == Some("cu")
+                && !replaced_cuda_files.contains(file_name)
+            {
                 Some(path)
             } else {
                 None
@@ -280,7 +433,15 @@ fn main() {
         })
         .collect();
 
-    // Compile each .cu file into a .o
+    println!(
+        "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
+        replaced_cuda_files
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let mut obj_files = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
@@ -325,7 +486,7 @@ fn main() {
         panic!("ar failed");
     }
 
-    compile_triton_aot_silu(&cuda_path, &out_dir, &sm_targets);
+    compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-search=native={}/lib64", cuda_path);

@@ -42,6 +42,10 @@ async fn completions(
         guard.model_id().to_string()
     };
     let prompt_len = req.prompt.len();
+    if req.prompt.trim().is_empty() {
+        warn!("Rejecting empty prompt request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     if let Some(ref requested_model) = requested_model
         && requested_model != &loaded_model
@@ -101,12 +105,15 @@ async fn completions(
                 Event::default().data(serde_json::to_string(&chunk).unwrap()),
             )];
 
-            if include_usage && is_terminal && let Some(usage) = usage {
+            if include_usage
+                && is_terminal
+                && let Some(usage) = usage
+            {
                 let usage_chunk =
                     StreamUsageChunk::from_usage(&request_id, created, &loaded_model, usage);
-                events.push(Ok(Event::default().data(
-                    serde_json::to_string(&usage_chunk).unwrap(),
-                )));
+                events.push(Ok(
+                    Event::default().data(serde_json::to_string(&usage_chunk).unwrap())
+                ));
             }
 
             stream::iter(events)
@@ -288,6 +295,26 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(payload.contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#), "payload={payload}");
+        assert!(
+            payload
+                .contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_empty_prompt() {
+        let app = build_app(Box::new(MockEngine::new("Qwen3-4B")));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"   ","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

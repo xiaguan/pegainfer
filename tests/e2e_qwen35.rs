@@ -32,8 +32,7 @@ struct TestCase {
 fn load_test_cases() -> Vec<TestCase> {
     let content = std::fs::read_to_string(TEST_DATA_PATH)
         .unwrap_or_else(|e| panic!("Failed to read {TEST_DATA_PATH}: {e}"));
-    let data: TestData =
-        serde_json::from_str(&content).expect("Failed to parse test data JSON");
+    let data: TestData = serde_json::from_str(&content).expect("Failed to parse test data JSON");
     data.cases
 }
 
@@ -68,8 +67,14 @@ fn test_e2e_qwen35_generation() {
 
     info!("Loading Qwen3.5 engine...");
     let start = Instant::now();
-    let mut engine = Qwen35ServerEngine::load_with_options(MODEL_PATH, 42, EngineOptions { enable_cuda_graph: true })
-        .expect("Failed to load Qwen3.5 engine");
+    let mut engine = Qwen35ServerEngine::load_with_options(
+        MODEL_PATH,
+        42,
+        EngineOptions {
+            enable_cuda_graph: true,
+        },
+    )
+    .expect("Failed to load Qwen3.5 engine");
     info!(
         "Engine loaded in {:.2?}, vocab_size={}",
         start.elapsed(),

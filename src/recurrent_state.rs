@@ -50,10 +50,7 @@ impl RecurrentState {
             });
         }
 
-        Ok(Self {
-            layers,
-            seq_len: 0,
-        })
+        Ok(Self { layers, seq_len: 0 })
     }
 
     /// Reset all state to zeros for a new generation.
