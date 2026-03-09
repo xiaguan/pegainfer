@@ -76,6 +76,11 @@ impl<'a> IncrementalDecoder<'a> {
         Ok(chunk)
     }
 
+    /// Text emitted so far by `step()` (and `finish()`). Used for stop-sequence checks.
+    pub fn emitted_text(&self) -> &str {
+        &self.emitted_text
+    }
+
     pub fn finish(&mut self) -> Result<Option<String>> {
         let decoded = self.tokenizer.decode(&self.token_ids)?;
         let suffix = decoded.strip_prefix(&self.emitted_text).ok_or_else(|| {

@@ -11,10 +11,62 @@ use crate::qwen35_model::Qwen35Model;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
+/// If `text` ends with any of `stops`, return the text with that suffix removed.
+/// Prefers the longest matching stop when several match at the end.
+fn strip_stop_suffix(text: &str, stops: &[String]) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for s in stops {
+        let s = s.as_str();
+        if s.is_empty() {
+            continue;
+        }
+        if text.ends_with(s) {
+            let len: usize = s.len();
+            if best.map_or(true, |(l, _)| len > l) {
+                best = Some((len, s));
+            }
+        }
+    }
+    best.map(|(len, _)| text[..text.len() - len].to_string())
+}
+
+/// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
+/// (from `sent_len` up to but not including the stop) and the matching stop.
+/// Prefers the longest matching stop when several match at the end.
+fn truncate_at_stop<'a>(
+    new_full: &str,
+    sent_len: usize,
+    stops: &[&'a str],
+) -> Option<(String, &'a str)> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for s in stops {
+        if s.is_empty() {
+            continue;
+        }
+        if new_full.ends_with(s) {
+            let len = s.len();
+            if best.map_or(true, |(l, _)| len > l) {
+                best = Some((len, *s));
+            }
+        }
+    }
+    best.map(|(stop_len, stop)| {
+        let end = new_full.len().saturating_sub(stop_len);
+        let to_send = if end >= sent_len {
+            new_full[sent_len..end].to_string()
+        } else {
+            String::new()
+        };
+        (to_send, stop)
+    })
+}
+
 pub struct CompleteRequest {
     pub prompt: String,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
+    /// Stop generation when output ends with any of these strings (OpenAI-compatible).
+    pub stop: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,14 +256,20 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             self.model
                 .generate(&prompt_tokens, req.max_tokens, &req.sampling, &mut self.rng)?;
         let completion_tokens = output_tokens.len().saturating_sub(prompt_tokens.len());
-        let text = self
+        let mut text = self
             .tokenizer
             .decode(&output_tokens[prompt_tokens.len()..])?;
-        let finish_reason = if completion_tokens >= req.max_tokens {
+        let mut finish_reason = if completion_tokens >= req.max_tokens {
             FinishReason::Length
         } else {
             FinishReason::Stop
         };
+        if let Some(ref stops) = req.stop {
+            if let Some(stripped) = strip_stop_suffix(&text, stops) {
+                text = stripped;
+                finish_reason = FinishReason::Stop;
+            }
+        }
         let usage = Usage {
             prompt_tokens: prompt_tokens.len(),
             completion_tokens,
@@ -232,6 +290,12 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let mut decoder = self.tokenizer.incremental_decoder();
         let mut decode_error = None;
+        let stops: Option<Vec<&str>> = req
+            .stop
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).filter(|s| !s.is_empty()).collect());
+        let mut sent_len: usize = 0;
+        let stopped_by_stop_sequence = std::cell::Cell::new(false);
 
         let stats = self.model.generate_streaming_with_callback(
             &prompt_tokens,
@@ -239,13 +303,45 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             &req.sampling,
             &mut self.rng,
             |token_id| match decoder.step(token_id) {
-                Ok(Some(text_delta)) => tx
-                    .send(StreamDelta {
-                        text_delta,
-                        finish_reason: None,
-                        usage: None,
-                    })
-                    .is_ok(),
+                Ok(Some(text_delta)) => {
+                    if let Some(ref stop_list) = stops {
+                        let new_full = {
+                            let emitted = decoder.emitted_text();
+                            emitted.to_string()
+                        };
+                        if let Some((to_send, stopped)) =
+                            truncate_at_stop(&new_full, sent_len, stop_list)
+                        {
+                            if !to_send.is_empty() {
+                                if tx.send(StreamDelta {
+                                    text_delta: to_send,
+                                    finish_reason: None,
+                                    usage: None,
+                                }).is_err() {
+                                    return false;
+                                }
+                            }
+                            sent_len = new_full.len() - stopped.len();
+                            stopped_by_stop_sequence.set(true);
+                            return false;
+                        }
+                        let to_send = &new_full[sent_len..];
+                        sent_len = new_full.len();
+                        tx.send(StreamDelta {
+                            text_delta: to_send.to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        })
+                        .is_ok()
+                    } else {
+                        tx.send(StreamDelta {
+                            text_delta: text_delta,
+                            finish_reason: None,
+                            usage: None,
+                        })
+                        .is_ok()
+                    }
+                }
                 Ok(None) => true,
                 Err(err) => {
                     decode_error = Some(err);
@@ -263,14 +359,38 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         }
 
         if let Some(text_delta) = decoder.finish()? {
-            let _ = tx.send(StreamDelta {
-                text_delta,
-                finish_reason: None,
-                usage: None,
-            });
+            if let Some(ref stop_list) = stops {
+                let new_full = decoder.emitted_text().to_string();
+                if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
+                    if !to_send.is_empty() {
+                        let _ = tx.send(StreamDelta {
+                            text_delta: to_send,
+                            finish_reason: None,
+                            usage: None,
+                        });
+                    }
+                } else {
+                    let to_send = &new_full[sent_len..];
+                    if !to_send.is_empty() {
+                        let _ = tx.send(StreamDelta {
+                            text_delta: to_send.to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        });
+                    }
+                }
+            } else {
+                let _ = tx.send(StreamDelta {
+                    text_delta: text_delta,
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
         }
 
-        let finish_reason = if stats.hit_eos {
+        let finish_reason = if stopped_by_stop_sequence.get() {
+            FinishReason::Stop
+        } else if stats.hit_eos {
             FinishReason::Stop
         } else {
             FinishReason::Length
@@ -348,5 +468,34 @@ impl Qwen35ServerEngine {
 
     pub fn vocab_size(&self) -> usize {
         self.tokenizer.vocab_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_stop_suffix, truncate_at_stop};
+
+    #[test]
+    fn test_strip_stop_suffix() {
+        let stops: Vec<String> = vec!["\n".into(), "END".into()];
+        assert_eq!(strip_stop_suffix("hello\n", &stops), Some("hello".to_string()));
+        assert_eq!(strip_stop_suffix("hello\n\n", &stops), Some("hello\n".to_string()));
+        assert_eq!(strip_stop_suffix("helloEND", &stops), Some("hello".to_string()));
+        assert_eq!(strip_stop_suffix("hello", &stops), None);
+        assert_eq!(strip_stop_suffix("", &stops), None);
+    }
+
+    #[test]
+    fn test_truncate_at_stop() {
+        let stops = ["\n"];
+        assert_eq!(
+            truncate_at_stop("hello\n", 0, &stops),
+            Some(("hello".to_string(), "\n"))
+        );
+        assert_eq!(truncate_at_stop("hello", 0, &stops), None);
+        assert_eq!(
+            truncate_at_stop("ab\n", 2, &stops),
+            Some(("".to_string(), "\n"))
+        );
     }
 }

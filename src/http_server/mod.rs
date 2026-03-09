@@ -78,6 +78,7 @@ async fn completions(
             top_k: req.top_k.unwrap_or(-1),
             top_p: req.top_p.unwrap_or(1.0),
         },
+        stop: req.stop,
     };
 
     // Drop non-Send guard before awaiting task joins.

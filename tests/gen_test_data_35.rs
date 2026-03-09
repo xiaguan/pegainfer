@@ -68,6 +68,7 @@ fn generate_qwen35_test_data() {
                 prompt: prompt.to_string(),
                 max_tokens: *max_tokens,
                 sampling: SamplingParams::default(),
+                stop: None,
             })
             .expect("complete() failed");
 

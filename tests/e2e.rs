@@ -79,6 +79,7 @@ fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
         prompt: prompt.to_string(),
         max_tokens,
         sampling: SamplingParams::default(),
+        stop: None,
     }
 }
 

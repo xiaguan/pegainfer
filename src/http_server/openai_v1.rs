@@ -15,7 +15,6 @@ pub(super) struct CompletionRequest {
     pub(super) n: Option<usize>,
     pub(super) stream: Option<bool>,
     pub(super) stream_options: Option<StreamOptions>,
-    #[allow(dead_code)]
     pub(super) stop: Option<Vec<String>>,
 }
 
