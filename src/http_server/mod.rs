@@ -101,12 +101,15 @@ async fn completions(
                 Event::default().data(serde_json::to_string(&chunk).unwrap()),
             )];
 
-            if include_usage && is_terminal && let Some(usage) = usage {
+            if include_usage
+                && is_terminal
+                && let Some(usage) = usage
+            {
                 let usage_chunk =
                     StreamUsageChunk::from_usage(&request_id, created, &loaded_model, usage);
-                events.push(Ok(Event::default().data(
-                    serde_json::to_string(&usage_chunk).unwrap(),
-                )));
+                events.push(Ok(
+                    Event::default().data(serde_json::to_string(&usage_chunk).unwrap())
+                ));
             }
 
             stream::iter(events)
@@ -288,6 +291,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(payload.contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#), "payload={payload}");
+        assert!(
+            payload
+                .contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#),
+            "payload={payload}"
+        );
     }
 }

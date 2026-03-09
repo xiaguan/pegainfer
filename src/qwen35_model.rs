@@ -151,14 +151,21 @@ impl Qwen35Model {
         let wp = "model.language_model";
 
         info!("Loading embeddings to GPU");
-        let embed_tokens =
-            load_tensor_2d(&ctx, &shards, &weight_map, &format!("{}.embed_tokens.weight", wp))?;
+        let embed_tokens = load_tensor_2d(
+            &ctx,
+            &shards,
+            &weight_map,
+            &format!("{}.embed_tokens.weight", wp),
+        )?;
         info!(
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
         );
 
-        info!("Loading layers to GPU: num_layers={}", config.num_hidden_layers);
+        info!(
+            "Loading layers to GPU: num_layers={}",
+            config.num_hidden_layers
+        );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("{}.layers.{}", wp, i);
@@ -169,27 +176,39 @@ impl Qwen35Model {
                     let attn_prefix = format!("{}.self_attn", prefix);
                     LayerKind::FullAttention(FullAttentionLayer {
                         q_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.q_proj.weight", attn_prefix),
                         )?,
                         k_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.k_proj.weight", attn_prefix),
                         )?,
                         v_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.v_proj.weight", attn_prefix),
                         )?,
                         o_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.o_proj.weight", attn_prefix),
                         )?,
                         q_norm: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.q_norm.weight", attn_prefix),
                         )?,
                         k_norm: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.k_norm.weight", attn_prefix),
                         )?,
                     })
@@ -198,39 +217,57 @@ impl Qwen35Model {
                     let attn_prefix = format!("{}.linear_attn", prefix);
                     LayerKind::LinearAttention(LinearAttentionLayer {
                         in_proj_qkv: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.in_proj_qkv.weight", attn_prefix),
                         )?,
                         in_proj_z: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.in_proj_z.weight", attn_prefix),
                         )?,
                         in_proj_b: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.in_proj_b.weight", attn_prefix),
                         )?,
                         in_proj_a: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.in_proj_a.weight", attn_prefix),
                         )?,
                         conv1d_weight: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.conv1d.weight", attn_prefix),
                         )?,
                         dt_bias: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.dt_bias", attn_prefix),
                         )?,
                         a_log: load_tensor_1d_f32(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.A_log", attn_prefix),
                         )?,
                         norm_weight: load_tensor_1d_f32(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.norm.weight", attn_prefix),
                         )?,
                         out_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.out_proj.weight", attn_prefix),
                         )?,
                     })
@@ -239,25 +276,35 @@ impl Qwen35Model {
 
             let block = TransformerBlock35 {
                 input_layernorm: load_tensor_1d(
-                    &ctx, &shards, &weight_map,
+                    &ctx,
+                    &shards,
+                    &weight_map,
                     &format!("{}.input_layernorm.weight", prefix),
                 )?,
                 attn,
                 post_attention_layernorm: load_tensor_1d(
-                    &ctx, &shards, &weight_map,
+                    &ctx,
+                    &shards,
+                    &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
                 mlp: MLP35 {
                     gate_proj: load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.mlp.gate_proj.weight", prefix),
                     )?,
                     up_proj: load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.mlp.up_proj.weight", prefix),
                     )?,
                     down_proj: load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
                     )?,
                 },
@@ -272,12 +319,12 @@ impl Qwen35Model {
             layers.push(block);
         }
 
-        let norm = load_tensor_1d(
-            &ctx, &shards, &weight_map,
-            &format!("{}.norm.weight", wp),
-        )?;
+        let norm = load_tensor_1d(&ctx, &shards, &weight_map, &format!("{}.norm.weight", wp))?;
 
-        info!("Precomputing partial RoPE cache (rotary_dim={})", config.rotary_dim);
+        info!(
+            "Precomputing partial RoPE cache (rotary_dim={})",
+            config.rotary_dim
+        );
         let (cos_cache, sin_cache) =
             precompute_rope(&ctx, config.rotary_dim, 4096, config.rope_theta)?;
 
@@ -452,7 +499,6 @@ impl Qwen35Model {
                 eps,
                 &mut bufs.normed,
             )?;
-
         }
 
         // 4. LM Head (normed already computed by last fused_add_rms_norm_offset)
@@ -521,7 +567,12 @@ impl Qwen35Model {
         let c = &self.config;
 
         // Projections
-        ops::gemv(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.proj_8192)?;
+        ops::gemv(
+            &self.ctx,
+            &attn.in_proj_qkv,
+            &bufs.normed,
+            &mut bufs.proj_8192,
+        )?;
         ops::gemv(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.proj_z)?;
         ops::gemv(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.proj_b)?;
         ops::gemv(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.proj_a)?;
@@ -530,10 +581,10 @@ impl Qwen35Model {
         let layer_state = &mut recurrent.layers[recurrent_idx];
         ops::conv1d_decode_into(
             &self.ctx,
-            &bufs.proj_8192,       // qkv_raw input
+            &bufs.proj_8192, // qkv_raw input
             &attn.conv1d_weight,
             &mut layer_state.conv_state,
-            &mut bufs.qkv_conv,    // conv output
+            &mut bufs.qkv_conv, // conv output
             c.linear_conv_kernel_dim,
         )?;
 
@@ -566,7 +617,12 @@ impl Qwen35Model {
         )?;
 
         // Output projection
-        ops::gemv(&self.ctx, &attn.out_proj, &bufs.norm_gated, &mut bufs.attn_proj)?;
+        ops::gemv(
+            &self.ctx,
+            &attn.out_proj,
+            &bufs.norm_gated,
+            &mut bufs.attn_proj,
+        )?;
 
         Ok(())
     }
@@ -596,7 +652,12 @@ impl Qwen35Model {
 
         let hidden_dim = c.hidden_size;
         let mut hidden_batch = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden_batch)?;
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &token_ids_gpu,
+            &mut hidden_batch,
+        )?;
 
         // Process layers
         let mut linear_idx = 0usize;
@@ -604,8 +665,13 @@ impl Qwen35Model {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden_batch = self.prefill_layer(
-                layer_idx, layer, hidden_batch, &mut linear_idx, &mut full_idx,
-                kv_cache, recurrent,
+                layer_idx,
+                layer,
+                hidden_batch,
+                &mut linear_idx,
+                &mut full_idx,
+                kv_cache,
+                recurrent,
             )?;
         }
 
@@ -619,7 +685,13 @@ impl Qwen35Model {
         // Final norm (1+weight offset)
         let normed = {
             let mut out = DeviceVec::zeros(&self.ctx, hidden_dim)?;
-            ops::rms_norm_offset_into(&self.ctx, &last_hidden, &self.norm, c.rms_norm_eps, &mut out)?;
+            ops::rms_norm_offset_into(
+                &self.ctx,
+                &last_hidden,
+                &self.norm,
+                c.rms_norm_eps,
+                &mut out,
+            )?;
             out
         };
 
@@ -646,9 +718,8 @@ impl Qwen35Model {
         // 1. Input layernorm — per-token (no batched offset norm kernel yet)
         // Use standard batched norm and add the offset correction manually
         // Actually we need the (1+w) variant. Process token by token for now.
-        let mut normed_batch = self.batched_rms_norm_offset(
-            &hidden_batch, &layer.input_layernorm, eps,
-        )?;
+        let mut normed_batch =
+            self.batched_rms_norm_offset(&hidden_batch, &layer.input_layernorm, eps)?;
 
         // 2. Attention / Linear attention — per-token for correctness
         let attn_out_dim = match &layer.attn {
@@ -684,13 +755,24 @@ impl Qwen35Model {
                     let mut attn_out = DeviceVec::zeros(&self.ctx, attn_out_dim)?;
 
                     ops::fused_attention_hd256_single_token_into(
-                        &self.ctx, &q, &k, &v,
-                        &attn.q_norm, &attn.k_norm,
-                        &cos_pos, &sin_pos,
-                        kc, vc, &mut attn_out,
-                        c.num_attention_heads, c.num_key_value_heads,
-                        pos, attn_seq, c.rotary_dim,
-                        scale, eps,
+                        &self.ctx,
+                        &q,
+                        &k,
+                        &v,
+                        &attn.q_norm,
+                        &attn.k_norm,
+                        &cos_pos,
+                        &sin_pos,
+                        kc,
+                        vc,
+                        &mut attn_out,
+                        c.num_attention_heads,
+                        c.num_key_value_heads,
+                        pos,
+                        attn_seq,
+                        c.rotary_dim,
+                        scale,
+                        eps,
                     )?;
 
                     ops::write_vec(&self.ctx, &mut attn_out_batch, t, &attn_out)?;
@@ -724,27 +806,41 @@ impl Qwen35Model {
                     // Conv1d
                     let mut qkv_conv = DeviceVec::zeros(&self.ctx, qkv_dim)?;
                     ops::conv1d_decode_into(
-                        &self.ctx, &qkv_raw, &attn.conv1d_weight,
-                        &mut layer_state.conv_state, &mut qkv_conv,
+                        &self.ctx,
+                        &qkv_raw,
+                        &attn.conv1d_weight,
+                        &mut layer_state.conv_state,
+                        &mut qkv_conv,
                         c.linear_conv_kernel_dim,
                     )?;
 
                     // GDR
                     let mut gdr_out = DeviceVec::zeros(&self.ctx, z_dim)?;
                     ops::gated_delta_rule_decode_into(
-                        &self.ctx, &qkv_conv, &b, &a,
-                        &attn.dt_bias, &attn.a_log,
-                        &mut layer_state.state, &mut gdr_out,
-                        c.linear_num_key_heads, c.linear_num_value_heads,
-                        c.linear_key_head_dim, c.linear_value_head_dim,
+                        &self.ctx,
+                        &qkv_conv,
+                        &b,
+                        &a,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut layer_state.state,
+                        &mut gdr_out,
+                        c.linear_num_key_heads,
+                        c.linear_num_value_heads,
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
                     )?;
 
                     // Gated norm
                     let mut normed_out = DeviceVec::zeros(&self.ctx, z_dim)?;
                     ops::rms_norm_gated_into(
-                        &self.ctx, &gdr_out, &attn.norm_weight, &z,
+                        &self.ctx,
+                        &gdr_out,
+                        &attn.norm_weight,
+                        &z,
                         &mut normed_out,
-                        c.linear_num_value_heads, c.linear_value_head_dim,
+                        c.linear_num_value_heads,
+                        c.linear_value_head_dim,
                         c.rms_norm_eps,
                     )?;
 
@@ -762,9 +858,8 @@ impl Qwen35Model {
         let hidden_plus_attn = ops::add_batch(&self.ctx, &hidden_batch, &attn_results)?;
 
         // Post-attention layernorm (1+weight offset, batched per-token)
-        normed_batch = self.batched_rms_norm_offset(
-            &hidden_plus_attn, &layer.post_attention_layernorm, eps,
-        )?;
+        normed_batch =
+            self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
 
         // 4. MLP (batched)
         let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
@@ -876,8 +971,11 @@ impl Qwen35Model {
         let next_token = if prompt_tokens.len() == 1 {
             // Single token: use decode path (CUDA Graph eligible)
             self.decode_one_token(
-                prompt_tokens[0], &mut kv_cache, &mut recurrent,
-                &mut bufs, &mut graph_state,
+                prompt_tokens[0],
+                &mut kv_cache,
+                &mut recurrent,
+                &mut bufs,
+                &mut graph_state,
             )?;
             self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
         } else {
@@ -900,10 +998,14 @@ impl Qwen35Model {
         let mut generated_count = 0;
         for _i in 1..max_new_tokens {
             self.decode_one_token(
-                *tokens.last().unwrap(), &mut kv_cache, &mut recurrent,
-                &mut bufs, &mut graph_state,
+                *tokens.last().unwrap(),
+                &mut kv_cache,
+                &mut recurrent,
+                &mut bufs,
+                &mut graph_state,
             )?;
-            let next_token = self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
+            let next_token =
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
 
             if next_token == self.config.eos_token_id {
                 break;
@@ -956,8 +1058,11 @@ impl Qwen35Model {
         let ttft_start = Instant::now();
         let next_token = if prompt_tokens.len() == 1 {
             self.decode_one_token(
-                prompt_tokens[0], &mut kv_cache, &mut recurrent,
-                &mut bufs, &mut graph_state,
+                prompt_tokens[0],
+                &mut kv_cache,
+                &mut recurrent,
+                &mut bufs,
+                &mut graph_state,
             )?;
             self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
         } else {
@@ -992,10 +1097,14 @@ impl Qwen35Model {
         let mut hit_eos = false;
         for _i in 1..max_new_tokens {
             self.decode_one_token(
-                *tokens.last().unwrap(), &mut kv_cache, &mut recurrent,
-                &mut bufs, &mut graph_state,
+                *tokens.last().unwrap(),
+                &mut kv_cache,
+                &mut recurrent,
+                &mut bufs,
+                &mut graph_state,
             )?;
-            let next_token = self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
+            let next_token =
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
 
             if next_token == self.config.eos_token_id {
                 hit_eos = true;
@@ -1068,17 +1177,45 @@ impl Qwen35Model {
     pub fn verify_shapes(&self) -> Result<()> {
         let c = &self.config;
 
-        assert_shape("embed_tokens", &self.embed_tokens, c.vocab_size, c.hidden_size)?;
+        assert_shape(
+            "embed_tokens",
+            &self.embed_tokens,
+            c.vocab_size,
+            c.hidden_size,
+        )?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("layer.{}", i);
 
-            assert_vec_len(&format!("{}.input_layernorm", prefix), &layer.input_layernorm, c.hidden_size)?;
-            assert_vec_len(&format!("{}.post_attn_layernorm", prefix), &layer.post_attention_layernorm, c.hidden_size)?;
+            assert_vec_len(
+                &format!("{}.input_layernorm", prefix),
+                &layer.input_layernorm,
+                c.hidden_size,
+            )?;
+            assert_vec_len(
+                &format!("{}.post_attn_layernorm", prefix),
+                &layer.post_attention_layernorm,
+                c.hidden_size,
+            )?;
 
-            assert_shape(&format!("{}.mlp.gate_proj", prefix), &layer.mlp.gate_proj, c.intermediate_size, c.hidden_size)?;
-            assert_shape(&format!("{}.mlp.up_proj", prefix), &layer.mlp.up_proj, c.intermediate_size, c.hidden_size)?;
-            assert_shape(&format!("{}.mlp.down_proj", prefix), &layer.mlp.down_proj, c.hidden_size, c.intermediate_size)?;
+            assert_shape(
+                &format!("{}.mlp.gate_proj", prefix),
+                &layer.mlp.gate_proj,
+                c.intermediate_size,
+                c.hidden_size,
+            )?;
+            assert_shape(
+                &format!("{}.mlp.up_proj", prefix),
+                &layer.mlp.up_proj,
+                c.intermediate_size,
+                c.hidden_size,
+            )?;
+            assert_shape(
+                &format!("{}.mlp.down_proj", prefix),
+                &layer.mlp.down_proj,
+                c.hidden_size,
+                c.intermediate_size,
+            )?;
 
             match &layer.attn {
                 LayerKind::FullAttention(attn) => {
@@ -1086,10 +1223,30 @@ impl Qwen35Model {
                     let kv_dim = c.full_attn_kv_dim();
                     let q_dim = c.full_attn_q_dim();
 
-                    assert_shape(&format!("{}.q_proj", prefix), &attn.q_proj, q_proj_dim, c.hidden_size)?;
-                    assert_shape(&format!("{}.k_proj", prefix), &attn.k_proj, kv_dim, c.hidden_size)?;
-                    assert_shape(&format!("{}.v_proj", prefix), &attn.v_proj, kv_dim, c.hidden_size)?;
-                    assert_shape(&format!("{}.o_proj", prefix), &attn.o_proj, c.hidden_size, q_dim)?;
+                    assert_shape(
+                        &format!("{}.q_proj", prefix),
+                        &attn.q_proj,
+                        q_proj_dim,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.k_proj", prefix),
+                        &attn.k_proj,
+                        kv_dim,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.v_proj", prefix),
+                        &attn.v_proj,
+                        kv_dim,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.o_proj", prefix),
+                        &attn.o_proj,
+                        c.hidden_size,
+                        q_dim,
+                    )?;
                     assert_vec_len(&format!("{}.q_norm", prefix), &attn.q_norm, c.head_dim)?;
                     assert_vec_len(&format!("{}.k_norm", prefix), &attn.k_norm, c.head_dim)?;
                 }
@@ -1098,17 +1255,42 @@ impl Qwen35Model {
                     let z_dim = c.linear_attn_z_dim();
                     let num_v_heads = c.linear_num_value_heads;
 
-                    assert_shape(&format!("{}.in_proj_qkv", prefix), &attn.in_proj_qkv, qkv_dim, c.hidden_size)?;
-                    assert_shape(&format!("{}.in_proj_z", prefix), &attn.in_proj_z, z_dim, c.hidden_size)?;
-                    assert_shape(&format!("{}.in_proj_b", prefix), &attn.in_proj_b, num_v_heads, c.hidden_size)?;
-                    assert_shape(&format!("{}.in_proj_a", prefix), &attn.in_proj_a, num_v_heads, c.hidden_size)?;
+                    assert_shape(
+                        &format!("{}.in_proj_qkv", prefix),
+                        &attn.in_proj_qkv,
+                        qkv_dim,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.in_proj_z", prefix),
+                        &attn.in_proj_z,
+                        z_dim,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.in_proj_b", prefix),
+                        &attn.in_proj_b,
+                        num_v_heads,
+                        c.hidden_size,
+                    )?;
+                    assert_shape(
+                        &format!("{}.in_proj_a", prefix),
+                        &attn.in_proj_a,
+                        num_v_heads,
+                        c.hidden_size,
+                    )?;
                     assert_vec_len(
                         &format!("{}.conv1d_weight", prefix),
                         &attn.conv1d_weight,
                         qkv_dim * c.linear_conv_kernel_dim,
                     )?;
                     assert_vec_len(&format!("{}.dt_bias", prefix), &attn.dt_bias, num_v_heads)?;
-                    assert_shape(&format!("{}.out_proj", prefix), &attn.out_proj, c.hidden_size, z_dim)?;
+                    assert_shape(
+                        &format!("{}.out_proj", prefix),
+                        &attn.out_proj,
+                        c.hidden_size,
+                        z_dim,
+                    )?;
                 }
             }
         }

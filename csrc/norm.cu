@@ -306,17 +306,17 @@ void rms_norm_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight, __nv_bfl
   rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(x, weight, out, n, eps);
 }
 
+void fused_add_rms_norm_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+                              const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
+                              float eps, cudaStream_t stream) {
+  fused_add_rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(hidden, residual, weight, out, n, eps);
+}
+
 void rms_norm_batched_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                             __nv_bfloat16 *out, int hidden_dim, int seq_len,
                             float eps, cudaStream_t stream) {
   rms_norm_batched_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
       x, weight, out, hidden_dim, eps);
-}
-
-void fused_add_rms_norm_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
-                              const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
-                              float eps, cudaStream_t stream) {
-  fused_add_rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(hidden, residual, weight, out, n, eps);
 }
 
 // ============================================================================

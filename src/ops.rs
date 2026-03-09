@@ -1,6 +1,6 @@
 //! GPU operations on device tensors.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
@@ -178,15 +178,16 @@ pub fn add_inplace(ctx: &DeviceContext, a: &mut DeviceVec, b: &DeviceVec) -> Res
     let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
     let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::add_cuda(
             a_ptr as *const ffi::Half,
             b_ptr as *const ffi::Half,
             a_ptr as *mut ffi::Half,
             a.len as i32,
             ctx.stream.cu_stream(),
-        );
-    }
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -234,15 +235,16 @@ pub fn add(ctx: &DeviceContext, a: &DeviceVec, b: &DeviceVec) -> Result<DeviceVe
         let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
         let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-        unsafe {
+        let result = unsafe {
             ffi::add_cuda(
                 a_ptr as *const ffi::Half,
                 b_ptr as *const ffi::Half,
                 out_ptr as *mut ffi::Half,
                 a.len as i32,
                 ctx.stream.cu_stream(),
-            );
-        }
+            )
+        };
+        result.result()?;
     }
 
     Ok(out)
@@ -260,15 +262,16 @@ pub fn embedding_into(
     let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::embedding_cuda(
             embed_ptr as *const ffi::Half,
             token_id as i32,
             out_ptr as *mut ffi::Half,
             embed.cols as i32,
             ctx.stream.cu_stream(),
-        );
-    }
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -293,15 +296,16 @@ pub fn embedding_decode_into(
     let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::embedding_decode_cuda(
             embed_ptr as *const ffi::Half,
             meta_ptr as *const i32,
             out_ptr as *mut ffi::Half,
             embed.cols as i32,
             ctx.stream.cu_stream(),
-        );
-    }
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -820,88 +824,15 @@ pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Res
         let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
         let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-        unsafe {
+        let result = unsafe {
             ffi::add_cuda(
                 a_ptr as *const ffi::Half,
                 b_ptr as *const ffi::Half,
                 out_ptr as *mut ffi::Half,
                 n as i32,
                 ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-fn silu_mul_batch_with(
-    ctx: &DeviceContext,
-    gate: &HiddenStates,
-    up: &HiddenStates,
-    kernel: unsafe extern "C" fn(
-        *const ffi::Half,
-        *const ffi::Half,
-        *mut ffi::Half,
-        i32,
-        cudarc::driver::sys::CUstream,
-    ),
-) -> Result<HiddenStates> {
-    assert_eq!(gate.hidden_dim, up.hidden_dim);
-    assert_eq!(gate.seq_len, up.seq_len);
-    let n = gate.hidden_dim * gate.seq_len;
-    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
-
-    {
-        let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
-        let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            kernel(
-                g_ptr as *const ffi::Half,
-                u_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                n as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-fn silu_mul_batch_with_result(
-    ctx: &DeviceContext,
-    gate: &HiddenStates,
-    up: &HiddenStates,
-    kernel: unsafe extern "C" fn(
-        *const ffi::Half,
-        *const ffi::Half,
-        *mut ffi::Half,
-        i32,
-        cudarc::driver::sys::CUstream,
-    ) -> cudarc::driver::sys::CUresult,
-) -> Result<HiddenStates> {
-    assert_eq!(gate.hidden_dim, up.hidden_dim);
-    assert_eq!(gate.seq_len, up.seq_len);
-    let n = gate.hidden_dim * gate.seq_len;
-    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
-
-    {
-        let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
-        let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        let result = unsafe {
-            kernel(
-                g_ptr as *const ffi::Half,
-                u_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                n as i32,
-                ctx.stream.cu_stream(),
             )
         };
-
         result.result()?;
     }
 
@@ -914,16 +845,29 @@ pub fn silu_mul_batch(
     gate: &HiddenStates,
     up: &HiddenStates,
 ) -> Result<HiddenStates> {
-    silu_mul_batch_with_result(ctx, gate, up, ffi::silu_mul_triton_aot_cuda)
-}
+    assert_eq!(gate.hidden_dim, up.hidden_dim);
+    assert_eq!(gate.seq_len, up.seq_len);
+    let n = gate.hidden_dim * gate.seq_len;
+    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
 
-#[doc(hidden)]
-pub fn silu_mul_batch_cuda_ref(
-    ctx: &DeviceContext,
-    gate: &HiddenStates,
-    up: &HiddenStates,
-) -> Result<HiddenStates> {
-    silu_mul_batch_with(ctx, gate, up, ffi::silu_mul_cuda)
+    {
+        let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+        let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+        let result = unsafe {
+            ffi::silu_mul_triton_aot_cuda(
+                g_ptr as *const ffi::Half,
+                u_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                n as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+
+    Ok(out)
 }
 
 /// Batched embedding lookup
@@ -937,7 +881,7 @@ pub fn embedding_batch(
     let (t_ptr, _gt) = token_ids_gpu.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::embedding_batched_cuda(
             e_ptr as *const ffi::Half,
             t_ptr as *const i32,
@@ -945,8 +889,9 @@ pub fn embedding_batch(
             embed.cols as i32,
             out.seq_len as i32,
             ctx.stream.cu_stream(),
-        );
-    }
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -961,19 +906,10 @@ pub fn extract_vec(
     let len = batch.hidden_dim;
     let mut out = DeviceVec::zeros(ctx, len)?;
 
-    {
-        let (src_ptr, _gs) = batch.data.device_ptr(&ctx.stream);
-        let (dst_ptr, _gd) = out.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::copy_cuda(
-                (src_ptr as *const ffi::Half).add(offset),
-                dst_ptr as *mut ffi::Half,
-                len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
+    let src_view = batch.data.slice(offset..offset + len);
+    ctx.stream
+        .memcpy_dtod(&src_view, &mut out.data)
+        .map_err(|e| anyhow!("Device copy failed: {}", e))?;
 
     Ok(out)
 }
@@ -986,20 +922,11 @@ pub fn write_vec(
     vec: &DeviceVec,
 ) -> Result<()> {
     let offset = token_idx * batch.hidden_dim;
+    let mut dst_view = batch.data.slice_mut(offset..offset + vec.len);
 
-    {
-        let (src_ptr, _gs) = vec.data.device_ptr(&ctx.stream);
-        let (dst_ptr, _gd) = batch.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::copy_cuda(
-                src_ptr as *const ffi::Half,
-                (dst_ptr as *mut ffi::Half).add(offset),
-                vec.len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
+    ctx.stream
+        .memcpy_dtod(&vec.data, &mut dst_view)
+        .map_err(|e| anyhow!("Device copy failed: {}", e))?;
 
     Ok(())
 }
@@ -1355,6 +1282,44 @@ mod tests {
         data.iter().map(|&x| bf16::from_f32(x)).collect()
     }
 
+    fn rms_norm_reference(x: &[bf16], weight: &[bf16], eps: f32, offset: bool) -> Vec<f32> {
+        let sum_sq: f32 = x
+            .iter()
+            .map(|value| {
+                let v = value.to_f32();
+                v * v
+            })
+            .sum();
+        let inv_rms = 1.0 / ((sum_sq / x.len() as f32) + eps).sqrt();
+
+        x.iter()
+            .zip(weight.iter())
+            .map(|(value, weight)| {
+                let normed = bf16::from_f32(value.to_f32() * inv_rms).to_f32();
+                let scale = if offset {
+                    1.0 + weight.to_f32()
+                } else {
+                    weight.to_f32()
+                };
+                bf16::from_f32(normed * scale).to_f32()
+            })
+            .collect()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tol: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tol,
+                "index {} expected {} got {} (tol {})",
+                idx,
+                expected,
+                actual,
+                tol
+            );
+        }
+    }
+
     #[test]
     fn test_gemv() -> Result<()> {
         let ctx = DeviceContext::new()?;
@@ -1385,32 +1350,109 @@ mod tests {
     }
 
     #[test]
+    fn test_argmax() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
+        let token = argmax(&ctx, &x)?;
+        assert_eq!(token, 1, "Expected argmax index 1, got {}", token);
+        Ok(())
+    }
+
+    #[test]
+    fn test_argmax_tie_matches_legacy_reduction_order() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let mut host = vec![bf16::from_f32(-1.0); 300];
+        host[2] = bf16::from_f32(10.0);
+        host[257] = bf16::from_f32(10.0);
+        let x = DeviceVec::from_host(&ctx, &host)?;
+        let token = argmax(&ctx, &x)?;
+        assert_eq!(
+            token, 2,
+            "Expected legacy reduction-order winner 2, got {}",
+            token
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_rms_norm() -> Result<()> {
         let ctx = DeviceContext::new()?;
 
-        // x = [1, 2, 3, 4], weight = [1, 1, 1, 1]
-        // mean(x^2) = (1+4+9+16)/4 = 7.5
-        // rms = sqrt(7.5 + 1e-6) ≈ 2.7386
-        // out = x / rms * weight = [0.365, 0.730, 1.095, 1.461]
-        let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
-        let w = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 1.0, 1.0, 1.0]))?;
+        let x_host = bf16_vec(&[1.0, 2.0, 3.0, 4.0]);
+        let w_host = bf16_vec(&[1.0, 1.0, 1.0, 1.0]);
+        let x = DeviceVec::from_host(&ctx, &x_host)?;
+        let w = DeviceVec::from_host(&ctx, &w_host)?;
         let out = rms_norm(&ctx, &x, &w, 1e-6)?;
 
         let result = out.to_host(&ctx)?;
+        let expected = rms_norm_reference(&x_host, &w_host, 1e-6, false);
+        assert_close(&result, &expected, 0.01);
 
-        let rms = (7.5_f32 + 1e-6).sqrt();
-        assert!(
-            (result[0] - 1.0 / rms).abs() < 0.01,
-            "Expected {}, got {}",
-            1.0 / rms,
-            result[0]
-        );
-        assert!(
-            (result[1] - 2.0 / rms).abs() < 0.01,
-            "Expected {}, got {}",
-            2.0 / rms,
-            result[1]
-        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rms_norm_batch_multi_tile() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden_dim = 260;
+        let seq_len = 2;
+
+        let x_host_f32: Vec<f32> = (0..hidden_dim * seq_len)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.25)
+            .collect();
+        let w_host_f32: Vec<f32> = (0..hidden_dim)
+            .map(|idx| 0.5 + (idx % 11) as f32 * 0.0625)
+            .collect();
+        let x_host = bf16_vec(&x_host_f32);
+        let w_host = bf16_vec(&w_host_f32);
+
+        let x = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&x_host)
+                .map_err(|e| anyhow!("H2D copy failed: {}", e))?,
+            hidden_dim,
+            seq_len,
+        };
+        let weight = DeviceVec::from_host(&ctx, &w_host)?;
+        let out = rms_norm_batch(&ctx, &x, &weight, 1e-6)?;
+
+        let result = ctx
+            .stream
+            .clone_dtoh(&out.data)
+            .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
+        ctx.sync()?;
+        let result: Vec<f32> = result.iter().map(|value| value.to_f32()).collect();
+
+        let mut expected = Vec::with_capacity(hidden_dim * seq_len);
+        for row in 0..seq_len {
+            let start = row * hidden_dim;
+            expected.extend(rms_norm_reference(
+                &x_host[start..start + hidden_dim],
+                &w_host,
+                1e-6,
+                false,
+            ));
+        }
+        assert_close(&result, &expected, 0.02);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rms_norm_offset() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+
+        let x_host = bf16_vec(&[-2.0, -0.5, 0.25, 1.5, 3.0, 0.75, -1.25]);
+        let w_host = bf16_vec(&[0.0, 0.5, -0.25, 0.125, 1.0, -0.5, 0.25]);
+        let x = DeviceVec::from_host(&ctx, &x_host)?;
+        let w = DeviceVec::from_host(&ctx, &w_host)?;
+        let mut out = DeviceVec::zeros(&ctx, x_host.len())?;
+        rms_norm_offset_into(&ctx, &x, &w, 1e-6, &mut out)?;
+
+        let result = out.to_host(&ctx)?;
+        let expected = rms_norm_reference(&x_host, &w_host, 1e-6, true);
+        assert_close(&result, &expected, 0.02);
 
         Ok(())
     }
@@ -1447,6 +1489,184 @@ mod tests {
             (result[3] - 0.0).abs() < 0.01,
             "Expected 0.0, got {}",
             result[3]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_and_add_inplace() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let a = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
+        let b = DeviceVec::from_host(&ctx, &bf16_vec(&[0.5, -1.0, 2.5, 3.0]))?;
+
+        let out = add(&ctx, &a, &b)?;
+        let result = out.to_host(&ctx)?;
+        assert!(
+            (result[0] - 1.5).abs() < 0.01,
+            "Expected 1.5, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 1.0).abs() < 0.01,
+            "Expected 1.0, got {}",
+            result[1]
+        );
+        assert!(
+            (result[2] - 5.5).abs() < 0.01,
+            "Expected 5.5, got {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 7.0).abs() < 0.01,
+            "Expected 7.0, got {}",
+            result[3]
+        );
+
+        let mut inplace = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
+        add_inplace(&ctx, &mut inplace, &b)?;
+        let inplace_result = inplace.to_host(&ctx)?;
+        assert!(
+            (inplace_result[0] - 1.5).abs() < 0.01,
+            "Expected 1.5, got {}",
+            inplace_result[0]
+        );
+        assert!(
+            (inplace_result[1] - 1.0).abs() < 0.01,
+            "Expected 1.0, got {}",
+            inplace_result[1]
+        );
+        assert!(
+            (inplace_result[2] - 5.5).abs() < 0.01,
+            "Expected 5.5, got {}",
+            inplace_result[2]
+        );
+        assert!(
+            (inplace_result[3] - 7.0).abs() < 0.01,
+            "Expected 7.0, got {}",
+            inplace_result[3]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_embedding_variants() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let embed = DeviceMatrix::from_host(
+            &ctx,
+            &bf16_vec(&[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ]),
+            3,
+            4,
+        )?;
+
+        let single = embedding(&ctx, &embed, 2)?;
+        let single_host = single.to_host(&ctx)?;
+        assert!(
+            (single_host[0] - 9.0).abs() < 0.01,
+            "Expected 9.0, got {}",
+            single_host[0]
+        );
+        assert!(
+            (single_host[3] - 12.0).abs() < 0.01,
+            "Expected 12.0, got {}",
+            single_host[3]
+        );
+
+        let decode_meta = ctx.stream.clone_htod(&[1_i32])?;
+        let mut decode_out = DeviceVec::zeros(&ctx, 4)?;
+        embedding_decode_into(&ctx, &embed, &decode_meta, &mut decode_out)?;
+        let decode_host = decode_out.to_host(&ctx)?;
+        assert!(
+            (decode_host[0] - 5.0).abs() < 0.01,
+            "Expected 5.0, got {}",
+            decode_host[0]
+        );
+        assert!(
+            (decode_host[3] - 8.0).abs() < 0.01,
+            "Expected 8.0, got {}",
+            decode_host[3]
+        );
+
+        let token_ids = ctx.stream.clone_htod(&[2_i32, 0_i32])?;
+        let mut batch_out = HiddenStates::zeros(&ctx, 4, 2)?;
+        embedding_batch(&ctx, &embed, &token_ids, &mut batch_out)?;
+        let batch_host = ctx.stream.clone_dtoh(&batch_out.data)?;
+        ctx.sync()?;
+        assert!(
+            (batch_host[0].to_f32() - 9.0).abs() < 0.01,
+            "Expected 9.0, got {}",
+            batch_host[0]
+        );
+        assert!(
+            (batch_host[3].to_f32() - 12.0).abs() < 0.01,
+            "Expected 12.0, got {}",
+            batch_host[3]
+        );
+        assert!(
+            (batch_host[4].to_f32() - 1.0).abs() < 0.01,
+            "Expected 1.0, got {}",
+            batch_host[4]
+        );
+        assert!(
+            (batch_host[7].to_f32() - 4.0).abs() < 0.01,
+            "Expected 4.0, got {}",
+            batch_host[7]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_write_vec_roundtrip() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let batch = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))?,
+            hidden_dim: 3,
+            seq_len: 2,
+        };
+
+        let extracted = extract_vec(&ctx, &batch, 1)?;
+        let extracted_host = extracted.to_host(&ctx)?;
+        assert!(
+            (extracted_host[0] - 4.0).abs() < 0.01,
+            "Expected 4.0, got {}",
+            extracted_host[0]
+        );
+        assert!(
+            (extracted_host[2] - 6.0).abs() < 0.01,
+            "Expected 6.0, got {}",
+            extracted_host[2]
+        );
+
+        let replacement = DeviceVec::from_host(&ctx, &bf16_vec(&[7.0, 8.0, 9.0]))?;
+        let mut batch = batch;
+        write_vec(&ctx, &mut batch, 0, &replacement)?;
+        let batch_host = ctx.stream.clone_dtoh(&batch.data)?;
+        ctx.sync()?;
+        assert!(
+            (batch_host[0].to_f32() - 7.0).abs() < 0.01,
+            "Expected 7.0, got {}",
+            batch_host[0]
+        );
+        assert!(
+            (batch_host[2].to_f32() - 9.0).abs() < 0.01,
+            "Expected 9.0, got {}",
+            batch_host[2]
+        );
+        assert!(
+            (batch_host[3].to_f32() - 4.0).abs() < 0.01,
+            "Expected 4.0, got {}",
+            batch_host[3]
+        );
+        assert!(
+            (batch_host[5].to_f32() - 6.0).abs() < 0.01,
+            "Expected 6.0, got {}",
+            batch_host[5]
         );
 
         Ok(())
