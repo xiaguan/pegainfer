@@ -47,6 +47,19 @@ export PEGAINFER_CUDA_SM=120
 
 `PEGAINFER_CUDA_SM` also drives the explicit Triton AOT compile target, so it is the default escape hatch when the build environment cannot query a live GPU.
 
+### Windows
+
+Official Triton does not ship Windows wheels. Use [`triton-windows`](https://github.com/woct0rdho/triton-windows) instead:
+
+```powershell
+uv venv .venv --python 3.12
+uv pip install "triton-windows<3.7"
+$env:PEGAINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x"
+```
+
+Requires CUDA 12+, Python 3.9–3.12, and an NVIDIA GPU with compute capability 7.5+ (GTX 16xx or newer).
+
 ## Build
 
 ```bash

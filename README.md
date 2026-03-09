@@ -78,6 +78,21 @@ cargo run --release -- --cuda-graph=false
 cargo run --release -- --trace-output-path traces/
 ```
 
+### Windows
+
+```powershell
+# Set CUDA path (auto-detected on Linux, required on Windows)
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x"
+
+# Install Triton for Windows (official Triton only supports Linux)
+uv venv .venv --python 3.12
+uv pip install "triton-windows<3.7"
+$env:PEGAINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
+
+cargo build --release
+cargo run --release --bin pegainfer -- --model-path models/Qwen3-4B
+```
+
 ### Triton AOT Notes
 
 - `silu_mul` is the first default-on Triton AOT replacement; the rest of the kernel stack still builds from `csrc/`.
