@@ -375,6 +375,29 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     generated_sources.push(embedding_batched_c);
     generated_sources.push(embedding_batched_wrapper);
 
+    let attention_decode_spec = TritonKernelSpec {
+        artifact_dir: "attention_decode",
+        kernel_path: "tools/triton/attention_decode_kernel.py",
+        kernel_name: "fused_attention_decode_kernel",
+        signature: "*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*i32,*bf16,*bf16,*bf16,i32,i32,i32,64,128",
+        grid: "num_qheads,1,1",
+        out_name: "triton_attention_decode",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (attention_decode_func, attention_decode_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &attention_decode_spec);
+    let attention_decode_wrapper = write_wrapper(
+        &attention_decode_c,
+        "triton_attention_decode_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr q_full, CUdeviceptr k_full, CUdeviceptr v_full, CUdeviceptr q_norm_weight, CUdeviceptr k_norm_weight, CUdeviceptr cos_cache_base, CUdeviceptr sin_cache_base, CUdeviceptr decode_meta, CUdeviceptr k_cache, CUdeviceptr v_cache, CUdeviceptr output, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio);\n\nCUresult fused_gqa_attention_decode(const uint16_t* q_full, const uint16_t* k_full, const uint16_t* v_full, const uint16_t* q_norm_weight, const uint16_t* k_norm_weight, const uint16_t* cos_cache_base, const uint16_t* sin_cache_base, const int32_t* decode_meta, uint16_t* k_cache, uint16_t* v_cache, uint16_t* output, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)q_full, (CUdeviceptr)k_full, (CUdeviceptr)v_full, (CUdeviceptr)q_norm_weight, (CUdeviceptr)k_norm_weight, (CUdeviceptr)cos_cache_base, (CUdeviceptr)sin_cache_base, (CUdeviceptr)decode_meta, (CUdeviceptr)k_cache, (CUdeviceptr)v_cache, (CUdeviceptr)output, num_qheads, num_kvheads, gqa_ratio);\n}}\n",
+            func = attention_decode_func
+        ),
+    );
+    generated_sources.push(attention_decode_c);
+    generated_sources.push(attention_decode_wrapper);
+
     let mut build = cc::Build::new();
     build
         .cuda(false)
@@ -388,8 +411,9 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, and embedding; extract/write vector copies now use cudarc device memcpy"
+        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, embedding, and Qwen3 decode attention; extract/write vector copies now use cudarc device memcpy"
     );
+    println!("cargo:rerun-if-changed=tools/triton/attention_decode_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");

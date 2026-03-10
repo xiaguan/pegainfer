@@ -43,6 +43,22 @@ Model type is auto-detected from `config.json` — just point `--model-path` at 
 - A CUDA-capable GPU (SM target auto-detected at build time)
 - Python 3 with Triton installed for build-time AOT kernel generation
 
+### Python Environment
+
+```bash
+# Create venv (once, from pegainfer/ root)
+uv venv
+
+# Activate
+source .venv/bin/activate
+
+# Install dependencies
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install transformers accelerate pytest
+```
+
+This single venv covers everything: build-time Triton AOT kernel compilation, HF reference generation, and Python kernel tests.
+
 ### Download a Model
 
 ```bash
@@ -57,7 +73,7 @@ huggingface-cli download Qwen/Qwen3.5-4B --local-dir models/Qwen3.5-4B
 ```bash
 export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-export PEGAINFER_TRITON_PYTHON=/path/to/python-with-triton
+export PEGAINFER_TRITON_PYTHON=.venv/bin/python  # uses the venv created above
 
 # If `nvidia-smi` is unavailable in your build environment, set the target SM explicitly.
 # Example: export PEGAINFER_CUDA_SM=120
@@ -224,9 +240,11 @@ csrc/
 └── sampling.cu              # GPU argmax, top-k/top-p sampling
 
 tools/triton/
-├── gen_silu_mul_aot.py      # Triton AOT generator entrypoint for silu_mul
-├── silu_mul_kernel.py       # Triton kernel definition for silu_mul
-└── README.md                # Setup, failure modes, and validation commands
+├── gen_triton_aot.py            # Triton AOT compilation driver (used by build.rs)
+├── silu_mul_kernel.py           # Triton silu_mul kernel
+├── attention_decode_kernel.py   # Triton fused decode attention kernel
+├── basic_kernels.py             # Triton add / embedding kernels
+└── README.md                    # Setup, failure modes, and validation commands
 ```
 
 ### Key Design Decisions
