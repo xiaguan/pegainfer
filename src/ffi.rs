@@ -232,7 +232,7 @@ unsafe extern "C" {
         scale: f32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // ========================================================================
     // Qwen3.5 kernels

@@ -3,13 +3,13 @@
     {
       "max_new_tokens": 50,
       "name": "tell_story",
-      "output": " about a young girl named Lila who is a talented painter and her journey to become a successful artist. Include the following elements: a mentor, a challenge, and a turning point. Also, include a scene where she paints a self-portrait and",
+      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and wants to express",
       "prompt": "Tell me a story"
     },
     {
       "max_new_tokens": 50,
       "name": "my_name",
-      "output": " Xiaoyu, and I am a student in the School of Economics and Management at Tsinghua University. I am currently studying a major in International Business. I have a strong interest in the field of international trade and have been involved in various activities",
+      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of AI in the field of education. I am interested in exploring how AI can be used to improve",
       "prompt": "My name is"
     },
     {
@@ -27,7 +27,7 @@
     {
       "max_new_tokens": 50,
       "name": "chinese_capital",
-      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京地处华北平原北部，东临渤海，西接内蒙古高原，南邻天津",
+      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京的地理位置非常优越，地处华北平原的北部边缘，东临渤海湾，",
       "prompt": "请介绍一下中国的首都"
     },
     {

@@ -233,13 +233,8 @@ impl Qwen3Model {
 
         ctx.sync()?;
         info!("GPU model loaded successfully");
-        if runtime.enable_cuda_graph {
-            info!("Decode path CUDA Graph is enabled");
-        } else {
-            info!("Decode path CUDA Graph is disabled");
-        }
 
-        Ok(Self {
+        let model = Self {
             ctx,
             config,
             embed_tokens,
@@ -252,7 +247,67 @@ impl Qwen3Model {
             kv_cache: None,
             graph_state: CudaGraphState { graph: None },
             enable_cuda_graph: runtime.enable_cuda_graph,
-        })
+        };
+
+        if model.enable_cuda_graph {
+            info!("Preloading decode-path Triton kernels before CUDA Graph capture");
+            model.preload_decode_triton_kernels()?;
+            info!("Decode path CUDA Graph is enabled");
+        } else {
+            info!("Decode path CUDA Graph is disabled");
+        }
+
+        Ok(model)
+    }
+
+    fn preload_decode_triton_kernels(&self) -> Result<()> {
+        let hidden_size = self.config.hidden_size;
+        let q_dim = self.config.num_attention_heads * self.config.head_dim;
+        let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+        let cache_len = self.config.num_key_value_heads * 4096 * self.config.head_dim;
+        let dummy_token_id = 0_i32;
+        let dummy_pos = 0_i32;
+        let dummy_seq_len = 1_i32;
+
+        let decode_meta = self
+            .ctx
+            .stream
+            .clone_htod(&[dummy_token_id, dummy_pos, dummy_seq_len])
+            .map_err(|e| anyhow::anyhow!("Preload decode_meta H2D failed: {}", e))?;
+        let mut embed_out = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        ops::embedding_decode_into(&self.ctx, &self.embed_tokens, &decode_meta, &mut embed_out)?;
+
+        let layer0 = &self.layers[0];
+        let q = DeviceVec::zeros(&self.ctx, q_dim)?;
+        let k = DeviceVec::zeros(&self.ctx, kv_dim)?;
+        let v = DeviceVec::zeros(&self.ctx, kv_dim)?;
+        let mut k_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
+        let mut v_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
+        let mut out = DeviceVec::zeros(&self.ctx, q_dim)?;
+        let scale = 1.0 / (self.config.head_dim as f32).sqrt();
+
+        ops::fused_attention_decode_into(
+            &self.ctx,
+            &q,
+            &k,
+            &v,
+            &layer0.attention.q_norm,
+            &layer0.attention.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            &decode_meta,
+            &mut k_cache,
+            &mut v_cache,
+            &mut out,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            scale,
+            self.config.rms_norm_eps,
+        )?;
+
+        self.ctx.sync()?;
+        Ok(())
     }
 
     /// Forward pass returning final logits (for accuracy testing).
@@ -300,7 +355,6 @@ impl Qwen3Model {
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
         let total_seq = start_pos + seq_len;
         let q_dim = num_heads * head_dim;
@@ -962,3 +1016,4 @@ impl Qwen3Model {
         Ok(())
     }
 }
+

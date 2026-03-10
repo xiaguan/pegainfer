@@ -718,7 +718,7 @@ pub fn fused_attention_decode_into(
     let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::fused_gqa_attention_decode(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
@@ -738,8 +738,9 @@ pub fn fused_attention_decode_into(
             scale,
             rms_eps,
             ctx.stream.cu_stream(),
-        );
-    }
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -1771,4 +1772,202 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    #[ignore]
+    fn test_triton_decode_attention_matches_cpu_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_qheads = 8;
+        let num_kvheads = 2;
+        let head_dim = 128;
+        let max_seq_len = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let eps = 1e-6_f32;
+
+        let q_host: Vec<f32> = (0..num_qheads * head_dim)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.125)
+            .collect();
+        let k_host: Vec<f32> = (0..num_kvheads * head_dim)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.15)
+            .collect();
+        let v_host: Vec<f32> = (0..num_kvheads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.2)
+            .collect();
+        let q_weight_host: Vec<f32> = (0..head_dim)
+            .map(|i| 0.9 + (i % 13) as f32 * 0.03)
+            .collect();
+        let k_weight_host: Vec<f32> = (0..head_dim)
+            .map(|i| 0.8 + (i % 11) as f32 * 0.025)
+            .collect();
+
+        let half = head_dim / 2;
+        let theta = 1_000_000.0_f32;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / head_dim as f32))
+            .collect();
+        let mut cos_host = vec![bf16::ZERO; max_seq_len * head_dim];
+        let mut sin_host = vec![bf16::ZERO; max_seq_len * head_dim];
+        for pos in 0..max_seq_len {
+            for i in 0..half {
+                let freq = pos as f32 * inv_freq[i];
+                let cos = bf16::from_f32(freq.cos());
+                let sin = bf16::from_f32(freq.sin());
+                cos_host[pos * head_dim + i] = cos;
+                cos_host[pos * head_dim + i + half] = cos;
+                sin_host[pos * head_dim + i] = sin;
+                sin_host[pos * head_dim + i + half] = sin;
+            }
+        }
+
+        for seq_len in [1_usize, 6_usize] {
+            let current_pos = seq_len - 1;
+            let cache_len = num_kvheads * 4096 * head_dim;
+            let mut k_cache_host = vec![bf16::ZERO; cache_len];
+            let mut v_cache_host = vec![bf16::ZERO; cache_len];
+            for kv_head in 0..num_kvheads {
+                for pos in 0..current_pos {
+                    let base = (kv_head * 4096 + pos) * head_dim;
+                    for dim in 0..head_dim {
+                        k_cache_host[base + dim] = bf16::from_f32(
+                            ((kv_head * 31 + pos * 7 + dim) % 41) as f32 * 0.05 - 1.0,
+                        );
+                        v_cache_host[base + dim] = bf16::from_f32(
+                            ((kv_head * 17 + pos * 5 + dim) % 37) as f32 * 0.04 - 0.7,
+                        );
+                    }
+                }
+            }
+
+            let q = DeviceVec::from_host(&ctx, &bf16_vec(&q_host))?;
+            let k = DeviceVec::from_host(&ctx, &bf16_vec(&k_host))?;
+            let v = DeviceVec::from_host(&ctx, &bf16_vec(&v_host))?;
+            let q_weight = DeviceVec::from_host(&ctx, &bf16_vec(&q_weight_host))?;
+            let k_weight = DeviceVec::from_host(&ctx, &bf16_vec(&k_weight_host))?;
+            let cos_cache = DeviceVec::from_host(&ctx, &cos_host)?;
+            let sin_cache = DeviceVec::from_host(&ctx, &sin_host)?;
+            let decode_meta = ctx
+                .stream
+                .clone_htod(&[0_i32, current_pos as i32, seq_len as i32])?;
+            let mut k_cache = DeviceVec::from_host(&ctx, &k_cache_host)?;
+            let mut v_cache = DeviceVec::from_host(&ctx, &v_cache_host)?;
+            let mut out = DeviceVec::zeros(&ctx, num_qheads * head_dim)?;
+
+            fused_attention_decode_into(
+                &ctx,
+                &q,
+                &k,
+                &v,
+                &q_weight,
+                &k_weight,
+                &cos_cache,
+                &sin_cache,
+                &decode_meta,
+                &mut k_cache,
+                &mut v_cache,
+                &mut out,
+                num_qheads,
+                num_kvheads,
+                head_dim,
+                scale,
+                eps,
+            )?;
+
+            let out_host = out.to_host(&ctx)?;
+            let got_k_cache = k_cache.to_host(&ctx)?;
+            let got_v_cache = v_cache.to_host(&ctx)?;
+
+            let q_heads: Vec<Vec<f32>> = q_host.chunks(head_dim).map(|x| x.to_vec()).collect();
+            let k_heads: Vec<Vec<f32>> = k_host.chunks(head_dim).map(|x| x.to_vec()).collect();
+            let v_heads: Vec<Vec<f32>> = v_host.chunks(head_dim).map(|x| x.to_vec()).collect();
+            let gqa_ratio = num_qheads / num_kvheads;
+
+            let mut ref_k_cache: Vec<f32> = k_cache_host.iter().map(|x| x.to_f32()).collect();
+            let mut ref_v_cache: Vec<f32> = v_cache_host.iter().map(|x| x.to_f32()).collect();
+            let mut ref_out = vec![0.0_f32; num_qheads * head_dim];
+
+            let rms_norm = |head: &[f32], weight: &[f32]| -> Vec<f32> {
+                let mean_sq = head.iter().map(|x| x * x).sum::<f32>() / head.len() as f32;
+                let inv = 1.0 / (mean_sq + eps).sqrt();
+                head.iter()
+                    .zip(weight.iter())
+                    .map(|(x, w)| x * inv * w)
+                    .collect()
+            };
+
+            let apply_rope = |head: &[f32]| -> Vec<f32> {
+                let mut out = vec![0.0_f32; head_dim];
+                for i in 0..half {
+                    let cos = cos_host[current_pos * head_dim + i].to_f32();
+                    let sin = sin_host[current_pos * head_dim + i].to_f32();
+                    let lo = head[i];
+                    let hi = head[i + half];
+                    out[i] = lo * cos - hi * sin;
+                    out[i + half] = lo * sin + hi * cos;
+                }
+                out
+            };
+
+            for kv_head in 0..num_kvheads {
+                let k_rot = apply_rope(&rms_norm(&k_heads[kv_head], &k_weight_host));
+                let base = (kv_head * 4096 + current_pos) * head_dim;
+                ref_k_cache[base..base + head_dim].copy_from_slice(&k_rot);
+                ref_v_cache[base..base + head_dim].copy_from_slice(&v_heads[kv_head]);
+            }
+
+            for q_head in 0..num_qheads {
+                let kv_head = q_head / gqa_ratio;
+                let q_rot = apply_rope(&rms_norm(&q_heads[q_head], &q_weight_host));
+                let mut scores = vec![0.0_f32; seq_len];
+                for (pos, score) in scores.iter_mut().enumerate() {
+                    let base = (kv_head * 4096 + pos) * head_dim;
+                    *score = (0..head_dim)
+                        .map(|dim| ref_k_cache[base + dim] * q_rot[dim])
+                        .sum::<f32>()
+                        * scale;
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exp_scores: Vec<f32> = scores.iter().map(|x| (x - max_score).exp()).collect();
+                let sum_exp = exp_scores.iter().sum::<f32>();
+                let probs: Vec<f32> = exp_scores.iter().map(|x| x / sum_exp).collect();
+                for dim in 0..head_dim {
+                    let mut acc = 0.0_f32;
+                    for (pos, prob) in probs.iter().enumerate() {
+                        let base = (kv_head * 4096 + pos) * head_dim;
+                        acc += prob * ref_v_cache[base + dim];
+                    }
+                    ref_out[q_head * head_dim + dim] = acc;
+                }
+            }
+
+            let current_base = current_pos * head_dim;
+            let max_k_diff = (0..num_kvheads * head_dim)
+                .map(|idx| {
+                    let kv_head = idx / head_dim;
+                    let dim = idx % head_dim;
+                    let offset = kv_head * 4096 * head_dim + current_base + dim;
+                    (got_k_cache[offset] - ref_k_cache[offset]).abs()
+                })
+                .fold(0.0_f32, f32::max);
+            let max_v_diff = (0..num_kvheads * head_dim)
+                .map(|idx| {
+                    let kv_head = idx / head_dim;
+                    let dim = idx % head_dim;
+                    let offset = kv_head * 4096 * head_dim + current_base + dim;
+                    (got_v_cache[offset] - ref_v_cache[offset]).abs()
+                })
+                .fold(0.0_f32, f32::max);
+            let max_out_diff = out_host
+                .iter()
+                .zip(ref_out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            assert!(max_k_diff < 0.02, "seq_len={seq_len} k_cache diff {max_k_diff}");
+            assert!(max_v_diff < 0.02, "seq_len={seq_len} v_cache diff {max_v_diff}");
+            assert!(max_out_diff < 0.1, "seq_len={seq_len} output diff {max_out_diff}");
+        }
+
+        Ok(())
+    }
+
 }
