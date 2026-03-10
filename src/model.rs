@@ -284,7 +284,6 @@ impl Qwen3Model {
         let mut k_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
         let mut v_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
         let mut out = DeviceVec::zeros(&self.ctx, q_dim)?;
-        let scale = 1.0 / (self.config.head_dim as f32).sqrt();
 
         ops::fused_attention_decode_into(
             &self.ctx,
@@ -301,9 +300,6 @@ impl Qwen3Model {
             &mut out,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
-            self.config.head_dim,
-            scale,
-            self.config.rms_norm_eps,
         )?;
 
         self.ctx.sync()?;
@@ -634,7 +630,6 @@ impl Qwen3Model {
         kv_cache: &mut KVCache,
         bufs: &mut DecodeBuffers,
     ) -> Result<()> {
-        let scale = 1.0 / (self.config.head_dim as f32).sqrt();
         let eps = self.config.rms_norm_eps;
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
@@ -678,9 +673,6 @@ impl Qwen3Model {
             &mut bufs.attn_out,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
-            self.config.head_dim,
-            scale,
-            eps,
         )?;
 
         // O projection: attn_out → attn_proj

@@ -683,7 +683,8 @@ pub fn fused_attention(
     Ok(output)
 }
 
-/// Fused GQA Attention for decode — reads pos/seq_len from decode_meta (CUDA Graph safe).
+/// Fused GQA Attention for decode (Triton AOT, HEAD_DIM=128 baked in).
+/// Reads pos/seq_len from decode_meta — CUDA Graph safe.
 /// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
 /// decode_meta: [token_id, current_pos, seq_len] on GPU.
 #[allow(clippy::too_many_arguments)]
@@ -702,9 +703,6 @@ pub fn fused_attention_decode_into(
     output: &mut DeviceVec,
     num_qheads: usize,
     num_kvheads: usize,
-    head_dim: usize,
-    scale: f32,
-    rms_eps: f32,
 ) -> Result<()> {
     let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
@@ -734,9 +732,6 @@ pub fn fused_attention_decode_into(
             num_qheads as i32,
             num_kvheads as i32,
             (num_qheads / num_kvheads) as i32,
-            head_dim as i32,
-            scale,
-            rms_eps,
             ctx.stream.cu_stream(),
         )
     };
@@ -1867,9 +1862,6 @@ mod tests {
                 &mut out,
                 num_qheads,
                 num_kvheads,
-                head_dim,
-                scale,
-                eps,
             )?;
 
             let out_host = out.to_host(&ctx)?;

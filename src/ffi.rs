@@ -212,7 +212,8 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA Attention — decode variant (reads pos/seq_len from decode_meta, base cos/sin)
+    // Fused GQA Attention — decode variant (Triton AOT, HEAD_DIM=128 baked in)
+    // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
     pub fn fused_gqa_attention_decode(
         q_full: *const Half,
         k_full: *const Half,
@@ -228,9 +229,6 @@ unsafe extern "C" {
         num_qheads: i32,
         num_kvheads: i32,
         gqa_ratio: i32,
-        head_dim: i32,
-        scale: f32,
-        rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;
 
