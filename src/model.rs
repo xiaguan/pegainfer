@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use fastrace::local::LocalSpan;
-use log::info;
+use log::{debug, info};
 use safetensors::SafeTensors;
 use std::fs;
 use std::time::Instant;
@@ -106,17 +106,17 @@ impl Qwen3Model {
         runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
         info!("Loading model from: {}", model_path);
-        info!("Initializing GPU");
+        debug!("Initializing GPU");
         let ctx = DeviceContext::new()?;
 
         let config = Config::from_file(model_path)?;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
-        info!("Loading {} safetensor shard(s)", shard_paths.len());
+        debug!("Loading {} safetensor shard(s)", shard_paths.len());
         let shard_data: Vec<Vec<u8>> = shard_paths
             .iter()
             .map(|p| {
-                info!("Reading shard: {}", p);
+                debug!("Reading shard: {}", p);
                 fs::read(p)
             })
             .collect::<std::io::Result<_>>()?;
@@ -127,13 +127,13 @@ impl Qwen3Model {
             })
             .collect::<Result<_>>()?;
 
-        info!("Loading embeddings to GPU");
+        debug!("Loading embeddings to GPU");
         let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
         let lm_head = if config.tie_word_embeddings {
-            info!("Using tied input/output embeddings");
+            debug!("Using tied input/output embeddings");
             None
         } else {
-            info!("Loading untied LM head to GPU");
+            debug!("Loading untied LM head to GPU");
             Some(load_tensor_2d(
                 &ctx,
                 &shards,
@@ -142,7 +142,7 @@ impl Qwen3Model {
             )?)
         };
 
-        info!(
+        debug!(
             "Loading layers to GPU: num_layers={}",
             config.num_hidden_layers
         );
@@ -227,7 +227,7 @@ impl Qwen3Model {
 
         let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
 
-        info!("Precomputing RoPE cache on GPU");
+        debug!("Precomputing RoPE cache on GPU");
         let (cos_cache, sin_cache) =
             precompute_rope(&ctx, config.head_dim, 4096, config.rope_theta)?;
 
@@ -250,11 +250,11 @@ impl Qwen3Model {
         };
 
         if model.enable_cuda_graph {
-            info!("Preloading decode-path Triton kernels before CUDA Graph capture");
+            debug!("Preloading decode-path Triton kernels before CUDA Graph capture");
             model.preload_decode_triton_kernels()?;
-            info!("Decode path CUDA Graph is enabled");
+            debug!("Decode path CUDA Graph is enabled");
         } else {
-            info!("Decode path CUDA Graph is disabled");
+            debug!("Decode path CUDA Graph is disabled");
         }
 
         Ok(model)
@@ -537,7 +537,7 @@ impl Qwen3Model {
             }
             None => {
                 // First call: capture the kernel sequence into a graph
-                info!("Capturing CUDA Graph for decode path...");
+                debug!("Capturing CUDA Graph for decode path...");
                 self.ctx
                     .stream
                     .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -550,7 +550,7 @@ impl Qwen3Model {
                     .stream
                     .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
                     .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-                info!("CUDA Graph captured successfully");
+                debug!("CUDA Graph captured successfully");
 
                 // Capture only records — kernels don't execute. Launch to actually compute.
                 if let Some(ref graph) = graph_state.graph {
@@ -781,7 +781,7 @@ impl Qwen3Model {
 
         LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
 
-        info!(
+        debug!(
             "TTFT: {:.2}ms (prompt_len={})",
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
@@ -838,7 +838,7 @@ impl Qwen3Model {
                     ),
                 ]
             });
-            info!(
+            debug!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
                 tpot_avg * 1000.0,
                 generated_count,
@@ -898,7 +898,7 @@ impl Qwen3Model {
         };
 
         let ttft = ttft_start.elapsed();
-        info!(
+        debug!(
             "TTFT: {:.2}ms (prompt_len={})",
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
@@ -972,7 +972,7 @@ impl Qwen3Model {
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
             let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            info!(
+            debug!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
                 tpot_avg * 1000.0,
                 generated_count,
@@ -1008,4 +1008,3 @@ impl Qwen3Model {
         Ok(())
     }
 }
-

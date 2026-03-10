@@ -11,11 +11,15 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{IsTerminal, stdout};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use log::info;
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
+use comfy_table::{Cell, CellAlignment, Table};
+use log::{debug, info};
 use pegainfer::logging;
 use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::qwen35_model::Qwen35Model;
@@ -352,16 +356,292 @@ fn aggregate_tok_s(tokens: usize, total: Duration) -> Option<f64> {
     }
 }
 
-fn print_duration_stats(buf: &mut String, label: &str, stats: &DurationStats) {
-    let _ = writeln!(
-        buf,
-        "  {label:<24} avg={:8.2}ms  p50={:8.2}ms  p95={:8.2}ms  p99={:8.2}ms  max={:8.2}ms  n={}",
-        stats.avg_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms, stats.samples
-    );
+fn new_table() -> Table {
+    let mut table = Table::new();
+    if stdout().is_terminal() {
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.apply_modifier(UTF8_ROUND_CORNERS);
+    } else {
+        table.load_preset(ASCII_FULL_CONDENSED);
+    }
+    table
 }
 
-fn push_line(buf: &mut String, key: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(buf, "  {key:<16} {value}");
+fn key_cell(label: impl Into<String>) -> Cell {
+    Cell::new(label.into())
+}
+
+fn value_cell(value: impl Into<String>) -> Cell {
+    Cell::new(value.into())
+}
+
+fn numeric_cell(value: impl Into<String>) -> Cell {
+    Cell::new(value.into()).set_alignment(CellAlignment::Right)
+}
+
+fn format_rate(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_duration_ms(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+fn format_count_avg(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+fn push_table(out: &mut String, table: &Table) {
+    out.push_str(&table.to_string());
+    out.push('\n');
+}
+
+fn render_run_summary(report: &RunInfo) -> Table {
+    let mut table = new_table();
+    table.add_row(vec![
+        key_cell("model"),
+        value_cell(format!("{} ({})", report.model_path, report.model_type)),
+    ]);
+    table.add_row(vec![
+        key_cell("cuda_graph"),
+        value_cell(report.cuda_graph.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("load_ms"),
+        numeric_cell(format_duration_ms(report.load_ms)),
+    ]);
+    if let Some(label) = &report.label {
+        table.add_row(vec![key_cell("label"), value_cell(label.clone())]);
+    }
+    table
+}
+
+fn render_request_meta(report: &RequestReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_source"),
+        value_cell(report.workload.prompt.source.clone()),
+    ]);
+    table.add_row(vec![
+        key_cell("prompt_tokens"),
+        numeric_cell(report.workload.prompt.prompt_tokens.to_string()),
+    ]);
+    if let Some(preview) = &report.workload.prompt.prompt_preview {
+        table.add_row(vec![
+            key_cell("prompt"),
+            value_cell(format!("\"{preview}\"")),
+        ]);
+    }
+    table.add_row(vec![
+        key_cell("output_len"),
+        numeric_cell(report.workload.output_len.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+fn render_duration_table(rows: Vec<(String, DurationStats)>) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("metric"),
+        Cell::new("avg_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p50_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p95_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p99_ms").set_alignment(CellAlignment::Right),
+        Cell::new("max_ms").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for (label, stats) in rows {
+        table.add_row(vec![
+            key_cell(label),
+            numeric_cell(format_duration_ms(stats.avg_ms)),
+            numeric_cell(format_duration_ms(stats.p50_ms)),
+            numeric_cell(format_duration_ms(stats.p95_ms)),
+            numeric_cell(format_duration_ms(stats.p99_ms)),
+            numeric_cell(format_duration_ms(stats.max_ms)),
+            numeric_cell(stats.samples.to_string()),
+        ]);
+    }
+    table
+}
+
+fn render_request_summary(report: &RequestReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("metric"),
+        Cell::new("value").set_alignment(CellAlignment::Right),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_avg"),
+        numeric_cell(format_count_avg(report.metrics.generated_tokens.avg)),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_min"),
+        numeric_cell(report.metrics.generated_tokens.min.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_max"),
+        numeric_cell(report.metrics.generated_tokens.max.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_token_runs"),
+        numeric_cell(report.metrics.generated_tokens.samples.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("request_tok_s"),
+        numeric_cell(format_rate(report.metrics.request_tok_s)),
+    ]);
+    table.add_row(vec![
+        key_cell("decode_tok_s"),
+        numeric_cell(format_rate(report.metrics.decode_tok_s)),
+    ]);
+    table
+}
+
+fn render_matrix_meta(report: &MatrixReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_lens"),
+        value_cell(
+            report
+                .workload
+                .prompt_lens
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("output_lens"),
+        value_cell(
+            report
+                .workload
+                .output_lens
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("synthetic_pattern"),
+        value_cell(report.workload.synthetic_pattern),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+fn render_matrix_table(report: &MatrixReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("prompt_tok").set_alignment(CellAlignment::Right),
+        Cell::new("output_tok").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_avg").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_p95").set_alignment(CellAlignment::Right),
+        Cell::new("e2e_avg").set_alignment(CellAlignment::Right),
+        Cell::new("req_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("decode_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("gen_avg").set_alignment(CellAlignment::Right),
+    ]);
+    for cell in &report.cells {
+        table.add_row(vec![
+            numeric_cell(cell.prompt_len.to_string()),
+            numeric_cell(cell.output_len.to_string()),
+            numeric_cell(format_duration_ms(cell.ttft_ms.avg_ms)),
+            numeric_cell(format_duration_ms(cell.ttft_ms.p95_ms)),
+            numeric_cell(format_duration_ms(cell.e2e_ms.avg_ms)),
+            numeric_cell(format_rate(cell.request_tok_s)),
+            numeric_cell(format_rate(cell.decode_tok_s)),
+            numeric_cell(format_count_avg(cell.generated_tokens.avg)),
+        ]);
+    }
+    table
+}
+
+fn render_curve_meta(report: &CurveReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_source"),
+        value_cell(report.workload.prompt.source.clone()),
+    ]);
+    table.add_row(vec![
+        key_cell("prompt_tokens"),
+        numeric_cell(report.workload.prompt.prompt_tokens.to_string()),
+    ]);
+    if let Some(preview) = &report.workload.prompt.prompt_preview {
+        table.add_row(vec![
+            key_cell("prompt"),
+            value_cell(format!("\"{preview}\"")),
+        ]);
+    }
+    table.add_row(vec![
+        key_cell("output_len"),
+        numeric_cell(report.workload.output_len.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("window"),
+        numeric_cell(report.workload.window.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+fn render_curve_table(report: &CurveReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("ctx_range"),
+        Cell::new("avg_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p50_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p95_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p99_ms").set_alignment(CellAlignment::Right),
+        Cell::new("tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for window in &report.windows {
+        table.add_row(vec![
+            value_cell(format!("{}-{}", window.ctx_start, window.ctx_end)),
+            numeric_cell(format_duration_ms(window.tpot_ms.avg_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p50_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p95_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p99_ms)),
+            numeric_cell(format_rate(window.decode_tok_s)),
+            numeric_cell(window.tpot_ms.samples.to_string()),
+        ]);
+    }
+    table
 }
 
 fn truncate_preview(text: &str, limit: usize) -> String {
@@ -669,7 +949,7 @@ fn bench_matrix(
     for &prompt_len in &prompt_lens {
         let prompt_tokens = synthetic_prompt_tokens(prompt_len);
         for &output_len in &output_lens {
-            info!(
+            debug!(
                 "Running matrix cell: prompt_len={} output_len={}",
                 prompt_len, output_len
             );
@@ -779,167 +1059,50 @@ fn render_text(report: &BenchReport) -> String {
     let mut out = String::new();
     match report {
         BenchReport::Request(report) => {
-            let _ = writeln!(out, "bench_serving request");
-            push_line(
+            let _ = writeln!(out, "bench_serving request\n");
+            push_table(&mut out, &render_request_meta(report));
+            out.push('\n');
+            push_table(
                 &mut out,
-                "model",
-                format!("{} ({})", report.run.model_path, report.run.model_type),
+                &render_duration_table(
+                    std::iter::once(("ttft_ms".to_string(), report.metrics.ttft_ms.clone()))
+                        .chain(
+                            report
+                                .metrics
+                                .first_decode_step_ms
+                                .clone()
+                                .into_iter()
+                                .map(|stats| ("first_decode_step_ms".to_string(), stats)),
+                        )
+                        .chain(
+                            report
+                                .metrics
+                                .steady_tpot_ms
+                                .clone()
+                                .into_iter()
+                                .map(|stats| ("steady_tpot_ms".to_string(), stats)),
+                        )
+                        .chain(std::iter::once((
+                            "e2e_ms".to_string(),
+                            report.metrics.e2e_ms.clone(),
+                        )))
+                        .collect(),
+                ),
             );
-            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
-            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
-            if let Some(label) = &report.run.label {
-                push_line(&mut out, "label", label);
-            }
-            push_line(&mut out, "prompt_source", &report.workload.prompt.source);
-            push_line(
-                &mut out,
-                "prompt_tokens",
-                report.workload.prompt.prompt_tokens,
-            );
-            if let Some(preview) = &report.workload.prompt.prompt_preview {
-                push_line(&mut out, "prompt_preview", preview);
-            }
-            push_line(&mut out, "output_len", report.workload.output_len);
-            push_line(&mut out, "warmup", report.workload.warmup);
-            push_line(&mut out, "iters", report.workload.iters);
-            push_line(&mut out, "seed", report.workload.seed);
-            let _ = writeln!(out);
-            let _ = writeln!(out, "metrics");
-            print_duration_stats(&mut out, "ttft_ms", &report.metrics.ttft_ms);
-            if let Some(stats) = &report.metrics.first_decode_step_ms {
-                print_duration_stats(&mut out, "first_decode_step_ms", stats);
-            }
-            if let Some(stats) = &report.metrics.steady_tpot_ms {
-                print_duration_stats(&mut out, "steady_tpot_ms", stats);
-            }
-            print_duration_stats(&mut out, "e2e_ms", &report.metrics.e2e_ms);
-            let _ = writeln!(
-                out,
-                "  {:<24} avg={:8.2}  min={:8}  max={:8}  n={}",
-                "generated_tokens",
-                report.metrics.generated_tokens.avg,
-                report.metrics.generated_tokens.min,
-                report.metrics.generated_tokens.max,
-                report.metrics.generated_tokens.samples
-            );
-            if let Some(tok_s) = report.metrics.request_tok_s {
-                let _ = writeln!(out, "  {:<24} {:.2}", "request_tok_s", tok_s);
-            }
-            if let Some(tok_s) = report.metrics.decode_tok_s {
-                let _ = writeln!(out, "  {:<24} {:.2}", "decode_tok_s", tok_s);
-            }
+            out.push('\n');
+            push_table(&mut out, &render_request_summary(report));
         }
         BenchReport::Matrix(report) => {
-            let _ = writeln!(out, "bench_serving matrix");
-            push_line(
-                &mut out,
-                "model",
-                format!("{} ({})", report.run.model_path, report.run.model_type),
-            );
-            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
-            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
-            if let Some(label) = &report.run.label {
-                push_line(&mut out, "label", label);
-            }
-            push_line(
-                &mut out,
-                "prompt_lens",
-                report
-                    .workload
-                    .prompt_lens
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            push_line(
-                &mut out,
-                "output_lens",
-                report
-                    .workload
-                    .output_lens
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            push_line(&mut out, "warmup", report.workload.warmup);
-            push_line(&mut out, "iters", report.workload.iters);
-            push_line(&mut out, "seed", report.workload.seed);
-            let _ = writeln!(out);
-            let _ = writeln!(
-                out,
-                "  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>12}  {:>9}",
-                "prompt_tok",
-                "output_tok",
-                "ttft_avg",
-                "ttft_p95",
-                "e2e_avg",
-                "req_tok/s",
-                "decode_tok/s",
-                "gen_avg"
-            );
-            for cell in &report.cells {
-                let _ = writeln!(
-                    out,
-                    "  {:>10}  {:>10}  {:>10.2}  {:>10.2}  {:>10.2}  {:>11.2}  {:>12.2}  {:>9.2}",
-                    cell.prompt_len,
-                    cell.output_len,
-                    cell.ttft_ms.avg_ms,
-                    cell.ttft_ms.p95_ms,
-                    cell.e2e_ms.avg_ms,
-                    cell.request_tok_s.unwrap_or(0.0),
-                    cell.decode_tok_s.unwrap_or(0.0),
-                    cell.generated_tokens.avg
-                );
-            }
+            let _ = writeln!(out, "bench_serving matrix\n");
+            push_table(&mut out, &render_matrix_meta(report));
+            out.push('\n');
+            push_table(&mut out, &render_matrix_table(report));
         }
         BenchReport::Curve(report) => {
-            let _ = writeln!(out, "bench_serving curve");
-            push_line(
-                &mut out,
-                "model",
-                format!("{} ({})", report.run.model_path, report.run.model_type),
-            );
-            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
-            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
-            if let Some(label) = &report.run.label {
-                push_line(&mut out, "label", label);
-            }
-            push_line(&mut out, "prompt_source", &report.workload.prompt.source);
-            push_line(
-                &mut out,
-                "prompt_tokens",
-                report.workload.prompt.prompt_tokens,
-            );
-            if let Some(preview) = &report.workload.prompt.prompt_preview {
-                push_line(&mut out, "prompt_preview", preview);
-            }
-            push_line(&mut out, "output_len", report.workload.output_len);
-            push_line(&mut out, "window", report.workload.window);
-            push_line(&mut out, "warmup", report.workload.warmup);
-            push_line(&mut out, "iters", report.workload.iters);
-            push_line(&mut out, "seed", report.workload.seed);
-            let _ = writeln!(out);
-            let _ = writeln!(
-                out,
-                "  {:>12}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}  {:>8}",
-                "ctx_range", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "tok/s", "samples"
-            );
-            for window in &report.windows {
-                let _ = writeln!(
-                    out,
-                    "  {:>5}-{:<6}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>10.2}  {:>8}",
-                    window.ctx_start,
-                    window.ctx_end,
-                    window.tpot_ms.avg_ms,
-                    window.tpot_ms.p50_ms,
-                    window.tpot_ms.p95_ms,
-                    window.tpot_ms.p99_ms,
-                    window.decode_tok_s.unwrap_or(0.0),
-                    window.tpot_ms.samples
-                );
-            }
+            let _ = writeln!(out, "bench_serving curve\n");
+            push_table(&mut out, &render_curve_meta(report));
+            out.push('\n');
+            push_table(&mut out, &render_curve_table(report));
         }
     }
     out
@@ -957,7 +1120,6 @@ fn emit_report(cli: &Cli, report: &BenchReport) -> Result<()> {
     }
 
     println!("{rendered}");
-    info!("Benchmark completed");
     Ok(())
 }
 
@@ -979,7 +1141,7 @@ fn main() -> Result<()> {
     logging::init_default();
 
     let cli = Cli::parse();
-    info!(
+    debug!(
         "bench_serving starting: command={} model_path={} cuda_graph={} format={:?}",
         match &cli.command {
             Command::Request(_) => "request",
@@ -991,7 +1153,7 @@ fn main() -> Result<()> {
         cli.format
     );
     let model_type = detect_model_type(&cli.model_path)?;
-    info!("Detected model type: {:?}", model_type);
+    debug!("Detected model type: {:?}", model_type);
     let runtime = ModelRuntimeConfig {
         enable_cuda_graph: cli.cuda_graph,
     };

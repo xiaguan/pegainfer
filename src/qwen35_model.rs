@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
-use log::info;
+use log::{debug, info};
 use rand::RngExt;
 use rand::rngs::StdRng;
 use safetensors::SafeTensors;
@@ -119,11 +119,11 @@ impl Qwen35Model {
         enable_cuda_graph: bool,
     ) -> Result<Self> {
         info!("Loading Qwen3.5 model from: {}", model_path);
-        info!("Initializing GPU");
+        debug!("Initializing GPU");
         let ctx = DeviceContext::new()?;
 
         let config = Config35::from_file(model_path)?;
-        info!(
+        debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}",
             config.hidden_size,
             config.num_hidden_layers,
@@ -132,11 +132,11 @@ impl Qwen35Model {
         );
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
-        info!("Loading {} safetensor shard(s)", shard_paths.len());
+        debug!("Loading {} safetensor shard(s)", shard_paths.len());
         let shard_data: Vec<Vec<u8>> = shard_paths
             .iter()
             .map(|p| {
-                info!("Reading shard: {}", p);
+                debug!("Reading shard: {}", p);
                 fs::read(p)
             })
             .collect::<std::io::Result<_>>()?;
@@ -150,19 +150,19 @@ impl Qwen35Model {
         // Weight prefix for Qwen3.5 text model
         let wp = "model.language_model";
 
-        info!("Loading embeddings to GPU");
+        debug!("Loading embeddings to GPU");
         let embed_tokens = load_tensor_2d(
             &ctx,
             &shards,
             &weight_map,
             &format!("{}.embed_tokens.weight", wp),
         )?;
-        info!(
+        debug!(
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
         );
 
-        info!(
+        debug!(
             "Loading layers to GPU: num_layers={}",
             config.num_hidden_layers
         );
@@ -310,7 +310,7 @@ impl Qwen35Model {
                 },
             };
 
-            info!(
+            debug!(
                 "Loaded layer {}/{}: {:?}",
                 i + 1,
                 config.num_hidden_layers,
@@ -321,7 +321,7 @@ impl Qwen35Model {
 
         let norm = load_tensor_1d(&ctx, &shards, &weight_map, &format!("{}.norm.weight", wp))?;
 
-        info!(
+        debug!(
             "Precomputing partial RoPE cache (rotary_dim={})",
             config.rotary_dim
         );
@@ -331,9 +331,9 @@ impl Qwen35Model {
         ctx.sync()?;
         info!("Qwen3.5 GPU model loaded successfully");
         if enable_cuda_graph {
-            info!("Decode path CUDA Graph is enabled");
+            debug!("Decode path CUDA Graph is enabled");
         } else {
-            info!("Decode path CUDA Graph is disabled");
+            debug!("Decode path CUDA Graph is disabled");
         }
 
         Ok(Self {
@@ -393,7 +393,7 @@ impl Qwen35Model {
                     .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
             }
             None => {
-                info!("Capturing CUDA Graph for Qwen3.5 decode path...");
+                debug!("Capturing CUDA Graph for Qwen3.5 decode path...");
                 self.ctx
                     .stream
                     .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -406,7 +406,7 @@ impl Qwen35Model {
                     .stream
                     .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
                     .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-                info!("CUDA Graph captured successfully");
+                debug!("CUDA Graph captured successfully");
 
                 if let Some(ref graph) = graph_state.graph {
                     graph
@@ -989,7 +989,7 @@ impl Qwen35Model {
         let ttft = ttft_start.elapsed();
         tokens.push(next_token);
 
-        info!(
+        debug!(
             "TTFT: {:.2}ms (prompt_len={})",
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
@@ -1026,7 +1026,7 @@ impl Qwen35Model {
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
             let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            info!(
+            debug!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
                 tpot_avg * 1000.0,
                 generated_count,
@@ -1074,7 +1074,7 @@ impl Qwen35Model {
         };
 
         let ttft = ttft_start.elapsed();
-        info!(
+        debug!(
             "TTFT: {:.2}ms (prompt_len={})",
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
@@ -1139,7 +1139,7 @@ impl Qwen35Model {
         if generated_count > 0 {
             let tpot_total = tpot_start.elapsed();
             let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            info!(
+            debug!(
                 "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
                 tpot_avg * 1000.0,
                 generated_count,

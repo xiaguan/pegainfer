@@ -1840,9 +1840,9 @@ mod tests {
             let k_weight = DeviceVec::from_host(&ctx, &bf16_vec(&k_weight_host))?;
             let cos_cache = DeviceVec::from_host(&ctx, &cos_host)?;
             let sin_cache = DeviceVec::from_host(&ctx, &sin_host)?;
-            let decode_meta = ctx
-                .stream
-                .clone_htod(&[0_i32, current_pos as i32, seq_len as i32])?;
+            let decode_meta =
+                ctx.stream
+                    .clone_htod(&[0_i32, current_pos as i32, seq_len as i32])?;
             let mut k_cache = DeviceVec::from_host(&ctx, &k_cache_host)?;
             let mut v_cache = DeviceVec::from_host(&ctx, &v_cache_host)?;
             let mut out = DeviceVec::zeros(&ctx, num_qheads * head_dim)?;
@@ -1954,12 +1954,20 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f32, f32::max);
 
-            assert!(max_k_diff < 0.02, "seq_len={seq_len} k_cache diff {max_k_diff}");
-            assert!(max_v_diff < 0.02, "seq_len={seq_len} v_cache diff {max_v_diff}");
-            assert!(max_out_diff < 0.1, "seq_len={seq_len} output diff {max_out_diff}");
+            assert!(
+                max_k_diff < 0.02,
+                "seq_len={seq_len} k_cache diff {max_k_diff}"
+            );
+            assert!(
+                max_v_diff < 0.02,
+                "seq_len={seq_len} v_cache diff {max_v_diff}"
+            );
+            assert!(
+                max_out_diff < 0.1,
+                "seq_len={seq_len} output diff {max_out_diff}"
+            );
         }
 
         Ok(())
     }
-
 }
