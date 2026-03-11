@@ -290,10 +290,12 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let mut decoder = self.tokenizer.incremental_decoder();
         let mut decode_error = None;
-        let stops: Option<Vec<&str>> = req
-            .stop
-            .as_ref()
-            .map(|v| v.iter().map(String::as_str).filter(|s| !s.is_empty()).collect());
+        let stops: Option<Vec<&str>> = req.stop.as_ref().map(|v| {
+            v.iter()
+                .map(String::as_str)
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
         let mut sent_len: usize = 0;
         let stopped_by_stop_sequence = std::cell::Cell::new(false);
 
@@ -313,11 +315,14 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
                             truncate_at_stop(&new_full, sent_len, stop_list)
                         {
                             if !to_send.is_empty() {
-                                if tx.send(StreamDelta {
-                                    text_delta: to_send,
-                                    finish_reason: None,
-                                    usage: None,
-                                }).is_err() {
+                                if tx
+                                    .send(StreamDelta {
+                                        text_delta: to_send,
+                                        finish_reason: None,
+                                        usage: None,
+                                    })
+                                    .is_err()
+                                {
                                     return false;
                                 }
                             }
