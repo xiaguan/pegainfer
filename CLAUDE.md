@@ -82,6 +82,11 @@ docs/
 └── archives/          # Completed, abandoned, or shelved inactive items
 ```
 
+## Documentation Style
+
+- Docs cover what `--help` and code can't: pitfalls, diagnostic paths, decision context. Don't restate CLI reference.
+- Every command in a doc must be run and verified before committing. Unverified commands are technical debt.
+
 ## Core Principles (CODE)
 
 Documentation exists to advance work, not to hoard information. Four steps when handling information:
