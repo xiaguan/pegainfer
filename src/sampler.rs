@@ -7,6 +7,7 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: i32,
     pub top_p: f32,
+    pub ignore_eos: bool,
 }
 
 impl Default for SamplingParams {
@@ -15,6 +16,7 @@ impl Default for SamplingParams {
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
+            ignore_eos: false,
         }
     }
 }
@@ -122,6 +124,7 @@ mod tests {
             temperature: 0.7,
             top_k: 1,
             top_p: 1.0,
+            ..Default::default()
         };
         assert!(params.is_greedy());
     }
@@ -132,6 +135,7 @@ mod tests {
             temperature: 0.7,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         assert!(!params.is_greedy());
     }
@@ -143,6 +147,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng1 = StdRng::seed_from_u64(42);
         let mut rng2 = StdRng::seed_from_u64(42);
@@ -158,6 +163,7 @@ mod tests {
             temperature: 1.0,
             top_k: 1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         let token = sample(&logits, &params, &mut rng);
@@ -173,6 +179,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 0.1,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(123);
         for _ in 0..10 {
@@ -187,6 +194,7 @@ mod tests {
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 1);
@@ -199,6 +207,7 @@ mod tests {
             temperature: -1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 1);
@@ -211,6 +220,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 0);
@@ -224,6 +234,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         sample(&logits, &params, &mut rng);
@@ -236,6 +247,7 @@ mod tests {
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         assert_eq!(sample(&logits, &params, &mut rng), 3); // -1.0 is largest
@@ -252,6 +264,7 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         let mut seen = std::collections::HashSet::new();
@@ -272,6 +285,7 @@ mod tests {
             temperature: 0.01,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         let n = 500;
@@ -294,6 +308,7 @@ mod tests {
             temperature: 100.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         let mut counts = [0u32; 4];
@@ -320,6 +335,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(42);
         let mut counts = [0u32; 5];
@@ -350,6 +366,7 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 0.5,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         for _ in 0..50 {
@@ -370,6 +387,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 0.01,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(0);
         for _ in 0..50 {

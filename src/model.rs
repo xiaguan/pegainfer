@@ -787,7 +787,7 @@ impl Qwen3Model {
             prompt_tokens.len()
         );
 
-        if self.config.is_stop_token(next_token) {
+        if !params.ignore_eos && self.config.is_stop_token(next_token) {
             self.kv_cache = Some(kv_cache);
             return Ok(tokens);
         }
@@ -812,7 +812,7 @@ impl Qwen3Model {
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
             };
 
-            if self.config.is_stop_token(next_token) {
+            if !params.ignore_eos && self.config.is_stop_token(next_token) {
                 break;
             }
 
@@ -904,7 +904,7 @@ impl Qwen3Model {
             prompt_tokens.len()
         );
 
-        if self.config.is_stop_token(next_token) {
+        if !params.ignore_eos && self.config.is_stop_token(next_token) {
             self.kv_cache = Some(kv_cache);
             return Ok(StreamingStats {
                 emitted_tokens: 0,
@@ -943,7 +943,7 @@ impl Qwen3Model {
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
             };
 
-            if self.config.is_stop_token(next_token) {
+            if !params.ignore_eos && self.config.is_stop_token(next_token) {
                 hit_eos = true;
                 break;
             }

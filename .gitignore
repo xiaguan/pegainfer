@@ -3,3 +3,4 @@
 /models
 /.venv/
 __pycache__/
+/bench_results/

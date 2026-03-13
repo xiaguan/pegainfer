@@ -77,6 +77,7 @@ async fn completions(
             temperature: req.temperature.unwrap_or(0.0),
             top_k: req.top_k.unwrap_or(-1),
             top_p: req.top_p.unwrap_or(1.0),
+            ignore_eos: req.ignore_eos.unwrap_or(false),
         },
         stop: req.stop,
     };

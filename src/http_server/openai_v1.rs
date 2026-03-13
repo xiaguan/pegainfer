@@ -16,6 +16,7 @@ pub(super) struct CompletionRequest {
     pub(super) stream: Option<bool>,
     pub(super) stream_options: Option<StreamOptions>,
     pub(super) stop: Option<Vec<String>>,
+    pub(super) ignore_eos: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

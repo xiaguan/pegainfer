@@ -115,6 +115,7 @@ fn regen_test_data() {
                 temperature: 0.0,
                 top_k: 0,
                 top_p: 1.0,
+                ..Default::default()
             },
             stop: None,
         };

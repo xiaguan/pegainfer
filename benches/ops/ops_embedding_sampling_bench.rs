@@ -72,6 +72,7 @@ pub fn bench_embedding_sampling_ops(c: &mut Criterion) {
             temperature: 0.8,
             top_k: 50,
             top_p: 0.95,
+            ..Default::default()
         };
         iter_sync(b, &ctx, || {
             let token = ops::gpu_sample(&ctx, &logits, &mut probs, &params, 0.37)

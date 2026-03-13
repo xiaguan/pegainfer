@@ -1009,7 +1009,7 @@ impl Qwen35Model {
             let next_token =
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
 
-            if next_token == self.config.eos_token_id {
+            if !params.ignore_eos && next_token == self.config.eos_token_id {
                 break;
             }
 
@@ -1109,7 +1109,7 @@ impl Qwen35Model {
             let next_token =
                 self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
 
-            if next_token == self.config.eos_token_id {
+            if !params.ignore_eos && next_token == self.config.eos_token_id {
                 hit_eos = true;
                 break;
             }

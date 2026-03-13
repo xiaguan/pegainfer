@@ -1742,6 +1742,7 @@ mod tests {
             temperature: 0.01,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.5)?;
         assert_eq!(token, 2, "near-greedy should pick index 2 (highest logit)");
@@ -1751,6 +1752,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1.0,
+            ..Default::default()
         };
         let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.0)?;
         // random_val=0.0 should pick the first token (index 0)
@@ -1761,6 +1763,7 @@ mod tests {
             temperature: 1.0,
             top_k: 1,
             top_p: 1.0,
+            ..Default::default()
         };
         let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.5)?;
         assert_eq!(token, 2, "top_k=1 should pick highest probability token");
