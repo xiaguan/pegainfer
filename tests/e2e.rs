@@ -14,7 +14,7 @@ use pegainfer::server_engine::{
 };
 use pegainfer::trace_reporter::FileReporter;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
+const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 fn get_model_path() -> String {
     let model_path =

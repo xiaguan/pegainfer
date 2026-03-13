@@ -148,7 +148,7 @@ fn find_triton_python() -> Result<String, String> {
         });
     }
 
-    let local_venv = PathBuf::from("tools/triton/.venv/bin/python");
+    let local_venv = PathBuf::from(".venv/bin/python");
     let mut diagnostics = Vec::new();
     let mut candidates = Vec::new();
     if local_venv.exists() {
@@ -164,7 +164,7 @@ fn find_triton_python() -> Result<String, String> {
     }
 
     Err(format!(
-        "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON, bootstrap tools/triton/.venv, or ensure `python3 -c 'import triton'` works. Probe results: {}. See tools/triton/README.md.",
+        "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
         diagnostics.join(" | ")
     ))
 }

@@ -119,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Qwen3-8B model"]
     fn test_load_8b_config() {
         let config = Config::from_file(MODEL_8B_PATH).unwrap();
 

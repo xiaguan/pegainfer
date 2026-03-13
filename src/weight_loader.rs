@@ -205,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Qwen3-8B model"]
     fn test_load_shard_info_for_untied_qwen3_8b() {
         let (shards, weight_map) = load_shard_info(QWEN3_8B_PATH).unwrap();
 
