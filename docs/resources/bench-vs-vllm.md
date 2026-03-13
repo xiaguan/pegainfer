@@ -88,10 +88,10 @@ Read both JSON results. Key metrics:
 
 | Config | What it tests |
 |--------|---------------|
-| `in=1, out=1, n=1000` | Minimal overhead — launch latency, framework tax |
-| `in=1024, out=256, n=100` | Realistic workload — prefill + sustained decode |
-| `in=1, out=512, n=50` | Pure decode — long generation from short prompt |
-| `in=2048, out=32, n=50` | Prefill-heavy — TTFT dominates |
+| `in=1, out=1, n=200` | Minimal overhead — launch latency, framework tax |
+| `in=1024, out=256, n=20` | Realistic workload — prefill + sustained decode |
+| `in=1, out=512, n=20` | Pure decode — long generation from short prompt |
+| `in=2048, out=32, n=20` | Prefill-heavy — TTFT dominates |
 
 ## Gotchas
 
