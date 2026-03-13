@@ -165,8 +165,9 @@ unsafe extern "C" {
 
     pub fn cublas_init();
 
-    // Batched prefill attention (QK norm + RoPE + cuBLAS GEMM + causal softmax)
-    pub fn prefill_attention_cuda(
+    // Prefill attention preparation: QK norm + RoPE + KV cache write (steps 1-2).
+    // Step 3 (attention) is handled by flash_attention_prefill_cuda (Triton).
+    pub fn prefill_attention_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
         v_batch: *const Half,
@@ -176,18 +177,30 @@ unsafe extern "C" {
         sin_cache: *const Half,
         k_cache: *mut Half,
         v_cache: *mut Half,
-        output: *mut Half,
-        scores_buf: *mut f32,
-        softmax_buf: *mut Half,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
         seq_len: i32,
         start_pos: i32,
-        scale: f32,
         rms_eps: f32,
         stream: CUstream,
     );
+
+    // FlashAttention-2 prefill (Triton AOT): fused QK + softmax + V for all query tokens.
+    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
+    pub fn flash_attention_prefill_cuda(
+        Q: *const Half,
+        K_cache: *const Half,
+        V_cache: *const Half,
+        Output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        gqa_ratio: i32,
+        seq_len: i32,
+        start_pos: i32,
+        q_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     // Fused GQA Attention — prefill variant (scalar pos/seq_len, per-position cos/sin)
     pub fn fused_gqa_attention_single_token(

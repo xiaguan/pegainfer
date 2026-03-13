@@ -537,42 +537,15 @@ pub fn fused_attention_into(
     Ok(())
 }
 
-/// Batched prefill attention: replaces per-token attention loop with cuBLAS GEMM.
-/// Modifies q_batch and k_batch in-place (QK norm + RoPE).
+/// Batched prefill attention with FlashAttention-2.
+///
+/// Pipeline:
+///   1. QK norm + RoPE (CUDA kernel, in-place on q_batch/k_batch)
+///   2. KV cache write (CUDA kernel)
+///   3. FlashAttention-2 (Triton kernel — fused QK + causal softmax + V)
+///
+/// No O(n²) scratch buffers needed — FlashAttention uses online softmax.
 #[allow(clippy::too_many_arguments)]
-/// Scratch buffers for prefill attention (reused across layers to avoid per-layer allocation).
-pub struct PrefillAttnScratch {
-    pub scores_fp32: CudaSlice<f32>,
-    pub softmax_bf16: CudaSlice<half::bf16>,
-    pub capacity: usize, // number of elements allocated
-}
-
-impl PrefillAttnScratch {
-    pub fn new(
-        ctx: &DeviceContext,
-        num_q_heads: usize,
-        total_seq: usize,
-        seq_len: usize,
-    ) -> Result<Self> {
-        let capacity = num_q_heads * total_seq * seq_len;
-        let scores_fp32: CudaSlice<f32> = unsafe {
-            ctx.stream
-                .alloc::<f32>(capacity)
-                .map_err(|e| anyhow!("scores alloc failed: {}", e))?
-        };
-        let softmax_bf16: CudaSlice<half::bf16> = unsafe {
-            ctx.stream
-                .alloc::<half::bf16>(capacity)
-                .map_err(|e| anyhow!("softmax alloc failed: {}", e))?
-        };
-        Ok(Self {
-            scores_fp32,
-            softmax_bf16,
-            capacity,
-        })
-    }
-}
-
 pub fn prefill_attention_batch(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
@@ -584,16 +557,17 @@ pub fn prefill_attention_batch(
     sin_cache: &DeviceVec,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
-    scratch: &mut PrefillAttnScratch,
     output: &mut HiddenStates,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     start_pos: usize,
-    scale: f32,
     rms_eps: f32,
 ) -> Result<()> {
     let seq_len = q_batch.seq_len;
+    let q_dim = num_q_heads * head_dim;
+    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
+    let gqa_ratio = num_q_heads / num_kv_heads;
 
     {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
@@ -606,11 +580,10 @@ pub fn prefill_attention_batch(
         let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
         let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
         let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-        let (sc_ptr, _gsc) = scratch.scores_fp32.device_ptr_mut(&ctx.stream);
-        let (sm_ptr, _gsm) = scratch.softmax_bf16.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            ffi::prefill_attention_cuda(
+            // Steps 1-2: QK norm + RoPE, KV cache write
+            ffi::prefill_attention_prep_cuda(
                 q_ptr as *mut ffi::Half,
                 k_ptr as *mut ffi::Half,
                 v_ptr as *const ffi::Half,
@@ -620,16 +593,27 @@ pub fn prefill_attention_batch(
                 sin_ptr as *const ffi::Half,
                 kc_ptr as *mut ffi::Half,
                 vc_ptr as *mut ffi::Half,
-                o_ptr as *mut ffi::Half,
-                sc_ptr as *mut f32,
-                sm_ptr as *mut ffi::Half,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,
                 seq_len as i32,
                 start_pos as i32,
-                scale,
                 rms_eps,
+                ctx.stream.cu_stream(),
+            );
+
+            // Step 3: FlashAttention-2 (Triton) — reads normed Q and KV cache
+            ffi::flash_attention_prefill_cuda(
+                q_ptr as *const ffi::Half,
+                kc_ptr as *const ffi::Half,
+                vc_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                gqa_ratio as i32,
+                seq_len as i32,
+                start_pos as i32,
+                q_dim as i32,
                 ctx.stream.cu_stream(),
             );
         }
@@ -770,34 +754,39 @@ pub fn fused_attention_decode_into(
 /// GEMM: Y = weight @ X (batched linear projection)
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
-    assert_eq!(
-        weight.cols, x.hidden_dim,
-        "weight cols {} != hidden_dim {}",
-        weight.cols, x.hidden_dim
-    );
-    let out_dim = weight.rows;
-    let seq_len = x.seq_len;
-    let mut out = HiddenStates::zeros(ctx, out_dim, seq_len)?;
+    let mut out = HiddenStates::zeros(ctx, weight.rows, x.seq_len)?;
+    gemm_into(ctx, weight, x, &mut out)?;
+    Ok(out)
+}
 
-    {
-        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+/// GEMM into pre-allocated output buffer (zero allocation).
+pub fn gemm_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(weight.cols, x.hidden_dim, "weight cols {} != hidden_dim {}", weight.cols, x.hidden_dim);
+    assert_eq!(out.hidden_dim, weight.rows, "out hidden_dim {} != weight rows {}", out.hidden_dim, weight.rows);
+    assert_eq!(out.seq_len, x.seq_len, "out seq_len {} != x seq_len {}", out.seq_len, x.seq_len);
 
-        unsafe {
-            ffi::gemm_cuda(
-                w_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                y_ptr as *mut ffi::Half,
-                out_dim as i32,
-                seq_len as i32,
-                weight.cols as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gemm_cuda(
+            w_ptr as *const ffi::Half,
+            x_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            weight.rows as i32,
+            x.seq_len as i32,
+            weight.cols as i32,
+            ctx.stream.cu_stream(),
+        );
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Batched RMSNorm: normalize each token's hidden state independently
@@ -807,55 +796,78 @@ pub fn rms_norm_batch(
     weight: &DeviceVec,
     eps: f32,
 ) -> Result<HiddenStates> {
-    assert_eq!(weight.len, x.hidden_dim);
     let mut out = HiddenStates::zeros(ctx, x.hidden_dim, x.seq_len)?;
+    rms_norm_batch_into(ctx, x, weight, eps, &mut out)?;
+    Ok(out)
+}
 
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+/// Batched RMSNorm into pre-allocated output buffer (zero allocation).
+pub fn rms_norm_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(weight.len, x.hidden_dim);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
 
-        unsafe {
-            ffi::rms_norm_batched_cuda(
-                x_ptr as *const ffi::Half,
-                w_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.hidden_dim as i32,
-                x.seq_len as i32,
-                eps,
-                ctx.stream.cu_stream(),
-            );
-        }
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_batched_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
+    let mut out = HiddenStates::zeros(ctx, a.hidden_dim, a.seq_len)?;
+    add_batch_into(ctx, a, b, &mut out)?;
+    Ok(out)
+}
+
+/// Batched element-wise add into pre-allocated output buffer (zero allocation).
+pub fn add_batch_into(
+    ctx: &DeviceContext,
+    a: &HiddenStates,
+    b: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     assert_eq!(a.hidden_dim, b.hidden_dim);
     assert_eq!(a.seq_len, b.seq_len);
+    assert_eq!(out.hidden_dim, a.hidden_dim);
+    assert_eq!(out.seq_len, a.seq_len);
+
     let n = a.hidden_dim * a.seq_len;
-    let mut out = HiddenStates::zeros(ctx, a.hidden_dim, a.seq_len)?;
+    let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    {
-        let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
-        let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::add_cuda(
+            a_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
 
-        let result = unsafe {
-            ffi::add_cuda(
-                a_ptr as *const ffi::Half,
-                b_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                n as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-
-    Ok(out)
+    Ok(())
 }
 
 /// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
@@ -864,29 +876,40 @@ pub fn silu_mul_batch(
     gate: &HiddenStates,
     up: &HiddenStates,
 ) -> Result<HiddenStates> {
+    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
+    silu_mul_batch_into(ctx, gate, up, &mut out)?;
+    Ok(out)
+}
+
+/// Batched SiLU+mul into pre-allocated output buffer (zero allocation).
+pub fn silu_mul_batch_into(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     assert_eq!(gate.hidden_dim, up.hidden_dim);
     assert_eq!(gate.seq_len, up.seq_len);
+    assert_eq!(out.hidden_dim, gate.hidden_dim);
+    assert_eq!(out.seq_len, gate.seq_len);
+
     let n = gate.hidden_dim * gate.seq_len;
-    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
-    {
-        let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
-        let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::silu_mul_triton_aot_cuda(
+            g_ptr as *const ffi::Half,
+            u_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
 
-        let result = unsafe {
-            ffi::silu_mul_triton_aot_cuda(
-                g_ptr as *const ffi::Half,
-                u_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                n as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-
-    Ok(out)
+    Ok(())
 }
 
 /// Batched embedding lookup

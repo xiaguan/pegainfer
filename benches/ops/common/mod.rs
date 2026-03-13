@@ -7,7 +7,6 @@ use anyhow::{Result, anyhow};
 use criterion::{Bencher, BenchmarkGroup, measurement::WallTime};
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use pegainfer::ops::PrefillAttnScratch;
 use pegainfer::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 pub const VECTOR_DIM: usize = 1024;
@@ -192,11 +191,3 @@ pub fn rope_cache(
     ))
 }
 
-pub fn prefill_scratch(
-    ctx: &DeviceContext,
-    num_q_heads: usize,
-    total_seq: usize,
-    seq_len: usize,
-) -> Result<PrefillAttnScratch> {
-    PrefillAttnScratch::new(ctx, num_q_heads, total_seq, seq_len)
-}

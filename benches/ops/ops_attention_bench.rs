@@ -7,7 +7,7 @@ use pegainfer::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use super::common::{
     ATTN_SEQ_LEN, EPS, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128, ROPE_THETA_QWEN3,
     configure_group, decode_meta, device_vec, hidden_states, iter_sync, positive_device_vec,
-    prefill_scratch, rope_cache,
+    rope_cache,
 };
 
 pub fn bench_attention_ops(c: &mut Criterion) {
@@ -133,11 +133,8 @@ pub fn bench_attention_ops(c: &mut Criterion) {
                 DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate k cache");
             let mut v_cache =
                 DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate v cache");
-            let mut scratch = prefill_scratch(&ctx, Q_HEADS_128, ATTN_SEQ_LEN, ATTN_SEQ_LEN)
-                .expect("failed to allocate prefill scratch");
             let mut output_batch = HiddenStates::zeros(&ctx, q_dim, ATTN_SEQ_LEN)
                 .expect("failed to allocate attention batch out");
-            let scale = 1.0 / (HEAD_DIM_128 as f32).sqrt();
             iter_sync(b, &ctx, || {
                 ops::prefill_attention_batch(
                     &ctx,
@@ -150,13 +147,11 @@ pub fn bench_attention_ops(c: &mut Criterion) {
                     &sin_cache,
                     &mut k_cache,
                     &mut v_cache,
-                    &mut scratch,
                     &mut output_batch,
                     Q_HEADS_128,
                     KV_HEADS_128,
                     HEAD_DIM_128,
                     0,
-                    scale,
                     EPS,
                 )
                 .expect("prefill_attention_batch failed");
