@@ -91,10 +91,15 @@ async fn main() {
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+    axum::serve(
+        axum::serve::ListenerExt::tap_io(listener, |tcp_stream| {
+            let _ = tcp_stream.set_nodelay(true);
+        }),
+        app,
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap();
 
     if args.trace_output_path.is_some() {
         info!("Flushing pending traces...");
