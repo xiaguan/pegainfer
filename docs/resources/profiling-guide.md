@@ -1,187 +1,107 @@
-# Profiling & Benchmarking Guide
+# GPU Profiling Guide
 
-> **TL;DR:** Three layers of performance visibility: `bench_serving` for application-level metrics, `fastrace` for per-request tracing, `nsys`/`ncu` for GPU kernel analysis. All outputs viewable in [Perfetto UI](https://ui.perfetto.dev).
+> **TL;DR:** For benchmarking, use `bench_serving --help`. For profiling, capture a trace with `nsys` and analyze with `nsys stats`. This document covers pitfalls and diagnostic paths, not CLI reference.
+>
+> **Status:** Active.
 
-## bench_serving — Application-Level Benchmarks
+## Prerequisites
 
-In-process benchmark binary. Loads model once, runs generation directly — no HTTP overhead.
+- `nsys`: ships with the CUDA Toolkit, or install the standalone [Nsight Systems CLI](https://developer.nvidia.com/nsight-systems). Verify: `nsys --version`.
+- **Must use `--release`.** Debug builds slow GPU kernels by 10x+ due to debug info. Traces from debug builds do not reflect real behavior.
 
-```bash
-cd pegainfer/
-cargo run -r --bin bench_serving -- [global-opts] <subcommand> [subcommand-opts]
-```
+## Capturing a Trace
 
-### Global Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model-path` | `models/Qwen3-4B` | Model directory |
-| `--cuda-graph` | `true` | Enable/disable CUDA Graph on decode path |
-| `--format` | `text` | Output format: `text` or `json` |
-| `--label` | — | Annotation tag for the report |
-| `--out` | — | Write rendered report to file |
-
-### Subcommand: `request`
-
-Measures a single (prompt_len, output_len) shape. The workhorse for A/B comparisons.
+One command:
 
 ```bash
-cargo run -r --bin bench_serving -- request --prompt-len 1024 --output-len 256
+# Example: capture a trace for 1024 prompt + 256 decode, export sqlite directly
+nsys profile --force-overwrite=true --cuda-graph-trace=node \
+  --export=sqlite -o target/profiling/trace \
+  cargo run -r --bin bench_serving -- request --prompt-len 1024 --output-len 256
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--prompt` | — | Literal prompt text |
-| `--prompt-file` | — | Read prompt from file |
-| `--prompt-len` | — | Generate synthetic prompt of N tokens (mutually exclusive with above) |
-| `--output-len` | 64 | Max tokens to generate |
-| `--warmup` | 5 | Warmup iterations (not measured) |
-| `--iters` | 20 | Measured iterations |
-| `--seed` | 42 | RNG seed for sampling |
+Produces `target/profiling/trace.nsys-rep` + `target/profiling/trace.sqlite`. The sqlite file can be analyzed directly with `nsys stats` — no secondary conversion needed.
 
-**Metrics reported:** TTFT, first decode step, steady TPOT (excludes first step), E2E latency, decode tok/s. Each with min/avg/p50/p95/p99/max.
+### Key Flags
 
-**Synthetic tokens:** `token_id = 100 + (idx % 1000)` — deterministic, avoids special tokens.
+**`--cuda-graph-trace=node`** — The single most important pitfall. Without this, CUDA Graph replay appears as an opaque block in the timeline — you cannot see which kernels run inside the graph. With it, every kernel inside replay is expanded. The tradeoff is overhead: absolute times in the trace are inflated. Use it only for composition and proportions, not for benchmarking.
 
-### Subcommand: `matrix`
+**`--force-overwrite=true`** — Without this, nsys refuses to overwrite an existing output file and exits with an error.
 
-Sweeps prompt_len x output_len combinations. Good for finding performance cliffs.
+### Other Useful nsys Options
 
 ```bash
-cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
+# Capture only CUDA activity, skip OS scheduling noise (smaller trace, faster to open)
+nsys profile --trace=cuda,nvtx --cuda-graph-trace=node ...
+
+# Delayed start (skip model loading, capture only inference)
+nsys profile --delay=10 --duration=30 --cuda-graph-trace=node ...
 ```
 
-Each cell shows TTFT, E2E, TPOT, and throughput.
+## Analyzing a Trace
 
-### Subcommand: `curve`
-
-Shows how TPOT degrades as KV cache context grows. Reveals attention scaling behavior.
+Use `nsys stats` to produce reports (reads sqlite directly, no conversion):
 
 ```bash
-cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
+# Kernel time summary — the first report to look at
+nsys stats --report cuda_gpu_kern_sum target/profiling/trace.sqlite
+
+# CUDA API call summary — find sync / memcpy overhead
+nsys stats --report cuda_api_sum target/profiling/trace.sqlite
 ```
 
-Groups decode positions into windows (e.g., "tokens 1025–1056") and reports per-window TPOT. `--window` controls granularity.
+`cuda_gpu_kern_sum` example output (Qwen3-4B, prompt=1, output=10, 2026-03-13):
 
-### Typical Comparisons
+```
+ Time (%)  Total Time (ns)  Instances  Avg (ns)    Name
+     41.4   86,781,589          720    120,530   fused_mlp_intermediate_kernel  ← MLP top half: gate+up, largest share
+     32.7   68,628,022        2,900     23,665   gemv_handwritten_kernel        ← all projection GEMV
+     21.2   44,380,185          720     61,639   fused_mlp_output_kernel        ← MLP bottom half: down projection
+      2.2    4,595,007        1,440      3,191   fused_add_rms_norm_kernel      ← residual + norm, lightweight
+      2.0    4,128,672          721      5,726   fused_attention_decode_kernel   ← decode attention
+      0.3      549,600          721        762   attention_reduce_kernel         ← split-KV reduce
+```
+
+Normal pattern: MLP (intermediate + output) + GEMV account for >90%. Attention share is small at short context and grows with sequence length.
+
+`cuda_api_sum` example output:
+
+```
+ Time (%)  Total Time (ns)  Num Calls   Name
+     67.4  661,216,067          421    cuMemcpyHtoDAsync_v2      ← model weight loading, one-time at startup
+     20.3  199,588,713           22    cuStreamSynchronize       ← host waiting for GPU
+      5.9   58,181,025          518    cuMemAllocAsync           ← VRAM allocation
+      1.2   11,474,056          310    cudaLaunchKernel          ← kernel launch overhead
+      0.8    8,100,427           20    cuGraphLaunch             ← CUDA Graph replay
+```
+
+Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). During inference, watch `cuStreamSynchronize` — if it far exceeds kernel launch + graph launch, the host is waiting for the GPU unnecessarily.
+
+## Diagnosing Decode Degradation With Sequence Length
+
+If `bench_serving curve` shows TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
 
 ```bash
-# Before/after kernel change
-cargo run -r --bin bench_serving -- --format json --out before.json request --prompt-len 512 --output-len 128
-# ... make changes, rebuild ...
-cargo run -r --bin bench_serving -- --format json --out after.json request --prompt-len 512 --output-len 128
+# Fix output tokens, vary only prompt length
+nsys profile --force-overwrite=true --cuda-graph-trace=node \
+  --export=sqlite -o target/profiling/ctx_short \
+  cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128 --warmup 1 --iters 1
 
-# CUDA Graph on vs off
-cargo run -r --bin bench_serving -- --cuda-graph true  request --prompt-len 512
-cargo run -r --bin bench_serving -- --cuda-graph false request --prompt-len 512
+nsys profile --force-overwrite=true --cuda-graph-trace=node \
+  --export=sqlite -o target/profiling/ctx_long \
+  cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 128 --warmup 1 --iters 1
 ```
 
----
+Compare the two `cuda_gpu_kern_sum` reports — the kernel with the largest avg time increase is the culprit.
 
-## fastrace — Per-Request Tracing
-
-Application-level spans via the [fastrace](https://github.com/fastrace-rs/fastrace) crate. Outputs Chrome Trace Event Format JSON — one file per request.
-
-### Enable
-
-```bash
-RUST_LOG=info cargo run --release -- --trace-output-path traces/
-```
-
-Creates `traces/{timestamp_ms}_{trace_id}.json` per request.
-
-### What's Traced
-
-- `get_embeddings_batch` — embedding lookup
-- `process_all_layers_batch` — all transformer layers
-- Generation-level properties: `ttft_ms`, `tpot_avg_ms`, `generated_tokens`, `tok_per_sec`
-
-### View
-
-Open any `traces/*.json` in [Perfetto UI](https://ui.perfetto.dev). Events are sorted by timestamp, with pid=1/tid=1 (single-threaded inference).
-
----
-
-## nsys — GPU Kernel Profiling
-
-NVIDIA Nsight Systems. Use when you need kernel-level timing — which kernels dominate, launch overhead, memory transfers.
-
-### Quick Profile
-
-```bash
-nsys profile -o bench_trace --force-overwrite \
-  cargo run -r --bin bench_serving -- request
-```
-
-### With CUDA Graph Trace Modes
-
-```bash
-# Default: graph replay shown as single GRAPH_TRACE block (low overhead)
-nsys profile -o trace cargo run -r --bin bench_serving -- request
-
-# Expand graph internals: see individual kernels inside replayed graph (has profiling overhead)
-nsys profile --cuda-graph-trace=node -o trace cargo run -r --bin bench_serving -- request
-```
-
-**Important:** `--cuda-graph-trace=node` adds significant overhead that masks the speedup from CUDA Graphs. Use it to understand kernel composition, not to measure absolute performance.
-
-### Automation Script
-
-`profile_data/run_profile.sh` wraps nsys + summary generation + JSON conversion:
-
-```bash
-cd profile_data/
-./run_profile.sh ../pegainfer ./output                       # basic
-./run_profile.sh ../pegainfer ./output --cuda-graph-trace=node  # expanded graph
-```
-
-Produces:
-- `.nsys-rep` — native nsys report (open with `nsys-ui`)
-- kernel summary (`cuda_gpu_kern_sum`)
-- CUDA API summary (`cuda_api_sum`)
-- `.json` — for Perfetto
-
-### nsys → Perfetto JSON
-
-```bash
-# Manual conversion (nsys exports to SQLite, then convert)
-nsys export -t sqlite -o trace.sqlite trace.nsys-rep
-python3 scripts/nsys2json.py -f trace.sqlite -o trace.json -t kernel
-```
-
-**Known issue:** ns→us conversion causes precision loss. Tightly-spaced kernels (e.g., consecutive fused_mlp stages) appear to overlap, causing Perfetto to hide the second kernel. `nsys2json.py` includes a fix that pushes overlapping events forward. See `profile_data/nsys2json-overlap-bug.md` for details.
-
----
-
-## ncu — Kernel Micro-Profiling
-
-NVIDIA Nsight Compute. Use for deep-diving a single kernel — occupancy, memory throughput, instruction mix.
-
-```bash
-# Profile a specific kernel (slow — replays kernel many times)
-/usr/local/cuda/bin/ncu \
-  --kernel-name "fused_gqa_attention_decode" \
-  --launch-count 3 \
-  cargo run -r --bin bench_serving -- --cuda-graph false request --output-len 8
-```
-
-**Note:** Disable CUDA Graph (`--cuda-graph false`) and use short output lengths. ncu replays each kernel launch multiple times for accurate counters — CUDA Graph replay complicates this.
-
-Key metrics to look at:
-- **Memory throughput** — are you bandwidth-bound? (decode kernels usually are)
-- **Occupancy** — enough warps to hide latency?
-- **Compute throughput** — are ALUs utilized? (prefill GEMM should be high)
-
----
-
-## Decision Tree
+Measured comparison (Qwen3-4B, 2026-03-13):
 
 ```
-"Is it slow?"
-  → Run bench_serving request, check TTFT vs TPOT
-    → TTFT high → prefill problem → nsys profile with batch GEMM workload
-    → TPOT high → decode problem → nsys profile, look at per-kernel time
-      → One kernel dominates → ncu that kernel
-      → Launch overhead high → check CUDA Graph is enabled
-  → Unclear where time goes → fastrace tracing for span-level breakdown
+kernel                          prompt=1 avg    prompt=2048 avg    change
+fused_attention_decode_kernel      6.1μs           41.5μs          6.8x  ← only kernel that scales with context
+fused_mlp_intermediate_kernel    120.5μs          120.5μs          1.0x
+gemv_handwritten_kernel           23.7μs           23.8μs          1.0x
+fused_mlp_output_kernel           61.7μs           61.8μs          1.0x
 ```
+
+MLP and GEMV are completely flat. Attention decode is O(seq_len). If other kernels also show growth, there is an unexpected context dependency to investigate.
