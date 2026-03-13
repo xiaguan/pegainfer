@@ -285,6 +285,25 @@ impl Qwen3Model {
         let mut v_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
         let mut out = DeviceVec::zeros(&self.ctx, q_dim)?;
 
+        let num_qheads = self.config.num_attention_heads;
+        let head_dim = self.config.head_dim;
+        let num_kv_splits = 4usize;
+        let mut partial_out = self
+            .ctx
+            .stream
+            .alloc_zeros::<f32>(num_qheads * num_kv_splits * head_dim)
+            .map_err(|e| anyhow::anyhow!("Alloc partial_out failed: {}", e))?;
+        let mut partial_m = self
+            .ctx
+            .stream
+            .alloc_zeros::<f32>(num_qheads * num_kv_splits)
+            .map_err(|e| anyhow::anyhow!("Alloc partial_m failed: {}", e))?;
+        let mut partial_l = self
+            .ctx
+            .stream
+            .alloc_zeros::<f32>(num_qheads * num_kv_splits)
+            .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {}", e))?;
+
         ops::fused_attention_decode_into(
             &self.ctx,
             &q,
@@ -298,6 +317,9 @@ impl Qwen3Model {
             &mut k_cache,
             &mut v_cache,
             &mut out,
+            &mut partial_out,
+            &mut partial_m,
+            &mut partial_l,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
         )?;
@@ -656,7 +678,7 @@ impl Qwen3Model {
             &mut bufs.v,
         )?;
 
-        // Fused Attention (decode variant): reads pos/seq_len from decode_meta
+        // Fused Attention (decode variant): split-KV + reduce
         let (k_cache, v_cache) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
         ops::fused_attention_decode_into(
             &self.ctx,
@@ -671,6 +693,9 @@ impl Qwen3Model {
             k_cache,
             v_cache,
             &mut bufs.attn_out,
+            &mut bufs.partial_out,
+            &mut bufs.partial_m,
+            &mut bufs.partial_l,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
         )?;

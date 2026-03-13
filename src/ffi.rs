@@ -212,8 +212,9 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA Attention — decode variant (Triton AOT, HEAD_DIM=128 baked in)
+    // Fused GQA Attention — decode variant (Triton AOT, split-KV, HEAD_DIM=128)
     // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
+    // Writes partial results to partial_out/m/l (FP32). Call attention_decode_reduce after.
     pub fn fused_gqa_attention_decode(
         q_full: *const Half,
         k_full: *const Half,
@@ -225,10 +226,22 @@ unsafe extern "C" {
         decode_meta: *const i32,
         k_cache: *mut Half,
         v_cache: *mut Half,
-        output: *mut Half,
+        partial_out: *mut f32,
+        partial_m: *mut f32,
+        partial_l: *mut f32,
         num_qheads: i32,
         num_kvheads: i32,
         gqa_ratio: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Attention reduce: merge split-KV partials into final bf16 output.
+    pub fn attention_decode_reduce(
+        partial_out: *mut f32,
+        partial_m: *mut f32,
+        partial_l: *mut f32,
+        output: *mut Half,
+        num_qheads: i32,
         stream: CUstream,
     ) -> CUresult;
 

@@ -683,10 +683,11 @@ pub fn fused_attention(
     Ok(output)
 }
 
-/// Fused GQA Attention for decode (Triton AOT, HEAD_DIM=128 baked in).
+/// Fused GQA Attention for decode (Triton AOT, split-KV, HEAD_DIM=128).
 /// Reads pos/seq_len from decode_meta — CUDA Graph safe.
 /// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
 /// decode_meta: [token_id, current_pos, seq_len] on GPU.
+/// partial_out/m/l: pre-allocated FP32 scratch for split-KV intermediates.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention_decode_into(
     ctx: &DeviceContext,
@@ -701,6 +702,9 @@ pub fn fused_attention_decode_into(
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     output: &mut DeviceVec,
+    partial_out: &mut CudaSlice<f32>,
+    partial_m: &mut CudaSlice<f32>,
+    partial_l: &mut CudaSlice<f32>,
     num_qheads: usize,
     num_kvheads: usize,
 ) -> Result<()> {
@@ -715,7 +719,11 @@ pub fn fused_attention_decode_into(
     let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
     let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (partial_out_ptr, _gpo) = partial_out.device_ptr_mut(&ctx.stream);
+    let (partial_m_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
+    let (partial_l_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
 
+    // Phase 1: split-KV attention (writes partials)
     let result = unsafe {
         ffi::fused_gqa_attention_decode(
             q_ptr as *const ffi::Half,
@@ -728,10 +736,25 @@ pub fn fused_attention_decode_into(
             meta_ptr as *const i32,
             k_cache_ptr as *mut ffi::Half,
             v_cache_ptr as *mut ffi::Half,
-            out_ptr as *mut ffi::Half,
+            partial_out_ptr as *mut f32,
+            partial_m_ptr as *mut f32,
+            partial_l_ptr as *mut f32,
             num_qheads as i32,
             num_kvheads as i32,
             (num_qheads / num_kvheads) as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    // Phase 2: reduce partials → final bf16 output
+    let result = unsafe {
+        ffi::attention_decode_reduce(
+            partial_out_ptr as *mut f32,
+            partial_m_ptr as *mut f32,
+            partial_l_ptr as *mut f32,
+            out_ptr as *mut ffi::Half,
+            num_qheads as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -1849,6 +1872,14 @@ mod tests {
             let mut k_cache = DeviceVec::from_host(&ctx, &k_cache_host)?;
             let mut v_cache = DeviceVec::from_host(&ctx, &v_cache_host)?;
             let mut out = DeviceVec::zeros(&ctx, num_qheads * head_dim)?;
+            let num_kv_splits = 4usize;
+            let mut partial_out: CudaSlice<f32> = ctx
+                .stream
+                .alloc_zeros(num_qheads * num_kv_splits * head_dim)?;
+            let mut partial_m: CudaSlice<f32> =
+                ctx.stream.alloc_zeros(num_qheads * num_kv_splits)?;
+            let mut partial_l: CudaSlice<f32> =
+                ctx.stream.alloc_zeros(num_qheads * num_kv_splits)?;
 
             fused_attention_decode_into(
                 &ctx,
@@ -1863,6 +1894,9 @@ mod tests {
                 &mut k_cache,
                 &mut v_cache,
                 &mut out,
+                &mut partial_out,
+                &mut partial_m,
+                &mut partial_l,
                 num_qheads,
                 num_kvheads,
             )?;
