@@ -77,6 +77,18 @@ Normal pattern: MLP (intermediate + output) + GEMV account for >90%. Attention s
 
 Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). During inference, watch `cuStreamSynchronize` — if it far exceeds kernel launch + graph launch, the host is waiting for the GPU unnecessarily.
 
+## Standard Optimization Profiles
+
+Two profiles isolate prefill and decode paths for per-model optimization.
+
+```bash
+# Prefill-heavy: TTFT dominates, decode negligible
+cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 1
+
+# Decode-heavy: TPOT dominates, prefill negligible
+cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128
+```
+
 ## Diagnosing Decode Degradation With Sequence Length
 
 If `bench_serving curve` shows TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
