@@ -1,8 +1,8 @@
-# Performance Parity With vLLM
+# Qwen3-4B Optimization
 
-> **TL;DR:** pegainfer leads vLLM across all workloads after prefill optimizations. Prefill at parity (+7% faster). Decode 7% faster TPOT. Fixed overhead 38% faster.
+> **TL;DR:** pegainfer leads vLLM on all 4 tested workloads. Prefill +7%, decode +7%, fixed overhead +38%. Current numbers from single-concurrency bench on RTX 5070 Ti only — needs broader stress testing (longer contexts, batch concurrency, other GPUs) before declaring victory.
 >
-> **Status:** Closed. pegainfer leads vLLM on all measured workloads. GQA-aware FA2 attempted — register pressure makes it net-slower in Triton; would require explicit CUDA SMEM. Not worth the complexity at current parity margin.
+> **Status:** Active. Leads vLLM on measured workloads. Needs more diverse benchmarking to validate across wider conditions.
 
 ## Goal
 
