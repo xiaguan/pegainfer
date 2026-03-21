@@ -1,8 +1,8 @@
 # Qwen3-4B Optimization
 
-> **TL;DR:** pegainfer leads vLLM on all 4 tested workloads. Prefill +7%, decode +7%, fixed overhead +38%. Current numbers from single-concurrency bench on RTX 5070 Ti only — needs broader stress testing (longer contexts, batch concurrency, other GPUs) before declaring victory.
+> **TL;DR:** pegainfer led the measured Qwen3-4B workloads on RTX 5070 Ti after the FlashAttention-2 + PrefillBuffers work. This doc is archived as a dense-attention optimization reference rather than an active project.
 >
-> **Status:** Active. Leads vLLM on measured workloads. Needs more diverse benchmarking to validate across wider conditions.
+> **Status:** Archived. Kept as a reference for dense-attention optimization work; no longer an active milestone.
 
 ## Goal
 

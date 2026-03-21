@@ -1,8 +1,8 @@
 # Qwen3.5 GDR Chunk-Wise Plan
 
-> **TL;DR:** The current Triton fused-recurrent GDR prefill path solved the old host-side launch disaster, but it is now clearly register / occupancy bound. `ncu` shows `254` registers per thread, `16.67%` theoretical occupancy, and `14.19%` achieved occupancy, while DRAM throughput is only `0.75%`. Chunk-wise prefill is the next serious path forward. FlashInfer provides a useful CUDA engineering reference for launcher, workspace, and state continuation; Flash Linear Attention (FLA) provides a Triton decomposition and correctness model. The first delivery target should be batch=`1`, forward-only, fixed Qwen3.5 shape.
+> **TL;DR:** The chunk-wise GDR prefill plan landed in the real Qwen3.5 runtime, restored `e2e_qwen35`, and brought `(2048,1)` TTFT down to the `~222ms` range. This doc is archived because the plan has been executed and its outcome is now reflected in the broader Qwen3.5 optimization record.
 >
-> **Status:** Active. The chunk-wise path now runs end-to-end in the real Rust Qwen3.5 prefill path. TTFT at `(2048,1)` is `~222ms`, and `e2e_qwen35` passes again after fixing the key chunk-state bug: `v_new` was being written after gating, while FLA semantics require ungated `v_new` writeback and gated `v_new` only for the recurrent state update. Regenerating `test_data/Qwen3.5-4B.json` still changes `6/13` prompts relative to the old `HEAD` baseline, but that refreshed baseline is now explicitly accepted.
+> **Status:** Archived. The plan is complete and superseded by the runtime state documented in `projects/qwen35-4b-optimization.md`.
 
 ## Goal
 

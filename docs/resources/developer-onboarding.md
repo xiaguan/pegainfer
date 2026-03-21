@@ -1,4 +1,4 @@
-# Landing: Setting Up the pegainfer Dev Environment from Scratch
+# Developer Onboarding: Setting Up the pegainfer Dev Environment from Scratch
 
 **Status**: Complete
 **TL;DR**: Full new-developer onboarding — toolchain check, unified venv, build, tests, benchmark smoke test.
