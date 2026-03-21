@@ -11,23 +11,9 @@ use super::common::{
     iter_sync, token_ids,
 };
 
-pub fn bench_embedding_sampling_ops(c: &mut Criterion) {
+pub(crate) fn bench_embedding_sampling_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("ops_embedding_sampling");
     configure_group(&mut group);
-
-    group.throughput(Throughput::Elements(VECTOR_DIM as u64));
-    group.bench_function(BenchmarkId::new("embedding_into", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let embed = embedding_matrix(&ctx, VOCAB_SIZE, VECTOR_DIM)
-            .expect("failed to allocate embedding matrix");
-        let token_id = 17_u32;
-        let mut embed_out =
-            DeviceVec::zeros(&ctx, VECTOR_DIM).expect("failed to allocate embedding out");
-        iter_sync(b, &ctx, || {
-            ops::embedding_into(&ctx, &embed, token_id, &mut embed_out)
-                .expect("embedding_into failed");
-        });
-    });
 
     group.throughput(Throughput::Elements(VECTOR_DIM as u64));
     group.bench_function(BenchmarkId::new("embedding_decode_into", VECTOR_DIM), |b| {

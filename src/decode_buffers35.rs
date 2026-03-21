@@ -12,54 +12,54 @@ use crate::tensor::{DeviceContext, DeviceVec};
 /// All buffer dimensions are determined by the model config and remain fixed
 /// for the entire generation. Shared between full and linear attention layers
 /// where buffer sizes match (only one layer type runs at a time).
-pub struct DecodeBuffers35 {
+pub(crate) struct DecodeBuffers35 {
     /// Current hidden state, persists across layers (hidden_size=2560)
-    pub hidden: DeviceVec,
+    pub(crate) hidden: DeviceVec,
     /// RMSNorm output / general scratch (hidden_size=2560)
-    pub normed: DeviceVec,
+    pub(crate) normed: DeviceVec,
 
     // Shared large projection buffer: q_full [8192] for full attn, qkv_raw [8192] for linear
-    pub proj_8192: DeviceVec,
+    pub(crate) proj_8192: DeviceVec,
 
     // Full attention specific
     /// K projection output (num_kv_heads * head_dim = 1024)
-    pub k_full: DeviceVec,
+    pub(crate) k_full: DeviceVec,
     /// V projection output (num_kv_heads * head_dim = 1024)
-    pub v_full: DeviceVec,
+    pub(crate) v_full: DeviceVec,
 
     // Linear attention specific
     /// Conv1d output (qkv_dim = 8192)
-    pub qkv_conv: DeviceVec,
+    pub(crate) qkv_conv: DeviceVec,
     /// Z projection output (z_dim = 4096)
-    pub proj_z: DeviceVec,
+    pub(crate) proj_z: DeviceVec,
     /// B projection output (num_value_heads = 32)
-    pub proj_b: DeviceVec,
+    pub(crate) proj_b: DeviceVec,
     /// A projection output (num_value_heads = 32)
-    pub proj_a: DeviceVec,
+    pub(crate) proj_a: DeviceVec,
 
     // Shared attention / GDR output (num_qheads * head_dim = 4096 or num_vheads * v_dim = 4096)
-    pub attn_out: DeviceVec,
+    pub(crate) attn_out: DeviceVec,
     // Gated norm output — linear attention only (4096)
-    pub norm_gated: DeviceVec,
+    pub(crate) norm_gated: DeviceVec,
 
     /// O/out projection output (hidden_size = 2560)
-    pub attn_proj: DeviceVec,
+    pub(crate) attn_proj: DeviceVec,
 
     // MLP
-    pub mlp_act: DeviceVec,
-    pub mlp_out: DeviceVec,
+    pub(crate) mlp_act: DeviceVec,
+    pub(crate) mlp_out: DeviceVec,
 
     // Output
-    pub logits: DeviceVec,
+    pub(crate) logits: DeviceVec,
 
     /// Decode metadata on GPU: [token_id, current_pos, seq_len] as i32
-    pub decode_meta: CudaSlice<i32>,
+    pub(crate) decode_meta: CudaSlice<i32>,
     /// FP32 scratch buffer for GPU sampling softmax (vocab_size)
-    pub sample_probs: CudaSlice<f32>,
+    pub(crate) sample_probs: CudaSlice<f32>,
 }
 
 impl DecodeBuffers35 {
-    pub fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
         let h = config.hidden_size;
         let q_proj_dim = config.full_attn_q_proj_dim(); // 8192 (includes gate)
         let kv_dim = config.full_attn_kv_dim(); // 1024

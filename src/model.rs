@@ -45,41 +45,41 @@ impl Default for ModelRuntimeConfig {
 }
 
 /// Attention layer weights
-pub struct Attention {
-    pub q_proj: DeviceMatrix,
-    pub k_proj: DeviceMatrix,
-    pub v_proj: DeviceMatrix,
-    pub o_proj: DeviceMatrix,
-    pub q_norm: DeviceVec,
-    pub k_norm: DeviceVec,
+struct Attention {
+    q_proj: DeviceMatrix,
+    k_proj: DeviceMatrix,
+    v_proj: DeviceMatrix,
+    o_proj: DeviceMatrix,
+    q_norm: DeviceVec,
+    k_norm: DeviceVec,
 }
 
 /// MLP layer weights
-pub struct MLP {
-    pub gate_proj: DeviceMatrix,
-    pub up_proj: DeviceMatrix,
-    pub down_proj: DeviceMatrix,
+struct MLP {
+    gate_proj: DeviceMatrix,
+    up_proj: DeviceMatrix,
+    down_proj: DeviceMatrix,
 }
 
 /// Transformer block
-pub struct TransformerBlock {
-    pub input_layernorm: DeviceVec,
-    pub attention: Attention,
-    pub post_attention_layernorm: DeviceVec,
-    pub mlp: MLP,
+struct TransformerBlock {
+    input_layernorm: DeviceVec,
+    attention: Attention,
+    post_attention_layernorm: DeviceVec,
+    mlp: MLP,
 }
 
 /// Qwen3 model
 pub struct Qwen3Model {
-    pub ctx: DeviceContext,
-    pub config: Config,
-    pub embed_tokens: DeviceMatrix,
+    ctx: DeviceContext,
+    config: Config,
+    embed_tokens: DeviceMatrix,
     lm_head: Option<DeviceMatrix>,
-    pub layers: Vec<TransformerBlock>,
-    pub norm: DeviceVec,
+    layers: Vec<TransformerBlock>,
+    norm: DeviceVec,
     // RoPE cache on GPU - contiguous buffer [max_seq_len * head_dim]
-    pub cos_cache: DeviceVec,
-    pub sin_cache: DeviceVec,
+    cos_cache: DeviceVec,
+    sin_cache: DeviceVec,
     // Persistent decode state (reused across generate calls for CUDA Graph replay)
     decode_bufs: Option<DecodeBuffers>,
     kv_cache: Option<KVCache>,
@@ -89,9 +89,9 @@ pub struct Qwen3Model {
 
 /// Streaming generation summary for transport layers.
 pub struct StreamingStats {
-    pub emitted_tokens: usize,
-    pub hit_eos: bool,
-    pub consumer_dropped: bool,
+    pub(crate) emitted_tokens: usize,
+    pub(crate) hit_eos: bool,
+    pub(crate) consumer_dropped: bool,
 }
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -140,10 +140,6 @@ impl PrefillBuffers {
 }
 
 impl Qwen3Model {
-    pub fn from_safetensors(model_path: &str) -> Result<Self> {
-        Self::from_safetensors_with_runtime(model_path, ModelRuntimeConfig::default())
-    }
-
     pub fn from_safetensors_with_runtime(
         model_path: &str,
         runtime: ModelRuntimeConfig,
@@ -369,19 +365,6 @@ impl Qwen3Model {
 
         self.ctx.sync()?;
         Ok(())
-    }
-
-    /// Forward pass returning final logits (for accuracy testing).
-    pub fn forward_logits(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let mut kv_cache = KVCache::new(
-            self.config.num_hidden_layers,
-            self.config.num_key_value_heads,
-        );
-        let start_pos = kv_cache.len();
-        let hidden = self.get_embeddings_batch(token_ids)?;
-        let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
-        let logits = self.compute_logits_batch(&hidden)?;
-        logits.to_host(&self.ctx)
     }
 
     // ============================================================
@@ -1097,25 +1080,5 @@ impl Qwen3Model {
             hit_eos,
             consumer_dropped: false,
         })
-    }
-
-    /// Like `generate`, but sends each new token through `tx` as it's produced.
-    /// The caller receives tokens via the corresponding `mpsc::Receiver`.
-    pub fn generate_streaming(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        tx: tokio::sync::mpsc::UnboundedSender<u32>,
-    ) -> Result<()> {
-        let _ = self.generate_streaming_with_callback(
-            prompt_tokens,
-            max_new_tokens,
-            params,
-            rng,
-            |token_id| tx.send(token_id).is_ok(),
-        )?;
-        Ok(())
     }
 }

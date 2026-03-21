@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayerType {
+pub(crate) enum LayerType {
     FullAttention,
     LinearAttention,
 }
@@ -32,7 +32,6 @@ struct TextConfig {
     linear_value_head_dim: usize,
     rope_parameters: RopeParameters,
     eos_token_id: u32,
-    tie_word_embeddings: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,39 +41,37 @@ struct RawConfig {
 
 /// Qwen3.5 model configuration (text-only).
 #[derive(Debug)]
-pub struct Config35 {
+pub(crate) struct Config35 {
     // Common
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub vocab_size: usize,
-    pub rms_norm_eps: f32,
-    pub tie_word_embeddings: bool,
-    pub eos_token_id: u32,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) eos_token_id: u32,
 
     // Full attention params
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
 
     // Linear attention params
-    pub linear_num_key_heads: usize,
-    pub linear_key_head_dim: usize,
-    pub linear_num_value_heads: usize,
-    pub linear_value_head_dim: usize,
-    pub linear_conv_kernel_dim: usize,
+    pub(crate) linear_num_key_heads: usize,
+    pub(crate) linear_key_head_dim: usize,
+    pub(crate) linear_num_value_heads: usize,
+    pub(crate) linear_value_head_dim: usize,
+    pub(crate) linear_conv_kernel_dim: usize,
 
     // RoPE
-    pub rope_theta: f32,
-    pub partial_rotary_factor: f32,
-    pub rotary_dim: usize,
+    pub(crate) rope_theta: f32,
+    pub(crate) rotary_dim: usize,
 
     // Layer layout
-    pub layer_types: Vec<LayerType>,
+    pub(crate) layer_types: Vec<LayerType>,
 }
 
 impl Config35 {
-    pub fn from_file(model_path: &str) -> Result<Self> {
+    pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
@@ -97,7 +94,6 @@ impl Config35 {
             t.num_hidden_layers
         );
 
-        let partial_rotary_factor = t.rope_parameters.partial_rotary_factor as f32;
         let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
 
         Ok(Self {
@@ -106,7 +102,6 @@ impl Config35 {
             num_hidden_layers: t.num_hidden_layers,
             vocab_size: t.vocab_size,
             rms_norm_eps: t.rms_norm_eps as f32,
-            tie_word_embeddings: t.tie_word_embeddings,
             eos_token_id: t.eos_token_id,
             num_attention_heads: t.num_attention_heads,
             num_key_value_heads: t.num_key_value_heads,
@@ -117,14 +112,13 @@ impl Config35 {
             linear_value_head_dim: t.linear_value_head_dim,
             linear_conv_kernel_dim: t.linear_conv_kernel_dim,
             rope_theta: t.rope_parameters.rope_theta as f32,
-            partial_rotary_factor,
             rotary_dim,
             layer_types,
         })
     }
 
     /// Number of full attention layers in the model.
-    pub fn num_full_attention_layers(&self) -> usize {
+    pub(crate) fn num_full_attention_layers(&self) -> usize {
         self.layer_types
             .iter()
             .filter(|&&t| t == LayerType::FullAttention)
@@ -132,22 +126,22 @@ impl Config35 {
     }
 
     /// Total Q dimension for full attention (includes gate).
-    pub fn full_attn_q_proj_dim(&self) -> usize {
+    pub(crate) fn full_attn_q_proj_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim * 2
     }
 
     /// Q dimension for full attention (without gate).
-    pub fn full_attn_q_dim(&self) -> usize {
+    pub(crate) fn full_attn_q_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim
     }
 
     /// KV dimension for full attention.
-    pub fn full_attn_kv_dim(&self) -> usize {
+    pub(crate) fn full_attn_kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
     }
 
     /// QKV projection output dimension for linear attention.
-    pub fn linear_attn_qkv_dim(&self) -> usize {
+    pub(crate) fn linear_attn_qkv_dim(&self) -> usize {
         let q_dim = self.linear_num_key_heads * self.linear_key_head_dim;
         let k_dim = q_dim;
         let v_dim = self.linear_num_value_heads * self.linear_value_head_dim;
@@ -155,7 +149,7 @@ impl Config35 {
     }
 
     /// Z projection output dimension for linear attention.
-    pub fn linear_attn_z_dim(&self) -> usize {
+    pub(crate) fn linear_attn_z_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
     }
 }
@@ -176,7 +170,6 @@ mod tests {
         assert_eq!(config.vocab_size, 248320);
         assert_eq!(config.rms_norm_eps, 1e-6);
         assert_eq!(config.eos_token_id, 248044);
-        assert!(config.tie_word_embeddings);
 
         // Full attention
         assert_eq!(config.num_attention_heads, 16);
@@ -192,7 +185,6 @@ mod tests {
 
         // RoPE
         assert_eq!(config.rope_theta, 1e7);
-        assert_eq!(config.partial_rotary_factor, 0.25);
         assert_eq!(config.rotary_dim, 64);
     }
 

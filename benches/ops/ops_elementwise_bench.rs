@@ -5,11 +5,11 @@ use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
-    EPS, HEAD_DIM_128, INTERMEDIATE_DIM, OUT_DIM, ROPE_THETA_QWEN3, VECTOR_DIM, configure_group,
-    device_matrix, device_vec, iter_sync, positive_device_vec, rope_cache,
+    EPS, INTERMEDIATE_DIM, OUT_DIM, VECTOR_DIM, configure_group, device_matrix, device_vec,
+    iter_sync, positive_device_vec,
 };
 
-pub fn bench_elementwise_ops(c: &mut Criterion) {
+pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("ops_elementwise");
     configure_group(&mut group);
 
@@ -60,39 +60,6 @@ pub fn bench_elementwise_ops(c: &mut Criterion) {
                 &mut mlp_out,
             )
             .expect("fused_mlp_into failed");
-        });
-    });
-
-    group.throughput(Throughput::Elements(HEAD_DIM_128 as u64));
-    group.bench_function(BenchmarkId::new("rope", HEAD_DIM_128), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let rope_x = device_vec(&ctx, HEAD_DIM_128).expect("failed to allocate rope x");
-        let (rope_cos, rope_sin) = rope_cache(&ctx, 1, HEAD_DIM_128, ROPE_THETA_QWEN3)
-            .expect("failed to create rope cache");
-        iter_sync(b, &ctx, || {
-            let out = ops::rope(&ctx, &rope_x, &rope_cos, &rope_sin).expect("rope failed");
-            black_box(out);
-        });
-    });
-
-    group.throughput(Throughput::Elements(VECTOR_DIM as u64));
-    group.bench_function(BenchmarkId::new("add", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let add_a = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add lhs");
-        let add_b = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add rhs");
-        iter_sync(b, &ctx, || {
-            let out = ops::add(&ctx, &add_a, &add_b).expect("add failed");
-            black_box(out);
-        });
-    });
-
-    group.throughput(Throughput::Elements(VECTOR_DIM as u64));
-    group.bench_function(BenchmarkId::new("add_inplace", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let mut add_a = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add lhs");
-        let add_b = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add rhs");
-        iter_sync(b, &ctx, || {
-            ops::add_inplace(&ctx, &mut add_a, &add_b).expect("add_inplace failed");
         });
     });
 

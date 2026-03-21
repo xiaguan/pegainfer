@@ -7,7 +7,7 @@ use super::common::{
     device_vec, f32_slice, hidden_states, iter_sync, positive_device_vec,
 };
 
-pub fn bench_qwen35_norm_ops(c: &mut Criterion) {
+pub(crate) fn bench_qwen35_norm_ops(c: &mut Criterion) {
     // rms_norm_offset / fused_add_rms_norm_offset operate on hidden states (dim=2560)
     let hidden = QWEN35_4B_HIDDEN;
     // rms_norm_gated operates on linear attention value heads (32 heads × 128 dim = 4096)

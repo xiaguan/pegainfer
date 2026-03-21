@@ -49,7 +49,7 @@ pub struct GdrChunkwiseScratch35 {
 impl GdrChunkwiseScratch35 {
     pub const CHUNK_SIZE: usize = 64;
 
-    pub fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
         Self::from_dims(
             ctx,
             config.linear_num_value_heads,

@@ -76,7 +76,7 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    pub fn as_openai_str(self) -> &'static str {
+    pub(crate) fn as_openai_str(self) -> &'static str {
         match self {
             Self::Length => "length",
             Self::Stop => "stop",

@@ -18,7 +18,7 @@ pub struct Tokenizer {
     inner: HfTokenizer,
 }
 
-pub struct IncrementalDecoder<'a> {
+pub(crate) struct IncrementalDecoder<'a> {
     tokenizer: &'a Tokenizer,
     inner: InnerDecodeStream<'a>,
     token_ids: Vec<u32>,
@@ -41,13 +41,13 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
-    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+    pub(crate) fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("Decode error: {}", e))
     }
 
-    pub fn incremental_decoder(&self) -> IncrementalDecoder<'_> {
+    pub(crate) fn incremental_decoder(&self) -> IncrementalDecoder<'_> {
         IncrementalDecoder {
             tokenizer: self,
             inner: self.inner.decode_stream(true),
@@ -62,7 +62,7 @@ impl Tokenizer {
 }
 
 impl<'a> IncrementalDecoder<'a> {
-    pub fn step(&mut self, token_id: u32) -> Result<Option<String>> {
+    pub(crate) fn step(&mut self, token_id: u32) -> Result<Option<String>> {
         self.token_ids.push(token_id);
         let chunk = self
             .inner
@@ -77,11 +77,11 @@ impl<'a> IncrementalDecoder<'a> {
     }
 
     /// Text emitted so far by `step()` (and `finish()`). Used for stop-sequence checks.
-    pub fn emitted_text(&self) -> &str {
+    pub(crate) fn emitted_text(&self) -> &str {
         &self.emitted_text
     }
 
-    pub fn finish(&mut self) -> Result<Option<String>> {
+    pub(crate) fn finish(&mut self) -> Result<Option<String>> {
         let decoded = self.tokenizer.decode(&self.token_ids)?;
         let suffix = decoded.strip_prefix(&self.emitted_text).ok_or_else(|| {
             anyhow!(

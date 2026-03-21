@@ -32,7 +32,11 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
 }
 
 /// Linear layer: y = weight @ x
-pub fn linear(ctx: &DeviceContext, x: &DeviceVec, weight: &DeviceMatrix) -> Result<DeviceVec> {
+pub(crate) fn linear(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    weight: &DeviceMatrix,
+) -> Result<DeviceVec> {
     let mut y = DeviceVec::zeros(ctx, weight.rows)?;
     gemv(ctx, weight, x, &mut y)?;
     Ok(y)
@@ -67,7 +71,7 @@ pub fn rms_norm_into(
 }
 
 /// RMSNorm (allocating)
-pub fn rms_norm(
+pub(crate) fn rms_norm(
     ctx: &DeviceContext,
     x: &DeviceVec,
     weight: &DeviceVec,
@@ -128,71 +132,6 @@ pub fn fused_mlp_into(
     Ok(())
 }
 
-/// Fully fused MLP (allocating)
-pub fn fused_mlp(
-    ctx: &DeviceContext,
-    x: &DeviceVec,
-    gate_proj: &DeviceMatrix,
-    up_proj: &DeviceMatrix,
-    down_proj: &DeviceMatrix,
-) -> Result<DeviceVec> {
-    let mut act = DeviceVec::zeros(ctx, gate_proj.rows)?;
-    let mut out = DeviceVec::zeros(ctx, down_proj.rows)?;
-    fused_mlp_into(ctx, x, gate_proj, up_proj, down_proj, &mut act, &mut out)?;
-    Ok(out)
-}
-
-/// RoPE
-pub fn rope(
-    ctx: &DeviceContext,
-    x: &DeviceVec,
-    cos: &DeviceVec,
-    sin: &DeviceVec,
-) -> Result<DeviceVec> {
-    let mut out = DeviceVec::zeros(ctx, x.len)?;
-
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gc) = cos.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gs) = sin.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::rope_cuda(
-                x_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-/// Element-wise add in-place: a += b
-pub fn add_inplace(ctx: &DeviceContext, a: &mut DeviceVec, b: &DeviceVec) -> Result<()> {
-    assert_eq!(a.len, b.len);
-
-    let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
-    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
-
-    let result = unsafe {
-        ffi::add_cuda(
-            a_ptr as *const ffi::Half,
-            b_ptr as *const ffi::Half,
-            a_ptr as *mut ffi::Half,
-            a.len as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-
-    Ok(())
-}
-
 /// Fused add + RMSNorm: hidden += residual; out = rms_norm(hidden, weight)
 /// Saves one global read of hidden compared to separate add + rms_norm.
 pub fn fused_add_rms_norm_into(
@@ -224,64 +163,6 @@ pub fn fused_add_rms_norm_into(
     }
 
     Ok(())
-}
-
-/// Element-wise add (allocating)
-pub fn add(ctx: &DeviceContext, a: &DeviceVec, b: &DeviceVec) -> Result<DeviceVec> {
-    assert_eq!(a.len, b.len);
-    let mut out = DeviceVec::zeros(ctx, a.len)?;
-
-    {
-        let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
-        let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        let result = unsafe {
-            ffi::add_cuda(
-                a_ptr as *const ffi::Half,
-                b_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                a.len as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-
-    Ok(out)
-}
-
-/// Embedding lookup into pre-allocated output buffer
-pub fn embedding_into(
-    ctx: &DeviceContext,
-    embed: &DeviceMatrix,
-    token_id: u32,
-    out: &mut DeviceVec,
-) -> Result<()> {
-    assert_eq!(embed.cols, out.len);
-
-    let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-    let result = unsafe {
-        ffi::embedding_cuda(
-            embed_ptr as *const ffi::Half,
-            token_id as i32,
-            out_ptr as *mut ffi::Half,
-            embed.cols as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-
-    Ok(())
-}
-
-/// Embedding lookup (allocating)
-pub fn embedding(ctx: &DeviceContext, embed: &DeviceMatrix, token_id: u32) -> Result<DeviceVec> {
-    let mut out = DeviceVec::zeros(ctx, embed.cols)?;
-    embedding_into(ctx, embed, token_id, &mut out)?;
-    Ok(out)
 }
 
 /// Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
@@ -393,68 +274,6 @@ pub fn gpu_sample(
     Ok(result[0] as u32)
 }
 
-/// Attention scores: scores[i] = q @ k_cache[i] * scale
-pub fn attention_scores(
-    ctx: &DeviceContext,
-    q: &DeviceVec,
-    k_cache: &DeviceVec, // Flattened (seq_len * head_dim)
-    seq_len: usize,
-    head_dim: usize,
-    scale: f32,
-) -> Result<DeviceVec> {
-    let mut scores = DeviceVec::zeros(ctx, seq_len)?;
-
-    {
-        let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
-        let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
-        let (scores_ptr, _gs) = scores.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::attention_scores_cuda(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                scores_ptr as *mut ffi::Half,
-                seq_len as i32,
-                head_dim as i32,
-                scale,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    Ok(scores)
-}
-
-/// Attention weighted sum: out = sum(weights[i] * v_cache[i])
-pub fn attention_weighted_sum(
-    ctx: &DeviceContext,
-    weights: &DeviceVec, // (seq_len,)
-    v_cache: &DeviceVec, // Flattened (seq_len * head_dim)
-    seq_len: usize,
-    head_dim: usize,
-) -> Result<DeviceVec> {
-    let mut out = DeviceVec::zeros(ctx, head_dim)?;
-
-    {
-        let (w_ptr, _gw) = weights.data.device_ptr(&ctx.stream);
-        let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::attention_weighted_sum_cuda(
-                w_ptr as *const ffi::Half,
-                v_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                seq_len as i32,
-                head_dim as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
 /// Fused GQA Attention (single token generation)
 ///
 /// 融合所有 attention 操作：
@@ -479,65 +298,6 @@ pub fn attention_weighted_sum(
 /// Fused GQA Attention into pre-allocated output buffer
 /// Fused GQA Attention into pre-allocated output buffer.
 /// cos_pos/sin_pos: RoPE values for the current position (head_dim elements).
-#[allow(clippy::too_many_arguments)]
-pub fn fused_attention_into(
-    ctx: &DeviceContext,
-    q_full: &DeviceVec,
-    k_full: &DeviceVec,
-    v_full: &DeviceVec,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_pos: &DeviceVecView<'_>,
-    sin_pos: &DeviceVecView<'_>,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    output: &mut DeviceVec,
-    num_qheads: usize,
-    num_kvheads: usize,
-    head_dim: usize,
-    current_pos: usize,
-    seq_len: usize,
-    scale: f32,
-    rms_eps: f32,
-) -> Result<()> {
-    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
-    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
-    let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gcos) = cos_pos.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gsin) = sin_pos.data.device_ptr(&ctx.stream);
-    let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-    let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::fused_gqa_attention_single_token(
-            q_ptr as *const ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            q_norm_ptr as *const ffi::Half,
-            k_norm_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            k_cache_ptr as *mut ffi::Half,
-            v_cache_ptr as *mut ffi::Half,
-            out_ptr as *mut ffi::Half,
-            num_qheads as i32,
-            num_kvheads as i32,
-            (num_qheads / num_kvheads) as i32,
-            head_dim as i32,
-            current_pos as i32,
-            seq_len as i32,
-            scale,
-            rms_eps,
-            ctx.stream.cu_stream(),
-        );
-    }
-
-    Ok(())
-}
-
 /// Batched prefill attention with FlashAttention-2.
 ///
 /// Pipeline:
@@ -626,7 +386,7 @@ pub fn prefill_attention_batch(
 /// FlashAttention-2 prefill for HEAD_DIM=256 with precomputed Q and KV cache.
 /// Q / output layout: HiddenStates [q_dim, seq_len] in column-major token-major storage.
 #[allow(clippy::too_many_arguments)]
-pub fn flash_attention_prefill_hd256_into(
+fn flash_attention_prefill_hd256_into(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
     k_cache: &DeviceVec,
@@ -763,51 +523,6 @@ pub fn prefill_attention_hd256_batch(
     Ok(())
 }
 
-/// Fused GQA Attention (allocating)
-#[allow(clippy::too_many_arguments)]
-pub fn fused_attention(
-    ctx: &DeviceContext,
-    q_full: &DeviceVec,
-    k_full: &DeviceVec,
-    v_full: &DeviceVec,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_pos: &DeviceVecView<'_>,
-    sin_pos: &DeviceVecView<'_>,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    num_qheads: usize,
-    num_kvheads: usize,
-    head_dim: usize,
-    current_pos: usize,
-    seq_len: usize,
-    scale: f32,
-    rms_eps: f32,
-) -> Result<DeviceVec> {
-    let mut output = DeviceVec::zeros(ctx, num_qheads * head_dim)?;
-    fused_attention_into(
-        ctx,
-        q_full,
-        k_full,
-        v_full,
-        q_norm_weight,
-        k_norm_weight,
-        cos_pos,
-        sin_pos,
-        k_cache,
-        v_cache,
-        &mut output,
-        num_qheads,
-        num_kvheads,
-        head_dim,
-        current_pos,
-        seq_len,
-        scale,
-        rms_eps,
-    )?;
-    Ok(output)
-}
-
 /// Fused GQA Attention for decode (Triton AOT, split-KV, HEAD_DIM=128).
 /// Reads pos/seq_len from decode_meta — CUDA Graph safe.
 /// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
@@ -901,7 +616,7 @@ pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Res
 }
 
 /// GEMM into pre-allocated output buffer (zero allocation).
-pub fn gemm_into(
+pub(crate) fn gemm_into(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,
@@ -942,20 +657,8 @@ pub fn gemm_into(
     Ok(())
 }
 
-/// Batched RMSNorm: normalize each token's hidden state independently
-pub fn rms_norm_batch(
-    ctx: &DeviceContext,
-    x: &HiddenStates,
-    weight: &DeviceVec,
-    eps: f32,
-) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, x.hidden_dim, x.seq_len)?;
-    rms_norm_batch_into(ctx, x, weight, eps, &mut out)?;
-    Ok(out)
-}
-
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).
-pub fn rms_norm_batch_into(
+pub(crate) fn rms_norm_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &DeviceVec,
@@ -993,7 +696,7 @@ pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Res
 }
 
 /// Batched element-wise add into pre-allocated output buffer (zero allocation).
-pub fn add_batch_into(
+pub(crate) fn add_batch_into(
     ctx: &DeviceContext,
     a: &HiddenStates,
     b: &HiddenStates,
@@ -1035,7 +738,7 @@ pub fn silu_mul_batch(
 }
 
 /// Batched SiLU+mul into pre-allocated output buffer (zero allocation).
-pub fn silu_mul_batch_into(
+pub(crate) fn silu_mul_batch_into(
     ctx: &DeviceContext,
     gate: &HiddenStates,
     up: &HiddenStates,
@@ -1092,7 +795,7 @@ pub fn embedding_batch(
 }
 
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
-pub fn extract_vec(
+pub(crate) fn extract_vec(
     ctx: &DeviceContext,
     batch: &HiddenStates,
     token_idx: usize,
@@ -1107,23 +810,6 @@ pub fn extract_vec(
         .map_err(|e| anyhow!("Device copy failed: {}", e))?;
 
     Ok(out)
-}
-
-/// Write a single token's vector into a HiddenStates batch (GPU copy)
-pub fn write_vec(
-    ctx: &DeviceContext,
-    batch: &mut HiddenStates,
-    token_idx: usize,
-    vec: &DeviceVec,
-) -> Result<()> {
-    let offset = token_idx * batch.hidden_dim;
-    let mut dst_view = batch.data.slice_mut(offset..offset + vec.len);
-
-    ctx.stream
-        .memcpy_dtod(&vec.data, &mut dst_view)
-        .map_err(|e| anyhow!("Device copy failed: {}", e))?;
-
-    Ok(())
 }
 
 // ============================================================
@@ -1262,7 +948,7 @@ pub fn rms_norm_gated_into(
 /// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
 #[allow(clippy::too_many_arguments)]
-pub fn rms_norm_gated_batch_into(
+pub(crate) fn rms_norm_gated_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &CudaSlice<f32>,
@@ -1337,7 +1023,7 @@ pub fn conv1d_decode_into(
 
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
 #[allow(clippy::too_many_arguments)]
-pub fn conv1d_prefill_batch_into(
+pub(crate) fn conv1d_prefill_batch_into(
     ctx: &DeviceContext,
     x_seq: &HiddenStates,
     conv_weight: &DeviceVec,
@@ -1787,7 +1473,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
 /// q_full: interleaved [head0_q(256), head0_gate(256), head1_q(256), ...] = [num_qheads * 2 * 256]
 /// Output already gated: output *= sigmoid(gate).
 #[allow(clippy::too_many_arguments)]
-pub fn fused_attention_hd256_decode_into(
+pub(crate) fn fused_attention_hd256_decode_into(
     ctx: &DeviceContext,
     q_full: &DeviceVec,
     k_full: &DeviceVec,
@@ -1837,42 +1523,6 @@ pub fn fused_attention_hd256_decode_into(
             rotary_dim as i32,
             scale,
             rms_eps,
-            ctx.stream.cu_stream(),
-        );
-    }
-
-    Ok(())
-}
-
-/// Causal depthwise conv1d prefill (parallel over sequence).
-#[allow(clippy::too_many_arguments)]
-pub fn conv1d_prefill_into(
-    ctx: &DeviceContext,
-    x_seq: &DeviceVec,
-    conv_weight: &DeviceVec,
-    conv_state: &mut DeviceVec,
-    out_seq: &mut DeviceVec,
-    num_channels: usize,
-    seq_len: usize,
-    kernel_size: usize,
-) -> Result<()> {
-    assert_eq!(x_seq.len, num_channels * seq_len);
-    assert_eq!(out_seq.len, num_channels * seq_len);
-
-    let (x_ptr, _gx) = x_seq.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
-    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
-    let (o_ptr, _go) = out_seq.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::conv1d_prefill_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            s_ptr as *mut ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_channels as i32,
-            seq_len as i32,
-            kernel_size as i32,
             ctx.stream.cu_stream(),
         );
     }
@@ -2022,7 +1672,8 @@ mod tests {
             seq_len,
         };
         let weight = DeviceVec::from_host(&ctx, &w_host)?;
-        let out = rms_norm_batch(&ctx, &x, &weight, 1e-6)?;
+        let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
+        rms_norm_batch_into(&ctx, &x, &weight, 1e-6, &mut out)?;
 
         let result = ctx
             .stream
@@ -2065,99 +1716,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rope() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-
-        // Simple test: x = [1, 0, 1, 0], cos = [1, 1, 1, 1], sin = [0, 0, 0, 0]
-        // With sin=0, cos=1, output should equal input
-        let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 0.0, 1.0, 0.0]))?;
-        let cos = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 1.0, 1.0, 1.0]))?;
-        let sin = DeviceVec::from_host(&ctx, &bf16_vec(&[0.0, 0.0, 0.0, 0.0]))?;
-        let out = rope(&ctx, &x, &cos, &sin)?;
-
-        let result = out.to_host(&ctx)?;
-
-        assert!(
-            (result[0] - 1.0).abs() < 0.01,
-            "Expected 1.0, got {}",
-            result[0]
-        );
-        assert!(
-            (result[1] - 0.0).abs() < 0.01,
-            "Expected 0.0, got {}",
-            result[1]
-        );
-        assert!(
-            (result[2] - 1.0).abs() < 0.01,
-            "Expected 1.0, got {}",
-            result[2]
-        );
-        assert!(
-            (result[3] - 0.0).abs() < 0.01,
-            "Expected 0.0, got {}",
-            result[3]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_and_add_inplace() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-        let a = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
-        let b = DeviceVec::from_host(&ctx, &bf16_vec(&[0.5, -1.0, 2.5, 3.0]))?;
-
-        let out = add(&ctx, &a, &b)?;
-        let result = out.to_host(&ctx)?;
-        assert!(
-            (result[0] - 1.5).abs() < 0.01,
-            "Expected 1.5, got {}",
-            result[0]
-        );
-        assert!(
-            (result[1] - 1.0).abs() < 0.01,
-            "Expected 1.0, got {}",
-            result[1]
-        );
-        assert!(
-            (result[2] - 5.5).abs() < 0.01,
-            "Expected 5.5, got {}",
-            result[2]
-        );
-        assert!(
-            (result[3] - 7.0).abs() < 0.01,
-            "Expected 7.0, got {}",
-            result[3]
-        );
-
-        let mut inplace = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
-        add_inplace(&ctx, &mut inplace, &b)?;
-        let inplace_result = inplace.to_host(&ctx)?;
-        assert!(
-            (inplace_result[0] - 1.5).abs() < 0.01,
-            "Expected 1.5, got {}",
-            inplace_result[0]
-        );
-        assert!(
-            (inplace_result[1] - 1.0).abs() < 0.01,
-            "Expected 1.0, got {}",
-            inplace_result[1]
-        );
-        assert!(
-            (inplace_result[2] - 5.5).abs() < 0.01,
-            "Expected 5.5, got {}",
-            inplace_result[2]
-        );
-        assert!(
-            (inplace_result[3] - 7.0).abs() < 0.01,
-            "Expected 7.0, got {}",
-            inplace_result[3]
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn test_embedding_variants() -> Result<()> {
         let ctx = DeviceContext::new()?;
         let embed = DeviceMatrix::from_host(
@@ -2168,19 +1726,6 @@ mod tests {
             3,
             4,
         )?;
-
-        let single = embedding(&ctx, &embed, 2)?;
-        let single_host = single.to_host(&ctx)?;
-        assert!(
-            (single_host[0] - 9.0).abs() < 0.01,
-            "Expected 9.0, got {}",
-            single_host[0]
-        );
-        assert!(
-            (single_host[3] - 12.0).abs() < 0.01,
-            "Expected 12.0, got {}",
-            single_host[3]
-        );
 
         let decode_meta = ctx.stream.clone_htod(&[1_i32])?;
         let mut decode_out = DeviceVec::zeros(&ctx, 4)?;
@@ -2221,114 +1766,6 @@ mod tests {
             (batch_host[7].to_f32() - 4.0).abs() < 0.01,
             "Expected 4.0, got {}",
             batch_host[7]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_extract_write_vec_roundtrip() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-        let batch = HiddenStates {
-            data: ctx
-                .stream
-                .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))?,
-            hidden_dim: 3,
-            seq_len: 2,
-        };
-
-        let extracted = extract_vec(&ctx, &batch, 1)?;
-        let extracted_host = extracted.to_host(&ctx)?;
-        assert!(
-            (extracted_host[0] - 4.0).abs() < 0.01,
-            "Expected 4.0, got {}",
-            extracted_host[0]
-        );
-        assert!(
-            (extracted_host[2] - 6.0).abs() < 0.01,
-            "Expected 6.0, got {}",
-            extracted_host[2]
-        );
-
-        let replacement = DeviceVec::from_host(&ctx, &bf16_vec(&[7.0, 8.0, 9.0]))?;
-        let mut batch = batch;
-        write_vec(&ctx, &mut batch, 0, &replacement)?;
-        let batch_host = ctx.stream.clone_dtoh(&batch.data)?;
-        ctx.sync()?;
-        assert!(
-            (batch_host[0].to_f32() - 7.0).abs() < 0.01,
-            "Expected 7.0, got {}",
-            batch_host[0]
-        );
-        assert!(
-            (batch_host[2].to_f32() - 9.0).abs() < 0.01,
-            "Expected 9.0, got {}",
-            batch_host[2]
-        );
-        assert!(
-            (batch_host[3].to_f32() - 4.0).abs() < 0.01,
-            "Expected 4.0, got {}",
-            batch_host[3]
-        );
-        assert!(
-            (batch_host[5].to_f32() - 6.0).abs() < 0.01,
-            "Expected 6.0, got {}",
-            batch_host[5]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_attention_scores() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-
-        // q = [1, 0], k_cache = [[1, 0], [0, 1]] (2 positions, head_dim=2)
-        // scores = [q @ k[0], q @ k[1]] = [1*1+0*0, 1*0+0*1] = [1, 0]
-        // with scale=1
-        let q = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 0.0]))?;
-        let k_cache = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 0.0, 0.0, 1.0]))?; // flattened
-
-        let scores = attention_scores(&ctx, &q, &k_cache, 2, 2, 1.0)?;
-
-        let result = scores.to_host(&ctx)?;
-
-        assert!(
-            (result[0] - 1.0).abs() < 0.01,
-            "Expected 1.0, got {}",
-            result[0]
-        );
-        assert!(
-            (result[1] - 0.0).abs() < 0.01,
-            "Expected 0.0, got {}",
-            result[1]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_attention_weighted_sum() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-
-        // weights = [0.5, 0.5], v_cache = [[1, 2], [3, 4]]
-        // out = 0.5 * [1, 2] + 0.5 * [3, 4] = [2, 3]
-        let weights = DeviceVec::from_host(&ctx, &bf16_vec(&[0.5, 0.5]))?;
-        let v_cache = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?;
-
-        let out = attention_weighted_sum(&ctx, &weights, &v_cache, 2, 2)?;
-
-        let result = out.to_host(&ctx)?;
-
-        assert!(
-            (result[0] - 2.0).abs() < 0.01,
-            "Expected 2.0, got {}",
-            result[0]
-        );
-        assert!(
-            (result[1] - 3.0).abs() < 0.01,
-            "Expected 3.0, got {}",
-            result[1]
         );
 
         Ok(())
@@ -2816,7 +2253,11 @@ mod tests {
                 key_dim,
                 val_dim,
             )?;
-            write_vec(&ctx, &mut out_decode, t, &out_t)?;
+            let offset = t * out_dim;
+            let mut dst_view = out_decode.data.slice_mut(offset..offset + out_dim);
+            ctx.stream
+                .memcpy_dtod(&out_t.data, &mut dst_view)
+                .map_err(|e| anyhow!("Device copy failed: {}", e))?;
         }
 
         let out_prefill_host = ctx.stream.clone_dtoh(&out_prefill.data)?;

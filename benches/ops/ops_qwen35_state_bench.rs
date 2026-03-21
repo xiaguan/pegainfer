@@ -4,14 +4,14 @@ use pegainfer::prefill_buffers35::GdrChunkwiseScratch35;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
-    ATTN_SEQ_LEN, CONV_KERNEL_SIZE, EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS,
+    CONV_KERNEL_SIZE, EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS,
     QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
     QWEN35_4B_LINEAR_V_HEADS, QWEN35_4B_Q_HEADS, QWEN35_4B_ROPE_THETA, QWEN35_4B_ROTARY_DIM,
     configure_group, device_vec, f32_slice, hidden_states, iter_sync, positive_device_vec,
     rope_cache, zero_f32_slice,
 };
 
-pub fn bench_qwen35_state_ops(c: &mut Criterion) {
+pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
     // Qwen3.5-4B linear attention: q=16×128, k=16×128, v=32×128
     let conv_channels = QWEN35_4B_LINEAR_K_HEADS * QWEN35_4B_LINEAR_K_DIM * 2
         + QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM;
@@ -39,32 +39,6 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
                 CONV_KERNEL_SIZE,
             )
             .expect("conv1d_decode_into failed");
-        });
-    });
-
-    group.throughput(Throughput::Elements((conv_channels * ATTN_SEQ_LEN) as u64));
-    group.bench_function(BenchmarkId::new("conv1d_prefill_into", ATTN_SEQ_LEN), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let x_seq =
-            device_vec(&ctx, conv_channels * ATTN_SEQ_LEN).expect("failed to allocate conv seq");
-        let conv_weight = device_vec(&ctx, conv_channels * CONV_KERNEL_SIZE)
-            .expect("failed to allocate conv weight");
-        let mut conv_state_prefill = DeviceVec::zeros(&ctx, conv_channels * (CONV_KERNEL_SIZE - 1))
-            .expect("failed to allocate prefill conv state");
-        let mut conv_prefill_out = DeviceVec::zeros(&ctx, conv_channels * ATTN_SEQ_LEN)
-            .expect("failed to allocate prefill conv out");
-        iter_sync(b, &ctx, || {
-            ops::conv1d_prefill_into(
-                &ctx,
-                &x_seq,
-                &conv_weight,
-                &mut conv_state_prefill,
-                &mut conv_prefill_out,
-                conv_channels,
-                ATTN_SEQ_LEN,
-                CONV_KERNEL_SIZE,
-            )
-            .expect("conv1d_prefill_into failed");
         });
     });
 
@@ -172,7 +146,7 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
 /// Qwen3.5 full-attention prefill microbench on the Triton path.
 ///
 /// This includes Q/K prep, KV cache write, Triton attention, and output gating.
-pub fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
+pub(crate) fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
     let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
     let q_full_dim = q_dim * 2;
     let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;

@@ -33,73 +33,73 @@ struct CudaGraphState35 {
 unsafe impl Send for CudaGraphState35 {}
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
-pub struct FullAttentionLayer {
+struct FullAttentionLayer {
     /// Q projection including gate: [num_heads * head_dim * 2, hidden_size]
-    pub q_proj: DeviceMatrix,
+    q_proj: DeviceMatrix,
     /// K projection: [num_kv_heads * head_dim, hidden_size]
-    pub k_proj: DeviceMatrix,
+    k_proj: DeviceMatrix,
     /// V projection: [num_kv_heads * head_dim, hidden_size]
-    pub v_proj: DeviceMatrix,
+    v_proj: DeviceMatrix,
     /// Output projection: [hidden_size, num_heads * head_dim]
-    pub o_proj: DeviceMatrix,
+    o_proj: DeviceMatrix,
     /// QK norm weights: [head_dim] (broadcast to all heads)
-    pub q_norm: DeviceVec,
-    pub k_norm: DeviceVec,
+    q_norm: DeviceVec,
+    k_norm: DeviceVec,
 }
 
 /// Linear attention layer weights (24 layers in Qwen3.5-4B).
-pub struct LinearAttentionLayer {
+struct LinearAttentionLayer {
     /// Fused QKV projection: [q_dim + k_dim + v_dim, hidden_size]
-    pub in_proj_qkv: DeviceMatrix,
+    in_proj_qkv: DeviceMatrix,
     /// Z projection (for output gating): [z_dim, hidden_size]
-    pub in_proj_z: DeviceMatrix,
+    in_proj_z: DeviceMatrix,
     /// Beta projection: [num_value_heads, hidden_size]
-    pub in_proj_b: DeviceMatrix,
+    in_proj_b: DeviceMatrix,
     /// Alpha projection: [num_value_heads, hidden_size]
-    pub in_proj_a: DeviceMatrix,
+    in_proj_a: DeviceMatrix,
     /// Depthwise conv1d weight: [qkv_dim * conv_kernel_dim] (flattened from [qkv_dim, 1, 4])
-    pub conv1d_weight: DeviceVec,
+    conv1d_weight: DeviceVec,
     /// dt_bias: [num_value_heads] bf16
-    pub dt_bias: DeviceVec,
+    dt_bias: DeviceVec,
     /// A_log: [num_value_heads] f32
-    pub a_log: CudaSlice<f32>,
+    a_log: CudaSlice<f32>,
     /// RMSNorm weight for output normalization: [value_head_dim] f32
-    pub norm_weight: CudaSlice<f32>,
+    norm_weight: CudaSlice<f32>,
     /// Output projection: [hidden_size, z_dim]
-    pub out_proj: DeviceMatrix,
+    out_proj: DeviceMatrix,
 }
 
 /// Attention layer — either full or linear.
-pub enum LayerKind {
+enum LayerKind {
     FullAttention(FullAttentionLayer),
     LinearAttention(LinearAttentionLayer),
 }
 
 /// MLP layer weights (shared between both layer types).
-pub struct MLP35 {
-    pub gate_proj: DeviceMatrix,
-    pub up_proj: DeviceMatrix,
-    pub down_proj: DeviceMatrix,
+struct MLP35 {
+    gate_proj: DeviceMatrix,
+    up_proj: DeviceMatrix,
+    down_proj: DeviceMatrix,
 }
 
 /// Transformer block for Qwen3.5.
-pub struct TransformerBlock35 {
-    pub input_layernorm: DeviceVec,
-    pub attn: LayerKind,
-    pub post_attention_layernorm: DeviceVec,
-    pub mlp: MLP35,
+struct TransformerBlock35 {
+    input_layernorm: DeviceVec,
+    attn: LayerKind,
+    post_attention_layernorm: DeviceVec,
+    mlp: MLP35,
 }
 
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
-    pub ctx: DeviceContext,
-    pub config: Config35,
-    pub embed_tokens: DeviceMatrix,
-    pub layers: Vec<TransformerBlock35>,
-    pub norm: DeviceVec,
+    ctx: DeviceContext,
+    config: Config35,
+    embed_tokens: DeviceMatrix,
+    layers: Vec<TransformerBlock35>,
+    norm: DeviceVec,
     // Partial RoPE cache: [max_seq_len * rotary_dim]
-    pub cos_cache: DeviceVec,
-    pub sin_cache: DeviceVec,
+    cos_cache: DeviceVec,
+    sin_cache: DeviceVec,
     // Persistent decode state
     decode_bufs: Option<DecodeBuffers35>,
     kv_cache: Option<KVCache>,
@@ -109,7 +109,8 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-    pub fn from_safetensors(model_path: &str) -> Result<Self> {
+    #[cfg(test)]
+    fn from_safetensors(model_path: &str) -> Result<Self> {
         Self::from_safetensors_with_options(model_path, true)
     }
 
@@ -913,7 +914,7 @@ impl Qwen35Model {
     // Generation
     // ========================================================================
 
-    pub fn generate(
+    pub(crate) fn generate(
         &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
@@ -1115,29 +1116,12 @@ impl Qwen35Model {
         })
     }
 
-    pub fn generate_streaming(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        tx: tokio::sync::mpsc::UnboundedSender<u32>,
-    ) -> Result<()> {
-        let _ = self.generate_streaming_with_callback(
-            prompt_tokens,
-            max_new_tokens,
-            params,
-            rng,
-            |token_id| tx.send(token_id).is_ok(),
-        )?;
-        Ok(())
-    }
-
     // ========================================================================
     // Shape verification
     // ========================================================================
 
-    pub fn verify_shapes(&self) -> Result<()> {
+    #[cfg(test)]
+    fn verify_shapes(&self) -> Result<()> {
         let c = &self.config;
 
         assert_shape(
@@ -1265,6 +1249,7 @@ impl Qwen35Model {
     }
 }
 
+#[cfg(test)]
 fn assert_shape(name: &str, m: &DeviceMatrix, rows: usize, cols: usize) -> Result<()> {
     anyhow::ensure!(
         m.rows == rows && m.cols == cols,
@@ -1278,6 +1263,7 @@ fn assert_shape(name: &str, m: &DeviceMatrix, rows: usize, cols: usize) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn assert_vec_len(name: &str, v: &DeviceVec, expected: usize) -> Result<()> {
     anyhow::ensure!(
         v.len == expected,

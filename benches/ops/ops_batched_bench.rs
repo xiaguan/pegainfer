@@ -5,11 +5,10 @@ use pegainfer::ops;
 use pegainfer::tensor::DeviceContext;
 
 use super::common::{
-    BATCH_SEQ_LEN, EPS, OUT_DIM, VECTOR_DIM, configure_group, device_matrix, hidden_states,
-    iter_sync, positive_device_vec,
+    BATCH_SEQ_LEN, OUT_DIM, VECTOR_DIM, configure_group, device_matrix, hidden_states, iter_sync,
 };
 
-pub fn bench_batched_ops(c: &mut Criterion) {
+pub(crate) fn bench_batched_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("ops_batched");
     configure_group(&mut group);
 
@@ -24,20 +23,6 @@ pub fn bench_batched_ops(c: &mut Criterion) {
             hidden_states(&ctx, VECTOR_DIM, BATCH_SEQ_LEN).expect("failed to allocate gemm input");
         iter_sync(b, &ctx, || {
             let out = ops::gemm(&ctx, &gemm_weight, &gemm_x).expect("gemm failed");
-            black_box(out);
-        });
-    });
-
-    group.throughput(Throughput::Elements((VECTOR_DIM * BATCH_SEQ_LEN) as u64));
-    group.bench_function(BenchmarkId::new("rms_norm_batch", BATCH_SEQ_LEN), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let rms_x =
-            hidden_states(&ctx, VECTOR_DIM, BATCH_SEQ_LEN).expect("failed to allocate rms input");
-        let rms_weight =
-            positive_device_vec(&ctx, VECTOR_DIM).expect("failed to allocate rms weight");
-        iter_sync(b, &ctx, || {
-            let out =
-                ops::rms_norm_batch(&ctx, &rms_x, &rms_weight, EPS).expect("rms_norm_batch failed");
             black_box(out);
         });
     });

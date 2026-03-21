@@ -11,25 +11,25 @@ use crate::qwen35_config::Config35;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Per-layer recurrent state for a single linear attention layer.
-pub struct LayerRecurrentState {
+pub(crate) struct LayerRecurrentState {
     /// Recurrent state matrix: [num_value_heads * key_head_dim * value_head_dim] f32
     /// Stored as f32 per mamba_ssm_dtype="float32" in config.
-    pub state: CudaSlice<f32>,
+    pub(crate) state: CudaSlice<f32>,
     /// Conv1d state buffer: [qkv_dim * (conv_kernel_dim - 1)] bf16
     /// Stores the last (kernel_dim - 1) inputs for causal conv1d.
-    pub conv_state: DeviceVec,
+    pub(crate) conv_state: DeviceVec,
 }
 
 /// Recurrent state for all linear attention layers.
-pub struct RecurrentState {
-    pub layers: Vec<LayerRecurrentState>,
+pub(crate) struct RecurrentState {
+    pub(crate) layers: Vec<LayerRecurrentState>,
     /// Number of tokens processed so far (for prefill/decode tracking).
-    pub seq_len: usize,
+    pub(crate) seq_len: usize,
 }
 
 impl RecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
-    pub fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
         let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
 
         let state_size = config.linear_num_value_heads
@@ -54,7 +54,7 @@ impl RecurrentState {
     }
 
     /// Reset all state to zeros for a new generation.
-    pub fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
         self.seq_len = 0;
         for layer in &mut self.layers {
             ctx.stream
