@@ -1,5 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use pegainfer::ops;
+use pegainfer::prefill_buffers35::GdrChunkwiseScratch35;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
@@ -111,7 +112,7 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
             (QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM * seq_len) as u64,
         ));
         group.bench_function(
-            BenchmarkId::new("gated_delta_rule_prefill_into", seq_len),
+            BenchmarkId::new("gated_delta_rule_prefill_chunkwise_into", seq_len),
             |b| {
                 let ctx = DeviceContext::new().expect("failed to create CUDA context");
                 let qkv =
@@ -135,8 +136,16 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
                     seq_len,
                 )
                 .expect("failed to allocate recurrent out");
+                let mut scratch = GdrChunkwiseScratch35::from_dims(
+                    &ctx,
+                    QWEN35_4B_LINEAR_V_HEADS,
+                    QWEN35_4B_LINEAR_K_DIM,
+                    QWEN35_4B_LINEAR_V_DIM,
+                    seq_len,
+                )
+                .expect("failed to allocate chunkwise scratch");
                 iter_sync(b, &ctx, || {
-                    ops::gated_delta_rule_prefill_into(
+                    ops::gated_delta_rule_prefill_chunkwise_into(
                         &ctx,
                         &qkv,
                         &b_proj,
@@ -144,13 +153,14 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
                         &dt_bias,
                         &a_log,
                         &mut state,
+                        &mut scratch,
                         &mut recurrent_out,
                         QWEN35_4B_LINEAR_K_HEADS,
                         QWEN35_4B_LINEAR_V_HEADS,
                         QWEN35_4B_LINEAR_K_DIM,
                         QWEN35_4B_LINEAR_V_DIM,
                     )
-                    .expect("gated_delta_rule_prefill_into failed");
+                    .expect("gated_delta_rule_prefill_chunkwise_into failed");
                 });
             },
         );

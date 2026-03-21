@@ -6,6 +6,7 @@ pub mod kv_cache;
 pub mod logging;
 pub mod model;
 pub mod ops;
+pub mod prefill_buffers35;
 pub mod qwen35_config;
 pub mod qwen35_model;
 pub mod qwen3_config;

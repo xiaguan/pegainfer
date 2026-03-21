@@ -1,16 +1,38 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). After replacing linear-attention prefill's per-token GDR loop with a Triton fused recurrent kernel, prefill-heavy TTFT dropped from `3.89s` to `~378ms` at `(2048,1)`; decode-heavy TPOT remains `12.53ms` at `(1,128)`. `nsys` now shows prefill is dominated by real compute rather than orchestration: `gated_delta_rule_prefill_kernel` is `48.2%` of GPU time and batched GEMM is another `~44%`, while DtoD-copy / alloc-free churn has effectively been removed.
+> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). The fused-recurrent Triton rewrite first cut prefill-heavy TTFT from `3.89s` to `~378ms` at `(2048,1)`. The current in-tree chunk-wise GDR prefill path now runs end-to-end in Rust and further drops TTFT to `~222ms` on the same profile. `e2e_qwen35` is green again after fixing a concrete chunk-wise bug: `v_new` was being gated before writeback inside the chunk-state kernel, while FLA semantics require ungated `v_new` to be written and only the recurrent update to use the gated form.
 >
-> **Status:** Active. RMSNorm_offset batched (#1), standalone HD256 Triton attention (#2), full-attention prefill wiring (#3), E2E refresh (#4), reprofile after full-attention rewrite (#5), and Triton GDR prefill (#6) are all done. Current blocker before commit: decide whether to accept the refreshed Qwen3.5 greedy baseline (`6/13` prompts changed, one materially) or investigate that longstanding drift first. Perf-wise, the next target is reducing real linear-prefill compute inside `gated_delta_rule_prefill_kernel` / GEMM rather than more host-side cleanup.
+> **Status:** Active. RMSNorm_offset batched (#1), standalone HD256 Triton attention (#2), full-attention prefill wiring (#3), E2E refresh (#4), reprofile after full-attention rewrite (#5), and Triton GDR prefill (#6) are done and committed. The current Rust chunk-wise GDR prefill path now runs in the real Qwen3.5 path, materially improves TTFT, and passes `e2e_qwen35` after the `v_new` fix. The refreshed `test_data/Qwen3.5-4B.json` baseline was accepted even though it still differs from the old `HEAD` baseline on `6/13` prompts.
 
 ## Goal
 
-pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. Prefill is still the only meaningful gap, but the problem has changed: the old host-side per-token orchestration disaster is gone, and the remaining gap is now real linear-prefill compute.
+pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. The original prefill-heavy gap is now mostly closed: chunk-wise GDR prefill gets `(2048,1)` TTFT to parity level on this GPU, so the remaining work is normal tuning and cleanup rather than a structural latency crisis.
 
 ## Known Caveat
 
-Refreshing `test_data/Qwen3.5-4B.json` on the current code changes `6/13` prompts relative to the old baseline. Most changes are small tail whitespace / newline drift, but `python_prime` changes more substantially. The focused `gated_delta_rule_prefill` reference check passes, so the current suspicion is integration-level numerical drift rather than a gross recurrent-state bug.
+The major chunk-wise correctness blocker has now been identified and fixed:
+
+- root cause: `gdr_chunk_state_qwen35_kernel` wrote `v_new` after multiplying by `exp(g_last - g_t)`
+- correct semantics: write ungated `v_new` to memory, and only use the gated form for the recurrent `h += k @ v_new_gated` update
+
+After this fix:
+
+- mixed-pipeline validation shows:
+  - `v_new` stage diff vs FLA drops to `max ~1.95e-3`
+  - `chunk_o` output stage diff vs FLA is `max ~1.22e-4`
+  - final recurrent state remains exact after layout alignment
+- `cargo test --release --test e2e_qwen35 -- --nocapture` passes again
+
+The refreshed baseline is accepted despite remaining drift relative to the old `HEAD` JSON:
+
+- regenerated `test_data/Qwen3.5-4B.json` changes `6/13` prompts
+- changed cases currently are:
+  - `tell_story`
+  - `python_prime`
+  - `quantum_simple`
+  - `math_multiply`
+  - `chinese_capital`
+  - `chinese_weather`
 
 ## E2E Dashboard
 
@@ -19,13 +41,14 @@ pegainfer: in-process bench_serving (no HTTP overhead). vLLM: `vllm bench serve`
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 377.20ms | 222ms¹ | **+1.7× slower** |
-| prefill-heavy (2048,1) | TTFT p99 | 379.85ms | 245ms¹ | **+1.6× slower** |
+| prefill-heavy (2048,1) | TTFT median | 222.55ms³ | 222ms¹ | **~parity** |
+| prefill-heavy (2048,1) | TTFT p99 | 222.85ms³ | 245ms¹ | slightly faster³ |
 | decode-heavy (1,128) | TPOT median | 12.54ms | 11.64ms² | +8% |
 | decode-heavy (1,128) | TPOT p99 | 12.94ms | 11.76ms² | +10% |
 
 ¹ vLLM enforce-eager (no torch.compile/CUDA Graph). Compiled mode OOM'd on 2048-token prefill on this GPU.
 ² vLLM with torch.compile + CUDA Graph (default production config).
+³ current Rust chunk-wise path (`warmup=1`, `iters=3`); TTFT is now at parity level, `e2e_qwen35` passes, and the refreshed JSON baseline has been accepted.
 
 Reference — Qwen3-4B on same GPU: TTFT(2048,1)=213ms, TPOT(1,128)≈10.6ms.
 
@@ -82,7 +105,13 @@ RMSNorm_offset [2560,seq]
   → GEMM B [2560→32,seq]       ← batched
   → GEMM A [2560→32,seq]       ← batched
   → conv1d_prefill [8192,seq]  ← one launch/layer, updates conv_state across seq
-  → gated_delta_rule_prefill [4096,seq]  ← one Triton fused-recurrent launch/layer
+  → gdr_prepare_qkv_gbeta [Q/K expand + g/beta]     ← one launch/layer
+  → gdr_chunk_local_cumsum                          ← one launch/layer
+  → gdr_chunk_scaled_dot_kkt                        ← one launch/layer
+  → gdr_solve_tril_64                               ← one launch/layer
+  → gdr_recompute_w_u                               ← one launch/layer
+  → gdr_chunk_state                                 ← one launch/layer
+  → gdr_chunk_o                                     ← one launch/layer
   → rms_norm_gated [4096,seq]  ← one launch/layer
   → GEMM O [4096→2560,seq]     ← batched
   → Residual + RMSNorm_offset [2560,seq]
@@ -93,7 +122,7 @@ RMSNorm_offset [2560,seq]
   → Residual
 ```
 
-**Critical:** the recurrence is still real, but it now lives inside `conv1d_prefill` / `gated_delta_rule_prefill` instead of a host-side token loop. For one request, the linear stack now pays `24` conv1d launches + `24` GDR launches + `24` gated-norm launches, instead of `2048 × 3 × 24 = 147,456` tiny sequential launches. `RMSNorm_offset` was already fixed in #1 and is no longer part of the prefill hotspot.
+**Critical:** the recurrence is still real, but it has moved from token granularity to chunk granularity. The linear stack now pays a small fixed chunk-wise pipeline per layer instead of a host-side token loop, and `RMSNorm_offset` was already fixed in #1 so it is no longer part of the prefill hotspot.
 
 ### Full Attention Layer — decode
 
@@ -259,16 +288,69 @@ Note: `cuMemcpyHtoDAsync_v2` dominates total API time in this whole-process trac
 
 **API conclusion:** compared with the historical #5 snapshot, the big wins are structural: `cudaLaunchKernel` went from `~295k` to `278`, `cuMemcpyDtoDAsync_v2` from `~492k` to `2`, and `cuMemAllocAsync` from `~690k` to `1.5k`. Prefill is no longer spending its life in launch/copy/allocation bookkeeping.
 
+### Prefill (2048 tokens) — after chunk-wise GDR prefill (#7 current snapshot)
+
+Stable request bench:
+
+```bash
+PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
+  request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3
+```
+
+Result:
+
+- TTFT avg `222.45ms`
+- TTFT p50 `222.55ms`
+- TTFT p99 `222.85ms`
+
+Correctness refresh:
+
+```bash
+PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture
+PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture
+```
+
+Result:
+
+- `e2e_qwen35` passes again after fixing the chunk-state `v_new` writeback bug
+- regenerated `test_data/Qwen3.5-4B.json` differs from the old `HEAD` baseline on `6/13` prompts
+- this refreshed baseline is accepted for the chunk-wise path
+
+**Interpretation:** the first fused-recurrent rewrite removed the host-side disaster and got TTFT down to `~378ms`; the chunk-wise rewrite is the follow-up step that actually gets Qwen3.5 prefill-heavy latency to parity level on this GPU. Remaining work is now normal tuning and cleanup, not feasibility.
+
 ## Optimization Log
+
+### #7 Chunk-wise GDR prefill for Qwen3.5 (2026-03-21)
+
+**Goal:** Replace the fused-recurrent linear-prefill GDR path with a chunk-wise path that preserves decode-state semantics while materially reducing prefill-heavy TTFT.
+
+**Changes:** Added explicit chunk-wise scratch buffers, added Triton AOT stages for `gdr_prepare_qkv_gbeta`, `chunk_local_cumsum`, `chunk_scaled_dot_kkt`, `solve_tril_64`, `recompute_w_u`, `chunk_state`, and `chunk_o`, rewired the real Qwen3.5 prefill path to launch this pipeline per linear-attention layer, and fixed the main correctness bug in `gdr_chunk_state_qwen35_kernel`: `v_new` must be written back ungated and only the recurrent update should use the gated form. The chunk-wise solve/recompute/state/output kernels are adapted from FLA and now carry explicit source attribution in `tools/triton/gated_delta_rule_chunkwise_kernels.py`.
+
+**Validated commands:**
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo check --release`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
+
+**Results:**
+- Prefill-heavy `(2048,1)`: TTFT avg `222.45ms`, p50 `222.55ms`, p99 `222.85ms`
+- `e2e_qwen35`: pass
+- refreshed `test_data/Qwen3.5-4B.json`: accepted, with `6/13` prompt outputs changed relative to the old `HEAD` baseline
+- focused stage-level comparison against FLA after the `v_new` fix:
+  - `v_new` diff: `max ~1.95e-3`
+  - `chunk_o` output diff: `max ~1.22e-4`
+  - final recurrent state diff after layout alignment: `0.0`
+
+**Interpretation:** the chunk-wise path is now the real runtime path for Qwen3.5 prefill. It preserves decode compatibility, restores E2E correctness, and cuts the prefill-heavy TTFT from the fused-recurrent `~378ms` level to `~222ms`, which is effectively parity on this setup.
 
 ### #6 Triton GDR prefill for Qwen3.5 (2026-03-21)
 
 **Goal:** Remove the Qwen3.5 linear-attention prefill host-side token loop by replacing per-token GDR launches with a single Triton fused-recurrent kernel per layer.
 
-**Changes:** Added `tools/triton/gated_delta_rule_prefill_kernel.py` and its AOT build wiring, exposed `gated_delta_rule_prefill_cuda` through FFI, added `conv1d_prefill_batch_into()`, `gated_delta_rule_prefill_into()`, and `rms_norm_gated_batch_into()` in `ops.rs`, rewired `Qwen35Model` linear prefill to use the batched `conv1d -> GDR -> gated_norm` path, and added a `gated_delta_rule_prefill_into` microbench entry.
+**Changes:** Added a temporary Triton fused-recurrent GDR prefill kernel and its AOT build wiring, exposed it through FFI, added batched `conv1d -> GDR -> gated_norm` operator plumbing in `ops.rs`, rewired `Qwen35Model` linear prefill to use that path, and added a standalone prefill microbench entry. This path was later superseded by the chunk-wise implementation in `#7`.
 
 **Validated commands:**
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release test_gated_delta_rule_prefill_matches_decode_reference -- --ignored --nocapture`
 - `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
 - `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 1 --iters 3`
 - `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`

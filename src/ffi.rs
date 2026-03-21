@@ -391,20 +391,100 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Gated delta rule prefill (Triton AOT, full sequence)
-    pub fn gated_delta_rule_prefill_cuda(
+    pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
         a_proj: *const Half,
         dt_bias: *const Half,
         a_log: *const f32,
-        state: *mut f32,
-        output: *mut Half,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        g_out: *mut f32,
+        beta_out: *mut f32,
         num_key_heads: i32,
         num_value_heads: i32,
         qkv_dim: i32,
         seq_len: i32,
-        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_cumsum_cuda(
+        g_in: *const f32,
+        g_out: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_a_cuda(
+        k: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        a_tril: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_solve_cuda(
+        a_tril: *const f32,
+        a_inv: *mut Half,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_recompute_cuda(
+        k: *const Half,
+        v: *const Half,
+        beta: *const f32,
+        w: *mut Half,
+        u: *mut Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Chunk-wise GDR prefill stage 1 (Triton AOT): recurrent chunk-state update.
+    // Expected future inputs:
+    //   k / w: [seq_len, num_value_heads, 128] bf16
+    //   u / v_new: [seq_len, num_value_heads, 128] bf16
+    //   g_cumsum: [seq_len, num_value_heads] fp32
+    //   initial_state / final_state: [num_value_heads, 128, 128] fp32 in [H, V, K]
+    //   chunk_state: [num_chunks, num_value_heads, 128, 128] fp32
+    pub fn gated_delta_rule_prefill_chunk_state_cuda(
+        k: *const Half,
+        w: *const Half,
+        u: *const Half,
+        g_cumsum: *const f32,
+        initial_state: *const f32,
+        chunk_state: *mut f32,
+        v_new: *mut Half,
+        final_state: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Chunk-wise GDR prefill stage 2 (Triton AOT): chunk output accumulation.
+    // Expected future inputs:
+    //   q / k / v_new: [seq_len, num_value_heads, 128] bf16
+    //   chunk_state: [num_chunks, num_value_heads, 128, 128] fp32
+    //   g_cumsum: [seq_len, num_value_heads] fp32
+    //   output: [seq_len, num_value_heads * 128] bf16
+    pub fn gated_delta_rule_prefill_chunk_o_cuda(
+        q: *const Half,
+        k: *const Half,
+        v_new: *const Half,
+        chunk_state: *const f32,
+        g_cumsum: *const f32,
+        output: *mut Half,
+        seq_len: i32,
+        num_value_heads: i32,
+        scale: f32,
         stream: CUstream,
     ) -> CUresult;
 

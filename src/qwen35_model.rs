@@ -18,6 +18,7 @@ use crate::decode_buffers35::DecodeBuffers35;
 use crate::kv_cache::KVCache;
 use crate::model::StreamingStats;
 use crate::ops;
+use crate::prefill_buffers35::GdrChunkwiseScratch35;
 use crate::qwen35_config::{Config35, LayerType};
 use crate::recurrent_state::RecurrentState;
 use crate::sampler::{self, SamplingParams};
@@ -661,12 +662,14 @@ impl Qwen35Model {
         // Process layers
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
+        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden_batch = self.prefill_layer(
                 layer_idx,
                 layer,
                 hidden_batch,
+                &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 kv_cache,
@@ -705,6 +708,7 @@ impl Qwen35Model {
         _layer_idx: usize,
         layer: &TransformerBlock35,
         hidden_batch: HiddenStates,
+        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         kv_cache: &mut KVCache,
@@ -782,7 +786,7 @@ impl Qwen35Model {
                 )?;
 
                 let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-                ops::gated_delta_rule_prefill_into(
+                ops::gated_delta_rule_prefill_chunkwise_into(
                     &self.ctx,
                     &qkv_conv_batch,
                     &b_batch,
@@ -790,6 +794,7 @@ impl Qwen35Model {
                     &attn.dt_bias,
                     &attn.a_log,
                     &mut layer_state.state,
+                    gdr_chunkwise_scratch,
                     &mut gdr_out_batch,
                     c.linear_num_key_heads,
                     c.linear_num_value_heads,

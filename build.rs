@@ -260,6 +260,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
     let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();
+    let chunkwise_kernel_path = Path::new("tools/triton/gated_delta_rule_chunkwise_kernels.py");
 
     let silu_spec = TritonKernelSpec {
         artifact_dir: "silu_mul",
@@ -455,28 +456,173 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     generated_sources.push(flash_attn_hd256_c);
     generated_sources.push(flash_attn_hd256_wrapper);
 
-    let gdr_prefill_spec = TritonKernelSpec {
-        artifact_dir: "gated_delta_rule_prefill",
-        kernel_path: "tools/triton/gated_delta_rule_prefill_kernel.py",
-        kernel_name: "gated_delta_rule_prefill_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,*fp32,*fp32,*bf16,i32,i32,i32,i32,i32,32,128,128",
-        grid: "4,num_value_heads,1",
-        out_name: "triton_gated_delta_rule_prefill",
-        num_warps: 4,
-        num_stages: 3,
-    };
-    let (gdr_prefill_func, gdr_prefill_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_prefill_spec);
-    let gdr_prefill_wrapper = write_wrapper(
-        &gdr_prefill_c,
-        "triton_gated_delta_rule_prefill_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr state, CUdeviceptr output, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, int32_t out_dim);\n\nCUresult gated_delta_rule_prefill_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, float* state, uint16_t* output, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, int32_t out_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)state, (CUdeviceptr)output, num_key_heads, num_value_heads, qkv_dim, seq_len, out_dim);\n}}\n",
-            func = gdr_prefill_func
-        ),
-    );
-    generated_sources.push(gdr_prefill_c);
-    generated_sources.push(gdr_prefill_wrapper);
+    if chunkwise_kernel_path.exists() {
+        let gdr_prepare_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_prepare",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_prepare_qkv_gbeta_qwen35_kernel",
+            signature: "*bf16,*bf16,*bf16,*bf16,*fp32,*bf16,*bf16,*bf16,*fp32,*fp32,i32,i32,i32,i32,128,128",
+            grid: "seq_len,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_prepare",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_prepare_func, gdr_prepare_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_prepare_spec);
+        let gdr_prepare_wrapper = write_wrapper(
+            &gdr_prepare_c,
+            "triton_gated_delta_rule_chunk_prepare_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr q_out, CUdeviceptr k_out, CUdeviceptr v_out, CUdeviceptr g_out, CUdeviceptr beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len);\n\nCUresult gated_delta_rule_prefill_chunk_prepare_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)q_out, (CUdeviceptr)k_out, (CUdeviceptr)v_out, (CUdeviceptr)g_out, (CUdeviceptr)beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len);\n}}\n",
+                func = gdr_prepare_func
+            ),
+        );
+        generated_sources.push(gdr_prepare_c);
+        generated_sources.push(gdr_prepare_wrapper);
+
+        let gdr_cumsum_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_cumsum",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_chunk_local_cumsum_qwen35_kernel",
+            signature: "*fp32,*fp32,i32,i32,64",
+            grid: "(seq_len + 63) / 64,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_cumsum",
+            num_warps: 1,
+            num_stages: 1,
+        };
+        let (gdr_cumsum_func, gdr_cumsum_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_cumsum_spec);
+        let gdr_cumsum_wrapper = write_wrapper(
+            &gdr_cumsum_c,
+            "triton_gated_delta_rule_chunk_cumsum_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr g_in, CUdeviceptr g_out, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_cumsum_cuda(const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)g_in, (CUdeviceptr)g_out, seq_len, num_value_heads);\n}}\n",
+                func = gdr_cumsum_func
+            ),
+        );
+        generated_sources.push(gdr_cumsum_c);
+        generated_sources.push(gdr_cumsum_wrapper);
+
+        let gdr_a_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_a",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_chunk_scaled_dot_kkt_qwen35_kernel",
+            signature: "*bf16,*fp32,*fp32,*fp32,i32,i32,64,64,128",
+            grid: "(seq_len + 63) / 64,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_a",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_a_func, gdr_a_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_a_spec);
+        let gdr_a_wrapper = write_wrapper(
+            &gdr_a_c,
+            "triton_gated_delta_rule_chunk_a_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr g_cumsum, CUdeviceptr beta, CUdeviceptr a_tril, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_a_cuda(const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)g_cumsum, (CUdeviceptr)beta, (CUdeviceptr)a_tril, seq_len, num_value_heads);\n}}\n",
+                func = gdr_a_func
+            ),
+        );
+        generated_sources.push(gdr_a_c);
+        generated_sources.push(gdr_a_wrapper);
+
+        let gdr_solve_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_solve",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_solve_tril_64_qwen35_kernel",
+            signature: "*fp32,*bf16,i32,i32",
+            grid: "(seq_len + 63) / 64,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_solve",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_solve_func, gdr_solve_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_solve_spec);
+        let gdr_solve_wrapper = write_wrapper(
+            &gdr_solve_c,
+            "triton_gated_delta_rule_chunk_solve_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr a_tril, CUdeviceptr a_inv, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_solve_cuda(const float* a_tril, uint16_t* a_inv, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)a_tril, (CUdeviceptr)a_inv, seq_len, num_value_heads);\n}}\n",
+                func = gdr_solve_func
+            ),
+        );
+        generated_sources.push(gdr_solve_c);
+        generated_sources.push(gdr_solve_wrapper);
+
+        let gdr_recompute_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_recompute",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_recompute_w_u_qwen35_kernel",
+            signature: "*bf16,*bf16,*fp32,*bf16,*bf16,*bf16,*fp32,i32,i32,128,128,64,64,64",
+            grid: "(seq_len + 63) / 64,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_recompute",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_recompute_func, gdr_recompute_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_recompute_spec);
+        let gdr_recompute_wrapper = write_wrapper(
+            &gdr_recompute_c,
+            "triton_gated_delta_rule_chunk_recompute_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr beta, CUdeviceptr w, CUdeviceptr u, CUdeviceptr a_inv, CUdeviceptr g_cumsum, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_recompute_cuda(const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)v, (CUdeviceptr)beta, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)a_inv, (CUdeviceptr)g_cumsum, seq_len, num_value_heads);\n}}\n",
+                func = gdr_recompute_func
+            ),
+        );
+        generated_sources.push(gdr_recompute_c);
+        generated_sources.push(gdr_recompute_wrapper);
+
+        let gdr_chunk_state_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_state",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_chunk_state_qwen35_kernel",
+            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*fp32,*bf16,*fp32,i32,i32,32,64,128,128,64",
+            grid: "4,num_value_heads,1",
+            out_name: "triton_gated_delta_rule_chunk_state",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_chunk_state_func, gdr_chunk_state_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_chunk_state_spec);
+        let gdr_chunk_state_wrapper = write_wrapper(
+            &gdr_chunk_state_c,
+            "triton_gated_delta_rule_chunk_state_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr w, CUdeviceptr u, CUdeviceptr g_cumsum, CUdeviceptr initial_state, CUdeviceptr chunk_state, CUdeviceptr v_new, CUdeviceptr final_state, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_state_cuda(const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)g_cumsum, (CUdeviceptr)initial_state, (CUdeviceptr)chunk_state, (CUdeviceptr)v_new, (CUdeviceptr)final_state, seq_len, num_value_heads);\n}}\n",
+                func = gdr_chunk_state_func
+            ),
+        );
+        generated_sources.push(gdr_chunk_state_c);
+        generated_sources.push(gdr_chunk_state_wrapper);
+
+        let gdr_chunk_o_spec = TritonKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_o",
+            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
+            kernel_name: "gdr_chunk_o_qwen35_kernel",
+            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*bf16,i32,i32,fp32,64,32,64,128,128",
+            grid: "4,(seq_len + 63) / 64,num_value_heads",
+            out_name: "triton_gated_delta_rule_chunk_o",
+            num_warps: 4,
+            num_stages: 2,
+        };
+        let (gdr_chunk_o_func, gdr_chunk_o_c) =
+            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_chunk_o_spec);
+        let gdr_chunk_o_wrapper = write_wrapper(
+            &gdr_chunk_o_c,
+            "triton_gated_delta_rule_chunk_o_wrapper.c",
+            format!(
+                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v_new, CUdeviceptr chunk_state, CUdeviceptr g_cumsum, CUdeviceptr output, int32_t seq_len, int32_t num_value_heads, float scale);\n\nCUresult gated_delta_rule_prefill_chunk_o_cuda(const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)q, (CUdeviceptr)k, (CUdeviceptr)v_new, (CUdeviceptr)chunk_state, (CUdeviceptr)g_cumsum, (CUdeviceptr)output, seq_len, num_value_heads, scale);\n}}\n",
+                func = gdr_chunk_o_func
+            ),
+        );
+        generated_sources.push(gdr_chunk_o_c);
+        generated_sources.push(gdr_chunk_o_wrapper);
+    } else {
+        println!(
+            "cargo:warning=Skipping chunk-wise GDR Triton AOT scaffolding because {} is not present yet.",
+            chunkwise_kernel_path.display()
+        );
+    }
 
     // Attention reduce kernel: merges split-KV partials into final output
     let attention_reduce_spec = TritonKernelSpec {
@@ -521,7 +667,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!("cargo:rerun-if-changed=tools/triton/attention_reduce_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_hd256_kernel.py");
-    println!("cargo:rerun-if-changed=tools/triton/gated_delta_rule_prefill_kernel.py");
+    println!("cargo:rerun-if-changed=tools/triton/gated_delta_rule_chunkwise_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
