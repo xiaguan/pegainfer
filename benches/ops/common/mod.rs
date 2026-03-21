@@ -32,6 +32,18 @@ pub const EPS: f32 = 1e-6;
 pub const ROPE_THETA_QWEN3: f32 = 1_000_000.0;
 pub const ROPE_THETA_QWEN35: f32 = 10_000_000.0;
 
+// Qwen3.5-4B actual model dimensions
+pub const QWEN35_4B_HIDDEN: usize = 2560;
+pub const QWEN35_4B_Q_HEADS: usize = 16;
+pub const QWEN35_4B_KV_HEADS: usize = 4;
+pub const QWEN35_4B_HEAD_DIM: usize = 256;
+pub const QWEN35_4B_ROTARY_DIM: usize = 64;
+pub const QWEN35_4B_LINEAR_K_HEADS: usize = 16;
+pub const QWEN35_4B_LINEAR_V_HEADS: usize = 32;
+pub const QWEN35_4B_LINEAR_K_DIM: usize = 128;
+pub const QWEN35_4B_LINEAR_V_DIM: usize = 128;
+pub const QWEN35_4B_ROPE_THETA: f32 = 10_000_000.0;
+
 pub fn configure_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(1));

@@ -8,6 +8,7 @@ use super::common::{
     ATTN_SEQ_LEN, BATCH_SEQ_LEN, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128,
     ROPE_THETA_QWEN3, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta, device_vec,
     embedding_matrix, hidden_states, iter_sync, positive_device_vec, rope_cache, token_ids,
+    zero_f32_slice,
 };
 
 pub fn bench_triton_ops(c: &mut Criterion) {
@@ -121,6 +122,14 @@ pub fn bench_triton_ops(c: &mut Criterion) {
                 DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate v cache");
             let mut fused_out =
                 DeviceVec::zeros(&ctx, q_dim).expect("failed to allocate fused out");
+            let num_kv_splits = 4usize;
+            let mut partial_out =
+                zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits * HEAD_DIM_128)
+                    .expect("partial_out");
+            let mut partial_m =
+                zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits).expect("partial_m");
+            let mut partial_l =
+                zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits).expect("partial_l");
             iter_sync(b, &ctx, || {
                 ops::fused_attention_decode_into(
                     &ctx,
@@ -135,6 +144,9 @@ pub fn bench_triton_ops(c: &mut Criterion) {
                     &mut k_cache,
                     &mut v_cache,
                     &mut fused_out,
+                    &mut partial_out,
+                    &mut partial_m,
+                    &mut partial_l,
                     Q_HEADS_128,
                     KV_HEADS_128,
                 )
