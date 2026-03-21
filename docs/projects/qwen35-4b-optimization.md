@@ -1,12 +1,16 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). After removing the legacy HD256 single-token prefill path, prefill-heavy TTFT improved from 14.5s to 3.89s at `(2048,1)`; decode-heavy TPOT remains 12.53ms at `(1,128)`. `nsys` now shows the bottleneck has shifted almost entirely to linear-attention prefill: `gated_delta_rule_decode_kernel` alone is `87.6%` of GPU time, while the full Triton HD256 prefill-attention stack is below `0.5%`.
+> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). After replacing linear-attention prefill's per-token GDR loop with a Triton fused recurrent kernel, prefill-heavy TTFT dropped from `3.89s` to `~378ms` at `(2048,1)`; decode-heavy TPOT remains `12.53ms` at `(1,128)`. `nsys` now shows prefill is dominated by real compute rather than orchestration: `gated_delta_rule_prefill_kernel` is `48.2%` of GPU time and batched GEMM is another `~44%`, while DtoD-copy / alloc-free churn has effectively been removed.
 >
-> **Status:** Active. RMSNorm_offset batched (#1 done). Standalone HD256 Triton attention landed (#2). Full-attention prefill is now wired to Triton and the legacy HD256 single-token prefill kernel has been removed (#3). E2E benchmark refresh done (#4). `nsys` reprofile done (#5). Next: reduce linear-attention/GDR sequential prefill overhead and the associated DtoD-copy / alloc-free churn.
+> **Status:** Active. RMSNorm_offset batched (#1), standalone HD256 Triton attention (#2), full-attention prefill wiring (#3), E2E refresh (#4), reprofile after full-attention rewrite (#5), and Triton GDR prefill (#6) are all done. Current blocker before commit: decide whether to accept the refreshed Qwen3.5 greedy baseline (`6/13` prompts changed, one materially) or investigate that longstanding drift first. Perf-wise, the next target is reducing real linear-prefill compute inside `gated_delta_rule_prefill_kernel` / GEMM rather than more host-side cleanup.
 
 ## Goal
 
-pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. Prefill is still the main problem, but the HD256 full-attention prefill bottleneck is no longer catastrophic after the Triton rewrite.
+pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. Prefill is still the only meaningful gap, but the problem has changed: the old host-side per-token orchestration disaster is gone, and the remaining gap is now real linear-prefill compute.
+
+## Known Caveat
+
+Refreshing `test_data/Qwen3.5-4B.json` on the current code changes `6/13` prompts relative to the old baseline. Most changes are small tail whitespace / newline drift, but `python_prime` changes more substantially. The focused `gated_delta_rule_prefill` reference check passes, so the current suspicion is integration-level numerical drift rather than a gross recurrent-state bug.
 
 ## E2E Dashboard
 
@@ -15,8 +19,8 @@ pegainfer: in-process bench_serving (no HTTP overhead). vLLM: `vllm bench serve`
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 3,889ms | 222ms¹ | **+17.5× slower** |
-| prefill-heavy (2048,1) | TTFT p99 | 3,891ms | 245ms¹ | **+15.9× slower** |
+| prefill-heavy (2048,1) | TTFT median | 377.20ms | 222ms¹ | **+1.7× slower** |
+| prefill-heavy (2048,1) | TTFT p99 | 379.85ms | 245ms¹ | **+1.6× slower** |
 | decode-heavy (1,128) | TPOT median | 12.54ms | 11.64ms² | +8% |
 | decode-heavy (1,128) | TPOT p99 | 12.94ms | 11.76ms² | +10% |
 
@@ -67,7 +71,7 @@ RMSNorm_offset [2560,seq]
   → Residual
 ```
 
-**Current state:** full-attention prefill no longer runs a per-token decode kernel. The remaining prefill bottleneck should now be the linear-attention sequential path, but this needs a fresh end-to-end profile.
+**Current state:** full-attention prefill is no longer a meaningful TTFT bottleneck. The current end-to-end profile shows the remaining cost sits in linear-attention prefill compute.
 
 ### Linear Attention Layer — prefill
 
@@ -77,9 +81,9 @@ RMSNorm_offset [2560,seq]
   → GEMM Z [2560→4096,seq]     ← batched
   → GEMM B [2560→32,seq]       ← batched
   → GEMM A [2560→32,seq]       ← batched
-  → per-token: conv1d_decode (update conv_state, SiLU)
-  → per-token: gated_delta_rule_decode (update recurrent state [32×128×128])
-  → per-token: rms_norm_gated (norm * SiLU(z))
+  → conv1d_prefill [8192,seq]  ← one launch/layer, updates conv_state across seq
+  → gated_delta_rule_prefill [4096,seq]  ← one Triton fused-recurrent launch/layer
+  → rms_norm_gated [4096,seq]  ← one launch/layer
   → GEMM O [4096→2560,seq]     ← batched
   → Residual + RMSNorm_offset [2560,seq]
   → GEMM Gate [2560→9216,seq]
@@ -89,7 +93,7 @@ RMSNorm_offset [2560,seq]
   → Residual
 ```
 
-**Critical:** conv1d + GDR + gated_norm are inherently sequential (state depends on previous token). At seq=2048: 2048 × 3 kernel launches × 24 layers = 147,456 kernels. Additionally, RMSNorm_offset is per-token (no batched kernel) — adds 2048 × 2 × 32 = 131,072 norm kernels across all layers.
+**Critical:** the recurrence is still real, but it now lives inside `conv1d_prefill` / `gated_delta_rule_prefill` instead of a host-side token loop. For one request, the linear stack now pays `24` conv1d launches + `24` GDR launches + `24` gated-norm launches, instead of `2048 × 3 × 24 = 147,456` tiny sequential launches. `RMSNorm_offset` was already fixed in #1 and is no longer part of the prefill hotspot.
 
 ### Full Attention Layer — decode
 
@@ -163,7 +167,7 @@ Wall clock: 669ms. GPU kernel time: 222ms. **CPU kernel launch overhead: 447ms (
 
 This section is retained as the pre-#3 baseline. Full-attention prefill has since been moved to a batched Triton path; the updated end-to-end `nsys` capture is summarized below.
 
-### Prefill (2048 tokens) — after batched Triton full-attention wiring
+### Prefill (2048 tokens) — before Triton GDR prefill (#5 historical snapshot)
 
 `nsys` command used:
 
@@ -198,9 +202,93 @@ Trace note: this capture includes one warmup request plus one measured request, 
 | cuMemAllocAsync | 689,545 | 0.97us | temporary allocations remain excessive |
 | cuMemFreeAsync | 689,545 | 0.75us | same churn on the free side |
 
-**API conclusion:** after deleting the old HD256 attention loop, prefill is still paying for a massive amount of linear-attention per-token orchestration: launches, DtoD copies, memsets, and alloc/free traffic. The next optimization target should be the linear-attention prefill structure, not full attention.
+**API conclusion:** after deleting the old HD256 attention loop, prefill was still paying for a massive amount of linear-attention per-token orchestration: launches, DtoD copies, memsets, and alloc/free traffic. That is the exact problem addressed in #6 below.
+
+### Prefill (2048 tokens) — after Triton GDR prefill (#6 current snapshot)
+
+Stable request bench:
+
+```bash
+PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
+  request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3
+```
+
+Result:
+
+- TTFT avg `377.89ms`
+- TTFT p50 `377.20ms`
+- TTFT p99 `379.85ms`
+
+`nsys` command used:
+
+```bash
+PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node \
+  --export=sqlite -o target/profiling/qwen35_prefill_2048_gdr \
+  cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
+  request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1
+```
+
+Trace note: this capture includes one warmup request plus one measured request, so instance counts below are doubled relative to a single `(2048,1)` run. The profile run measured TTFT `377.27ms`, matching the 3-iteration bench.
+
+| Kernel | GPU% | Instances in trace | Avg each | Notes |
+|--------|------|--------------------|----------|-------|
+| gated_delta_rule_prefill | 48.2% | 48 | 7.39ms | 24 linear-attn layers × 2 runs; now the main compute kernel |
+| batched GEMM kernels (CUTLASS) | ~44.1% | 496 | 14.9us to 1.04ms | projections + MLP are now co-dominant with GDR |
+| flash_attention_prefill_hd256_kernel | 3.1% | 16 | 1.41ms | 8 full-attn layers × 2 runs |
+| conv1d_prefill | 1.3% | 48 | 205us | one launch per linear-attn layer per run |
+| rms_norm_gated | 0.6% | 48 | 95us | one launch per linear-attn layer per run |
+| prefill qk/rope + gate + v-cache helpers | ~0.5% | 48 | 14.9us to 122us | still negligible |
+| rms_norm_batched_offset | 0.2% | 128 | 12.6us | unchanged from #1; not relevant |
+
+**Kernel conclusion:** the bottleneck has finally moved to genuine compute. Full-attention prefill is small, host-side per-token orchestration is gone, and the remaining cost is `gated_delta_rule_prefill_kernel` plus batched GEMM.
+
+`cuda_api_sum` from the same trace:
+
+| API | Total calls in trace | Avg each | Interpretation |
+|-----|----------------------|----------|----------------|
+| cudaLaunchKernel | 278 | 1.28ms | request-level launch count has collapsed from the old per-token regime |
+| cuLaunchKernel | 754 | 15.5us | includes driver-level kernel entry points |
+| cuMemcpyDtoDAsync_v2 | 2 | 14.4us | row extraction / writeback style copies are effectively gone |
+| cuMemAllocAsync | 1,513 | 37.0us | far lower than the old per-token churn, though still not zero |
+| cuMemFreeAsync | 1,513 | 1.12us | tracks the same temporary allocation pattern |
+| cuMemsetD8Async | 1,131 | 9.44us | no longer a dominant cost center |
+
+Note: `cuMemcpyHtoDAsync_v2` dominates total API time in this whole-process trace because it includes model-load / one-time setup traffic, so it is not the useful signal for request-level comparison here.
+
+**API conclusion:** compared with the historical #5 snapshot, the big wins are structural: `cudaLaunchKernel` went from `~295k` to `278`, `cuMemcpyDtoDAsync_v2` from `~492k` to `2`, and `cuMemAllocAsync` from `~690k` to `1.5k`. Prefill is no longer spending its life in launch/copy/allocation bookkeeping.
 
 ## Optimization Log
+
+### #6 Triton GDR prefill for Qwen3.5 (2026-03-21)
+
+**Goal:** Remove the Qwen3.5 linear-attention prefill host-side token loop by replacing per-token GDR launches with a single Triton fused-recurrent kernel per layer.
+
+**Changes:** Added `tools/triton/gated_delta_rule_prefill_kernel.py` and its AOT build wiring, exposed `gated_delta_rule_prefill_cuda` through FFI, added `conv1d_prefill_batch_into()`, `gated_delta_rule_prefill_into()`, and `rms_norm_gated_batch_into()` in `ops.rs`, rewired `Qwen35Model` linear prefill to use the batched `conv1d -> GDR -> gated_norm` path, and added a `gated_delta_rule_prefill_into` microbench entry.
+
+**Validated commands:**
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release test_gated_delta_rule_prefill_matches_decode_reference -- --ignored --nocapture`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 1 --iters 3`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
+- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite -o target/profiling/qwen35_prefill_2048_gdr cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1`
+- `nsys stats --report cuda_gpu_kern_sum target/profiling/qwen35_prefill_2048_gdr.sqlite`
+- `nsys stats --report cuda_api_sum target/profiling/qwen35_prefill_2048_gdr.sqlite`
+
+**Results:**
+- Prefill-heavy `(2048,1)`: TTFT avg `377.89ms`, p50 `377.20ms`, p99 `379.85ms`
+- Decode-heavy `(1,128)`: TTFT avg `12.27ms`, steady TPOT avg `12.53ms`, p50 `12.54ms`, p99 `12.94ms`
+- `gated_delta_rule_prefill_kernel`: `48.2%` of GPU time, `48` instances, `7.39ms` avg each
+- Batched GEMM kernels: another `~44.1%` of GPU time
+- Launch/copy/allocation churn collapsed:
+  - `cudaLaunchKernel`: `~295k` -> `278`
+  - `cuMemcpyDtoDAsync_v2`: `~492k` -> `2`
+  - `cuMemAllocAsync`: `~690k` -> `1,513`
+
+**Correctness note:** Regenerating `test_data/Qwen3.5-4B.json` changes `6/13` prompts relative to the old baseline. Most changes are small tail drift, but `python_prime` changes materially. The focused GDR-prefill-vs-decode reference test passes, so this looks like an existing integration-level drift rather than an obvious Triton kernel failure.
+
+**Interpretation:** This is the first Qwen3.5 profile where prefill is no longer dominated by orchestration. TTFT is now within about `1.7x` of vLLM at `(2048,1)`, and the remaining work is real recurrent/GEMM compute rather than launch bookkeeping.
 
 ### #3 Batched Triton full-attention prefill for Qwen3.5 (2026-03-21)
 

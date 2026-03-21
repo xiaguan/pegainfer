@@ -1258,6 +1258,47 @@ pub fn rms_norm_gated_into(
     Ok(())
 }
 
+/// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
+/// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &CudaSlice<f32>,
+    gate: &HiddenStates,
+    out: &mut HiddenStates,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    let total_heads = x.seq_len * num_heads;
+    assert_eq!(x.hidden_dim, num_heads * head_dim);
+    assert_eq!(gate.hidden_dim, x.hidden_dim);
+    assert_eq!(gate.seq_len, x.seq_len);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_gated_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const f32,
+            g_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            total_heads as i32,
+            head_dim as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Causal depthwise conv1d decode (single step).
 /// Updates conv_state in-place. Applies SiLU activation.
 pub fn conv1d_decode_into(
@@ -1285,6 +1326,43 @@ pub fn conv1d_decode_into(
             s_ptr as *mut ffi::Half,
             o_ptr as *mut ffi::Half,
             num_channels as i32,
+            kernel_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Causal depthwise conv1d prefill over a HiddenStates batch.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_prefill_batch_into(
+    ctx: &DeviceContext,
+    x_seq: &HiddenStates,
+    conv_weight: &DeviceVec,
+    conv_state: &mut DeviceVec,
+    out_seq: &mut HiddenStates,
+    kernel_size: usize,
+) -> Result<()> {
+    let num_channels = x_seq.hidden_dim;
+    assert_eq!(out_seq.hidden_dim, num_channels);
+    assert_eq!(out_seq.seq_len, x_seq.seq_len);
+    assert_eq!(conv_weight.len, num_channels * kernel_size);
+    assert_eq!(conv_state.len, num_channels * (kernel_size - 1));
+
+    let (x_ptr, _gx) = x_seq.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out_seq.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_prefill_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            s_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            x_seq.seq_len as i32,
             kernel_size as i32,
             ctx.stream.cu_stream(),
         );
@@ -1337,6 +1415,63 @@ pub fn gated_delta_rule_decode_into(
             ctx.stream.cu_stream(),
         );
     }
+
+    Ok(())
+}
+
+/// Gated delta rule recurrent prefill over the full sequence (Triton AOT).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_rule_prefill_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> Result<()> {
+    assert_eq!(
+        qkv.hidden_dim,
+        num_key_heads * key_dim * 2 + num_value_heads * val_dim
+    );
+    assert_eq!(b_proj.hidden_dim, num_value_heads);
+    assert_eq!(a_proj.hidden_dim, num_value_heads);
+    assert_eq!(b_proj.seq_len, qkv.seq_len);
+    assert_eq!(a_proj.seq_len, qkv.seq_len);
+    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(output.seq_len, qkv.seq_len);
+
+    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            s_ptr as *mut f32,
+            o_ptr as *mut ffi::Half,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            qkv.hidden_dim as i32,
+            qkv.seq_len as i32,
+            output.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
 
     Ok(())
 }
@@ -2271,6 +2406,128 @@ mod tests {
                 "start_pos={start_pos} seq_len={seq_len} output diff {max_out_diff}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gated_delta_rule_prefill_matches_decode_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_key_heads = 2usize;
+        let num_value_heads = 4usize;
+        let key_dim = 128usize;
+        let val_dim = 128usize;
+        let seq_len = 5usize;
+        let qkv_dim = num_key_heads * key_dim * 2 + num_value_heads * val_dim;
+        let out_dim = num_value_heads * val_dim;
+        let state_len = num_value_heads * key_dim * val_dim;
+
+        let qkv_host = bf16_vec(
+            &(0..qkv_dim * seq_len)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let b_host = bf16_vec(
+            &(0..num_value_heads * seq_len)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.125)
+                .collect::<Vec<_>>(),
+        );
+        let a_host = bf16_vec(
+            &(0..num_value_heads * seq_len)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.09375)
+                .collect::<Vec<_>>(),
+        );
+        let dt_bias_host = bf16_vec(
+            &(0..num_value_heads)
+                .map(|i| 0.2 + i as f32 * 0.05)
+                .collect::<Vec<_>>(),
+        );
+        let a_log_host: Vec<f32> = (0..num_value_heads)
+            .map(|i| -1.5 + i as f32 * 0.125)
+            .collect();
+        let state_init_host: Vec<f32> = (0..state_len)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.002)
+            .collect();
+
+        let qkv = HiddenStates {
+            data: ctx.stream.clone_htod(&qkv_host)?,
+            hidden_dim: qkv_dim,
+            seq_len,
+        };
+        let b_proj = HiddenStates {
+            data: ctx.stream.clone_htod(&b_host)?,
+            hidden_dim: num_value_heads,
+            seq_len,
+        };
+        let a_proj = HiddenStates {
+            data: ctx.stream.clone_htod(&a_host)?,
+            hidden_dim: num_value_heads,
+            seq_len,
+        };
+        let dt_bias = DeviceVec::from_host(&ctx, &dt_bias_host)?;
+        let a_log = ctx.stream.clone_htod(&a_log_host)?;
+
+        let mut state_prefill = ctx.stream.clone_htod(&state_init_host)?;
+        let mut out_prefill = HiddenStates::zeros(&ctx, out_dim, seq_len)?;
+        gated_delta_rule_prefill_into(
+            &ctx,
+            &qkv,
+            &b_proj,
+            &a_proj,
+            &dt_bias,
+            &a_log,
+            &mut state_prefill,
+            &mut out_prefill,
+            num_key_heads,
+            num_value_heads,
+            key_dim,
+            val_dim,
+        )?;
+
+        let mut state_decode = ctx.stream.clone_htod(&state_init_host)?;
+        let mut out_decode = HiddenStates::zeros(&ctx, out_dim, seq_len)?;
+        for t in 0..seq_len {
+            let qkv_t = extract_vec(&ctx, &qkv, t)?;
+            let b_t = extract_vec(&ctx, &b_proj, t)?;
+            let a_t = extract_vec(&ctx, &a_proj, t)?;
+            let mut out_t = DeviceVec::zeros(&ctx, out_dim)?;
+            gated_delta_rule_decode_into(
+                &ctx,
+                &qkv_t,
+                &b_t,
+                &a_t,
+                &dt_bias,
+                &a_log,
+                &mut state_decode,
+                &mut out_t,
+                num_key_heads,
+                num_value_heads,
+                key_dim,
+                val_dim,
+            )?;
+            write_vec(&ctx, &mut out_decode, t, &out_t)?;
+        }
+
+        let out_prefill_host = ctx.stream.clone_dtoh(&out_prefill.data)?;
+        let out_decode_host = ctx.stream.clone_dtoh(&out_decode.data)?;
+        let state_prefill_host = ctx.stream.clone_dtoh(&state_prefill)?;
+        let state_decode_host = ctx.stream.clone_dtoh(&state_decode)?;
+        ctx.sync()?;
+
+        let max_out_diff = out_prefill_host
+            .iter()
+            .zip(out_decode_host.iter())
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .fold(0.0_f32, f32::max);
+        let max_state_diff = state_prefill_host
+            .iter()
+            .zip(state_decode_host.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_out_diff < 0.05, "output diff {max_out_diff}");
+        assert!(max_state_diff < 0.01, "state diff {max_state_diff}");
 
         Ok(())
     }

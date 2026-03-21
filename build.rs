@@ -455,6 +455,29 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     generated_sources.push(flash_attn_hd256_c);
     generated_sources.push(flash_attn_hd256_wrapper);
 
+    let gdr_prefill_spec = TritonKernelSpec {
+        artifact_dir: "gated_delta_rule_prefill",
+        kernel_path: "tools/triton/gated_delta_rule_prefill_kernel.py",
+        kernel_name: "gated_delta_rule_prefill_kernel",
+        signature: "*bf16,*bf16,*bf16,*bf16,*fp32,*fp32,*bf16,i32,i32,i32,i32,i32,32,128,128",
+        grid: "4,num_value_heads,1",
+        out_name: "triton_gated_delta_rule_prefill",
+        num_warps: 4,
+        num_stages: 3,
+    };
+    let (gdr_prefill_func, gdr_prefill_c) =
+        generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_prefill_spec);
+    let gdr_prefill_wrapper = write_wrapper(
+        &gdr_prefill_c,
+        "triton_gated_delta_rule_prefill_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr state, CUdeviceptr output, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, int32_t out_dim);\n\nCUresult gated_delta_rule_prefill_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, float* state, uint16_t* output, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, int32_t out_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)state, (CUdeviceptr)output, num_key_heads, num_value_heads, qkv_dim, seq_len, out_dim);\n}}\n",
+            func = gdr_prefill_func
+        ),
+    );
+    generated_sources.push(gdr_prefill_c);
+    generated_sources.push(gdr_prefill_wrapper);
+
     // Attention reduce kernel: merges split-KV partials into final output
     let attention_reduce_spec = TritonKernelSpec {
         artifact_dir: "attention_reduce",
@@ -492,12 +515,13 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, embedding, and Qwen3 decode attention; extract/write vector copies now use cudarc device memcpy"
+        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, embedding, Qwen3 decode attention, and Qwen3.5 prefill GDR; extract/write vector copies now use cudarc device memcpy"
     );
     println!("cargo:rerun-if-changed=tools/triton/attention_decode_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/attention_reduce_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_hd256_kernel.py");
+    println!("cargo:rerun-if-changed=tools/triton/gated_delta_rule_prefill_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");

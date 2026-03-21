@@ -771,63 +771,48 @@ impl Qwen35Model {
                 let z_dim = c.linear_attn_z_dim();
                 let layer_state = &mut recurrent.layers[*linear_idx];
 
-                let mut out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
+                let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
+                ops::conv1d_prefill_batch_into(
+                    &self.ctx,
+                    &qkv_batch,
+                    &attn.conv1d_weight,
+                    &mut layer_state.conv_state,
+                    &mut qkv_conv_batch,
+                    c.linear_conv_kernel_dim,
+                )?;
 
-                // Sequential: conv1d + gated delta rule per token
-                for t in 0..seq_len {
-                    let qkv_raw = ops::extract_vec(&self.ctx, &qkv_batch, t)?;
-                    let z = ops::extract_vec(&self.ctx, &z_batch, t)?;
-                    let b = ops::extract_vec(&self.ctx, &b_batch, t)?;
-                    let a = ops::extract_vec(&self.ctx, &a_batch, t)?;
+                let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                ops::gated_delta_rule_prefill_into(
+                    &self.ctx,
+                    &qkv_conv_batch,
+                    &b_batch,
+                    &a_batch,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut layer_state.state,
+                    &mut gdr_out_batch,
+                    c.linear_num_key_heads,
+                    c.linear_num_value_heads,
+                    c.linear_key_head_dim,
+                    c.linear_value_head_dim,
+                )?;
 
-                    // Conv1d
-                    let mut qkv_conv = DeviceVec::zeros(&self.ctx, qkv_dim)?;
-                    ops::conv1d_decode_into(
-                        &self.ctx,
-                        &qkv_raw,
-                        &attn.conv1d_weight,
-                        &mut layer_state.conv_state,
-                        &mut qkv_conv,
-                        c.linear_conv_kernel_dim,
-                    )?;
-
-                    // GDR
-                    let mut gdr_out = DeviceVec::zeros(&self.ctx, z_dim)?;
-                    ops::gated_delta_rule_decode_into(
-                        &self.ctx,
-                        &qkv_conv,
-                        &b,
-                        &a,
-                        &attn.dt_bias,
-                        &attn.a_log,
-                        &mut layer_state.state,
-                        &mut gdr_out,
-                        c.linear_num_key_heads,
-                        c.linear_num_value_heads,
-                        c.linear_key_head_dim,
-                        c.linear_value_head_dim,
-                    )?;
-
-                    // Gated norm
-                    let mut normed_out = DeviceVec::zeros(&self.ctx, z_dim)?;
-                    ops::rms_norm_gated_into(
-                        &self.ctx,
-                        &gdr_out,
-                        &attn.norm_weight,
-                        &z,
-                        &mut normed_out,
-                        c.linear_num_value_heads,
-                        c.linear_value_head_dim,
-                        c.rms_norm_eps,
-                    )?;
-
-                    ops::write_vec(&self.ctx, &mut out_batch, t, &normed_out)?;
-                }
+                let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                ops::rms_norm_gated_batch_into(
+                    &self.ctx,
+                    &gdr_out_batch,
+                    &attn.norm_weight,
+                    &z_batch,
+                    &mut normed_out_batch,
+                    c.linear_num_value_heads,
+                    c.linear_value_head_dim,
+                    c.rms_norm_eps,
+                )?;
 
                 *linear_idx += 1;
 
                 // Output projection (batched)
-                ops::gemm(&self.ctx, &attn.out_proj, &out_batch)?
+                ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?
             }
         };
 

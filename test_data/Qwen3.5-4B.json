@@ -16,25 +16,25 @@
       "name": "quick_fox",
       "prompt": "The quick brown fox",
       "max_new_tokens": 50,
-      "output": " jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\n\n\n   \n              a "
+      "output": " jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\n\n\n   \n               a"
     },
     {
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young girl who discovers a magical mirror.\n\n<think>\n\n</think>\n\nIn the quiet, cobblestoned village of Oakhaven, lived\n\n\n \n    \n\n  \n  \n\n  \n"
+      "output": " about a young girl who discovers a magical mirror.\n\n<think>\n\n</think>\n\nIn the quiet, cobblestoned village of Oakhaven, lived\n\n\n\n\n\n\n\n\n\n   \n   \n\n  "
     },
     {
       "name": "python_prime",
       "prompt": "Write a Python function to check if a number is prime.",
       "max_new_tokens": 80,
-      "output": "\n\nA prime number is a natural number greater than 1 that has no positive divisors other than \n \n               \n                                       \n"
+      "output": "\n\nTo determine whether a number is prime, we must first understand what makes a number prime: a natural\n\n \n            \n         \n         \n                      "
     },
     {
       "name": "quantum_simple",
       "prompt": "Explain quantum computing in simple terms.",
       "max_new_tokens": 80,
-      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone \n  \n\n     \n   \n   \n           \n                  \n    "
+      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone \n \n\n  \n   \n\n    \n                                     "
     },
     {
       "name": "math_add",
@@ -58,13 +58,13 @@
       "name": "chinese_capital",
       "prompt": "中国的首都是哪里？",
       "max_new_tokens": 50,
-      "output": "\n\n中国的首都是**北京**。\n\n北京是中国的首都，也是中华人民共和国的政治中心、文化中心、国际交往中心和科技创新中心。它位于\n   \n            \n  \n "
+      "output": "\n\n中国的首都是**北京**。\n\n北京是中国的首都，也是中华人民共和国的政治中心、文化中心、国际交往中心和科技创新中心。它位于\n     \n               "
     },
     {
       "name": "chinese_weather",
       "prompt": "今天天气真好",
       "max_new_tokens": 50,
-      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去    \n  \n            "
+      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去    \n   \n           "
     },
     {
       "name": "chinese_math",

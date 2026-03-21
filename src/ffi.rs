@@ -391,6 +391,23 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Gated delta rule prefill (Triton AOT, full sequence)
+    pub fn gated_delta_rule_prefill_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        state: *mut f32,
+        output: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        qkv_dim: i32,
+        seq_len: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // Fused GQA attention HD256 — decode variant (reads pos/seq_len from decode_meta)
     pub fn fused_gqa_attention_hd256_decode(
         q_full: *const Half,

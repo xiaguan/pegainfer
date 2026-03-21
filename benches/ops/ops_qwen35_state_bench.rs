@@ -106,6 +106,56 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
         });
     });
 
+    for &seq_len in &[128usize, 512, 2048] {
+        group.throughput(Throughput::Elements(
+            (QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM * seq_len) as u64,
+        ));
+        group.bench_function(
+            BenchmarkId::new("gated_delta_rule_prefill_into", seq_len),
+            |b| {
+                let ctx = DeviceContext::new().expect("failed to create CUDA context");
+                let qkv =
+                    hidden_states(&ctx, conv_channels, seq_len).expect("failed to allocate qkv");
+                let b_proj = hidden_states(&ctx, QWEN35_4B_LINEAR_V_HEADS, seq_len)
+                    .expect("failed to allocate b_proj");
+                let a_proj = hidden_states(&ctx, QWEN35_4B_LINEAR_V_HEADS, seq_len)
+                    .expect("failed to allocate a_proj");
+                let dt_bias = positive_device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS)
+                    .expect("failed to allocate dt_bias");
+                let a_log =
+                    f32_slice(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_log");
+                let mut state = zero_f32_slice(
+                    &ctx,
+                    QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM,
+                )
+                .expect("failed to allocate recurrent state");
+                let mut recurrent_out = pegainfer::tensor::HiddenStates::zeros(
+                    &ctx,
+                    QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM,
+                    seq_len,
+                )
+                .expect("failed to allocate recurrent out");
+                iter_sync(b, &ctx, || {
+                    ops::gated_delta_rule_prefill_into(
+                        &ctx,
+                        &qkv,
+                        &b_proj,
+                        &a_proj,
+                        &dt_bias,
+                        &a_log,
+                        &mut state,
+                        &mut recurrent_out,
+                        QWEN35_4B_LINEAR_K_HEADS,
+                        QWEN35_4B_LINEAR_V_HEADS,
+                        QWEN35_4B_LINEAR_K_DIM,
+                        QWEN35_4B_LINEAR_V_DIM,
+                    )
+                    .expect("gated_delta_rule_prefill_into failed");
+                });
+            },
+        );
+    }
+
     group.finish();
 }
 
