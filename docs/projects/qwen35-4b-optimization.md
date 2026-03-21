@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). The fused-recurrent Triton rewrite first cut prefill-heavy TTFT from `3.89s` to `~378ms` at `(2048,1)`. The current in-tree chunk-wise GDR prefill path now runs end-to-end in Rust and further drops TTFT to `~222ms` on the same profile. `e2e_qwen35` is green again after fixing a concrete chunk-wise bug: `v_new` was being gated before writeback inside the chunk-state kernel, while FLA semantics require ungated `v_new` to be written and only the recurrent update to use the gated form.
+> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). The fused-recurrent Triton rewrite first cut prefill-heavy TTFT from `3.89s` to `~378ms` at `(2048,1)`. The chunk-wise GDR prefill path further drops TTFT to `~222ms` (in-process) / `235ms` (HTTP, vs vLLM 222ms — +6%). Final head-to-head via `vllm bench serve`: TTFT +6%, TPOT +7%, both measured HTTP against the same GPU. `e2e_qwen35` is green after fixing the chunk-state `v_new` writeback bug.
 >
-> **Status:** Active. RMSNorm_offset batched (#1), standalone HD256 Triton attention (#2), full-attention prefill wiring (#3), E2E refresh (#4), reprofile after full-attention rewrite (#5), and Triton GDR prefill (#6) are done and committed. The current Rust chunk-wise GDR prefill path now runs in the real Qwen3.5 path, materially improves TTFT, and passes `e2e_qwen35` after the `v_new` fix. The refreshed `test_data/Qwen3.5-4B.json` baseline was accepted even though it still differs from the old `HEAD` baseline on `6/13` prompts.
+> **Status:** Complete. All planned optimizations (#1–#7) done and committed. Final HTTP benchmark run on 2026-03-21: pegainfer 235ms TTFT vs vLLM 222ms (+6%), pegainfer 12.54ms TPOT vs vLLM 11.67ms (+7%). Remaining gap is GEMMs (60%) + GDR (25%) in the prefill path — normal tuning territory, not a structural gap.
 
 ## Goal
 
@@ -36,19 +36,17 @@ The refreshed baseline is accepted despite remaining drift relative to the old `
 
 ## E2E Dashboard
 
-GPU: RTX 5070 Ti, Model: Qwen3.5-4B, vLLM 0.17.1, single concurrency.
-pegainfer: in-process bench_serving (no HTTP overhead). vLLM: `vllm bench serve` HTTP.
+GPU: RTX 5070 Ti, Model: Qwen3.5-4B, vLLM 0.18.0, single concurrency.
+Both measured via `vllm bench serve` HTTP client (apples-to-apples). vLLM: torch.compile + CUDA Graph (`--max-num-seqs 1` to fit in 16 GB alongside desktop).
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 222.55ms³ | 222ms¹ | **~parity** |
-| prefill-heavy (2048,1) | TTFT p99 | 222.85ms³ | 245ms¹ | slightly faster³ |
-| decode-heavy (1,128) | TPOT median | 12.54ms | 11.64ms² | +8% |
-| decode-heavy (1,128) | TPOT p99 | 12.94ms | 11.76ms² | +10% |
+| prefill-heavy (2048,1) | TTFT median | 234.80ms | 222.29ms | +6% |
+| prefill-heavy (2048,1) | TTFT p99 | 385.30ms | 9846ms¹ | — |
+| decode-heavy (1,128) | TPOT median | 12.54ms | 11.67ms | +7% |
+| decode-heavy (1,128) | ITL p99 | 13.03ms | 12.01ms | +9% |
 
-¹ vLLM enforce-eager (no torch.compile/CUDA Graph). Compiled mode OOM'd on 2048-token prefill on this GPU.
-² vLLM with torch.compile + CUDA Graph (default production config).
-³ current Rust chunk-wise path (`warmup=1`, `iters=3`); TTFT is now at parity level, `e2e_qwen35` passes, and the refreshed JSON baseline has been accepted.
+¹ vLLM P99 is dominated by torch.compile cold-start on the first request; steady-state latency = median.
 
 Reference — Qwen3-4B on same GPU: TTFT(2048,1)=213ms, TPOT(1,128)≈10.6ms.
 

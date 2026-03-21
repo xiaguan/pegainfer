@@ -11,7 +11,7 @@ Key flags applied to both: `--ignore-eos` (forces exact output length), `--datas
 ## Setup
 
 ```
-MODEL_PATH=models/Qwen3-4B
+MODEL_PATH=models/Qwen3-4B        # or models/Qwen3.5-4B
 VLLM_PYTHON=.venv/bin/python      # pegainfer/.venv with vllm installed
 VLLM_CMD=.venv/bin/vllm
 PORT=8000
@@ -31,16 +31,17 @@ Start server, wait for ready, run benchmarks, kill server:
 
 ```bash
 # Start
-$VLLM_CMD serve $MODEL_PATH --port $PORT --max-model-len 4096 --gpu-memory-utilization 0.9 &
+$VLLM_CMD serve $MODEL_PATH --port $PORT --max-model-len 4096 --gpu-memory-utilization 0.9 \
+  --served-model-name <short-name> &
 
-# Poll until ready (up to 120s — vLLM has torch.compile cold start)
-curl -s http://localhost:$PORT/v1/models
+# Poll until ready (up to 180s — vLLM torch.compile warmup)
+until curl -sf http://localhost:$PORT/v1/models >/dev/null; do sleep 5; done
 
 # Benchmark (repeat for each config)
 $VLLM_CMD bench serve \
-  --backend openai --model <model_name> --port $PORT \
+  --backend openai --model <short-name> --port $PORT \
   --dataset-name random --input-len <in> --output-len <out> \
-  --num-prompts <n> --request-rate inf --max-concurrency 1 \
+  --num-prompts 20 --request-rate inf --max-concurrency 1 \
   --ignore-eos --tokenizer $MODEL_PATH \
   --save-result --result-dir $RESULTS_DIR \
   --result-filename vllm-in<in>-out<out>.json
@@ -54,16 +55,20 @@ pkill -f "vllm serve"
 Same flow, different server:
 
 ```bash
-# Start
-RUST_LOG=warn cargo run --release -- --port $PORT &
+# Start (Qwen3.5 requires PEGAINFER_TRITON_PYTHON for AOT Triton kernels)
+RUST_LOG=warn PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+  cargo run --release -- --model-path $MODEL_PATH --port $PORT &
 
-# Poll until ready (up to 60s — no torch.compile, much faster startup)
+# Poll until ready — pegainfer has no /v1/models; probe with a minimal completions request
+until curl -sf http://localhost:$PORT/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<short-name>","prompt":"hi","max_tokens":1}' >/dev/null; do sleep 5; done
 
 # Benchmark (same vllm bench serve client)
 $VLLM_CMD bench serve \
-  --backend openai --model Qwen3-4B --port $PORT \
+  --backend openai --model <short-name> --port $PORT \
   --dataset-name random --input-len <in> --output-len <out> \
-  --num-prompts <n> --request-rate inf --max-concurrency 1 \
+  --num-prompts 20 --request-rate inf --max-concurrency 1 \
   --ignore-eos --tokenizer $MODEL_PATH \
   --save-result --result-dir $RESULTS_DIR \
   --result-filename pega-in<in>-out<out>.json
@@ -95,8 +100,10 @@ Read both JSON results. Key metrics:
 
 ## Gotchas
 
-- **vLLM cold start:** First request triggers torch.compile. Mean TTFT >> Median TTFT is expected. Note this in reports.
+- **vLLM cold start:** torch.compile triggers on the first 1–3 requests. With `n=10`, mean TTFT is inflated 5–50× and p99 is always a cold-start spike — neither is meaningful. **Read median only.** For stable p99, use `n>=30` (cold-start requests become a small tail of the distribution). Example: Qwen3.5-4B at (2048,1), n=10: mean=1279ms, median=222ms, p99=9846ms.
+- **Text-only Qwen3.5 on vLLM:** Some Qwen3.5 checkpoints expose multimodal metadata. For text-only benchmarking, start `vllm serve` with `--language-model-only` (equivalent to `--limit-mm-per-prompt '{"image":0,"video":0}'`).
 - **pegainfer empty prompts:** Random dataset may produce empty prompts which pegainfer rejects. Check failed request count.
 - **Zombie processes:** Always `pkill` after benchmarking. Leftover servers block the port and hold GPU memory.
 - **CUDA Graph:** pegainfer enables CUDA Graph by default. For apples-to-apples decode comparison, note this in the report. vLLM also uses CUDA Graph by default.
 - **Concurrency=1:** Default is single-request sequential. pegainfer has no batching yet, so concurrency>1 would just queue on the server side.
+- **Qwen3.5-4B CUDA Graph OOM on 16 GB:** torch.compile + CUDA Graph needs ~1 GiB extra for graph profiling on top of the 12 GiB model+activation footprint. Workaround: `--max-num-seqs 1` reduces the graph capture to batch_size=1 only and fits in 16 GB. Add `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for marginal help.
