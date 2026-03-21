@@ -4,7 +4,7 @@
 | --- | --- |
 | `projects/nonstandard-attention-milestone.md` | Milestone direction: pegainfer focuses on non-standard attention models, with emphasis on model-family readiness, service experience, framework debt repayment, and disciplined evaluation |
 | `projects/qwen35-4b-optimization.md` | Hybrid 24 linear + 8 full attn. Chunk-wise Rust GDR prefill now reaches ~222ms TTFT(2048,1), passes e2e_qwen35, and ships with an accepted refreshed JSON baseline |
-| `projects/runtime-complexity-paydown.md` | Project to reduce model-specific runtime fragmentation before more non-standard attention families are added |
+| `projects/runtime-complexity-paydown.md` | Project to reduce model-specific runtime fragmentation; current work is cutting API-surface and dead code, including legacy ops wrappers, non-representative microbenches, and leaked model/loading internals |
 | `archives/qwen3-4b-optimization.md` | Dense-attention Qwen3-4B optimization record; archived as reference material after pegainfer led the measured RTX 5070 Ti workloads |
 | `archives/qwen35-gdr-chunkwise-plan.md` | Qwen3.5 chunk-wise GDR plan and validation history; archived after the plan landed in the real runtime and rolled into the broader Qwen3.5 optimization record |
 | `resources/developer-onboarding.md` | New-developer onboarding — toolchain, unified venv, build, tests, benchmark smoke test |

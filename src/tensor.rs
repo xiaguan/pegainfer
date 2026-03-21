@@ -65,7 +65,7 @@ impl DeviceVec {
         })
     }
 
-    pub fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
+    pub(crate) fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
         if data.len() % 2 != 0 {
             return Err(anyhow!(
                 "Data length must be even for bf16: got {} bytes",
@@ -93,37 +93,13 @@ impl DeviceVec {
     }
 
     /// Copy to host as f32 (for compatibility)
-    pub fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
+    pub(crate) fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
         let host_f16 = ctx
             .stream
             .clone_dtoh(&self.data)
             .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
         ctx.sync()?;
         Ok(host_f16.iter().map(|x| x.to_f32()).collect())
-    }
-}
-
-/// An immutable view into a sub-range of a DeviceVec.
-/// Borrows the parent's CudaSlice without copying.
-pub struct DeviceVecView<'a> {
-    pub data: cudarc::driver::CudaView<'a, bf16>,
-    pub len: usize,
-}
-
-impl DeviceVec {
-    /// Create an immutable sub-view: elements [offset..offset+len).
-    pub fn view(&self, offset: usize, len: usize) -> DeviceVecView<'_> {
-        assert!(
-            offset + len <= self.len,
-            "view out of bounds: {}+{} > {}",
-            offset,
-            len,
-            self.len
-        );
-        DeviceVecView {
-            data: self.data.slice(offset..offset + len),
-            len,
-        }
     }
 }
 
@@ -158,7 +134,7 @@ impl DeviceMatrix {
         })
     }
 
-    pub fn from_safetensors(
+    pub(crate) fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],
         rows: usize,

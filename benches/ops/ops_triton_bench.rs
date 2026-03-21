@@ -11,20 +11,9 @@ use super::common::{
     zero_f32_slice,
 };
 
-pub fn bench_triton_ops(c: &mut Criterion) {
+pub(crate) fn bench_triton_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("ops_triton");
     configure_group(&mut group);
-
-    group.throughput(Throughput::Elements(VECTOR_DIM as u64));
-    group.bench_function(BenchmarkId::new("add", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let add_a = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add lhs");
-        let add_b = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate add rhs");
-        iter_sync(b, &ctx, || {
-            let out = ops::add(&ctx, &add_a, &add_b).expect("add failed");
-            black_box(out);
-        });
-    });
 
     group.throughput(Throughput::Elements((VECTOR_DIM * BATCH_SEQ_LEN) as u64));
     group.bench_function(BenchmarkId::new("add_batch", BATCH_SEQ_LEN), |b| {
@@ -47,20 +36,6 @@ pub fn bench_triton_ops(c: &mut Criterion) {
         iter_sync(b, &ctx, || {
             let out = ops::silu_mul_batch(&ctx, &gate, &up).expect("silu_mul_batch failed");
             black_box(out);
-        });
-    });
-
-    group.throughput(Throughput::Elements(VECTOR_DIM as u64));
-    group.bench_function(BenchmarkId::new("embedding_into", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let embed = embedding_matrix(&ctx, VOCAB_SIZE, VECTOR_DIM)
-            .expect("failed to allocate embedding matrix");
-        let token_id = 17_u32;
-        let mut embed_out =
-            DeviceVec::zeros(&ctx, VECTOR_DIM).expect("failed to allocate embedding out");
-        iter_sync(b, &ctx, || {
-            ops::embedding_into(&ctx, &embed, token_id, &mut embed_out)
-                .expect("embedding_into failed");
         });
     });
 

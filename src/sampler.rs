@@ -22,7 +22,7 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
-    pub fn is_greedy(&self) -> bool {
+    pub(crate) fn is_greedy(&self) -> bool {
         (self.temperature <= 0.0 || self.top_k == 1) && self.top_p >= 1.0
     }
 }
@@ -30,7 +30,7 @@ impl SamplingParams {
 /// Sample a token from logits using temperature, top-k, and top-p.
 ///
 /// Pipeline: temperature scale → top-k truncate → softmax → top-p truncate → multinomial.
-pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> u32 {
+pub(crate) fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> u32 {
     assert!(!logits.is_empty(), "sample() called with empty logits");
 
     let temperature = params.temperature;

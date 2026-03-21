@@ -48,7 +48,7 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
 }
 
 /// Memory-map shard files. Returns the mmaps; caller deserializes SafeTensors from them.
-pub fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
+pub(crate) fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
     let t0 = Instant::now();
     let mmaps: Vec<Mmap> = shard_paths
         .iter()
@@ -70,7 +70,7 @@ pub fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
     Ok(mmaps)
 }
 
-pub fn find_tensor<'a>(
+fn find_tensor<'a>(
     shards: &'a [SafeTensors<'a>],
     weight_map: &HashMap<String, usize>,
     name: &str,
@@ -90,7 +90,7 @@ pub fn find_tensor<'a>(
     }
 }
 
-pub fn load_tensor_1d(
+pub(crate) fn load_tensor_1d(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
@@ -100,7 +100,7 @@ pub fn load_tensor_1d(
     DeviceVec::from_safetensors(ctx, tensor.data())
 }
 
-pub fn load_tensor_2d(
+pub(crate) fn load_tensor_2d(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
@@ -113,7 +113,7 @@ pub fn load_tensor_2d(
 
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.
 /// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
-pub fn precompute_rope(
+pub(crate) fn precompute_rope(
     ctx: &DeviceContext,
     head_dim: usize,
     max_seq_len: usize,
@@ -151,7 +151,7 @@ pub fn precompute_rope(
 
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
 /// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).
-pub fn load_tensor_1d_f32(
+pub(crate) fn load_tensor_1d_f32(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
@@ -180,7 +180,9 @@ pub fn load_tensor_1d_f32(
 /// Some models (e.g., Qwen3.5) have index.json with shard filenames like
 /// `model.safetensors-00001-of-00002.safetensors` while actual files are
 /// `model-00001-of-00002.safetensors`. This function detects and fixes that.
-pub fn load_shard_info_fixed(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
+pub(crate) fn load_shard_info_fixed(
+    model_path: &str,
+) -> Result<(Vec<String>, HashMap<String, usize>)> {
     let (mut shard_files, weight_map) = load_shard_info(model_path)?;
 
     for path in &mut shard_files {

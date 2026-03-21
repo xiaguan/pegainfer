@@ -1,5 +1,3 @@
-use std::hint::black_box;
-
 use criterion::{BenchmarkId, Criterion, Throughput};
 use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -10,101 +8,9 @@ use super::common::{
     rope_cache, zero_f32_slice,
 };
 
-pub fn bench_attention_ops(c: &mut Criterion) {
+pub(crate) fn bench_attention_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("ops_attention");
     configure_group(&mut group);
-
-    group.throughput(Throughput::Elements((ATTN_SEQ_LEN * HEAD_DIM_128) as u64));
-    group.bench_function(BenchmarkId::new("attention_scores", ATTN_SEQ_LEN), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let q = device_vec(&ctx, HEAD_DIM_128).expect("failed to allocate q");
-        let k_primitives =
-            device_vec(&ctx, ATTN_SEQ_LEN * HEAD_DIM_128).expect("failed to allocate k cache");
-        let scale = 1.0 / (HEAD_DIM_128 as f32).sqrt();
-        iter_sync(b, &ctx, || {
-            let scores =
-                ops::attention_scores(&ctx, &q, &k_primitives, ATTN_SEQ_LEN, HEAD_DIM_128, scale)
-                    .expect("attention_scores failed");
-            black_box(scores);
-        });
-    });
-
-    group.throughput(Throughput::Elements((ATTN_SEQ_LEN * HEAD_DIM_128) as u64));
-    group.bench_function(
-        BenchmarkId::new("attention_weighted_sum", ATTN_SEQ_LEN),
-        |b| {
-            let ctx = DeviceContext::new().expect("failed to create CUDA context");
-            let weights =
-                positive_device_vec(&ctx, ATTN_SEQ_LEN).expect("failed to allocate weights");
-            let v_primitives =
-                device_vec(&ctx, ATTN_SEQ_LEN * HEAD_DIM_128).expect("failed to allocate v cache");
-            iter_sync(b, &ctx, || {
-                let out = ops::attention_weighted_sum(
-                    &ctx,
-                    &weights,
-                    &v_primitives,
-                    ATTN_SEQ_LEN,
-                    HEAD_DIM_128,
-                )
-                .expect("attention_weighted_sum failed");
-                black_box(out);
-            });
-        },
-    );
-
-    group.throughput(Throughput::Elements((Q_HEADS_128 * HEAD_DIM_128) as u64));
-    group.bench_function(
-        BenchmarkId::new("fused_attention_into", ATTN_SEQ_LEN),
-        |b| {
-            let ctx = DeviceContext::new().expect("failed to create CUDA context");
-            let q_dim = Q_HEADS_128 * HEAD_DIM_128;
-            let kv_dim = KV_HEADS_128 * HEAD_DIM_128;
-            let q_full = device_vec(&ctx, q_dim).expect("failed to allocate q_full");
-            let k_full = device_vec(&ctx, kv_dim).expect("failed to allocate k_full");
-            let v_full = device_vec(&ctx, kv_dim).expect("failed to allocate v_full");
-            let q_norm =
-                positive_device_vec(&ctx, HEAD_DIM_128).expect("failed to allocate q_norm");
-            let k_norm =
-                positive_device_vec(&ctx, HEAD_DIM_128).expect("failed to allocate k_norm");
-            let (cos_cache, sin_cache) =
-                rope_cache(&ctx, MAX_SEQ_LEN, HEAD_DIM_128, ROPE_THETA_QWEN3)
-                    .expect("failed to create rope cache");
-            let current_pos = ATTN_SEQ_LEN - 1;
-            let cos_pos = cos_cache.view(current_pos * HEAD_DIM_128, HEAD_DIM_128);
-            let sin_pos = sin_cache.view(current_pos * HEAD_DIM_128, HEAD_DIM_128);
-            let cache_len = KV_HEADS_128 * MAX_SEQ_LEN * HEAD_DIM_128;
-            let mut k_cache =
-                DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate k cache");
-            let mut v_cache =
-                DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate v cache");
-            let mut fused_out =
-                DeviceVec::zeros(&ctx, q_dim).expect("failed to allocate fused out");
-            let scale = 1.0 / (HEAD_DIM_128 as f32).sqrt();
-            iter_sync(b, &ctx, || {
-                ops::fused_attention_into(
-                    &ctx,
-                    &q_full,
-                    &k_full,
-                    &v_full,
-                    &q_norm,
-                    &k_norm,
-                    &cos_pos,
-                    &sin_pos,
-                    &mut k_cache,
-                    &mut v_cache,
-                    &mut fused_out,
-                    Q_HEADS_128,
-                    KV_HEADS_128,
-                    HEAD_DIM_128,
-                    current_pos,
-                    ATTN_SEQ_LEN,
-                    scale,
-                    EPS,
-                )
-                .expect("fused_attention_into failed");
-            });
-        },
-    );
 
     group.throughput(Throughput::Elements(
         (Q_HEADS_128 * HEAD_DIM_128 * ATTN_SEQ_LEN) as u64,
