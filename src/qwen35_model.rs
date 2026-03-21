@@ -729,53 +729,31 @@ impl Qwen35Model {
         // Batch project, then per-token attention/recurrent
         let attn_results = match &layer.attn {
             LayerKind::FullAttention(attn) => {
-                let q_batch = ops::gemm(&self.ctx, &attn.q_proj, &normed_batch)?;
+                let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, &normed_batch)?;
                 let k_batch = ops::gemm(&self.ctx, &attn.k_proj, &normed_batch)?;
                 let v_batch = ops::gemm(&self.ctx, &attn.v_proj, &normed_batch)?;
-
-                let scale = 1.0 / (c.head_dim as f32).sqrt();
                 let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
 
-                // Each full attention layer processes tokens at the SAME positions.
-                // Don't increment kv_cache.seq_len per-token here; advance once at end.
                 let base_pos = kv_cache.len();
-                for t in 0..seq_len {
-                    let q = ops::extract_vec(&self.ctx, &q_batch, t)?;
-                    let k = ops::extract_vec(&self.ctx, &k_batch, t)?;
-                    let v = ops::extract_vec(&self.ctx, &v_batch, t)?;
-
-                    let pos = base_pos + t;
-                    let attn_seq = pos + 1;
-
-                    let cos_pos = self.cos_cache.view(pos * c.rotary_dim, c.rotary_dim);
-                    let sin_pos = self.sin_cache.view(pos * c.rotary_dim, c.rotary_dim);
-
-                    let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
-                    let mut attn_out = DeviceVec::zeros(&self.ctx, attn_out_dim)?;
-
-                    ops::fused_attention_hd256_single_token_into(
-                        &self.ctx,
-                        &q,
-                        &k,
-                        &v,
-                        &attn.q_norm,
-                        &attn.k_norm,
-                        &cos_pos,
-                        &sin_pos,
-                        kc,
-                        vc,
-                        &mut attn_out,
-                        c.num_attention_heads,
-                        c.num_key_value_heads,
-                        pos,
-                        attn_seq,
-                        c.rotary_dim,
-                        scale,
-                        eps,
-                    )?;
-
-                    ops::write_vec(&self.ctx, &mut attn_out_batch, t, &attn_out)?;
-                }
+                let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
+                ops::prefill_attention_hd256_batch(
+                    &self.ctx,
+                    &q_full_batch,
+                    &k_batch,
+                    &v_batch,
+                    &attn.q_norm,
+                    &attn.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    kc,
+                    vc,
+                    &mut attn_out_batch,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    base_pos,
+                    c.rotary_dim,
+                    eps,
+                )?;
 
                 *full_idx += 1;
 

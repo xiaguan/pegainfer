@@ -103,16 +103,16 @@ pub struct StreamingStats {
 ///   `o_buf`   reused for `mlp_out`  (step 7 done before step 12)
 struct PrefillBuffers {
     /// Output ping-pong: layer writes result here; caller swaps with the incoming hidden.
-    hidden_out: HiddenStates,    // hidden_dim × seq_len
-    normed: HiddenStates,        // hidden_dim × seq_len (reused for normed2)
-    q_batch: HiddenStates,       // q_dim × seq_len
-    k_batch: HiddenStates,       // kv_dim × seq_len
-    v_batch: HiddenStates,       // kv_dim × seq_len
-    o_buf: HiddenStates,         // hidden_dim × seq_len (reused for mlp_out)
-    gate_out: HiddenStates,      // inter_dim × seq_len
-    up_out: HiddenStates,        // inter_dim × seq_len
-    act_out: HiddenStates,       // inter_dim × seq_len
-    attn_output: HiddenStates,   // q_dim × seq_len
+    hidden_out: HiddenStates, // hidden_dim × seq_len
+    normed: HiddenStates,      // hidden_dim × seq_len (reused for normed2)
+    q_batch: HiddenStates,     // q_dim × seq_len
+    k_batch: HiddenStates,     // kv_dim × seq_len
+    v_batch: HiddenStates,     // kv_dim × seq_len
+    o_buf: HiddenStates,       // hidden_dim × seq_len (reused for mlp_out)
+    gate_out: HiddenStates,    // inter_dim × seq_len
+    up_out: HiddenStates,      // inter_dim × seq_len
+    act_out: HiddenStates,     // inter_dim × seq_len
+    attn_output: HiddenStates, // q_dim × seq_len
 }
 
 impl PrefillBuffers {
@@ -125,16 +125,16 @@ impl PrefillBuffers {
         seq_len: usize,
     ) -> Result<Self> {
         Ok(Self {
-            hidden_out:  HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            normed:      HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            q_batch:     HiddenStates::zeros(ctx, q_dim,      seq_len)?,
-            k_batch:     HiddenStates::zeros(ctx, kv_dim,     seq_len)?,
-            v_batch:     HiddenStates::zeros(ctx, kv_dim,     seq_len)?,
-            o_buf:       HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            gate_out:    HiddenStates::zeros(ctx, inter_dim,  seq_len)?,
-            up_out:      HiddenStates::zeros(ctx, inter_dim,  seq_len)?,
-            act_out:     HiddenStates::zeros(ctx, inter_dim,  seq_len)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim,      seq_len)?,
+            hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
+            normed: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
+            v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
+            o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
+            gate_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
         })
     }
 }
@@ -491,9 +491,24 @@ impl Qwen3Model {
         )?;
 
         // 2. QKV projections → bufs.q_batch, bufs.k_batch, bufs.v_batch
-        ops::gemm_into(&self.ctx, &layer.attention.q_proj, &bufs.normed, &mut bufs.q_batch)?;
-        ops::gemm_into(&self.ctx, &layer.attention.k_proj, &bufs.normed, &mut bufs.k_batch)?;
-        ops::gemm_into(&self.ctx, &layer.attention.v_proj, &bufs.normed, &mut bufs.v_batch)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.q_proj,
+            &bufs.normed,
+            &mut bufs.q_batch,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.k_proj,
+            &bufs.normed,
+            &mut bufs.k_batch,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.v_proj,
+            &bufs.normed,
+            &mut bufs.v_batch,
+        )?;
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
         let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
@@ -517,7 +532,12 @@ impl Qwen3Model {
         )?;
 
         // 4. O projection → bufs.o_buf (as o_batch)
-        ops::gemm_into(&self.ctx, &layer.attention.o_proj, &bufs.attn_output, &mut bufs.o_buf)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.o_proj,
+            &bufs.attn_output,
+            &mut bufs.o_buf,
+        )?;
 
         // 5. Residual add: hidden_in + o_batch → bufs.hidden_out
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
@@ -534,10 +554,25 @@ impl Qwen3Model {
         )?;
 
         // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
-        ops::gemm_into(&self.ctx, &layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
-        ops::gemm_into(&self.ctx, &layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        )?;
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(&self.ctx, &layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.o_buf,
+        )?;
 
         // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;

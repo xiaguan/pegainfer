@@ -21,8 +21,7 @@ pub fn bench_qwen35_norm_ops(c: &mut Criterion) {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         let x = device_vec(&ctx, hidden).expect("failed to allocate x");
         let weight = positive_device_vec(&ctx, hidden).expect("failed to allocate offset weight");
-        let mut offset_out =
-            DeviceVec::zeros(&ctx, hidden).expect("failed to allocate offset out");
+        let mut offset_out = DeviceVec::zeros(&ctx, hidden).expect("failed to allocate offset out");
         iter_sync(b, &ctx, || {
             ops::rms_norm_offset_into(&ctx, &x, &weight, EPS, &mut offset_out)
                 .expect("rms_norm_offset_into failed");
@@ -40,8 +39,10 @@ pub fn bench_qwen35_norm_ops(c: &mut Criterion) {
                 positive_device_vec(&ctx, hidden).expect("failed to allocate fused weight");
             let mut out = DeviceVec::zeros(&ctx, hidden).expect("failed to allocate fused out");
             iter_sync(b, &ctx, || {
-                ops::fused_add_rms_norm_offset_into(&ctx, &mut h, &residual, &weight, EPS, &mut out)
-                    .expect("fused_add_rms_norm_offset_into failed");
+                ops::fused_add_rms_norm_offset_into(
+                    &ctx, &mut h, &residual, &weight, EPS, &mut out,
+                )
+                .expect("fused_add_rms_norm_offset_into failed");
             });
         },
     );

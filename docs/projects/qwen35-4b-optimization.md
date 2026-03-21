@@ -1,12 +1,12 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). Decode TPOT 12.55ms vs vLLM 11.64ms (+8%). Prefill 14.5s vs vLLM 222ms (65× slower). Bottleneck is now per-token attention (80% GPU) and GDR (17% GPU) — both still using decode kernels in a per-token loop.
+> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). After removing the legacy HD256 single-token prefill path, prefill-heavy TTFT improved from 14.5s to 3.89s at `(2048,1)`; decode-heavy TPOT remains 12.53ms at `(1,128)`. `nsys` now shows the bottleneck has shifted almost entirely to linear-attention prefill: `gated_delta_rule_decode_kernel` alone is `87.6%` of GPU time, while the full Triton HD256 prefill-attention stack is below `0.5%`.
 >
-> **Status:** Active. RMSNorm_offset batched (#1 done). Next: FA2 for full attention prefill.
+> **Status:** Active. RMSNorm_offset batched (#1 done). Standalone HD256 Triton attention landed (#2). Full-attention prefill is now wired to Triton and the legacy HD256 single-token prefill kernel has been removed (#3). E2E benchmark refresh done (#4). `nsys` reprofile done (#5). Next: reduce linear-attention/GDR sequential prefill overhead and the associated DtoD-copy / alloc-free churn.
 
 ## Goal
 
-pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. Prefill is 76× behind vLLM — this is the only thing that matters right now.
+pegainfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. Prefill is still the main problem, but the HD256 full-attention prefill bottleneck is no longer catastrophic after the Triton rewrite.
 
 ## E2E Dashboard
 
@@ -15,10 +15,10 @@ pegainfer: in-process bench_serving (no HTTP overhead). vLLM: `vllm bench serve`
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 14,500ms | 222ms¹ | **+65× slower** |
-| prefill-heavy (2048,1) | TTFT p99 | 14,501ms | 245ms¹ | **+59× slower** |
-| decode-heavy (1,128) | TPOT median | 12.55ms | 11.64ms² | +8% |
-| decode-heavy (1,128) | TPOT p99 | 12.95ms | 11.76ms² | +10% |
+| prefill-heavy (2048,1) | TTFT median | 3,889ms | 222ms¹ | **+17.5× slower** |
+| prefill-heavy (2048,1) | TTFT p99 | 3,891ms | 245ms¹ | **+15.9× slower** |
+| decode-heavy (1,128) | TPOT median | 12.54ms | 11.64ms² | +8% |
+| decode-heavy (1,128) | TPOT p99 | 12.94ms | 11.76ms² | +10% |
 
 ¹ vLLM enforce-eager (no torch.compile/CUDA Graph). Compiled mode OOM'd on 2048-token prefill on this GPU.
 ² vLLM with torch.compile + CUDA Graph (default production config).
@@ -55,7 +55,9 @@ RMSNorm_offset [2560,seq]
   → GEMM Q [2560→8192,seq]     ← batched
   → GEMM K [2560→1024,seq]     ← batched
   → GEMM V [2560→1024,seq]     ← batched
-  → per-token: fused_attention_hd256_single_token (QK norm, partial RoPE, KV write, attention, output gate)
+  → prefill_attention_hd256_prep (Q/K norm, partial RoPE, KV write)   ← batched CUDA helper
+  → flash_attention_prefill_hd256_into (attention core)               ← batched Triton
+  → attention_gate_batch_hd256 (apply sigmoid(gate))                  ← batched CUDA helper
   → GEMM O [4096→2560,seq]     ← batched
   → Residual + RMSNorm_offset [2560,seq]
   → GEMM Gate [2560→9216,seq]  ← batched
@@ -65,7 +67,7 @@ RMSNorm_offset [2560,seq]
   → Residual
 ```
 
-**Critical:** attention is per-token — no FlashAttention-2, no batched prefill attention kernel. Each token launches a separate fused_attention_hd256_single_token (designed for decode). At seq=2048, that's 2048 tiny kernel launches per full-attention layer × 8 layers = 16,384 kernels.
+**Current state:** full-attention prefill no longer runs a per-token decode kernel. The remaining prefill bottleneck should now be the linear-attention sequential path, but this needs a fresh end-to-end profile.
 
 ### Linear Attention Layer — prefill
 
@@ -143,25 +145,129 @@ Total GPU kernel time: ~12.5ms/step (matches TPOT 12.55ms — fully GPU-bound, n
 
 GEMV + fused_mlp dominate at 84.6%. This is pure memory-bandwidth work (matrix-vector products). GDR is 8.7% — the main "exotic" cost of the hybrid architecture.
 
-### Prefill (128 tokens) — nsys kernel breakdown per prefill
+### Prefill (128 tokens) — baseline before batched Triton full-attention wiring
 
 Wall clock: 669ms. GPU kernel time: 222ms. **CPU kernel launch overhead: 447ms (67%).**
 
 | Kernel | Time/prefill | % of GPU | Count/prefill | Avg each | Notes |
 |--------|-------------|----------|---------------|----------|-------|
 | gated_delta_rule | 138ms | 62.2% | 3,072 | 45μs | 128 tokens × 24 layers, sequential |
-| fused_attention_hd256_single_token | 46ms | 20.8% | 1,024 | 45μs | 128 × 8 layers, decode kernel reused |
+| fused_attention_hd256_single_token | 46ms | 20.8% | 1,024 | 45μs | 128 × 8 layers, old decode-style kernel reused during prefill |
 | rms_norm_offset | 16ms | 7.1% | 8,193 | 1.9μs | per-token (no batched kernel) |
 | cuBLAS GEMM (batched projections) | 12ms | 5.3% | ~250 | 48μs | well-utilized, not a bottleneck |
 | conv1d_decode | 4.4ms | 2.0% | 3,072 | 1.4μs | |
 | rms_norm_gated | 3.7ms | 1.7% | 3,072 | 1.2μs | |
 | other | ~2ms | ~1% | — | — | silu_mul, add, embedding, argmax |
 
-**Key insight:** GPU only works 222ms out of 669ms wall clock. The remaining 447ms is CPU overhead from launching ~20,000 tiny kernels in a sequential per-token loop. At seq=2048, this scales to ~160K kernel launches → 16.8s wall clock.
+**Key insight (baseline):** GPU only works 222ms out of 669ms wall clock. The remaining 447ms is CPU overhead from launching ~20,000 tiny kernels in a sequential per-token loop. At seq=2048, this scales to ~160K kernel launches → 16.8s wall clock.
 
-The bottleneck is not kernel speed — it's the per-token loop architecture. Batching the sequential operations (or eliminating the per-token loop entirely) would bring prefill from seconds to sub-second.
+This section is retained as the pre-#3 baseline. Full-attention prefill has since been moved to a batched Triton path; the updated end-to-end `nsys` capture is summarized below.
+
+### Prefill (2048 tokens) — after batched Triton full-attention wiring
+
+`nsys` command used:
+
+```bash
+nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node \
+  --export=sqlite -o target/profiling/qwen35_prefill_2048 \
+  cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
+  request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1
+```
+
+Trace note: this capture includes one warmup request plus one measured request, so instance counts below are doubled relative to a single `(2048,1)` run. Percentages are still representative.
+
+| Kernel | GPU% | Instances in trace | Avg each | Notes |
+|--------|------|--------------------|----------|-------|
+| gated_delta_rule_decode | 87.6% | 98,304 | 45.0us | 24 linear-attn layers × 2048 tokens × 2 runs |
+| conv1d_decode | 2.8% | 98,304 | 1.44us | linear-attn sequential prefilter |
+| rms_norm_gated | 2.4% | 98,304 | 1.21us | linear-attn post-GDR gating |
+| batched GEMM kernels (CUTLASS) | ~6.3% | 416 | 122us to 1.04ms | projections + MLP, no longer dominant |
+| flash_attention_prefill_hd256_kernel | 0.4% | 16 | 1.41ms | 8 full-attn layers × 2 runs |
+| prefill_attention_hd256_prep + gate + v-cache helpers | <0.1% | 48 | 15us to 122us | Q/K norm + partial RoPE + gate are negligible |
+| rms_norm_batched_offset | 0.0% | 128 | 12.5us | fixed in #1, no longer relevant |
+
+**Kernel conclusion:** full-attention prefill is no longer the problem. The remaining GPU bottleneck is the linear-attention sequential loop, and specifically `gated_delta_rule_decode`.
+
+`cuda_api_sum` from the same trace shows the host/runtime side is now dominated by bookkeeping rather than full-attention launches:
+
+| API | Total calls in trace | Avg each | Interpretation |
+|-----|----------------------|----------|----------------|
+| cuMemsetD8Async | 689,163 | 4.65us | heavy temporary-buffer churn |
+| cuMemcpyDtoDAsync_v2 | 491,522 | 5.92us | row extraction / writeback style device copies still dominate |
+| cudaLaunchKernel | 295,094 | 5.25us | still a very large sequential launch count |
+| cuMemAllocAsync | 689,545 | 0.97us | temporary allocations remain excessive |
+| cuMemFreeAsync | 689,545 | 0.75us | same churn on the free side |
+
+**API conclusion:** after deleting the old HD256 attention loop, prefill is still paying for a massive amount of linear-attention per-token orchestration: launches, DtoD copies, memsets, and alloc/free traffic. The next optimization target should be the linear-attention prefill structure, not full attention.
 
 ## Optimization Log
+
+### #3 Batched Triton full-attention prefill for Qwen3.5 (2026-03-21)
+
+**Goal:** Replace the Qwen3.5 HD256 full-attention prefill loop with a batched Triton path and remove the legacy single-token CUDA prefill implementation.
+
+**Changes:** Added `prefill_attention_hd256_prep_cuda` and `attention_gate_batch_hd256_cuda`, wired `Qwen35Model` full-attention prefill to `prefill_attention_hd256_batch()`, updated the `qwen35_prefill_attn` microbench to measure the runtime path, regenerated the Qwen3.5 greedy baseline, and deleted the dead `fused_gqa_attention_hd256_single_token` CUDA implementation.
+
+**Validated commands:**
+- `cargo test --release test_prefill_attention_hd256_batch_matches_cpu_reference -- --ignored --nocapture`
+- `cargo test --release --test e2e_qwen35 -- --nocapture`
+- `cargo bench --bench ops_bench -- qwen35_prefill_attn`
+
+**Microbench result (runtime subpath: prep + Triton attention + gate):**
+- seq128: 50.7us
+- seq512: 365us
+- seq2048: 1.64ms
+
+**Interpretation:** Qwen3.5 full-attention prefill is no longer dominated by per-token HD256 attention launches. That follow-up profile is now in #5 and confirms the remaining TTFT cost sits in the linear-attention sequential kernels.
+
+### #4 End-to-end refresh after Triton prefill wiring (2026-03-21)
+
+**Goal:** Measure real request-level impact before running another profiling pass.
+
+**Validated commands:**
+- `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 5`
+- `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 1 --iters 5`
+
+**Results:**
+- Prefill-heavy `(2048,1)`: TTFT avg `3889.14ms`, p50 `3889.25ms`, p99 `3890.67ms`
+- Decode-heavy `(1,128)`: TTFT avg `12.28ms`, steady TPOT avg `12.53ms`, p50 `12.54ms`, p99 `12.94ms`
+
+**Interpretation:** Removing the old HD256 per-token prefill kernel improved TTFT by about `3.7x` versus the previous `14.5s` baseline while leaving decode essentially unchanged. The remaining gap to vLLM is now much more likely to sit in the 24 linear-attention layers and their sequential prefill kernels.
+
+### #5 nsys reprofile after Triton prefill wiring (2026-03-21)
+
+**Goal:** Confirm where prefill time moved after removing the old HD256 per-token full-attention path.
+
+**Validated commands:**
+- `nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite -o target/profiling/qwen35_prefill_2048 cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1`
+- `nsys stats --report cuda_gpu_kern_sum target/profiling/qwen35_prefill_2048.sqlite`
+- `nsys stats --report cuda_api_sum target/profiling/qwen35_prefill_2048.sqlite`
+
+**Key findings:**
+- `gated_delta_rule_decode_kernel`: `87.6%` of GPU time
+- `conv1d_decode_kernel` + `rms_norm_gated_kernel`: another `5.2%`
+- Batched Triton full-attention core: `0.4%`
+- HD256 prep/gate helpers combined: `<0.1%`
+- API activity still includes `~295k` kernel launches, `~492k` DtoD copies, and `~690k` alloc/free pairs in the warmup+iter trace
+
+**Interpretation:** the full-attention prefill rewrite worked. The dominant bottleneck is now the linear-attention prefill loop and the large amount of per-token runtime bookkeeping around it. The next meaningful win will come from batching or restructuring linear-attention prefill, especially GDR.
+
+### #2 Standalone HD256 Triton attention (2026-03-21)
+
+**Goal:** Validate the Qwen3.5 full-attention prefill core in Triton before touching model wiring, and drop the old CUDA-vs-Triton microbench duplication.
+
+**Changes:** Added `tools/triton/flash_attention_prefill_hd256_kernel.py`, `flash_attention_prefill_hd256_into()` in Rust/FFI, a focused CPU-reference test, and a Triton-only `qwen35_prefill_attn` microbench. Removed the legacy CUDA attention microbench entries so attention coverage now tracks only the Triton path.
+
+**Validated commands:**
+- `cargo test --release test_flash_attention_prefill_hd256_matches_cpu_reference -- --ignored --nocapture`
+- `cargo bench --bench ops_bench -- qwen35_prefill_attn`
+
+**Microbench result (attention only; excludes QK norm, partial RoPE, KV write, and output gate):**
+- seq128: 30.9us
+- seq512: 151us
+- seq2048: 1.43ms
+
+**Interpretation:** The batched HD256 attention core is no longer the blocking concern. The remaining work is the Qwen3.5-specific prep and gate wiring around it.
 
 ### #1 Batched RMSNorm_offset (2026-03-21)
 

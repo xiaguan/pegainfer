@@ -202,4 +202,3 @@ pub fn rope_cache(
         DeviceVec::from_host(ctx, &sin_host)?,
     ))
 }
-

@@ -202,6 +202,52 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
+    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
+    pub fn flash_attention_prefill_hd256_cuda(
+        Q: *const Half,
+        K_cache: *const Half,
+        V_cache: *const Half,
+        Output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        gqa_ratio: i32,
+        seq_len: i32,
+        start_pos: i32,
+        q_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
+    pub fn prefill_attention_hd256_prep_cuda(
+        q_full_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Apply sigmoid(gate) from interleaved q_full onto attention output in-place.
+    pub fn attention_gate_batch_hd256_cuda(
+        q_full_batch: *const Half,
+        attn_out: *mut Half,
+        num_q_heads: i32,
+        seq_len: i32,
+        stream: CUstream,
+    );
+
     // Fused GQA Attention — prefill variant (scalar pos/seq_len, per-position cos/sin)
     pub fn fused_gqa_attention_single_token(
         q_full: *const Half,
@@ -367,26 +413,4 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA attention HD256 — single token variant (scalar pos/seq_len)
-    pub fn fused_gqa_attention_hd256_single_token(
-        q_full: *const Half,
-        k_full: *const Half,
-        v_full: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        output: *mut Half,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        current_pos: i32,
-        seq_len: i32,
-        rotary_dim: i32,
-        scale: f32,
-        rms_eps: f32,
-        stream: CUstream,
-    );
 }

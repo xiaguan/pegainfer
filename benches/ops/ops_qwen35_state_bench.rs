@@ -6,15 +6,14 @@ use super::common::{
     ATTN_SEQ_LEN, CONV_KERNEL_SIZE, EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS,
     QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
     QWEN35_4B_LINEAR_V_HEADS, QWEN35_4B_Q_HEADS, QWEN35_4B_ROPE_THETA, QWEN35_4B_ROTARY_DIM,
-    configure_group, decode_meta, device_vec, f32_slice, iter_sync, positive_device_vec, rope_cache,
-    zero_f32_slice,
+    configure_group, device_vec, f32_slice, hidden_states, iter_sync, positive_device_vec,
+    rope_cache, zero_f32_slice,
 };
 
 pub fn bench_qwen35_state_ops(c: &mut Criterion) {
     // Qwen3.5-4B linear attention: q=16×128, k=16×128, v=32×128
     let conv_channels = QWEN35_4B_LINEAR_K_HEADS * QWEN35_4B_LINEAR_K_DIM * 2
         + QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM;
-    let scale = 1.0 / (QWEN35_4B_HEAD_DIM as f32).sqrt();
 
     let mut group = c.benchmark_group("ops_qwen35_state");
     configure_group(&mut group);
@@ -75,14 +74,11 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
     group.bench_function("gated_delta_rule_decode_into", |b| {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         let qkv = device_vec(&ctx, conv_channels).expect("failed to allocate qkv");
-        let b_proj =
-            device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate b_proj");
-        let a_proj =
-            device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_proj");
+        let b_proj = device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate b_proj");
+        let a_proj = device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_proj");
         let dt_bias = positive_device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS)
             .expect("failed to allocate dt_bias");
-        let a_log =
-            f32_slice(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_log");
+        let a_log = f32_slice(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_log");
         let mut state = zero_f32_slice(
             &ctx,
             QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM,
@@ -110,169 +106,62 @@ pub fn bench_qwen35_state_ops(c: &mut Criterion) {
         });
     });
 
-    // Full attention decode: q=16×256, kv=4×256, rotary_dim=64
+    group.finish();
+}
+
+/// Qwen3.5 full-attention prefill microbench on the Triton path.
+///
+/// This includes Q/K prep, KV cache write, Triton attention, and output gating.
+pub fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
     let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
+    let q_full_dim = q_dim * 2;
     let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
     let cache_len = QWEN35_4B_KV_HEADS * MAX_SEQ_LEN * QWEN35_4B_HEAD_DIM;
 
-    group.throughput(Throughput::Elements(q_dim as u64));
-    group.bench_function(
-        BenchmarkId::new("fused_attention_hd256_decode_into", ATTN_SEQ_LEN),
-        |b| {
-            let ctx = DeviceContext::new().expect("failed to create CUDA context");
-            let q_full = device_vec(&ctx, q_dim * 2).expect("failed to allocate q_full (w/ gate)");
-            let k_full = device_vec(&ctx, kv_dim).expect("failed to allocate k_full");
-            let v_full = device_vec(&ctx, kv_dim).expect("failed to allocate v_full");
-            let q_norm =
-                positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("failed to allocate q_norm");
-            let k_norm =
-                positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("failed to allocate k_norm");
-            let (cos_cache, sin_cache) =
-                rope_cache(&ctx, MAX_SEQ_LEN, QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROPE_THETA)
-                    .expect("failed to create rope cache");
-            let current_pos = ATTN_SEQ_LEN - 1;
-            let decode_meta = decode_meta(&ctx, 7, current_pos, ATTN_SEQ_LEN)
-                .expect("failed to allocate decode meta");
-            let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate k cache");
-            let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate v cache");
+    for &seq_len in &[128usize, 512, 2048] {
+        let mut group = c.benchmark_group(format!("qwen35_prefill_attn/seq{seq_len}"));
+        configure_group(&mut group);
+        group.throughput(Throughput::Elements((q_dim * seq_len) as u64));
+
+        group.bench_function("prefill_attention_hd256_batch", |b| {
+            let ctx = DeviceContext::new().expect("ctx");
+            let q_full_batch = hidden_states(&ctx, q_full_dim, seq_len).expect("q_full_batch");
+            let k_batch = hidden_states(&ctx, kv_dim, seq_len).expect("k_batch");
+            let v_batch = hidden_states(&ctx, kv_dim, seq_len).expect("v_batch");
+            let q_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("q_norm");
+            let k_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("k_norm");
+            let (cos_cache, sin_cache) = rope_cache(
+                &ctx,
+                MAX_SEQ_LEN,
+                QWEN35_4B_ROTARY_DIM,
+                QWEN35_4B_ROPE_THETA,
+            )
+            .expect("rope");
+            let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("k_cache");
+            let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("v_cache");
             let mut attn_out =
-                DeviceVec::zeros(&ctx, q_dim).expect("failed to allocate attention out");
+                pegainfer::tensor::HiddenStates::zeros(&ctx, q_dim, seq_len).expect("attn_out");
+
             iter_sync(b, &ctx, || {
-                ops::fused_attention_hd256_decode_into(
+                ops::prefill_attention_hd256_batch(
                     &ctx,
-                    &q_full,
-                    &k_full,
-                    &v_full,
+                    &q_full_batch,
+                    &k_batch,
+                    &v_batch,
                     &q_norm,
                     &k_norm,
                     &cos_cache,
                     &sin_cache,
-                    &decode_meta,
                     &mut k_cache,
                     &mut v_cache,
                     &mut attn_out,
                     QWEN35_4B_Q_HEADS,
                     QWEN35_4B_KV_HEADS,
+                    0,
                     QWEN35_4B_ROTARY_DIM,
-                    scale,
                     EPS,
                 )
-                .expect("fused_attention_hd256_decode_into failed");
-            });
-        },
-    );
-
-    group.throughput(Throughput::Elements(q_dim as u64));
-    group.bench_function(
-        BenchmarkId::new("fused_attention_hd256_single_token_into", ATTN_SEQ_LEN),
-        |b| {
-            let ctx = DeviceContext::new().expect("failed to create CUDA context");
-            let q_full = device_vec(&ctx, q_dim * 2).expect("failed to allocate q_full (w/ gate)");
-            let k_full = device_vec(&ctx, kv_dim).expect("failed to allocate k_full");
-            let v_full = device_vec(&ctx, kv_dim).expect("failed to allocate v_full");
-            let q_norm =
-                positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("failed to allocate q_norm");
-            let k_norm =
-                positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("failed to allocate k_norm");
-            let (cos_cache, sin_cache) =
-                rope_cache(&ctx, MAX_SEQ_LEN, QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROPE_THETA)
-                    .expect("failed to create rope cache");
-            let current_pos = ATTN_SEQ_LEN - 1;
-            let cos_pos = cos_cache.view(current_pos * QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROTARY_DIM);
-            let sin_pos = sin_cache.view(current_pos * QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROTARY_DIM);
-            let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate k cache");
-            let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("failed to allocate v cache");
-            let mut attn_out =
-                DeviceVec::zeros(&ctx, q_dim).expect("failed to allocate attention out");
-            iter_sync(b, &ctx, || {
-                ops::fused_attention_hd256_single_token_into(
-                    &ctx,
-                    &q_full,
-                    &k_full,
-                    &v_full,
-                    &q_norm,
-                    &k_norm,
-                    &cos_pos,
-                    &sin_pos,
-                    &mut k_cache,
-                    &mut v_cache,
-                    &mut attn_out,
-                    QWEN35_4B_Q_HEADS,
-                    QWEN35_4B_KV_HEADS,
-                    current_pos,
-                    ATTN_SEQ_LEN,
-                    QWEN35_4B_ROTARY_DIM,
-                    scale,
-                    EPS,
-                )
-                .expect("fused_attention_hd256_single_token_into failed");
-            });
-        },
-    );
-
-    group.finish();
-}
-
-/// Baseline for optimization #2: per-token full-attention prefill loop.
-///
-/// Measures seq_len calls to fused_attention_hd256_single_token_into with growing context
-/// (pos 0..seq_len). This is the dominant bottleneck at 80% GPU time after #1.
-/// Target: replace with 1 FA2 call per layer (8 calls total for 8 full-attn layers).
-pub fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
-    let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
-    let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
-    let cache_len = QWEN35_4B_KV_HEADS * MAX_SEQ_LEN * QWEN35_4B_HEAD_DIM;
-    let scale = 1.0 / (QWEN35_4B_HEAD_DIM as f32).sqrt();
-
-    for &seq_len in &[128usize, 512, 2048] {
-        let mut group =
-            c.benchmark_group(format!("qwen35_prefill_attn/seq{seq_len}"));
-        configure_group(&mut group);
-        group.throughput(Throughput::Elements((q_dim * seq_len) as u64));
-
-        group.bench_function("single_token_loop", |b| {
-            let ctx = DeviceContext::new().expect("ctx");
-            // Pre-allocate fixed per-token buffers (no alloc inside loop)
-            let q = device_vec(&ctx, q_dim * 2).expect("q");
-            let k = device_vec(&ctx, kv_dim).expect("k");
-            let v = device_vec(&ctx, kv_dim).expect("v");
-            let q_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("q_norm");
-            let k_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("k_norm");
-            let (cos_cache, sin_cache) =
-                rope_cache(&ctx, MAX_SEQ_LEN, QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROPE_THETA)
-                    .expect("rope");
-            let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("k_cache");
-            let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("v_cache");
-            let mut attn_out = DeviceVec::zeros(&ctx, q_dim).expect("attn_out");
-
-            iter_sync(b, &ctx, || {
-                for t in 0..seq_len {
-                    let cos_pos =
-                        cos_cache.view(t * QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROTARY_DIM);
-                    let sin_pos =
-                        sin_cache.view(t * QWEN35_4B_ROTARY_DIM, QWEN35_4B_ROTARY_DIM);
-                    ops::fused_attention_hd256_single_token_into(
-                        &ctx,
-                        &q,
-                        &k,
-                        &v,
-                        &q_norm,
-                        &k_norm,
-                        &cos_pos,
-                        &sin_pos,
-                        &mut k_cache,
-                        &mut v_cache,
-                        &mut attn_out,
-                        QWEN35_4B_Q_HEADS,
-                        QWEN35_4B_KV_HEADS,
-                        t,
-                        t + 1,
-                        QWEN35_4B_ROTARY_DIM,
-                        scale,
-                        EPS,
-                    )
-                    .expect("attn failed");
-                }
+                .expect("prefill_attention_hd256_batch failed");
             });
         });
 

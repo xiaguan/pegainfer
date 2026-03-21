@@ -123,9 +123,8 @@ pub fn bench_triton_ops(c: &mut Criterion) {
             let mut fused_out =
                 DeviceVec::zeros(&ctx, q_dim).expect("failed to allocate fused out");
             let num_kv_splits = 4usize;
-            let mut partial_out =
-                zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits * HEAD_DIM_128)
-                    .expect("partial_out");
+            let mut partial_out = zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits * HEAD_DIM_128)
+                .expect("partial_out");
             let mut partial_m =
                 zero_f32_slice(&ctx, Q_HEADS_128 * num_kv_splits).expect("partial_m");
             let mut partial_l =

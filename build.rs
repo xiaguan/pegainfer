@@ -428,6 +428,33 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     generated_sources.push(flash_attn_c);
     generated_sources.push(flash_attn_wrapper);
 
+    let flash_attn_prefill_hd256_spec = TritonKernelSpec {
+        artifact_dir: "flash_attention_prefill_hd256",
+        kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
+        kernel_name: "flash_attention_prefill_hd256_kernel",
+        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,i32,i32,64,64,256",
+        grid: "(seq_len + 63) / 64,num_q_heads,1",
+        out_name: "triton_flash_attention_prefill_hd256",
+        num_warps: 4,
+        num_stages: 2,
+    };
+    let (flash_attn_hd256_func, flash_attn_hd256_c) = generate_triton_artifacts(
+        &python,
+        out_dir,
+        &triton_target,
+        &flash_attn_prefill_hd256_spec,
+    );
+    let flash_attn_hd256_wrapper = write_wrapper(
+        &flash_attn_hd256_c,
+        "triton_flash_attention_prefill_hd256_wrapper.c",
+        format!(
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, start_pos, q_dim);\n}}\n",
+            func = flash_attn_hd256_func
+        ),
+    );
+    generated_sources.push(flash_attn_hd256_c);
+    generated_sources.push(flash_attn_hd256_wrapper);
+
     // Attention reduce kernel: merges split-KV partials into final output
     let attention_reduce_spec = TritonKernelSpec {
         artifact_dir: "attention_reduce",
@@ -470,6 +497,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!("cargo:rerun-if-changed=tools/triton/attention_decode_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/attention_reduce_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_kernel.py");
+    println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_hd256_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
     println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
