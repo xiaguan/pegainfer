@@ -330,6 +330,10 @@ void fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *
                                       const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                                       float eps, cudaStream_t stream);
 
+void rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+                                    __nv_bfloat16 *out, int hidden_dim, int seq_len,
+                                    float eps, cudaStream_t stream);
+
 void rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
                           const __nv_bfloat16 *gate, __nv_bfloat16 *out,
                           int num_heads, int head_dim, float eps, cudaStream_t stream);
@@ -503,6 +507,84 @@ __global__ void fused_add_rms_norm_offset_kernel(
 }
 
 // ============================================================================
+// Batched (1+weight) RMSNorm: one block per token.
+// Grid: <<<seq_len, NORM_BLOCK>>>
+// ============================================================================
+__global__ void rms_norm_batched_offset_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ weight,
+    __nv_bfloat16 *__restrict__ out,
+    int hidden_dim, float eps) {
+
+  const __nv_bfloat16 *x_row = x + blockIdx.x * hidden_dim;
+  __nv_bfloat16 *out_row = out + blockIdx.x * hidden_dim;
+
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+  int n4 = hidden_dim / 4;
+
+  const uint2 *x_vec = reinterpret_cast<const uint2 *>(x_row);
+
+  // Pass 1: sum of squares
+  float local_sum = 0.0f;
+  for (int i = tid; i < n4; i += NORM_BLOCK) {
+    uint2 xv = x_vec[i];
+    __nv_bfloat162 lo = *reinterpret_cast<__nv_bfloat162 *>(&xv.x);
+    __nv_bfloat162 hi = *reinterpret_cast<__nv_bfloat162 *>(&xv.y);
+    float v0 = __bfloat162float(lo.x), v1 = __bfloat162float(lo.y);
+    float v2 = __bfloat162float(hi.x), v3 = __bfloat162float(hi.y);
+    local_sum += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+  }
+  for (int i = n4*4 + tid; i < hidden_dim; i += NORM_BLOCK) {
+    float val = __bfloat162float(x_row[i]);
+    local_sum += val * val;
+  }
+
+  local_sum = warp_reduce_sum(local_sum);
+  __shared__ float warp_sums[NORM_NUM_WARPS];
+  if (lane_id == 0) warp_sums[warp_id] = local_sum;
+  __syncthreads();
+
+  float total = 0.0f;
+  if (warp_id == 0) {
+    float val = (lane_id < NORM_NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+    total = warp_reduce_sum(val);
+  }
+
+  __shared__ float s_inv_rms;
+  if (tid == 0) s_inv_rms = 1.0f / sqrtf(total / hidden_dim + eps);
+  __syncthreads();
+  float inv_rms = s_inv_rms;
+
+  // Pass 2: out = x * inv_rms * (1 + weight), all in f32
+  const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
+  uint2 *out_vec = reinterpret_cast<uint2 *>(out_row);
+
+  for (int i = tid; i < n4; i += NORM_BLOCK) {
+    uint2 xv = x_vec[i];
+    uint2 wv = w_vec[i];
+    __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&xv.x);
+    __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&xv.y);
+    __nv_bfloat162 w_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv.x);
+    __nv_bfloat162 w_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv.y);
+
+    uint2 result;
+    __nv_bfloat162 r_lo, r_hi;
+    r_lo.x = __float2bfloat16(__bfloat162float(x_lo.x) * inv_rms * (1.0f + __bfloat162float(w_lo.x)));
+    r_lo.y = __float2bfloat16(__bfloat162float(x_lo.y) * inv_rms * (1.0f + __bfloat162float(w_lo.y)));
+    r_hi.x = __float2bfloat16(__bfloat162float(x_hi.x) * inv_rms * (1.0f + __bfloat162float(w_hi.x)));
+    r_hi.y = __float2bfloat16(__bfloat162float(x_hi.y) * inv_rms * (1.0f + __bfloat162float(w_hi.y)));
+    result.x = *reinterpret_cast<unsigned int *>(&r_lo);
+    result.y = *reinterpret_cast<unsigned int *>(&r_hi);
+    out_vec[i] = result;
+  }
+  for (int i = n4*4 + tid; i < hidden_dim; i += NORM_BLOCK) {
+    out_row[i] = __float2bfloat16(__bfloat162float(x_row[i]) * inv_rms * (1.0f + __bfloat162float(weight[i])));
+  }
+}
+
+// ============================================================================
 // Gated RMSNorm for linear attention output:
 //   out = rms_norm(x, f32_weight) * silu(gate)
 // Per-head normalization: x is [num_heads * head_dim], weight is [head_dim] (broadcast).
@@ -567,6 +649,13 @@ void fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *
                                       const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                                       float eps, cudaStream_t stream) {
   fused_add_rms_norm_offset_kernel<<<1, NORM_BLOCK, 0, stream>>>(hidden, residual, weight, out, n, eps);
+}
+
+void rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+                                    __nv_bfloat16 *out, int hidden_dim, int seq_len,
+                                    float eps, cudaStream_t stream) {
+  rms_norm_batched_offset_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
+      x, weight, out, hidden_dim, eps);
 }
 
 void rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,

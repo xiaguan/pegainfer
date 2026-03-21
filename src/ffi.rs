@@ -262,6 +262,17 @@ unsafe extern "C" {
     // Qwen3.5 kernels
     // ========================================================================
 
+    // Batched (1+weight) RMSNorm — one block per token
+    pub fn rms_norm_batched_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub fn rms_norm_offset_cuda(
         x: *const Half,

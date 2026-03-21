@@ -1,9 +1,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use pegainfer::ops;
-use pegainfer::tensor::{DeviceContext, DeviceVec};
+use pegainfer::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use super::common::{
-    EPS, HEAD_DIM_256, Q_HEADS_256, configure_group, device_vec, f32_slice, iter_sync,
+    EPS, HEAD_DIM_256, Q_HEADS_256, configure_group, device_vec, f32_slice, hidden_states, iter_sync,
     positive_device_vec,
 };
 
@@ -75,4 +75,29 @@ pub fn bench_qwen35_norm_ops(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // ========================================================================
+    // Batched RMSNorm_offset: per-token loop (current) vs batched kernel (TODO)
+    // Qwen3.5 hidden_dim=2560, realistic seq_len values.
+    // ========================================================================
+    let hidden_dim = 2560;
+
+    for &seq_len in &[128, 2048] {
+        let mut group = c.benchmark_group(format!("rms_norm_offset_batched/seq{seq_len}"));
+        configure_group(&mut group);
+        group.throughput(Throughput::Elements((hidden_dim * seq_len) as u64));
+
+        group.bench_function("batched_kernel", |b| {
+            let ctx = DeviceContext::new().expect("ctx");
+            let x = hidden_states(&ctx, hidden_dim, seq_len).expect("x");
+            let weight = positive_device_vec(&ctx, hidden_dim).expect("weight");
+            let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len).expect("out");
+            iter_sync(b, &ctx, || {
+                ops::rms_norm_batch_offset_into(&ctx, &x, &weight, EPS, &mut out)
+                    .expect("batched norm");
+            });
+        });
+
+        group.finish();
+    }
 }

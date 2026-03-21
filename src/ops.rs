@@ -977,6 +977,37 @@ pub fn write_vec(
 // Qwen3.5 ops
 // ============================================================
 
+/// Batched (1+weight) RMSNorm over HiddenStates — one kernel launch for all tokens.
+pub fn rms_norm_batch_offset_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(weight.len, x.hidden_dim);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_batched_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// (1+weight) RMSNorm into pre-allocated output buffer (Gemma/Qwen3.5 style)
 pub fn rms_norm_offset_into(
     ctx: &DeviceContext,

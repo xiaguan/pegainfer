@@ -870,7 +870,6 @@ impl Qwen35Model {
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
     }
 
-    /// Batched (1+weight) RMSNorm — per-token iteration (no batched kernel yet).
     fn batched_rms_norm_offset(
         &self,
         x: &HiddenStates,
@@ -878,12 +877,7 @@ impl Qwen35Model {
         eps: f32,
     ) -> Result<HiddenStates> {
         let mut out = HiddenStates::zeros(&self.ctx, x.hidden_dim, x.seq_len)?;
-        for t in 0..x.seq_len {
-            let vec = ops::extract_vec(&self.ctx, x, t)?;
-            let mut normed = DeviceVec::zeros(&self.ctx, x.hidden_dim)?;
-            ops::rms_norm_offset_into(&self.ctx, &vec, weight, eps, &mut normed)?;
-            ops::write_vec(&self.ctx, &mut out, t, &normed)?;
-        }
+        ops::rms_norm_batch_offset_into(&self.ctx, x, weight, eps, &mut out)?;
         Ok(out)
     }
 

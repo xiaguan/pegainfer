@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). Decode TPOT 12.55ms vs vLLM 11.64ms (+8%). Prefill catastrophically slow — 16.8s vs vLLM 222ms (76× slower) — due to naive per-token loop where 67% of wall time is CPU kernel launch overhead. Prefill is the only bottleneck worth working on.
+> **TL;DR:** Hybrid architecture (24 linear + 8 full attention). Decode TPOT 12.55ms vs vLLM 11.64ms (+8%). Prefill 14.5s vs vLLM 222ms (65× slower). Bottleneck is now per-token attention (80% GPU) and GDR (17% GPU) — both still using decode kernels in a per-token loop.
 >
-> **Status:** Active. Baseline measured. Prefill optimization is the critical path.
+> **Status:** Active. RMSNorm_offset batched (#1 done). Next: FA2 for full attention prefill.
 
 ## Goal
 
@@ -15,8 +15,8 @@ pegainfer: in-process bench_serving (no HTTP overhead). vLLM: `vllm bench serve`
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 16,846ms | 222ms¹ | **+75× slower** |
-| prefill-heavy (2048,1) | TTFT p99 | 16,932ms | 245ms¹ | **+68× slower** |
+| prefill-heavy (2048,1) | TTFT median | 14,500ms | 222ms¹ | **+65× slower** |
+| prefill-heavy (2048,1) | TTFT p99 | 14,501ms | 245ms¹ | **+59× slower** |
 | decode-heavy (1,128) | TPOT median | 12.55ms | 11.64ms² | +8% |
 | decode-heavy (1,128) | TPOT p99 | 12.95ms | 11.76ms² | +10% |
 
@@ -163,6 +163,24 @@ The bottleneck is not kernel speed — it's the per-token loop architecture. Bat
 
 ## Optimization Log
 
+### #1 Batched RMSNorm_offset (2026-03-21)
+
+**Bottleneck:** rms_norm_offset — 8,193 kernel launches per prefill at seq=128 (~131K at seq=2048), costing ~2.3s of CPU launch overhead + per-token extract/write memcpys.
+
+**Approach:** New `rms_norm_batched_offset_kernel` with `<<<seq_len, 256>>>` grid — one block per token, single launch. Replaced per-token loop in `Qwen35Model::batched_rms_norm_offset`.
+
+**Changes:** `csrc/norm.cu`, `src/ffi.rs`, `src/ops.rs`, `src/qwen35_model.rs`
+
+**Result:** Kernel time seq=2048: 38.7ms → 17.7μs (2186×). RMSNorm now 0% of GPU time (64 launches vs 131K).
+
+**E2E impact:** TTFT (2048,1): 16,846ms → 14,500ms (−14%). Bottleneck shifts entirely to per-token attention (80%) and GDR (17%).
+
+| Kernel | GPU% | Instances | Avg |
+|--------|------|-----------|-----|
+| fused_attention_hd256_single_token | 80.4% | 16,384 | 630μs |
+| gated_delta_rule | 17.2% | 49,152 | 45μs |
+| rms_norm_batched_offset ← new | 0.0% | 64 | 13μs |
+
 ### #0 Baseline (2026-03-14)
 
 **E2E numbers:**
@@ -180,8 +198,6 @@ The bottleneck is not kernel speed — it's the per-token loop architecture. Bat
 
 **Next steps:**
 
-The two problems are independent and can be attacked in any order, but reducing kernel launch count has the higher leverage (67% of wall time):
-
-1. **Batched RMSNorm_offset kernel** — eliminates 8,193 kernel launches per prefill (quick win, ~16ms GPU + ~180ms CPU launch overhead at seq=128).
-2. **Chunk-parallel linear attention prefill** — the recurrent state update is inherently sequential, but the literature offers chunk-parallel approaches (process blocks of tokens, update state per-chunk). This would reduce 3,072 GDR launches to ~24 (one per layer) and enable GEMM-based QKV within each chunk.
-3. **FlashAttention-2 for full attention layers during prefill** — replace 1,024 single-token attention calls with 8 FA2 launches (already implemented for Qwen3-4B, needs adaptation for HD256 + partial RoPE + output gate).
+1. ~~**Batched RMSNorm_offset kernel**~~ — done in #1.
+2. **FlashAttention-2 for full attention layers during prefill** — replace 16,384 single-token attention calls with 8 FA2 launches (already implemented for Qwen3-4B, needs adaptation for HD256 + partial RoPE + output gate). **This is now the dominant bottleneck (80% GPU time).**
+3. **Chunk-parallel GDR prefill** — reduce 49,152 per-token GDR launches to ~24 (one per layer) via chunk-parallel recurrence. 17% GPU time. Note: WY decomposition tried and failed (FP rounding → incoherent output). Needs a different approach.
