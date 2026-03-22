@@ -41,7 +41,7 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
-    pub(crate) fn decode(&self, ids: &[u32]) -> Result<String> {
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("Decode error: {}", e))

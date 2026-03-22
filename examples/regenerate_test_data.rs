@@ -1,7 +1,7 @@
 //! Regenerate test_data/Qwen3-4B.json using pegainfer's greedy output.
 //! Run: cargo run -r --example regenerate_test_data
 
-use pegainfer::model::Qwen3Model;
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::tokenizer::Tokenizer;
 use rand::SeedableRng;
@@ -48,7 +48,9 @@ fn main() {
     let input: InputData = serde_json::from_str(&content).expect("Failed to parse JSON");
 
     let tokenizer = Tokenizer::from_file(MODEL_PATH).expect("Failed to load tokenizer");
-    let mut model = Qwen3Model::from_safetensors(MODEL_PATH).expect("Failed to load model");
+    let mut model =
+        Qwen3Model::from_safetensors_with_runtime(MODEL_PATH, ModelRuntimeConfig::default())
+            .expect("Failed to load model");
     let greedy = SamplingParams::default();
     let mut rng = StdRng::seed_from_u64(42);
 
