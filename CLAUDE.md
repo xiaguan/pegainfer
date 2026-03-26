@@ -124,3 +124,7 @@ The document index — nothing more:
 # Git Conventions
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
+
+# Code Conventions
+
+Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`.
