@@ -1,22 +1,25 @@
-//! Qwen3 model: weights, forward pass, generation.
+//! Qwen3 model: weights, forward pass.
 
 use anyhow::Result;
-use fastrace::local::LocalSpan;
 use log::{debug, info};
 use std::time::Instant;
 
 use rand::RngExt;
 use rand::rngs::StdRng;
 
-use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 
-use crate::decode_buffers::DecodeBuffers;
-use crate::kv_cache::KVCache;
+mod config;
+mod decode_buffers;
+
+pub use config::Config;
+
+use self::decode_buffers::DecodeBuffers;
+use super::kv_cache::KVCache;
+use super::{GenerationState, ModelForward};
 use crate::ops;
-use crate::qwen3_config::Config;
 use crate::sampler::{self, SamplingParams};
 use crate::tensor::*;
 use crate::weight_loader::*;
@@ -69,7 +72,7 @@ struct TransformerBlock {
     mlp: MLP,
 }
 
-/// Qwen3 model
+/// Qwen3 model — weights and config only. Mutable state lives in `Qwen3State`.
 pub struct Qwen3Model {
     ctx: DeviceContext,
     config: Config,
@@ -77,21 +80,36 @@ pub struct Qwen3Model {
     lm_head: Option<DeviceMatrix>,
     layers: Vec<TransformerBlock>,
     norm: DeviceVec,
-    // RoPE cache on GPU - contiguous buffer [max_seq_len * head_dim]
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
-    // Persistent decode state (reused across generate calls for CUDA Graph replay)
-    decode_bufs: Option<DecodeBuffers>,
-    kv_cache: Option<KVCache>,
-    graph_state: CudaGraphState,
     enable_cuda_graph: bool,
 }
 
-/// Streaming generation summary for transport layers.
-pub struct StreamingStats {
-    pub(crate) emitted_tokens: usize,
-    pub(crate) hit_eos: bool,
-    pub(crate) consumer_dropped: bool,
+/// Per-request mutable state for Qwen3.
+pub struct Qwen3State {
+    decode_bufs: DecodeBuffers,
+    kv_cache: KVCache,
+    graph_state: CudaGraphState,
+    /// Logits from multi-token prefill (None after decode path — logits are in decode_bufs).
+    prefill_logits: Option<DeviceVec>,
+}
+
+// SAFETY: Qwen3State contains CudaGraph (raw CUDA pointers) that are not Send by default.
+// We only access state from the single inference thread.
+unsafe impl Send for Qwen3State {}
+
+impl GenerationState for Qwen3State {
+    fn logits(&self) -> &DeviceVec {
+        self.prefill_logits
+            .as_ref()
+            .unwrap_or(&self.decode_bufs.logits)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.kv_cache.reset();
+        self.prefill_logits = None;
+        Ok(())
+    }
 }
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -282,9 +300,6 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
-            decode_bufs: None,
-            kv_cache: None,
-            graph_state: CudaGraphState { graph: None },
             enable_cuda_graph: runtime.enable_cuda_graph,
         };
 
@@ -565,26 +580,6 @@ impl Qwen3Model {
         Ok(())
     }
 
-    fn select_token(
-        &self,
-        logits: &DeviceVec,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        sample_probs: Option<&mut CudaSlice<f32>>,
-    ) -> Result<u32> {
-        if params.is_greedy() {
-            ops::argmax(&self.ctx, logits)
-        } else if let Some(probs) = sample_probs {
-            // GPU sampling: temperature → softmax → top-k → top-p → multinomial
-            let random_val: f32 = rng.random();
-            ops::gpu_sample(&self.ctx, logits, probs, params, random_val)
-        } else {
-            // CPU fallback (prefill first token — only called once)
-            let logits_f32 = logits.to_host(&self.ctx)?;
-            Ok(sampler::sample(&logits_f32, params, rng))
-        }
-    }
-
     // ============================================================
     // Zero-allocation decode path (pre-allocated buffers)
     // ============================================================
@@ -601,10 +596,8 @@ impl Qwen3Model {
         let pos = kv_cache.len();
         let seq_len = pos + 1;
 
-        // Ensure KV cache is initialized (no-op after first call)
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        // Upload decode metadata to GPU (outside graph — values change each step)
         self.ctx
             .stream
             .memcpy_htod(
@@ -621,13 +614,11 @@ impl Qwen3Model {
 
         match &graph_state.graph {
             Some(graph) => {
-                // Replay captured graph
                 graph
                     .launch()
                     .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
             }
             None => {
-                // First call: capture the kernel sequence into a graph
                 debug!("Capturing CUDA Graph for decode path...");
                 self.ctx
                     .stream
@@ -643,7 +634,6 @@ impl Qwen3Model {
                     .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
                 debug!("CUDA Graph captured successfully");
 
-                // Capture only records — kernels don't execute. Launch to actually compute.
                 if let Some(ref graph) = graph_state.graph {
                     graph
                         .launch()
@@ -656,13 +646,10 @@ impl Qwen3Model {
         Ok(())
     }
 
-    /// Pure kernel sequence for decode — no CPU-GPU sync, no allocation.
-    /// Called during graph capture and also replayed via CUDA Graph.
     fn decode_kernels(&self, kv_cache: &mut KVCache, bufs: &mut DecodeBuffers) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_layers = self.layers.len();
 
-        // 1. Embedding (reads token_id from decode_meta[0])
         ops::embedding_decode_into(
             &self.ctx,
             &self.embed_tokens,
@@ -670,7 +657,6 @@ impl Qwen3Model {
             &mut bufs.hidden,
         )?;
 
-        // 2. First layer input norm (standalone — no prior residual to fuse with)
         ops::rms_norm_into(
             &self.ctx,
             &bufs.hidden,
@@ -679,17 +665,13 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // 3. All transformer layers
-        //    Each layer assumes normed is already filled by the previous step.
-        //    Post-MLP residual is fused with the next norm (next layer's input or final norm).
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.decode_layer_inner(layer_idx, layer, kv_cache, bufs)?;
 
-            // Fused: hidden += mlp_out; normed = rms_norm(hidden, next_weight)
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
             } else {
-                &self.norm // final norm for last layer
+                &self.norm
             };
             ops::fused_add_rms_norm_into(
                 &self.ctx,
@@ -701,7 +683,6 @@ impl Qwen3Model {
             )?;
         }
 
-        // 4. LM Head (normed already computed by last fused_add_rms_norm)
         ops::gemv(
             &self.ctx,
             self.output_projection(),
@@ -709,14 +690,11 @@ impl Qwen3Model {
             &mut bufs.logits,
         )?;
 
-        // 5. Argmax (pre-allocated, captured inside CUDA Graph)
         ops::argmax_into(&self.ctx, &bufs.logits, &mut bufs.argmax_out);
 
         Ok(())
     }
 
-    /// Inner decode layer: assumes normed is pre-filled, does NOT do post-MLP residual.
-    /// Post-MLP residual + next norm is handled by the caller via fused_add_rms_norm.
     fn decode_layer_inner(
         &self,
         layer_idx: usize,
@@ -728,9 +706,6 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        // normed is already filled (by caller)
-
-        // QKV projection: normed → q, k, v (3× gemv)
         ops::gemv(
             &self.ctx,
             &layer.attention.q_proj,
@@ -750,7 +725,6 @@ impl Qwen3Model {
             &mut bufs.v,
         )?;
 
-        // Fused Attention (decode variant): split-KV + reduce
         let (k_cache, v_cache) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
         ops::fused_attention_decode_into(
             &self.ctx,
@@ -772,7 +746,6 @@ impl Qwen3Model {
             self.config.num_key_value_heads,
         )?;
 
-        // O projection: attn_out → attn_proj
         ops::gemv(
             &self.ctx,
             &layer.attention.o_proj,
@@ -780,7 +753,6 @@ impl Qwen3Model {
             &mut bufs.attn_proj,
         )?;
 
-        // Fused residual + post-attention RMSNorm: hidden += attn_proj; normed = rms_norm(hidden)
         ops::fused_add_rms_norm_into(
             &self.ctx,
             &mut bufs.hidden,
@@ -790,7 +762,6 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // Fused MLP: normed → mlp_out (post-MLP residual handled by caller)
         ops::fused_mlp_into(
             &self.ctx,
             &bufs.normed,
@@ -803,301 +774,74 @@ impl Qwen3Model {
 
         Ok(())
     }
+}
 
-    /// Take decode buffers from self, lazily allocating on first use.
-    fn take_decode_bufs(&mut self) -> Result<DecodeBuffers> {
-        match self.decode_bufs.take() {
-            Some(bufs) => Ok(bufs),
-            None => DecodeBuffers::new(&self.ctx, &self.config),
-        }
-    }
+// ============================================================================
+// ModelForward implementation
+// ============================================================================
 
-    /// Take KV cache from self, lazily creating on first use. Resets seq_len for new request.
-    fn take_kv_cache(&mut self) -> KVCache {
-        match self.kv_cache.take() {
-            Some(mut kv) => {
-                kv.reset();
-                kv
-            }
-            None => KVCache::new(
+impl ModelForward for Qwen3Model {
+    type State = Qwen3State;
+
+    fn create_state(&self) -> Result<Self::State> {
+        Ok(Qwen3State {
+            decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
+            kv_cache: KVCache::new(
                 self.config.num_hidden_layers,
                 self.config.num_key_value_heads,
             ),
-        }
-    }
-
-    /// Take graph state from self, leaving a fresh empty state.
-    fn take_graph_state(&mut self) -> CudaGraphState {
-        std::mem::replace(&mut self.graph_state, CudaGraphState { graph: None })
-    }
-
-    /// Generate tokens
-    pub fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-        let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
-            [
-                ("prompt_len", prompt_tokens.len().to_string()),
-                ("max_new_tokens", max_new_tokens.to_string()),
-            ]
-        });
-
-        // Process prompt and measure TTFT
-        let ttft_start = Instant::now();
-        let mut tokens = prompt_tokens.to_vec();
-        let mut kv_cache = self.take_kv_cache();
-
-        // Take persistent decode state early (needed for single-token prefill optimization)
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
-
-        let next_token = if prompt_tokens.len() == 1 {
-            // Single-token prompt: use decode path (GEMV + fused kernels + CUDA Graph)
-            // Avoids batch GEMM overhead, ~580 temp allocations, and non-fused MLP.
-            let _span = LocalSpan::enter_with_local_parent("prefill_decode")
-                .with_property(|| ("prompt_tokens", "1".to_string()));
-            self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
-            if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            }
-        } else {
-            // Multi-token prompt: batch prefill (GEMM)
-            let _span = LocalSpan::enter_with_local_parent("prefill")
-                .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
-            let start_pos = kv_cache.len();
-            let hidden = self.get_embeddings_batch(&tokens)?;
-            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
-            let logits = self.compute_logits_batch(&hidden)?;
-            self.select_token(&logits, params, rng, None)?
-        };
-
-        let ttft = ttft_start.elapsed();
-
-        LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
-
-        debug!(
-            "TTFT: {:.2}ms (prompt_len={})",
-            ttft.as_secs_f64() * 1000.0,
-            prompt_tokens.len()
-        );
-
-        if !params.ignore_eos && self.config.is_stop_token(next_token) {
-            self.kv_cache = Some(kv_cache);
-            return Ok(tokens);
-        }
-
-        tokens.push(next_token);
-
-        // Reuse the decode state and captured CUDA graph from the first token.
-
-        // Generate new tokens using pre-allocated buffers + CUDA Graph
-        let tpot_start = Instant::now();
-        let mut generated_count = 0;
-        for i in 1..max_new_tokens {
-            let next_token = {
-                let _span = LocalSpan::enter_with_local_parent("decode_step")
-                    .with_property(|| ("step", i.to_string()));
-                self.decode_one_token(
-                    *tokens.last().unwrap(),
-                    &mut kv_cache,
-                    &mut bufs,
-                    &mut graph_state,
-                )?;
-                if params.is_greedy() {
-                    ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-                } else {
-                    self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-                }
-            };
-
-            if !params.ignore_eos && self.config.is_stop_token(next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-            generated_count += 1;
-        }
-
-        // Put persistent state back for next generate call
-        self.decode_bufs = Some(bufs);
-        self.kv_cache = Some(kv_cache);
-        self.graph_state = graph_state;
-
-        if generated_count > 0 {
-            let tpot_total = tpot_start.elapsed();
-            let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            LocalSpan::add_properties(|| {
-                [
-                    ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
-                    ("generated_tokens", generated_count.to_string()),
-                    (
-                        "tok_per_sec",
-                        format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
-                    ),
-                ]
-            });
-            debug!(
-                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0,
-                generated_count,
-                tpot_total.as_secs_f64() * 1000.0,
-                generated_count as f64 / tpot_total.as_secs_f64()
-            );
-        }
-
-        Ok(tokens)
-    }
-
-    /// Like `generate`, but invokes `on_token` for each new token.
-    ///
-    /// Return `false` from `on_token` to stop generation early (e.g. client disconnected).
-    pub fn generate_streaming_with_callback<F>(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        mut on_token: F,
-    ) -> Result<StreamingStats>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-        let _span =
-            LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
-                [
-                    ("prompt_len", prompt_tokens.len().to_string()),
-                    ("max_new_tokens", max_new_tokens.to_string()),
-                ]
-            });
-
-        let mut tokens = prompt_tokens.to_vec();
-        let mut kv_cache = self.take_kv_cache();
-
-        // Take persistent decode state early (needed for single-token prefill optimization)
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
-
-        // Prefill
-        let ttft_start = Instant::now();
-        let next_token = if prompt_tokens.len() == 1 {
-            let _span = LocalSpan::enter_with_local_parent("prefill_decode")
-                .with_property(|| ("prompt_tokens", "1".to_string()));
-            self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
-            if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            }
-        } else {
-            let _span = LocalSpan::enter_with_local_parent("prefill")
-                .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
-            let start_pos = kv_cache.len();
-            let hidden = self.get_embeddings_batch(&tokens)?;
-            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut kv_cache)?;
-            let logits = self.compute_logits_batch(&hidden)?;
-            self.select_token(&logits, params, rng, None)?
-        };
-
-        let ttft = ttft_start.elapsed();
-        debug!(
-            "TTFT: {:.2}ms (prompt_len={})",
-            ttft.as_secs_f64() * 1000.0,
-            prompt_tokens.len()
-        );
-
-        if !params.ignore_eos && self.config.is_stop_token(next_token) {
-            self.kv_cache = Some(kv_cache);
-            return Ok(StreamingStats {
-                emitted_tokens: 0,
-                hit_eos: true,
-                consumer_dropped: false,
-            });
-        }
-
-        tokens.push(next_token);
-        let mut emitted_tokens = 1usize;
-        if !on_token(next_token) {
-            self.decode_bufs = Some(bufs);
-            self.kv_cache = Some(kv_cache);
-            self.graph_state = graph_state;
-            return Ok(StreamingStats {
-                emitted_tokens,
-                hit_eos: false,
-                consumer_dropped: true,
-            });
-        }
-
-        // Decode using pre-allocated buffers + CUDA Graph
-        let tpot_start = Instant::now();
-        let mut generated_count = 0;
-        let mut hit_eos = false;
-        for i in 1..max_new_tokens {
-            let next_token = {
-                let _span = LocalSpan::enter_with_local_parent("decode_step")
-                    .with_property(|| ("step", i.to_string()));
-                self.decode_one_token(
-                    *tokens.last().unwrap(),
-                    &mut kv_cache,
-                    &mut bufs,
-                    &mut graph_state,
-                )?;
-                if params.is_greedy() {
-                    ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-                } else {
-                    self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-                }
-            };
-
-            if !params.ignore_eos && self.config.is_stop_token(next_token) {
-                hit_eos = true;
-                break;
-            }
-
-            tokens.push(next_token);
-            generated_count += 1;
-            emitted_tokens += 1;
-
-            if !on_token(next_token) {
-                self.decode_bufs = Some(bufs);
-                self.kv_cache = Some(kv_cache);
-                self.graph_state = graph_state;
-                return Ok(StreamingStats {
-                    emitted_tokens,
-                    hit_eos: false,
-                    consumer_dropped: true,
-                });
-            }
-        }
-
-        // Put persistent state back for next generate call
-        self.decode_bufs = Some(bufs);
-        self.kv_cache = Some(kv_cache);
-        self.graph_state = graph_state;
-
-        if generated_count > 0 {
-            let tpot_total = tpot_start.elapsed();
-            let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            debug!(
-                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0,
-                generated_count,
-                tpot_total.as_secs_f64() * 1000.0,
-                generated_count as f64 / tpot_total.as_secs_f64()
-            );
-        }
-
-        Ok(StreamingStats {
-            emitted_tokens,
-            hit_eos,
-            consumer_dropped: false,
+            graph_state: CudaGraphState { graph: None },
+            prefill_logits: None,
         })
+    }
+
+    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        if tokens.len() == 1 {
+            self.decode_one_token(
+                tokens[0],
+                &mut state.kv_cache,
+                &mut state.decode_bufs,
+                &mut state.graph_state,
+            )?;
+            state.prefill_logits = None;
+        } else {
+            let start_pos = state.kv_cache.len();
+            let hidden = self.get_embeddings_batch(tokens)?;
+            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut state.kv_cache)?;
+            let logits = self.compute_logits_batch(&hidden)?;
+            state.prefill_logits = Some(logits);
+        }
+        Ok(())
+    }
+
+    fn select_token(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<u32> {
+        if let Some(ref logits) = state.prefill_logits {
+            if params.is_greedy() {
+                ops::argmax(&self.ctx, logits)
+            } else {
+                let logits_f32 = logits.to_host(&self.ctx)?;
+                Ok(sampler::sample(&logits_f32, params, rng))
+            }
+        } else if params.is_greedy() {
+            ops::read_argmax(&self.ctx, &state.decode_bufs.argmax_out)
+        } else {
+            let random_val: f32 = rng.random();
+            ops::gpu_sample(
+                &self.ctx,
+                &state.decode_bufs.logits,
+                &mut state.decode_bufs.sample_probs,
+                params,
+                random_val,
+            )
+        }
+    }
+
+    fn is_stop_token(&self, token_id: u32) -> bool {
+        self.config.is_stop_token(token_id)
     }
 }

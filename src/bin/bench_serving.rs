@@ -21,8 +21,9 @@ use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
 use log::{debug, info};
 use pegainfer::logging;
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
-use pegainfer::qwen35_model::Qwen35Model;
+use pegainfer::model::{
+    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
+};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
@@ -784,22 +785,12 @@ where
     }
 }
 
-impl BenchModel for Qwen3Model {
-    fn timed_generation(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        sampling: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> GenTimings {
-        run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
-            self.generate_streaming_with_callback(toks, n, sampling, rng, cb)?;
-            Ok(())
-        })
-    }
+struct ModelWithState<M: ModelForward> {
+    model: M,
+    state: M::State,
 }
 
-impl BenchModel for Qwen35Model {
+impl<M: ModelForward> BenchModel for ModelWithState<M> {
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],
@@ -808,7 +799,19 @@ impl BenchModel for Qwen35Model {
         rng: &mut StdRng,
     ) -> GenTimings {
         run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
-            self.generate_streaming_with_callback(toks, n, sampling, rng, cb)?;
+            self.state.reset()?;
+            self.model.forward(toks, &mut self.state)?;
+            let mut last = self.model.select_token(&mut self.state, sampling, rng)?;
+            if !cb(last) {
+                return Ok(());
+            }
+            for _ in 1..n {
+                self.model.forward(&[last], &mut self.state)?;
+                last = self.model.select_token(&mut self.state, sampling, rng)?;
+                if !cb(last) {
+                    break;
+                }
+            }
             Ok(())
         })
     }
@@ -1161,19 +1164,23 @@ fn main() -> Result<()> {
 
     let report = match model_type {
         ModelType::Qwen3 => {
-            let mut model = Qwen3Model::from_safetensors_with_runtime(&cli.model_path, runtime)?;
+            let model = Qwen3Model::from_safetensors_with_runtime(&cli.model_path, runtime)?;
+            let state = model.create_state()?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
-            run_command(&cli, model_type, load_ms, &mut model, &tokenizer)?
+            let mut bench = ModelWithState { model, state };
+            run_command(&cli, model_type, load_ms, &mut bench, &tokenizer)?
         }
         ModelType::Qwen35 => {
-            let mut model = Qwen35Model::from_safetensors_with_options(
+            let model = Qwen35Model::from_safetensors_with_options(
                 &cli.model_path,
                 runtime.enable_cuda_graph,
             )?;
+            let state = model.create_state()?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
-            run_command(&cli, model_type, load_ms, &mut model, &tokenizer)?
+            let mut bench = ModelWithState { model, state };
+            run_command(&cli, model_type, load_ms, &mut bench, &tokenizer)?
         }
     };
 

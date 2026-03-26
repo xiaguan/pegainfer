@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo test -r --test bench_prefill -- bench_prefill_1024 --nocapture
 
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -14,13 +14,14 @@ const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B")
 fn bench_prefill(seq_len: usize, warmup: usize, iters: usize) {
     pegainfer::logging::init_stderr("warn");
 
-    let mut model = Qwen3Model::from_safetensors_with_runtime(
+    let model = Qwen3Model::from_safetensors_with_runtime(
         MODEL_PATH,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
         },
     )
     .expect("Failed to load model");
+    let mut state = model.create_state().expect("Failed to create state");
 
     let greedy = SamplingParams::default();
     let mut rng = StdRng::seed_from_u64(42);
@@ -31,19 +32,23 @@ fn bench_prefill(seq_len: usize, warmup: usize, iters: usize) {
     // Warmup
     eprintln!("[warmup] {} runs, seq_len={}", warmup, seq_len);
     for _ in 0..warmup {
-        let _ = model
-            .generate(&prompt, 1, &greedy, &mut rng)
-            .expect("warmup failed");
+        state.reset().expect("reset failed");
+        model.forward(&prompt, &mut state).expect("warmup failed");
+        model
+            .select_token(&mut state, &greedy, &mut rng)
+            .expect("warmup select failed");
     }
 
-    // Benchmark: generate with max_tokens=1 (prefill only, no decode loop)
+    // Benchmark: prefill only (forward + select_token, no decode loop)
     eprintln!("[bench] {} runs, seq_len={}", iters, seq_len);
     let mut ttft_sum = 0.0f64;
     for _ in 0..iters {
+        state.reset().expect("reset failed");
         let start = Instant::now();
-        let _ = model
-            .generate(&prompt, 1, &greedy, &mut rng)
-            .expect("bench failed");
+        model.forward(&prompt, &mut state).expect("bench failed");
+        model
+            .select_token(&mut state, &greedy, &mut rng)
+            .expect("bench select failed");
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         ttft_sum += elapsed;
     }

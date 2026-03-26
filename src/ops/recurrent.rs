@@ -2,7 +2,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::prefill_buffers35::GdrChunkwiseScratch35;
+use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::tensor::*;
 
 /// Causal depthwise conv1d decode (single step).

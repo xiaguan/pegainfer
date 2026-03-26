@@ -25,9 +25,8 @@ The point is not abstraction for its own sake. The point is to make future model
 
 ## Current Focus
 
-- shrink public surface where runtime internals are only used inside the crate
-- remove dead wrappers/helpers that keep long files artificially larger
-- keep the first paydown passes behavior-preserving so compile/test coverage stays trustworthy
+- architecture: figure out the right abstraction boundary for model-specific execution details (prefill/decode orchestration, state management, attention patterns)
+- start pulling orchestration code out of long model files without changing prefill/decode behavior
 
 ## Progress
 
@@ -41,7 +40,4 @@ The point is not abstraction for its own sake. The point is to make future model
 
 ## Next Action
 
-Split the next pass into two tracks:
-
-- continue public-surface cleanup for model/serving APIs that are still wider than current callers require
-- start pulling orchestration code out of long model files without changing prefill/decode behavior
+Design the abstraction boundary between shared runtime infrastructure and model-specific execution logic, then incrementally extract from `model.rs` (1103 lines) and `qwen35_model.rs` (1323 lines).

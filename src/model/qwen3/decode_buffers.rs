@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
 
-use crate::qwen3_config::Config;
+use super::config::Config;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Pre-allocated temporary buffers for the single-token decode path.

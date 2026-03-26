@@ -1,4 +1,4 @@
-//! Qwen3.5 model: weights, forward pass, generation (text-only).
+//! Qwen3.5 model: weights, forward pass.
 //!
 //! Separate from Qwen3Model due to fundamental architectural differences:
 //! mixed layer types (full attention + linear attention), partial RoPE,
@@ -14,13 +14,18 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 use std::time::Instant;
 
-use crate::decode_buffers35::DecodeBuffers35;
-use crate::kv_cache::KVCache;
-use crate::model::StreamingStats;
+pub(crate) mod config;
+mod decode_buffers;
+pub(crate) mod prefill_buffers;
+mod recurrent_state;
+
+use self::config::{Config35, LayerType};
+use self::decode_buffers::DecodeBuffers35;
+use self::prefill_buffers::GdrChunkwiseScratch35;
+use self::recurrent_state::RecurrentState;
+use super::kv_cache::KVCache;
+use super::{GenerationState, ModelForward};
 use crate::ops;
-use crate::prefill_buffers35::GdrChunkwiseScratch35;
-use crate::qwen35_config::{Config35, LayerType};
-use crate::recurrent_state::RecurrentState;
 use crate::sampler::{self, SamplingParams};
 use crate::tensor::*;
 use crate::weight_loader::*;
@@ -100,12 +105,33 @@ pub struct Qwen35Model {
     // Partial RoPE cache: [max_seq_len * rotary_dim]
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
-    // Persistent decode state
-    decode_bufs: Option<DecodeBuffers35>,
-    kv_cache: Option<KVCache>,
-    recurrent_state: Option<RecurrentState>,
-    graph_state: CudaGraphState35,
     enable_cuda_graph: bool,
+}
+
+pub struct Qwen35State {
+    ctx: DeviceContext,
+    decode_bufs: DecodeBuffers35,
+    kv_cache: KVCache,
+    recurrent_state: RecurrentState,
+    graph_state: CudaGraphState35,
+    prefill_logits: Option<DeviceVec>,
+}
+
+unsafe impl Send for Qwen35State {}
+
+impl GenerationState for Qwen35State {
+    fn logits(&self) -> &DeviceVec {
+        self.prefill_logits
+            .as_ref()
+            .unwrap_or(&self.decode_bufs.logits)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.kv_cache.reset();
+        self.recurrent_state.reset(&self.ctx)?;
+        self.prefill_logits = None;
+        Ok(())
+    }
 }
 
 impl Qwen35Model {
@@ -344,10 +370,6 @@ impl Qwen35Model {
             norm,
             cos_cache,
             sin_cache,
-            decode_bufs: None,
-            kv_cache: None,
-            recurrent_state: None,
-            graph_state: CudaGraphState35 { graph: None },
             enable_cuda_graph,
         })
     }
@@ -854,286 +876,6 @@ impl Qwen35Model {
     }
 
     // ========================================================================
-    // Token selection
-    // ========================================================================
-
-    fn select_token(
-        &self,
-        logits: &DeviceVec,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        sample_probs: Option<&mut CudaSlice<f32>>,
-    ) -> Result<u32> {
-        if params.is_greedy() {
-            ops::argmax(&self.ctx, logits)
-        } else if let Some(probs) = sample_probs {
-            let random_val: f32 = rng.random();
-            ops::gpu_sample(&self.ctx, logits, probs, params, random_val)
-        } else {
-            let logits_f32 = logits.to_host(&self.ctx)?;
-            Ok(sampler::sample(&logits_f32, params, rng))
-        }
-    }
-
-    // ========================================================================
-    // State management
-    // ========================================================================
-
-    fn take_decode_bufs(&mut self) -> Result<DecodeBuffers35> {
-        match self.decode_bufs.take() {
-            Some(bufs) => Ok(bufs),
-            None => DecodeBuffers35::new(&self.ctx, &self.config),
-        }
-    }
-
-    fn take_kv_cache(&mut self) -> KVCache {
-        match self.kv_cache.take() {
-            Some(mut kv) => {
-                kv.reset();
-                kv
-            }
-            None => KVCache::new(
-                self.config.num_full_attention_layers(),
-                self.config.num_key_value_heads,
-            ),
-        }
-    }
-
-    fn take_recurrent_state(&mut self) -> Result<RecurrentState> {
-        match self.recurrent_state.take() {
-            Some(mut rs) => {
-                rs.reset(&self.ctx)?;
-                Ok(rs)
-            }
-            None => RecurrentState::new(&self.ctx, &self.config),
-        }
-    }
-
-    fn take_graph_state(&mut self) -> CudaGraphState35 {
-        std::mem::replace(&mut self.graph_state, CudaGraphState35 { graph: None })
-    }
-
-    // ========================================================================
-    // Generation
-    // ========================================================================
-
-    pub(crate) fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-        let ttft_start = Instant::now();
-        let mut tokens = prompt_tokens.to_vec();
-
-        let mut kv_cache = self.take_kv_cache();
-        let mut recurrent = self.take_recurrent_state()?;
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
-
-        // Prefill
-        let next_token = if prompt_tokens.len() == 1 {
-            // Single token: use decode path (CUDA Graph eligible)
-            self.decode_one_token(
-                prompt_tokens[0],
-                &mut kv_cache,
-                &mut recurrent,
-                &mut bufs,
-                &mut graph_state,
-            )?;
-            if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            }
-        } else {
-            // Multi-token: batch prefill
-            let logits = self.prefill_forward(prompt_tokens, &mut kv_cache, &mut recurrent)?;
-            self.select_token(&logits, params, rng, None)?
-        };
-
-        let ttft = ttft_start.elapsed();
-        tokens.push(next_token);
-
-        debug!(
-            "TTFT: {:.2}ms (prompt_len={})",
-            ttft.as_secs_f64() * 1000.0,
-            prompt_tokens.len()
-        );
-
-        // Decode
-        let tpot_start = Instant::now();
-        let mut generated_count = 0;
-        for _i in 1..max_new_tokens {
-            self.decode_one_token(
-                *tokens.last().unwrap(),
-                &mut kv_cache,
-                &mut recurrent,
-                &mut bufs,
-                &mut graph_state,
-            )?;
-            let next_token = if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            };
-
-            if !params.ignore_eos && next_token == self.config.eos_token_id {
-                break;
-            }
-
-            tokens.push(next_token);
-            generated_count += 1;
-        }
-
-        // Return state
-        self.decode_bufs = Some(bufs);
-        self.kv_cache = Some(kv_cache);
-        self.recurrent_state = Some(recurrent);
-        self.graph_state = graph_state;
-
-        if generated_count > 0 {
-            let tpot_total = tpot_start.elapsed();
-            let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            debug!(
-                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0,
-                generated_count,
-                tpot_total.as_secs_f64() * 1000.0,
-                generated_count as f64 / tpot_total.as_secs_f64()
-            );
-        }
-
-        Ok(tokens)
-    }
-
-    pub fn generate_streaming_with_callback<F>(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        mut on_token: F,
-    ) -> Result<StreamingStats>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-        let mut tokens = prompt_tokens.to_vec();
-
-        let mut kv_cache = self.take_kv_cache();
-        let mut recurrent = self.take_recurrent_state()?;
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
-
-        // Prefill
-        let ttft_start = Instant::now();
-        let next_token = if prompt_tokens.len() == 1 {
-            self.decode_one_token(
-                prompt_tokens[0],
-                &mut kv_cache,
-                &mut recurrent,
-                &mut bufs,
-                &mut graph_state,
-            )?;
-            if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            }
-        } else {
-            let logits = self.prefill_forward(prompt_tokens, &mut kv_cache, &mut recurrent)?;
-            self.select_token(&logits, params, rng, None)?
-        };
-
-        let ttft = ttft_start.elapsed();
-        debug!(
-            "TTFT: {:.2}ms (prompt_len={})",
-            ttft.as_secs_f64() * 1000.0,
-            prompt_tokens.len()
-        );
-
-        tokens.push(next_token);
-        let mut emitted_tokens = 1usize;
-        if !on_token(next_token) {
-            self.decode_bufs = Some(bufs);
-            self.kv_cache = Some(kv_cache);
-            self.recurrent_state = Some(recurrent);
-            self.graph_state = graph_state;
-            return Ok(StreamingStats {
-                emitted_tokens,
-                hit_eos: false,
-                consumer_dropped: true,
-            });
-        }
-
-        // Decode loop
-        let tpot_start = Instant::now();
-        let mut generated_count = 0;
-        let mut hit_eos = false;
-        for _i in 1..max_new_tokens {
-            self.decode_one_token(
-                *tokens.last().unwrap(),
-                &mut kv_cache,
-                &mut recurrent,
-                &mut bufs,
-                &mut graph_state,
-            )?;
-            let next_token = if params.is_greedy() {
-                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
-            } else {
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
-            };
-
-            if !params.ignore_eos && next_token == self.config.eos_token_id {
-                hit_eos = true;
-                break;
-            }
-
-            tokens.push(next_token);
-            generated_count += 1;
-            emitted_tokens += 1;
-
-            if !on_token(next_token) {
-                self.decode_bufs = Some(bufs);
-                self.kv_cache = Some(kv_cache);
-                self.recurrent_state = Some(recurrent);
-                self.graph_state = graph_state;
-                return Ok(StreamingStats {
-                    emitted_tokens,
-                    hit_eos: false,
-                    consumer_dropped: true,
-                });
-            }
-        }
-
-        self.decode_bufs = Some(bufs);
-        self.kv_cache = Some(kv_cache);
-        self.recurrent_state = Some(recurrent);
-        self.graph_state = graph_state;
-
-        if generated_count > 0 {
-            let tpot_total = tpot_start.elapsed();
-            let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-            debug!(
-                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0,
-                generated_count,
-                tpot_total.as_secs_f64() * 1000.0,
-                generated_count as f64 / tpot_total.as_secs_f64()
-            );
-        }
-
-        Ok(StreamingStats {
-            emitted_tokens,
-            hit_eos,
-            consumer_dropped: false,
-        })
-    }
-
-    // ========================================================================
     // Shape verification
     // ========================================================================
 
@@ -1263,6 +1005,73 @@ impl Qwen35Model {
 
         info!("All weight shapes verified successfully");
         Ok(())
+    }
+}
+
+impl ModelForward for Qwen35Model {
+    type State = Qwen35State;
+
+    fn create_state(&self) -> Result<Self::State> {
+        Ok(Qwen35State {
+            ctx: self.ctx.clone(),
+            decode_bufs: DecodeBuffers35::new(&self.ctx, &self.config)?,
+            kv_cache: KVCache::new(
+                self.config.num_full_attention_layers(),
+                self.config.num_key_value_heads,
+            ),
+            recurrent_state: RecurrentState::new(&self.ctx, &self.config)?,
+            graph_state: CudaGraphState35 { graph: None },
+            prefill_logits: None,
+        })
+    }
+
+    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        if tokens.len() == 1 {
+            self.decode_one_token(
+                tokens[0],
+                &mut state.kv_cache,
+                &mut state.recurrent_state,
+                &mut state.decode_bufs,
+                &mut state.graph_state,
+            )?;
+            state.prefill_logits = None;
+        } else {
+            let logits =
+                self.prefill_forward(tokens, &mut state.kv_cache, &mut state.recurrent_state)?;
+            state.prefill_logits = Some(logits);
+        }
+        Ok(())
+    }
+
+    fn select_token(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<u32> {
+        if let Some(ref logits) = state.prefill_logits {
+            if params.is_greedy() {
+                ops::argmax(&self.ctx, logits)
+            } else {
+                let logits_f32 = logits.to_host(&self.ctx)?;
+                Ok(sampler::sample(&logits_f32, params, rng))
+            }
+        } else if params.is_greedy() {
+            ops::read_argmax(&self.ctx, &state.decode_bufs.argmax_out)
+        } else {
+            let random_val: f32 = rng.random();
+            ops::gpu_sample(
+                &self.ctx,
+                &state.decode_bufs.logits,
+                &mut state.decode_bufs.sample_probs,
+                params,
+                random_val,
+            )
+        }
+    }
+
+    fn is_stop_token(&self, token_id: u32) -> bool {
+        token_id == self.config.eos_token_id
     }
 }
 

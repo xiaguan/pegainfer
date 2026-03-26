@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
+use pegainfer::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use pegainfer::ops;
-use pegainfer::prefill_buffers35::GdrChunkwiseScratch35;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
