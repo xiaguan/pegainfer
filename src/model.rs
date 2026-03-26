@@ -709,6 +709,9 @@ impl Qwen3Model {
             &mut bufs.logits,
         )?;
 
+        // 5. Argmax (pre-allocated, captured inside CUDA Graph)
+        ops::argmax_into(&self.ctx, &bufs.logits, &mut bufs.argmax_out);
+
         Ok(())
     }
 
@@ -859,7 +862,11 @@ impl Qwen3Model {
             let _span = LocalSpan::enter_with_local_parent("prefill_decode")
                 .with_property(|| ("prompt_tokens", "1".to_string()));
             self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
-            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            }
         } else {
             // Multi-token prompt: batch prefill (GEMM)
             let _span = LocalSpan::enter_with_local_parent("prefill")
@@ -903,7 +910,11 @@ impl Qwen3Model {
                     &mut bufs,
                     &mut graph_state,
                 )?;
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+                if params.is_greedy() {
+                    ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+                } else {
+                    self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+                }
             };
 
             if !params.ignore_eos && self.config.is_stop_token(next_token) {
@@ -980,7 +991,11 @@ impl Qwen3Model {
             let _span = LocalSpan::enter_with_local_parent("prefill_decode")
                 .with_property(|| ("prompt_tokens", "1".to_string()));
             self.decode_one_token(prompt_tokens[0], &mut kv_cache, &mut bufs, &mut graph_state)?;
-            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            }
         } else {
             let _span = LocalSpan::enter_with_local_parent("prefill")
                 .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
@@ -1034,7 +1049,11 @@ impl Qwen3Model {
                     &mut bufs,
                     &mut graph_state,
                 )?;
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+                if params.is_greedy() {
+                    ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+                } else {
+                    self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+                }
             };
 
             if !params.ignore_eos && self.config.is_stop_token(next_token) {

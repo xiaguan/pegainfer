@@ -36,6 +36,32 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     Ok(result[0] as u32)
 }
 
+/// Argmax into a pre-allocated output buffer (no alloc, no sync).
+/// Safe for CUDA Graph capture.
+pub fn argmax_into(ctx: &DeviceContext, x: &DeviceVec, out: &mut CudaSlice<i32>) {
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::argmax_cuda(
+            x_ptr as *const ffi::Half,
+            out_ptr as *mut i32,
+            x.len as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+}
+
+/// Read a pre-computed argmax result from GPU (sync + D2H).
+pub fn read_argmax(ctx: &DeviceContext, out: &CudaSlice<i32>) -> Result<u32> {
+    ctx.sync()?;
+    let result = ctx
+        .stream
+        .clone_dtoh(out)
+        .map_err(|e| anyhow!("D2H argmax read failed: {}", e))?;
+    Ok(result[0] as u32)
+}
+
 /// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
 /// Runs entirely on GPU. Only the final token ID (4 bytes) is transferred D2H.
 pub fn gpu_sample(

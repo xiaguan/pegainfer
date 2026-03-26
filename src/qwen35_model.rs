@@ -509,6 +509,9 @@ impl Qwen35Model {
             &mut bufs.logits,
         )?;
 
+        // 5. Argmax (pre-allocated, captured inside CUDA Graph)
+        ops::argmax_into(&self.ctx, &bufs.logits, &mut bufs.argmax_out);
+
         Ok(())
     }
 
@@ -940,7 +943,11 @@ impl Qwen35Model {
                 &mut bufs,
                 &mut graph_state,
             )?;
-            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            }
         } else {
             // Multi-token: batch prefill
             let logits = self.prefill_forward(prompt_tokens, &mut kv_cache, &mut recurrent)?;
@@ -967,8 +974,11 @@ impl Qwen35Model {
                 &mut bufs,
                 &mut graph_state,
             )?;
-            let next_token =
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
+            let next_token = if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            };
 
             if !params.ignore_eos && next_token == self.config.eos_token_id {
                 break;
@@ -1028,7 +1038,11 @@ impl Qwen35Model {
                 &mut bufs,
                 &mut graph_state,
             )?;
-            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            }
         } else {
             let logits = self.prefill_forward(prompt_tokens, &mut kv_cache, &mut recurrent)?;
             self.select_token(&logits, params, rng, None)?
@@ -1067,8 +1081,11 @@ impl Qwen35Model {
                 &mut bufs,
                 &mut graph_state,
             )?;
-            let next_token =
-                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?;
+            let next_token = if params.is_greedy() {
+                ops::read_argmax(&self.ctx, &bufs.argmax_out)?
+            } else {
+                self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+            };
 
             if !params.ignore_eos && next_token == self.config.eos_token_id {
                 hit_eos = true;
