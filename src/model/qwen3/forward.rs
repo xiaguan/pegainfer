@@ -2,9 +2,9 @@ use anyhow::Result;
 use rand::RngExt;
 use rand::rngs::StdRng;
 
-use super::decode::CudaGraphState;
 use super::decode_buffers::DecodeBuffers;
 use super::weights::Qwen3Model;
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
@@ -20,7 +20,7 @@ pub struct Qwen3State {
     pub(super) prefill_logits: Option<DeviceVec>,
 }
 
-// SAFETY: Qwen3State contains CudaGraph (raw CUDA pointers) that are not Send by default.
+// SAFETY: Contains raw CUDA pointers (CudaSlice, etc.) that are not Send by default.
 // We only access state from the single inference thread.
 unsafe impl Send for Qwen3State {}
 
@@ -48,7 +48,7 @@ impl ModelForward for Qwen3Model {
                 self.config.num_hidden_layers,
                 self.config.num_key_value_heads,
             ),
-            graph_state: CudaGraphState { graph: None },
+            graph_state: CudaGraphState::new(),
             prefill_logits: None,
         })
     }

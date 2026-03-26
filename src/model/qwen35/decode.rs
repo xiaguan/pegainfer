@@ -1,22 +1,11 @@
 use anyhow::Result;
-use log::debug;
-
-use cudarc::driver::safe::CudaGraph;
-use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 
 use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::weights::{FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model};
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;
-
-/// CUDA Graph state for decode path.
-pub(super) struct CudaGraphState35 {
-    pub(super) graph: Option<CudaGraph>,
-}
-
-unsafe impl Send for CudaGraphState35 {}
 
 impl Qwen35Model {
     /// Single decode step using pre-allocated buffers. Zero GPU allocation.
@@ -26,14 +15,13 @@ impl Qwen35Model {
         kv_cache: &mut KVCache,
         recurrent: &mut RecurrentState,
         bufs: &mut DecodeBuffers35,
-        graph_state: &mut CudaGraphState35,
+        graph_state: &mut CudaGraphState,
     ) -> Result<()> {
-        let pos = kv_cache.len(); // full attention seq len = total tokens processed
+        let pos = kv_cache.len();
         let seq_len = pos + 1;
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        // Upload decode metadata (outside graph)
         self.ctx
             .stream
             .memcpy_htod(
@@ -42,41 +30,11 @@ impl Qwen35Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
-        if !self.enable_cuda_graph {
+        if self.enable_cuda_graph {
+            graph_state
+                .run_or_capture(&self.ctx, || self.decode_kernels(kv_cache, recurrent, bufs))?;
+        } else {
             self.decode_kernels(kv_cache, recurrent, bufs)?;
-            kv_cache.increment_seq_len();
-            recurrent.seq_len += 1;
-            return Ok(());
-        }
-
-        match &graph_state.graph {
-            Some(graph) => {
-                graph
-                    .launch()
-                    .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
-            }
-            None => {
-                debug!("Capturing CUDA Graph for Qwen3.5 decode path...");
-                self.ctx
-                    .stream
-                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                    .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
-
-                self.decode_kernels(kv_cache, recurrent, bufs)?;
-
-                graph_state.graph = self
-                    .ctx
-                    .stream
-                    .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-                    .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-                debug!("CUDA Graph captured successfully");
-
-                if let Some(ref graph) = graph_state.graph {
-                    graph
-                        .launch()
-                        .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
-                }
-            }
         }
 
         kv_cache.increment_seq_len();

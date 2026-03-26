@@ -1,28 +1,13 @@
 use anyhow::Result;
-use log::debug;
-
-use cudarc::driver::safe::CudaGraph;
-use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;
 
-/// CUDA Graph state for decode path.
-/// First decode call captures the graph; subsequent calls replay it.
-pub(super) struct CudaGraphState {
-    pub(super) graph: Option<CudaGraph>,
-}
-
-// SAFETY: CudaGraph contains raw CUDA pointers that are not Send by default.
-// We only access the graph from the single inference thread that owns the model.
-unsafe impl Send for CudaGraphState {}
-
 impl Qwen3Model {
     /// Single decode step using pre-allocated buffers. Zero GPU allocation.
-    /// With CUDA Graph: first call captures, subsequent calls replay.
     pub(super) fn decode_one_token(
         &self,
         token_id: u32,
@@ -43,40 +28,10 @@ impl Qwen3Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
-        if !self.enable_cuda_graph {
+        if self.enable_cuda_graph {
+            graph_state.run_or_capture(&self.ctx, || self.decode_kernels(kv_cache, bufs))?;
+        } else {
             self.decode_kernels(kv_cache, bufs)?;
-            kv_cache.increment_seq_len();
-            return Ok(());
-        }
-
-        match &graph_state.graph {
-            Some(graph) => {
-                graph
-                    .launch()
-                    .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
-            }
-            None => {
-                debug!("Capturing CUDA Graph for decode path...");
-                self.ctx
-                    .stream
-                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                    .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
-
-                self.decode_kernels(kv_cache, bufs)?;
-
-                graph_state.graph = self
-                    .ctx
-                    .stream
-                    .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-                    .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-                debug!("CUDA Graph captured successfully");
-
-                if let Some(ref graph) = graph_state.graph {
-                    graph
-                        .launch()
-                        .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
-                }
-            }
         }
 
         kv_cache.increment_seq_len();

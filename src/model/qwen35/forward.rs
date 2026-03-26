@@ -2,10 +2,10 @@ use anyhow::Result;
 use rand::RngExt;
 use rand::rngs::StdRng;
 
-use super::decode::CudaGraphState35;
 use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
@@ -17,7 +17,7 @@ pub struct Qwen35State {
     pub(super) decode_bufs: DecodeBuffers35,
     pub(super) kv_cache: KVCache,
     pub(super) recurrent_state: RecurrentState,
-    pub(super) graph_state: CudaGraphState35,
+    pub(super) graph_state: CudaGraphState,
     pub(super) prefill_logits: Option<DeviceVec>,
 }
 
@@ -50,7 +50,7 @@ impl ModelForward for Qwen35Model {
                 self.config.num_key_value_heads,
             ),
             recurrent_state: RecurrentState::new(&self.ctx, &self.config)?,
-            graph_state: CudaGraphState35 { graph: None },
+            graph_state: CudaGraphState::new(),
             prefill_logits: None,
         })
     }
