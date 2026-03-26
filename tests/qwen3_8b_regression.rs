@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use pegainfer::qwen3_config::Config;
+use pegainfer::model::qwen3::Config;
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::weight_loader::load_shard_info;
 

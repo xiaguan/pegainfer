@@ -1,7 +1,7 @@
 //! Regenerate test_data/Qwen3-4B.json using pegainfer's greedy output.
 //! Run: cargo run -r --example regenerate_test_data
 
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::tokenizer::Tokenizer;
 use rand::SeedableRng;
@@ -48,18 +48,39 @@ fn main() {
     let input: InputData = serde_json::from_str(&content).expect("Failed to parse JSON");
 
     let tokenizer = Tokenizer::from_file(MODEL_PATH).expect("Failed to load tokenizer");
-    let mut model =
+    let model =
         Qwen3Model::from_safetensors_with_runtime(MODEL_PATH, ModelRuntimeConfig::default())
             .expect("Failed to load model");
+    let mut state = model.create_state().expect("Failed to create state");
     let greedy = SamplingParams::default();
     let mut rng = StdRng::seed_from_u64(42);
 
     let mut cases = Vec::new();
     for case in &input.cases {
         let prompt_tokens = tokenizer.encode(&case.prompt).expect("encode failed");
-        let output_tokens = model
-            .generate(&prompt_tokens, case.max_new_tokens, &greedy, &mut rng)
-            .expect("generate failed");
+
+        // Generate using ModelForward
+        state.reset().expect("reset failed");
+        model
+            .forward(&prompt_tokens, &mut state)
+            .expect("prefill failed");
+        let mut output_tokens = prompt_tokens.clone();
+        let first = model
+            .select_token(&mut state, &greedy, &mut rng)
+            .expect("select failed");
+        output_tokens.push(first);
+        for _ in 1..case.max_new_tokens {
+            model
+                .forward(&[*output_tokens.last().unwrap()], &mut state)
+                .expect("decode failed");
+            let tok = model
+                .select_token(&mut state, &greedy, &mut rng)
+                .expect("select failed");
+            if model.is_stop_token(tok) {
+                break;
+            }
+            output_tokens.push(tok);
+        }
 
         let new_tokens = &output_tokens[prompt_tokens.len()..];
         let output_text = tokenizer.decode(new_tokens).expect("decode failed");

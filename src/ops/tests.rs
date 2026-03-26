@@ -3,7 +3,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::*;
-use crate::prefill_buffers35::GdrChunkwiseScratch35;
+use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::tensor::*;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {

@@ -1,13 +1,15 @@
 use std::fmt;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Result;
+use fastrace::local::LocalSpan;
+use log::debug;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::model::{ModelRuntimeConfig, Qwen3Model, StreamingStats};
-use crate::qwen35_model::Qwen35Model;
+use crate::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
@@ -140,7 +142,6 @@ pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
     let content = std::fs::read_to_string(&config_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
-    // Qwen3.5 has nested text_config
     if json.get("text_config").is_some() {
         return Ok(ModelType::Qwen35);
     }
@@ -166,95 +167,211 @@ impl Default for EngineOptions {
 }
 
 // ============================================================================
-// GenerativeModel trait — shared by Qwen3 and Qwen3.5
+// Shared generation loop — uses ModelForward trait
 // ============================================================================
 
-pub trait GenerativeModel: Send {
-    fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>>;
-
-    fn generate_streaming_with_callback(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        callback: impl FnMut(u32) -> bool,
-    ) -> Result<StreamingStats>;
+struct StreamingStats {
+    emitted_tokens: usize,
+    hit_eos: bool,
+    consumer_dropped: bool,
 }
 
-impl GenerativeModel for Qwen3Model {
-    fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>> {
-        self.generate(prompt_tokens, max_new_tokens, params, rng)
+fn generate<M: ModelForward>(
+    model: &M,
+    state: &mut M::State,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    params: &SamplingParams,
+    rng: &mut StdRng,
+) -> Result<Vec<u32>> {
+    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+    let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
+        [
+            ("prompt_len", prompt_tokens.len().to_string()),
+            ("max_new_tokens", max_new_tokens.to_string()),
+        ]
+    });
+
+    let mut tokens = prompt_tokens.to_vec();
+
+    let ttft_start = Instant::now();
+    model.forward(prompt_tokens, state)?;
+    let next_token = model.select_token(state, params, rng)?;
+    let ttft = ttft_start.elapsed();
+
+    LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
+    debug!(
+        "TTFT: {:.2}ms (prompt_len={})",
+        ttft.as_secs_f64() * 1000.0,
+        prompt_tokens.len()
+    );
+
+    if !params.ignore_eos && model.is_stop_token(next_token) {
+        return Ok(tokens);
+    }
+    tokens.push(next_token);
+
+    let tpot_start = Instant::now();
+    let mut generated_count = 0;
+    for i in 1..max_new_tokens {
+        let _span = LocalSpan::enter_with_local_parent("decode_step")
+            .with_property(|| ("step", i.to_string()));
+        model.forward(&[*tokens.last().unwrap()], state)?;
+        let next_token = model.select_token(state, params, rng)?;
+
+        if !params.ignore_eos && model.is_stop_token(next_token) {
+            break;
+        }
+        tokens.push(next_token);
+        generated_count += 1;
     }
 
-    fn generate_streaming_with_callback(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        callback: impl FnMut(u32) -> bool,
-    ) -> Result<StreamingStats> {
-        self.generate_streaming_with_callback(prompt_tokens, max_new_tokens, params, rng, callback)
+    if generated_count > 0 {
+        let tpot_total = tpot_start.elapsed();
+        let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
+        LocalSpan::add_properties(|| {
+            [
+                ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
+                ("generated_tokens", generated_count.to_string()),
+                (
+                    "tok_per_sec",
+                    format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
+                ),
+            ]
+        });
+        debug!(
+            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
+            tpot_avg * 1000.0,
+            generated_count,
+            tpot_total.as_secs_f64() * 1000.0,
+            generated_count as f64 / tpot_total.as_secs_f64()
+        );
     }
+
+    Ok(tokens)
 }
 
-impl GenerativeModel for Qwen35Model {
-    fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>> {
-        self.generate(prompt_tokens, max_new_tokens, params, rng)
+fn generate_streaming_with_callback<M: ModelForward>(
+    model: &M,
+    state: &mut M::State,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    params: &SamplingParams,
+    rng: &mut StdRng,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<StreamingStats> {
+    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+    let _span = LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
+        [
+            ("prompt_len", prompt_tokens.len().to_string()),
+            ("max_new_tokens", max_new_tokens.to_string()),
+        ]
+    });
+
+    let mut tokens = prompt_tokens.to_vec();
+
+    let ttft_start = Instant::now();
+    model.forward(prompt_tokens, state)?;
+    let next_token = model.select_token(state, params, rng)?;
+    let ttft = ttft_start.elapsed();
+    debug!(
+        "TTFT: {:.2}ms (prompt_len={})",
+        ttft.as_secs_f64() * 1000.0,
+        prompt_tokens.len()
+    );
+
+    if !params.ignore_eos && model.is_stop_token(next_token) {
+        return Ok(StreamingStats {
+            emitted_tokens: 0,
+            hit_eos: true,
+            consumer_dropped: false,
+        });
     }
 
-    fn generate_streaming_with_callback(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        params: &SamplingParams,
-        rng: &mut StdRng,
-        callback: impl FnMut(u32) -> bool,
-    ) -> Result<StreamingStats> {
-        self.generate_streaming_with_callback(prompt_tokens, max_new_tokens, params, rng, callback)
+    tokens.push(next_token);
+    let mut emitted_tokens = 1usize;
+    if !on_token(next_token) {
+        return Ok(StreamingStats {
+            emitted_tokens,
+            hit_eos: false,
+            consumer_dropped: true,
+        });
     }
+
+    let tpot_start = Instant::now();
+    let mut generated_count = 0;
+    let mut hit_eos = false;
+    for i in 1..max_new_tokens {
+        let _span = LocalSpan::enter_with_local_parent("decode_step")
+            .with_property(|| ("step", i.to_string()));
+        model.forward(&[*tokens.last().unwrap()], state)?;
+        let next_token = model.select_token(state, params, rng)?;
+
+        if !params.ignore_eos && model.is_stop_token(next_token) {
+            hit_eos = true;
+            break;
+        }
+
+        tokens.push(next_token);
+        generated_count += 1;
+        emitted_tokens += 1;
+
+        if !on_token(next_token) {
+            return Ok(StreamingStats {
+                emitted_tokens,
+                hit_eos: false,
+                consumer_dropped: true,
+            });
+        }
+    }
+
+    if generated_count > 0 {
+        let tpot_total = tpot_start.elapsed();
+        let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
+        debug!(
+            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
+            tpot_avg * 1000.0,
+            generated_count,
+            tpot_total.as_secs_f64() * 1000.0,
+            generated_count as f64 / tpot_total.as_secs_f64()
+        );
+    }
+
+    Ok(StreamingStats {
+        emitted_tokens,
+        hit_eos,
+        consumer_dropped: false,
+    })
 }
 
 // ============================================================================
 // Generic server engine — shared complete/complete_stream logic
 // ============================================================================
 
-pub struct GenericServerEngine<M: GenerativeModel> {
+pub struct GenericServerEngine<M: ModelForward> {
     model_id: String,
     model: M,
+    state: M::State,
     tokenizer: Tokenizer,
     rng: StdRng,
 }
 
-impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
+impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
     fn model_id(&self) -> &str {
         &self.model_id
     }
 
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let output_tokens =
-            self.model
-                .generate(&prompt_tokens, req.max_tokens, &req.sampling, &mut self.rng)?;
+        self.state.reset()?;
+        let output_tokens = generate(
+            &self.model,
+            &mut self.state,
+            &prompt_tokens,
+            req.max_tokens,
+            &req.sampling,
+            &mut self.rng,
+        )?;
         let completion_tokens = output_tokens.len().saturating_sub(prompt_tokens.len());
         let mut text = self
             .tokenizer
@@ -288,6 +405,7 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
+        self.state.reset()?;
         let mut decoder = self.tokenizer.incremental_decoder();
         let mut decode_error = None;
         let stops: Option<Vec<&str>> = req.stop.as_ref().map(|v| {
@@ -299,7 +417,9 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
         let mut sent_len: usize = 0;
         let stopped_by_stop_sequence = std::cell::Cell::new(false);
 
-        let stats = self.model.generate_streaming_with_callback(
+        let stats = generate_streaming_with_callback(
+            &self.model,
+            &mut self.state,
             &prompt_tokens,
             req.max_tokens,
             &req.sampling,
@@ -359,7 +479,6 @@ impl<M: GenerativeModel> ServerEngine for GenericServerEngine<M> {
             return Err(err);
         }
 
-        // Only skip terminal delta when client actually dropped; stop-sequence stop is intentional.
         if stats.consumer_dropped && !stopped_by_stop_sequence.get() {
             return Ok(());
         }
@@ -446,10 +565,12 @@ impl RealServerEngine {
                 enable_cuda_graph: options.enable_cuda_graph,
             },
         )?;
+        let state = model.create_state()?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
             model_id: model_id_from_path(model_path),
             model,
+            state,
             tokenizer,
             rng,
         })
@@ -465,10 +586,12 @@ impl Qwen35ServerEngine {
         let tokenizer = Tokenizer::from_file(model_path)?;
         let model =
             Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)?;
+        let state = model.create_state()?;
         let rng = StdRng::seed_from_u64(seed);
         Ok(Self {
             model_id: model_id_from_path(model_path),
             model,
+            state,
             tokenizer,
             rng,
         })
@@ -496,7 +619,6 @@ mod tests {
         );
         assert_eq!(truncate_at_first_stop("hello", &stops), None);
         assert_eq!(truncate_at_first_stop("", &stops), None);
-        // Earliest stop wins
         assert_eq!(
             truncate_at_first_stop("a\n\nbEND", &stops),
             Some("a".to_string())
@@ -506,7 +628,6 @@ mod tests {
             truncate_at_first_stop("hello\nworld", &stops_nl),
             Some("hello".to_string())
         );
-        // Stop at beginning -> empty prefix
         assert_eq!(
             truncate_at_first_stop("ab", &vec!["ab".to_string()]),
             Some("".to_string())

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::ffi;
 
 /// CUDA device context holding context and stream.
+#[derive(Clone)]
 pub struct DeviceContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -92,7 +93,8 @@ impl DeviceVec {
         })
     }
 
-    /// Copy to host as f32 (for compatibility)
+    /// Copy to host as f32 (for testing)
+    #[cfg(test)]
     pub(crate) fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
         let host_f16 = ctx
             .stream

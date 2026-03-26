@@ -7,7 +7,7 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
-use crate::qwen35_config::Config35;
+use super::config::Config35;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Per-layer recurrent state for a single linear attention layer.
