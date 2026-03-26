@@ -56,8 +56,8 @@ pub(crate) struct DecodeBuffers35 {
     pub(crate) decode_meta: CudaSlice<i32>,
     /// FP32 scratch buffer for GPU sampling softmax (vocab_size)
     pub(crate) sample_probs: CudaSlice<f32>,
-    /// Pre-allocated argmax output (1 element) — lives inside CUDA Graph
-    pub(crate) argmax_out: CudaSlice<i32>,
+    /// Pre-allocated sampling output (1 element, token id)
+    pub(crate) sample_out: CudaSlice<i32>,
 }
 
 impl DecodeBuffers35 {
@@ -97,10 +97,10 @@ impl DecodeBuffers35 {
                 .stream
                 .alloc_zeros(config.vocab_size)
                 .map_err(|e| anyhow::anyhow!("Alloc sample_probs failed: {}", e))?,
-            argmax_out: ctx
+            sample_out: ctx
                 .stream
                 .alloc_zeros(1)
-                .map_err(|e| anyhow::anyhow!("Alloc argmax_out failed: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?,
         })
     }
 }

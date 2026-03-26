@@ -8,7 +8,7 @@ use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
-use crate::sampler::{self, SamplingParams};
+use crate::sampler::SamplingParams;
 use crate::tensor::DeviceVec;
 
 /// Per-request mutable state for Qwen3.
@@ -78,25 +78,19 @@ impl ModelForward for Qwen3Model {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> Result<u32> {
-        if let Some(ref logits) = state.prefill_logits {
-            if params.is_greedy() {
-                ops::argmax(&self.ctx, logits)
-            } else {
-                let logits_f32 = logits.to_host(&self.ctx)?;
-                Ok(sampler::sample(&logits_f32, params, rng))
-            }
-        } else if params.is_greedy() {
-            ops::read_argmax(&self.ctx, &state.decode_bufs.argmax_out)
-        } else {
-            let random_val: f32 = rng.random();
-            ops::gpu_sample(
-                &self.ctx,
-                &state.decode_bufs.logits,
-                &mut state.decode_bufs.sample_probs,
-                params,
-                random_val,
-            )
-        }
+        let random_val: f32 = rng.random();
+        let logits = state
+            .prefill_logits
+            .as_ref()
+            .unwrap_or(&state.decode_bufs.logits);
+        ops::gpu_sample_into(
+            &self.ctx,
+            logits,
+            &mut state.decode_bufs.sample_probs,
+            &mut state.decode_bufs.sample_out,
+            params,
+            random_val,
+        )
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {

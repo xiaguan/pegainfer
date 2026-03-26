@@ -82,8 +82,6 @@ impl Qwen3Model {
             &mut bufs.logits,
         )?;
 
-        ops::argmax_into(&self.ctx, &bufs.logits, &mut bufs.argmax_out);
-
         Ok(())
     }
 

@@ -130,9 +130,6 @@ impl Qwen35Model {
             &mut bufs.logits,
         )?;
 
-        // 5. Argmax (pre-allocated, captured inside CUDA Graph)
-        ops::argmax_into(&self.ctx, &bufs.logits, &mut bufs.argmax_out);
-
         Ok(())
     }
 

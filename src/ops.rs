@@ -25,7 +25,7 @@ pub use norm::{
 pub use recurrent::{
     conv1d_decode_into, gated_delta_rule_decode_into, gated_delta_rule_prefill_chunkwise_into,
 };
-pub use sampling::{argmax, argmax_into, gpu_sample, read_argmax};
+pub use sampling::{argmax, gpu_sample, gpu_sample_into};
 
 // pub(crate) re-exports
 #[cfg(test)]
