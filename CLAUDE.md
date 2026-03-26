@@ -36,28 +36,31 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 ## Architecture
 
 ```
-HTTP Request → GenericServerEngine<M> → tokenizer.encode() → M.generate() → tokenizer.decode() → SSE/JSON Response
-                                                                  │
-                                          ┌───────────────────────┤
-                                          │                       │
-                                    Qwen3Model              Qwen35Model
-                                   (full attention)    (24 linear + 8 full attn)
-                                          │                       │
-                                          └───────────────────────┘
-                                                    │
-                                    Prefill (batch GEMM) → Decode loop (GEMV, CUDA Graph)
-                                                    │
-                                              ops.rs → ffi.rs → CUDA/Triton kernels
+HTTP Request → GenericServerEngine<M> → tokenizer.encode() → generate(model, state, ...) → tokenizer.decode() → SSE/JSON Response
+                                                                        │
+                                                  ┌─────────────────────┤
+                                                  │                     │
+                                            Qwen3Model            Qwen35Model
+                                           (full attention)  (24 linear + 8 full attn)
+                                                  │                     │
+                                                  └─────────────────────┘
+                                                            │
+                                            M.forward(tokens, state)  ← ModelForward trait
+                                                            │
+                                            Prefill (batch GEMM) / Decode (GEMV, CUDA Graph)
+                                                            │
+                                                      ops.rs → ffi.rs → CUDA/Triton kernels
 ```
 
 **Key abstractions:**
 
-- **`GenerativeModel` trait** — implemented by `Qwen3Model` and `Qwen35Model`. `GenericServerEngine<M: GenerativeModel>` provides shared request handling (stop sequences, streaming, sampling).
+- **`ModelForward` trait** (`model.rs`) — single `forward(&self, tokens, state)` method; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable, shareable), per-request mutable state lives in the associated `State` type. Shared `generate()` / `generate_streaming()` in `server_engine.rs` replace per-model generation loops. `GenericServerEngine<M: ModelForward>` provides request handling (stop sequences, streaming, sampling).
+- **Model submodules** — each model lives under `src/model/{qwen3,qwen35}/` with `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `config.rs`, `decode_buffers.rs`. Shared code: `model/cuda_graph.rs` (CUDA Graph capture/replay), `model/kv_cache.rs`.
 - **`ops.rs`** — high-level GPU operators (gemv, rms_norm, rope, fused_mlp, fused_attention, sampling). Calls unsafe C FFI in `ffi.rs`.
 - **Tensor types** (`tensor.rs`) — `DeviceVec` (1D bf16), `DeviceMatrix` (2D bf16), `HiddenStates` (batched hidden states). All GPU-resident, accessed via cudarc.
-- **CUDA Graph** — decode path captured on first token, replayed on subsequent tokens. `embedding_decode_cuda()` reads token_id from GPU memory (not CPU) so the graph is stable. Pre-allocated `DecodeBuffers` ensure pointer stability.
-- **KVCache** (`kv_cache.rs`) — per-layer contiguous K/V buffers, seq_len tracking, reset between requests (keeps allocations).
-- **RecurrentState** (`recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
+- **CUDA Graph** (`model/cuda_graph.rs`) — decode path captured on first token, replayed on subsequent tokens. `embedding_decode_cuda()` reads token_id from GPU memory (not CPU) so the graph is stable. Pre-allocated `DecodeBuffers` ensure pointer stability.
+- **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers, seq_len tracking, reset between requests (keeps allocations).
+- **RecurrentState** (`model/qwen35/recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
 
 **Build system** (`build.rs`) does two things:
 1. Compiles `csrc/*.cu` with nvcc (auto-detects GPU SM targets)
