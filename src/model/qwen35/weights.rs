@@ -4,8 +4,11 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config35, LayerType};
-use crate::tensor::*;
-use crate::weight_loader::*;
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::weight_loader::{
+    load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, mmap_shards,
+    precompute_rope,
+};
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
@@ -51,6 +54,7 @@ pub(super) enum LayerKind {
 }
 
 /// MLP layer weights (shared between both layer types).
+#[allow(clippy::struct_field_names)]
 pub(super) struct MLP35 {
     pub(super) gate_proj: DeviceMatrix,
     pub(super) up_proj: DeviceMatrix,

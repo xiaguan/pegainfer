@@ -47,7 +47,7 @@ fn truncate_at_stop<'a>(
         }
         if new_full.ends_with(s) {
             let len = s.len();
-            if best.map_or(true, |(l, _)| len > l) {
+            if best.is_none_or(|(l, _)| len > l) {
                 best = Some((len, *s));
             }
         }
@@ -381,11 +381,11 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         } else {
             FinishReason::Stop
         };
-        if let Some(ref stops) = req.stop {
-            if let Some(truncated) = truncate_at_first_stop(&text, stops) {
-                text = truncated;
-                finish_reason = FinishReason::Stop;
-            }
+        if let Some(ref stops) = req.stop
+            && let Some(truncated) = truncate_at_first_stop(&text, stops)
+        {
+            text = truncated;
+            finish_reason = FinishReason::Stop;
         }
         let usage = Usage {
             prompt_tokens: prompt_tokens.len(),
@@ -434,17 +434,16 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                         if let Some((to_send, stopped)) =
                             truncate_at_stop(&new_full, sent_len, stop_list)
                         {
-                            if !to_send.is_empty() {
-                                if tx
+                            if !to_send.is_empty()
+                                && tx
                                     .send(StreamDelta {
                                         text_delta: to_send,
                                         finish_reason: None,
                                         usage: None,
                                     })
                                     .is_err()
-                                {
-                                    return false;
-                                }
+                            {
+                                return false;
                             }
                             sent_len = new_full.len() - stopped.len();
                             stopped_by_stop_sequence.set(true);
@@ -460,7 +459,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                         .is_ok()
                     } else {
                         tx.send(StreamDelta {
-                            text_delta: text_delta,
+                            text_delta,
                             finish_reason: None,
                             usage: None,
                         })
@@ -483,41 +482,39 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             return Ok(());
         }
 
-        if !stopped_by_stop_sequence.get() {
-            if let Some(text_delta) = decoder.finish()? {
-                if let Some(ref stop_list) = stops {
-                    let new_full = decoder.emitted_text().to_string();
-                    if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
-                        if !to_send.is_empty() {
-                            let _ = tx.send(StreamDelta {
-                                text_delta: to_send,
-                                finish_reason: None,
-                                usage: None,
-                            });
-                        }
-                    } else {
-                        let to_send = &new_full[sent_len..];
-                        if !to_send.is_empty() {
-                            let _ = tx.send(StreamDelta {
-                                text_delta: to_send.to_string(),
-                                finish_reason: None,
-                                usage: None,
-                            });
-                        }
+        if !stopped_by_stop_sequence.get()
+            && let Some(text_delta) = decoder.finish()?
+        {
+            if let Some(ref stop_list) = stops {
+                let new_full = decoder.emitted_text().to_string();
+                if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
+                    if !to_send.is_empty() {
+                        let _ = tx.send(StreamDelta {
+                            text_delta: to_send,
+                            finish_reason: None,
+                            usage: None,
+                        });
                     }
                 } else {
-                    let _ = tx.send(StreamDelta {
-                        text_delta: text_delta,
-                        finish_reason: None,
-                        usage: None,
-                    });
+                    let to_send = &new_full[sent_len..];
+                    if !to_send.is_empty() {
+                        let _ = tx.send(StreamDelta {
+                            text_delta: to_send.to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        });
+                    }
                 }
+            } else {
+                let _ = tx.send(StreamDelta {
+                    text_delta,
+                    finish_reason: None,
+                    usage: None,
+                });
             }
         }
 
-        let finish_reason = if stopped_by_stop_sequence.get() {
-            FinishReason::Stop
-        } else if stats.hit_eos {
+        let finish_reason = if stopped_by_stop_sequence.get() || stats.hit_eos {
             FinishReason::Stop
         } else {
             FinishReason::Length
@@ -629,8 +626,8 @@ mod tests {
             Some("hello".to_string())
         );
         assert_eq!(
-            truncate_at_first_stop("ab", &vec!["ab".to_string()]),
-            Some("".to_string())
+            truncate_at_first_stop("ab", &["ab".to_string()]),
+            Some(String::new())
         );
     }
 
@@ -644,7 +641,7 @@ mod tests {
         assert_eq!(truncate_at_stop("hello", 0, &stops), None);
         assert_eq!(
             truncate_at_stop("ab\n", 2, &stops),
-            Some(("".to_string(), "\n"))
+            Some((String::new(), "\n"))
         );
     }
 }

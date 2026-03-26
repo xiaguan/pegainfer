@@ -4,8 +4,10 @@ use std::time::Instant;
 
 use super::config::Config;
 use crate::ops;
-use crate::tensor::*;
-use crate::weight_loader::*;
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::weight_loader::{
+    load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards, precompute_rope,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
@@ -31,6 +33,7 @@ pub(super) struct Attention {
 }
 
 /// MLP layer weights
+#[allow(clippy::upper_case_acronyms, clippy::struct_field_names)]
 pub(super) struct MLP {
     pub(super) gate_proj: DeviceMatrix,
     pub(super) up_proj: DeviceMatrix,

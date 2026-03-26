@@ -10,7 +10,7 @@ use crate::model::kv_cache::KVCache;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec};
 
 pub struct Qwen35State {
     pub(super) ctx: DeviceContext,

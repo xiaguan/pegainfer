@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec};
 
 /// KV Cache — contiguous buffers for fused attention.
 pub(crate) struct KVCache {

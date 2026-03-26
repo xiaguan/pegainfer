@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Causal depthwise conv1d decode (single step).
 /// Updates conv_state in-place. Applies SiLU activation.
@@ -49,7 +49,7 @@ pub(crate) fn conv1d_prefill_batch_into(
     conv_state: &mut DeviceVec,
     out_seq: &mut HiddenStates,
     kernel_size: usize,
-) -> Result<()> {
+) {
     let num_channels = x_seq.hidden_dim;
     assert_eq!(out_seq.hidden_dim, num_channels);
     assert_eq!(out_seq.seq_len, x_seq.seq_len);
@@ -73,8 +73,6 @@ pub(crate) fn conv1d_prefill_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-
-    Ok(())
 }
 
 /// Gated delta rule recurrent decode (single step).
@@ -244,6 +242,7 @@ fn gated_delta_rule_prefill_chunk_solve_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_recompute_into(
     ctx: &DeviceContext,
     k: &HiddenStates,

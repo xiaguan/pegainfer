@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
@@ -149,6 +149,7 @@ pub(crate) fn precompute_rope(
     Ok((cos_cache, sin_cache))
 }
 
+#[allow(clippy::cast_ptr_alignment)]
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
 /// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).
 pub(crate) fn load_tensor_1d_f32(

@@ -161,15 +161,16 @@ mod tests {
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_load_config35() {
         let config = Config35::from_file(MODEL_PATH).unwrap();
 
         assert_eq!(config.hidden_size, 2560);
         assert_eq!(config.intermediate_size, 9216);
         assert_eq!(config.num_hidden_layers, 32);
-        assert_eq!(config.vocab_size, 248320);
+        assert_eq!(config.vocab_size, 248_320);
         assert_eq!(config.rms_norm_eps, 1e-6);
-        assert_eq!(config.eos_token_id, 248044);
+        assert_eq!(config.eos_token_id, 248_044);
 
         // Full attention
         assert_eq!(config.num_attention_heads, 16);

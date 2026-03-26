@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Argmax — returns the index of the maximum element.
 ///

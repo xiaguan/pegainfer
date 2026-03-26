@@ -2,7 +2,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// RMSNorm into pre-allocated output buffer
 pub fn rms_norm_into(
@@ -78,7 +78,7 @@ pub(crate) fn rms_norm_batch_into(
     weight: &DeviceVec,
     eps: f32,
     out: &mut HiddenStates,
-) -> Result<()> {
+) {
     assert_eq!(weight.len, x.hidden_dim);
     assert_eq!(out.hidden_dim, x.hidden_dim);
     assert_eq!(out.seq_len, x.seq_len);
@@ -96,7 +96,6 @@ pub(crate) fn rms_norm_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-    Ok(())
 }
 
 /// Batched (1+weight) RMSNorm over HiddenStates — one kernel launch for all tokens.
@@ -228,7 +227,7 @@ pub(crate) fn rms_norm_gated_batch_into(
     num_heads: usize,
     head_dim: usize,
     eps: f32,
-) -> Result<()> {
+) {
     let total_heads = x.seq_len * num_heads;
     assert_eq!(x.hidden_dim, num_heads * head_dim);
     assert_eq!(gate.hidden_dim, x.hidden_dim);
@@ -251,5 +250,4 @@ pub(crate) fn rms_norm_gated_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-    Ok(())
 }

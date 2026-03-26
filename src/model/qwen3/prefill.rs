@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill in `process_all_layers_batch`, eliminating
@@ -147,7 +147,7 @@ impl Qwen3Model {
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // 2. QKV projections → bufs.q_batch, bufs.k_batch, bufs.v_batch
         ops::gemm_into(
@@ -155,19 +155,19 @@ impl Qwen3Model {
             &layer.attention.q_proj,
             &bufs.normed,
             &mut bufs.q_batch,
-        )?;
+        );
         ops::gemm_into(
             &self.ctx,
             &layer.attention.k_proj,
             &bufs.normed,
             &mut bufs.k_batch,
-        )?;
+        );
         ops::gemm_into(
             &self.ctx,
             &layer.attention.v_proj,
             &bufs.normed,
             &mut bufs.v_batch,
-        )?;
+        );
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
         let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
@@ -196,7 +196,7 @@ impl Qwen3Model {
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        )?;
+        );
 
         // 5. Residual add: hidden_in + o_batch → bufs.hidden_out
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
@@ -210,7 +210,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
         ops::gemm_into(
@@ -218,20 +218,20 @@ impl Qwen3Model {
             &layer.mlp.gate_proj,
             &bufs.normed,
             &mut bufs.gate_out,
-        )?;
+        );
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.up_proj,
             &bufs.normed,
             &mut bufs.up_out,
-        )?;
+        );
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.act_out,
             &mut bufs.o_buf,
-        )?;
+        );
 
         // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;

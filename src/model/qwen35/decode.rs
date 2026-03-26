@@ -169,7 +169,7 @@ impl Qwen35Model {
             self.config.rotary_dim,
             scale,
             eps,
-        )?;
+        );
 
         // O projection
         ops::gemv(&self.ctx, &attn.o_proj, &bufs.attn_out, &mut bufs.attn_proj)?;

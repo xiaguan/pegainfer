@@ -222,14 +222,13 @@ fn generate_triton_artifacts(
             )
         });
 
-    if !output.status.success() {
-        panic!(
-            "Triton AOT generator failed for {}. stdout: {} stderr: {}",
-            spec.kernel_name,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
+    assert!(
+        output.status.success(),
+        "Triton AOT generator failed for {}. stdout: {} stderr: {}",
+        spec.kernel_name,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut func_name = None;
@@ -740,9 +739,11 @@ fn main() {
             .status()
             .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
 
-        if !status.success() {
-            panic!("nvcc compilation failed for {}", cu_file.display());
-        }
+        assert!(
+            status.success(),
+            "nvcc compilation failed for {}",
+            cu_file.display()
+        );
 
         obj_files.push(obj_file);
     }
@@ -760,9 +761,7 @@ fn main() {
         .status()
         .expect("Failed to run ar");
 
-    if !status.success() {
-        panic!("ar failed");
-    }
+    assert!(status.success(), "ar failed");
 
     compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
 

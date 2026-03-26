@@ -304,7 +304,7 @@ struct CurveReport {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BenchReport {
-    Request(RequestReport),
+    Request(Box<RequestReport>),
     Matrix(MatrixReport),
     Curve(CurveReport),
 }
@@ -381,9 +381,7 @@ fn numeric_cell(value: impl Into<String>) -> Cell {
 }
 
 fn format_rate(value: Option<f64>) -> String {
-    value
-        .map(|v| format!("{v:.2}"))
-        .unwrap_or_else(|| "-".to_string())
+    value.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"))
 }
 
 fn format_duration_ms(value: f64) -> String {
@@ -520,7 +518,7 @@ fn render_matrix_meta(report: &MatrixReport) -> Table {
                 .workload
                 .prompt_lens
                 .iter()
-                .map(|v| v.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -532,7 +530,7 @@ fn render_matrix_meta(report: &MatrixReport) -> Table {
                 .workload
                 .output_lens
                 .iter()
-                .map(|v| v.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -920,7 +918,7 @@ fn bench_request(
         args.run.seed
     );
     let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
-    Ok(BenchReport::Request(RequestReport {
+    Ok(BenchReport::Request(Box::new(RequestReport {
         run: run_info(cli, "request", model_type, load_ms),
         workload: RequestWorkload {
             prompt: prompt.descriptor,
@@ -930,7 +928,7 @@ fn bench_request(
             seed: args.run.seed,
         },
         metrics: build_request_metrics(&timings),
-    }))
+    })))
 }
 
 fn bench_matrix(

@@ -87,6 +87,7 @@ mod tests {
     const MODEL_8B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_load_config() {
         let config = Config::from_file(MODEL_PATH).unwrap();
 
@@ -95,15 +96,15 @@ mod tests {
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_key_value_heads, 8);
         assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.vocab_size, 151_936);
         assert_eq!(config.rms_norm_eps, 1e-6);
-        assert_eq!(config.rope_theta, 1000000.0);
-        assert_eq!(config.bos_token_id, 151643);
-        assert_eq!(config.eos_token_id, 151645);
+        assert_eq!(config.rope_theta, 1_000_000.0);
+        assert_eq!(config.bos_token_id, 151_643);
+        assert_eq!(config.eos_token_id, 151_645);
         assert!(config.tie_word_embeddings);
-        assert_eq!(config.stop_token_ids, vec![151645, 151643]);
-        assert!(config.is_stop_token(151645));
-        assert!(config.is_stop_token(151643));
+        assert_eq!(config.stop_token_ids, vec![151_645, 151_643]);
+        assert!(config.is_stop_token(151_645));
+        assert!(config.is_stop_token(151_643));
         assert_eq!(config.lm_head_tensor_name(), "model.embed_tokens.weight");
     }
 
@@ -120,24 +121,25 @@ mod tests {
 
     #[test]
     #[ignore = "requires Qwen3-8B model"]
+    #[allow(clippy::float_cmp)]
     fn test_load_8b_config() {
         let config = Config::from_file(MODEL_8B_PATH).unwrap();
 
         assert_eq!(config.hidden_size, 4096);
-        assert_eq!(config.intermediate_size, 12288);
+        assert_eq!(config.intermediate_size, 12_288);
         assert_eq!(config.num_hidden_layers, 36);
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_key_value_heads, 8);
         assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.vocab_size, 151_936);
         assert_eq!(config.rms_norm_eps, 1e-6);
-        assert_eq!(config.rope_theta, 1000000.0);
-        assert_eq!(config.bos_token_id, 151643);
-        assert_eq!(config.eos_token_id, 151645);
+        assert_eq!(config.rope_theta, 1_000_000.0);
+        assert_eq!(config.bos_token_id, 151_643);
+        assert_eq!(config.eos_token_id, 151_645);
         assert!(!config.tie_word_embeddings);
-        assert_eq!(config.stop_token_ids, vec![151645, 151643]);
-        assert!(config.is_stop_token(151645));
-        assert!(config.is_stop_token(151643));
+        assert_eq!(config.stop_token_ids, vec![151_645, 151_643]);
+        assert!(config.is_stop_token(151_645));
+        assert!(config.is_stop_token(151_643));
         assert_eq!(config.lm_head_tensor_name(), "lm_head.weight");
     }
 }

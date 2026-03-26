@@ -2,7 +2,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Batched prefill attention with FlashAttention-2.
 ///
@@ -331,7 +331,7 @@ pub(crate) fn fused_attention_hd256_decode_into(
     rotary_dim: usize,
     scale: f32,
     rms_eps: f32,
-) -> Result<()> {
+) {
     let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
     let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
@@ -366,6 +366,4 @@ pub(crate) fn fused_attention_hd256_decode_into(
             ctx.stream.cu_stream(),
         );
     }
-
-    Ok(())
 }

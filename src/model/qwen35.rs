@@ -5,7 +5,7 @@ mod decode;
 mod decode_buffers;
 mod forward;
 mod prefill;
-pub(crate) mod prefill_buffers;
+pub mod prefill_buffers;
 mod recurrent_state;
 mod weights;
 

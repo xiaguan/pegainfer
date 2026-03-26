@@ -66,8 +66,9 @@ impl DeviceVec {
         })
     }
 
+    #[allow(clippy::cast_ptr_alignment)]
     pub(crate) fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             return Err(anyhow!(
                 "Data length must be even for bf16: got {} bytes",
                 data.len()
@@ -136,6 +137,7 @@ impl DeviceMatrix {
         })
     }
 
+    #[allow(clippy::cast_ptr_alignment)]
     pub(crate) fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],

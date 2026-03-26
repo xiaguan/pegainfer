@@ -7,7 +7,7 @@ use super::weights::{
 };
 use crate::model::kv_cache::KVCache;
 use crate::ops;
-use crate::tensor::*;
+use crate::tensor::{DeviceVec, HiddenStates};
 
 impl Qwen35Model {
     pub(super) fn prefill_forward(
@@ -48,7 +48,7 @@ impl Qwen35Model {
             hidden_batch = self.prefill_layer(
                 layer_idx,
                 layer,
-                hidden_batch,
+                &hidden_batch,
                 &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
@@ -87,7 +87,7 @@ impl Qwen35Model {
         &self,
         _layer_idx: usize,
         layer: &TransformerBlock35,
-        hidden_batch: HiddenStates,
+        hidden_batch: &HiddenStates,
         gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
@@ -102,7 +102,7 @@ impl Qwen35Model {
         // Use standard batched norm and add the offset correction manually
         // Actually we need the (1+w) variant. Process token by token for now.
         let mut normed_batch =
-            self.batched_rms_norm_offset(&hidden_batch, &layer.input_layernorm, eps)?;
+            self.batched_rms_norm_offset(hidden_batch, &layer.input_layernorm, eps)?;
 
         // 2. Attention / Linear attention — per-token for correctness
         let attn_out_dim = match &layer.attn {
@@ -131,7 +131,7 @@ impl Qwen35Model {
         };
 
         // 3. Residual + post-attention layernorm
-        let hidden_plus_attn = ops::add_batch(&self.ctx, &hidden_batch, &attn_results)?;
+        let hidden_plus_attn = ops::add_batch(&self.ctx, hidden_batch, &attn_results)?;
 
         // Post-attention layernorm (1+weight offset, batched per-token)
         normed_batch =
@@ -221,7 +221,7 @@ impl Qwen35Model {
             &mut layer_state.conv_state,
             &mut qkv_conv_batch,
             c.linear_conv_kernel_dim,
-        )?;
+        );
 
         let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
         ops::gated_delta_rule_prefill_chunkwise_into(
@@ -250,7 +250,7 @@ impl Qwen35Model {
             c.linear_num_value_heads,
             c.linear_value_head_dim,
             c.rms_norm_eps,
-        )?;
+        );
 
         *linear_idx += 1;
 

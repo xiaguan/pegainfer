@@ -90,7 +90,7 @@ pub(crate) fn positive_bf16_data(len: usize) -> Vec<bf16> {
 
 pub(crate) fn f32_data(len: usize) -> Vec<f32> {
     (0..len)
-        .map(|idx| ((idx % 79) as f32 - 39.0) * 0.015625)
+        .map(|idx| ((idx % 79) as f32 - 39.0) * 0.015_625)
         .collect()
 }
 
@@ -117,7 +117,7 @@ pub(crate) fn embedding_matrix(
 ) -> Result<DeviceMatrix> {
     DeviceMatrix::from_host(
         ctx,
-        &bf16_data_scaled(vocab_size * hidden_size, 0.0078125),
+        &bf16_data_scaled(vocab_size * hidden_size, 0.007_812_5),
         vocab_size,
         hidden_size,
     )

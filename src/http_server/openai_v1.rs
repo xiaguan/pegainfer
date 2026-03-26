@@ -60,6 +60,7 @@ struct Choice {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: usize,
     completion_tokens: usize,

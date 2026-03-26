@@ -2,7 +2,7 @@ use anyhow::Result;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 /// Matrix-vector multiplication: y = A @ x
 /// A: (M, K) row-major, x: (K,), y: (M,)
@@ -93,7 +93,7 @@ pub fn fused_mlp_into(
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
     let mut out = HiddenStates::zeros(ctx, weight.rows, x.seq_len)?;
-    gemm_into(ctx, weight, x, &mut out)?;
+    gemm_into(ctx, weight, x, &mut out);
     Ok(out)
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn gemm_into(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-) -> Result<()> {
+) {
     assert_eq!(
         weight.cols, x.hidden_dim,
         "weight cols {} != hidden_dim {}",
@@ -135,6 +135,4 @@ pub(crate) fn gemm_into(
             ctx.stream.cu_stream(),
         );
     }
-
-    Ok(())
 }

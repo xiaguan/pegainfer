@@ -44,6 +44,43 @@ criterion = { version = "0.8", features = ["html_reports"] }
 base64 = "0.22"
 tower = "0.5"
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+# Allowed pedantic lints (too noisy for this codebase)
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+uninlined_format_args = "allow"
+upper_case_acronyms = "allow"
+doc_markdown = "allow"
+# Cherry-picked nursery lints
+redundant_clone = "warn"
+unused_peekable = "warn"
+# Restriction lints worth enforcing
+dbg_macro = "warn"
+exit = "warn"
+get_unwrap = "warn"
+print_stdout = "allow"
+print_stderr = "allow"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+
 [[bench]]
 name = "tokenizer_bench"
 harness = false

@@ -144,7 +144,7 @@ fn test_rms_norm_batch_multi_tile() -> Result<()> {
     };
     let weight = DeviceVec::from_host(&ctx, &w_host)?;
     let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
-    rms_norm_batch_into(&ctx, &x, &weight, 1e-6, &mut out)?;
+    rms_norm_batch_into(&ctx, &x, &weight, 1e-6, &mut out);
 
     let result = ctx
         .stream
@@ -290,7 +290,7 @@ fn test_gpu_sample() -> Result<()> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "slow reference comparison"]
 fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_qheads = 4;
@@ -398,7 +398,7 @@ fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "slow reference comparison"]
 fn test_prefill_attention_hd256_batch_matches_cpu_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_qheads = 4;
@@ -623,7 +623,7 @@ fn test_prefill_attention_hd256_batch_matches_cpu_reference() -> Result<()> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "slow reference comparison"]
 fn test_gated_delta_rule_prefill_chunkwise_matches_decode_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_key_heads = 2usize;
@@ -752,7 +752,7 @@ fn test_gated_delta_rule_prefill_chunkwise_matches_decode_reference() -> Result<
 }
 
 #[test]
-#[ignore]
+#[ignore = "slow reference comparison"]
 fn test_triton_decode_attention_matches_cpu_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_qheads = 8;
@@ -858,9 +858,9 @@ fn test_triton_decode_attention_matches_cpu_reference() -> Result<()> {
         let got_k_cache = k_cache.to_host(&ctx)?;
         let got_v_cache = v_cache.to_host(&ctx)?;
 
-        let q_heads: Vec<Vec<f32>> = q_host.chunks(head_dim).map(|x| x.to_vec()).collect();
-        let k_heads: Vec<Vec<f32>> = k_host.chunks(head_dim).map(|x| x.to_vec()).collect();
-        let v_heads: Vec<Vec<f32>> = v_host.chunks(head_dim).map(|x| x.to_vec()).collect();
+        let q_heads: Vec<Vec<f32>> = q_host.chunks(head_dim).map(<[f32]>::to_vec).collect();
+        let k_heads: Vec<Vec<f32>> = k_host.chunks(head_dim).map(<[f32]>::to_vec).collect();
+        let v_heads: Vec<Vec<f32>> = v_host.chunks(head_dim).map(<[f32]>::to_vec).collect();
         let gqa_ratio = num_qheads / num_kvheads;
 
         let mut ref_k_cache: Vec<f32> = k_cache_host.iter().map(|x| x.to_f32()).collect();

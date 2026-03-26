@@ -65,7 +65,7 @@ fn generate_qwen35_test_data() {
         eprintln!("\n--- {name}: \"{prompt}\" (max_tokens={max_tokens}) ---");
         let out = engine
             .complete(CompleteRequest {
-                prompt: prompt.to_string(),
+                prompt: (*prompt).to_string(),
                 max_tokens: *max_tokens,
                 sampling: SamplingParams::default(),
                 stop: None,
@@ -80,8 +80,8 @@ fn generate_qwen35_test_data() {
         eprintln!("  output: {:?}", preview);
 
         cases.push(TestCase {
-            name: name.to_string(),
-            prompt: prompt.to_string(),
+            name: (*name).to_string(),
+            prompt: (*prompt).to_string(),
             max_new_tokens: *max_tokens,
             output: out.text,
         });

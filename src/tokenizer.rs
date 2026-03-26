@@ -61,7 +61,7 @@ impl Tokenizer {
     }
 }
 
-impl<'a> IncrementalDecoder<'a> {
+impl IncrementalDecoder<'_> {
     pub(crate) fn step(&mut self, token_id: u32) -> Result<Option<String>> {
         self.token_ids.push(token_id);
         let chunk = self

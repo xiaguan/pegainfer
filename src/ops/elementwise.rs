@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::*;
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {

@@ -29,31 +29,28 @@ impl CudaGraphState {
     where
         F: FnOnce() -> Result<()>,
     {
-        match &self.graph {
-            Some(graph) => {
+        if let Some(graph) = &self.graph {
+            graph
+                .launch()
+                .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
+        } else {
+            debug!("Capturing CUDA Graph for decode path...");
+            ctx.stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
+
+            kernels()?;
+
+            self.graph = ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
+            debug!("CUDA Graph captured successfully");
+
+            if let Some(ref graph) = self.graph {
                 graph
                     .launch()
-                    .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
-            }
-            None => {
-                debug!("Capturing CUDA Graph for decode path...");
-                ctx.stream
-                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                    .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
-
-                kernels()?;
-
-                self.graph = ctx
-                    .stream
-                    .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-                    .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-                debug!("CUDA Graph captured successfully");
-
-                if let Some(ref graph) = self.graph {
-                    graph
-                        .launch()
-                        .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
-                }
+                    .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
             }
         }
         Ok(())
