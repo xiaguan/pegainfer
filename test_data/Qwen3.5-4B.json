@@ -4,79 +4,79 @@
       "name": "hello",
       "prompt": "Hello",
       "max_new_tokens": 50,
-      "output": ", I'm trying to create a simple program that calculates the area of a rectangle. I've written the code, but I'm getting an error message that says\n \n         \n     "
+      "output": ", I'm trying to create a simple program that reads a file and prints the first 10 lines. I'm using `fgets` to read the file, but I'm getting an error. Can you help me?\n\nThe issue is that"
     },
     {
       "name": "capital_france",
       "prompt": "The capital of France is",
       "max_new_tokens": 30,
-      "output": " Paris.\nA. True\nB. False\nAnswer:\nA\n\nWhich of the following is NOT a characteristic of the Mediterranean climate  "
+      "output": " Paris.\nA. True\nB. False\nAnswer:\nA\n\nWhich of the following is NOT a reason for the decline of the Roman"
     },
     {
       "name": "quick_fox",
       "prompt": "The quick brown fox",
       "max_new_tokens": 50,
-      "output": " jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\n\n\n   \n               a"
+      "output": " jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog.\nThe quick brown fox jumps over the lazy dog."
     },
     {
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young girl who discovers a magical mirror.\n\n<think>\n\n</think>\n\nIn the quiet, cobblestoned village of Oakhaven, lived\n\n\n the  \n       \n    \n "
+      "output": " about a young man who discovers a mysterious portal in his backyard.\n\n<think>\n\n</think>\n\nThe rain in Oakhaven didn't just fall; it seemed to hang in the air, a heavy, grey curtain that blurred the edges of the world. For"
     },
     {
       "name": "python_prime",
       "prompt": "Write a Python function to check if a number is prime.",
       "max_new_tokens": 80,
-      "output": "\n\nTo determine whether a number is prime, we must first understand what makes a number prime: a natural\n\n \n             a            a                              "
+      "output": "\n\nA prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself. To determine if a number is prime, we can use the following approach:\n\n1. If the number is less than 2, it is not prime.\n2. If the number is 2, it is prime.\n3. If the number is even and"
     },
     {
       "name": "quantum_simple",
       "prompt": "Explain quantum computing in simple terms.",
       "max_new_tokens": 80,
-      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone \n  \n \n\n \n\n     \n          \n\n  \n\n             \n     \n\n - "
+      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone or laptop) work like a very fast, single-minded worker. They can only look at one piece of the puzzle at a time. To solve the puzzle, they have to check piece A, then piece B, then piece C, one by one. If the puzzle has"
     },
     {
       "name": "math_add",
       "prompt": "What is 2+2?",
       "max_new_tokens": 30,
-      "output": "\n\n2+2=4.\n\nWhat is 2+2+2?\n\n2+2+2=6.   \n"
+      "output": "\n\n2+2=4.\n\nWhat is 2+2+2?\n\n2+2+2=6.\n\nWhat is "
     },
     {
       "name": "math_multiply",
       "prompt": "What is 12 times 15?",
       "max_new_tokens": 30,
-      "output": "\n\n12 times 15 is 180.\n\nWhat is 12 times 16       "
+      "output": "\n\n12 times 15 is 180.\n\nWhat is 12 times 15 times 15?\n\n1"
     },
     {
       "name": "math_sqrt",
       "prompt": "What is the square root of 144?",
       "max_new_tokens": 30,
-      "output": "\n\nThe square root of 144 is 12. This is because 12 multiplied by\n       "
+      "output": "\n\nThe square root of 144 is 12. This is because 12 multiplied by itself equals 144.\n\n"
     },
     {
       "name": "chinese_capital",
       "prompt": "中国的首都是哪里？",
       "max_new_tokens": 50,
-      "output": "\n\n中国的首都是**北京**。\n\n北京是中国的首都，也是中华人民共和国的政治中心、文化中心、国际交往中心和科技创新中心。它位于\n   \n            \n    "
+      "output": "\n\n中国的首都是**北京**。\n\n北京是中国的首都，也是中华人民共和国的政治中心、文化中心、国际交往中心和科技创新中心。它位于中国北部，是中华人民共和国的行政中心，也是全国最大的城市之一。北京的历史可以追溯到几千年前"
     },
     {
       "name": "chinese_weather",
       "prompt": "今天天气真好",
       "max_new_tokens": 50,
-      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去    \n   \n           "
+      "output": "，适合去公园散步。\nA. 今天天气真好，适合去公园散步。\nB. 今天天气真好，适合去公园散步。\nC. 今天天气真好，适合去公园散步。\nD. 选项"
     },
     {
       "name": "chinese_math",
       "prompt": "请计算：7乘以8等于多少？",
       "max_new_tokens": 30,
-      "output": "\n\n7乘以8等于56。这是因为在乘法运算中，7个8相加的结果是56。\n\n  \n   "
+      "output": "\n\n7乘以8等于56。这是因为在乘法运算中，7个8相加的结果是56。\n\n请计算：9乘以7"
     },
     {
       "name": "chinese_translate",
       "prompt": "请把Hello World翻译成中文",
       "max_new_tokens": 30,
-      "output": "\n\n<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Source text: \"Hello World\"\n  "
+      "output": "\n\n<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Source text: \"Hello World\"\n    *"
     }
   ]
 }

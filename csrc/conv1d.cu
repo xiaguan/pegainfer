@@ -46,8 +46,9 @@ __global__ void conv1d_decode_kernel(
         sum += vals[i] * __bfloat162float(conv_weight[c * kernel_size + i]);
     }
 
-    // SiLU activation
-    float silu_out = sum / (1.0f + expf(-sum));
+    // Match HF/PyTorch: conv1d writes bf16, then SiLU consumes bf16 input.
+    float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
+    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out[c] = __float2bfloat16(silu_out);
 
     // Update state: shift left, append new input
@@ -102,17 +103,26 @@ __global__ void conv1d_prefill_kernel(
         sum += val * __bfloat162float(conv_weight[c * kernel_size + k]);
     }
 
-    // SiLU
-    float silu_out = sum / (1.0f + expf(-sum));
+    // Match HF/PyTorch: conv1d writes bf16, then SiLU consumes bf16 input.
+    float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
+    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_seq[t * num_channels + c] = __float2bfloat16(silu_out);
 
     // Last (state_width) tokens update conv_state
     // Only the last thread for each channel updates state
     if (t == seq_len - 1) {
+        float old_state[4];
+        for (int i = 0; i < state_width; i++) {
+            old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
+        }
         for (int i = 0; i < state_width; i++) {
             int src_t = seq_len - state_width + i;
             if (src_t >= 0) {
                 conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
+            } else {
+                int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
+                conv_state[c * state_width + i] =
+                    state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
             }
         }
     }

@@ -15,30 +15,13 @@ impl Qwen35Model {
         kv_cache: &mut KVCache,
         recurrent: &mut RecurrentState,
         bufs: &mut DecodeBuffers35,
-        graph_state: &mut CudaGraphState,
+        _graph_state: &mut CudaGraphState,
     ) -> Result<()> {
-        let pos = kv_cache.len();
-        let seq_len = pos + 1;
-
-        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
-
+        let logits = self.prefill_forward(&[token_id], kv_cache, recurrent)?;
         self.ctx
             .stream
-            .memcpy_htod(
-                &[token_id as i32, pos as i32, seq_len as i32],
-                &mut bufs.decode_meta,
-            )
-            .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
-
-        if self.enable_cuda_graph {
-            graph_state
-                .run_or_capture(&self.ctx, || self.decode_kernels(kv_cache, recurrent, bufs))?;
-        } else {
-            self.decode_kernels(kv_cache, recurrent, bufs)?;
-        }
-
-        kv_cache.increment_seq_len();
-        recurrent.seq_len += 1;
+            .memcpy_dtod(&logits.data, &mut bufs.logits.data)
+            .map_err(|e| anyhow::anyhow!("D2D logits copy failed: {}", e))?;
         Ok(())
     }
 
