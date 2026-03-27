@@ -27,7 +27,6 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
 
     Ok(())
 }
-
 /// Linear layer: y = weight @ x
 pub(crate) fn linear(
     ctx: &DeviceContext,

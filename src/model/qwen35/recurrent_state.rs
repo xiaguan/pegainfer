@@ -1,7 +1,7 @@
 //! Recurrent state for Qwen3.5 linear attention layers.
 //!
 //! Each linear attention layer maintains:
-//! - Recurrent state: [num_value_heads × key_head_dim × value_head_dim] f32
+//! - Recurrent state: [num_value_heads, key_head_dim, value_head_dim] f32, V contiguous ([H,K,V])
 //! - Conv state: [qkv_dim × (conv_kernel_dim - 1)] bf16
 
 use anyhow::Result;

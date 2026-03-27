@@ -22,19 +22,19 @@
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young girl who discovers a magical mirror.\n\n<think>\nHere's a thinking process that could lead to the story above:\n\n1.\n\n  \n      \n  \n\n     "
+      "output": " about a young girl who discovers a magical mirror.\n\n<think>\n\n</think>\n\nIn the quiet, cobblestoned village of Oakhaven, lived\n\n\n the  \n       \n    \n "
     },
     {
       "name": "python_prime",
       "prompt": "Write a Python function to check if a number is prime.",
       "max_new_tokens": 80,
-      "output": "\n\nTo determine whether a number is prime, we must first understand what makes a number prime: a natural\n\n \n            \n    \n                                     "
+      "output": "\n\nTo determine whether a number is prime, we must first understand what makes a number prime: a natural\n\n \n             a            a                              "
     },
     {
       "name": "quantum_simple",
       "prompt": "Explain quantum computing in simple terms.",
       "max_new_tokens": 80,
-      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone \n  \n\n    \n\n    \n \n\n       \n               \n  \n         -"
+      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone \n  \n \n\n \n\n     \n          \n\n  \n\n             \n     \n\n - "
     },
     {
       "name": "math_add",
@@ -64,7 +64,7 @@
       "name": "chinese_weather",
       "prompt": "今天天气真好",
       "max_new_tokens": 50,
-      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去    \n  \n  \n      \n  "
+      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去    \n   \n           "
     },
     {
       "name": "chinese_math",

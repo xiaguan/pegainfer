@@ -380,7 +380,7 @@ unsafe extern "C" {
     //   k / w: [seq_len, num_value_heads, 128] bf16
     //   u / v_new: [seq_len, num_value_heads, 128] bf16
     //   g_cumsum: [seq_len, num_value_heads] fp32
-    //   initial_state / final_state: [num_value_heads, 128, 128] fp32 in [H, V, K]
+    //   initial_state / final_state: [num_value_heads, 128, 128] fp32 in [H, K, V] (V contiguous)
     //   chunk_state: [num_chunks, num_value_heads, 128, 128] fp32
     pub(crate) fn gated_delta_rule_prefill_chunk_state_cuda(
         k: *const Half,

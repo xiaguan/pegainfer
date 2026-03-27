@@ -5,130 +5,109 @@
 // Gated Delta Rule — Recurrent decode step for linear attention
 //
 // Each block handles one value head (32 blocks total for Qwen3.5-4B).
-// State: [key_head_dim, value_head_dim] f32 per head (128×128 = 64KB)
+// State layout: [key_dim, val_dim] f32 per head — val_dim is contiguous.
+//   Matches FLA convention [H, K, V] where V stride = 1.
 //
-// Algorithm per head:
-//   g = -exp(A_log[h]) * softplus(a[h] + dt_bias[h])
-//   beta = sigmoid(b[h])
-//   q, k = l2_normalize(q), l2_normalize(k)
-//   state *= exp(g)
-//   kv_mem = state @ k         // [key_dim] dot per row
-//   delta = (v - kv_mem) * beta
-//   state += outer(k, delta)   // rank-1 update
-//   output = state^T @ q       // [value_dim] dot per column
+// Parallelism strategy: 512 threads per block, split into J_SLICES=4 groups.
+//   Each group handles key_dim/4 = 32 rows of the j-loop.
+//   val_idx = threadIdx.x % 128, j_slice = threadIdx.x / 128.
+//   This gives 16 warps/block → better latency hiding on the 32-block grid.
+//   Partial kv_mem and output reductions across j_slices via shared memory.
 //
-// Thread mapping: tid ∈ [0, key_head_dim). Each thread owns row tid of state.
+// Thread mapping: val_idx ∈ [0, val_dim), j_slice ∈ [0, J_SLICES).
 // GQA: num_key_heads < num_value_heads, so multiple value heads share one key head.
-//       gqa_ratio = num_value_heads / num_key_heads.
 // ============================================================================
 
 #define GDR_KEY_DIM 128
 #define GDR_VAL_DIM 128
+#define GDR_J_SLICES 4
+#define GDR_BLOCK_DIM (GDR_VAL_DIM * GDR_J_SLICES)  // 512
+#define GDR_J_PER_SLICE (GDR_KEY_DIM / GDR_J_SLICES) // 32
 
 __global__ void gated_delta_rule_decode_kernel(
     const __nv_bfloat16* __restrict__ qkv,   // [q_dim + k_dim + v_dim] after conv1d+SiLU
-    const __nv_bfloat16* __restrict__ b_proj, // [num_value_heads] (pre-computed by gemv)
+    const __nv_bfloat16* __restrict__ b_proj, // [num_value_heads]
     const __nv_bfloat16* __restrict__ a_proj, // [num_value_heads]
     const __nv_bfloat16* __restrict__ dt_bias,// [num_value_heads] bf16
     const float* __restrict__ A_log,          // [num_value_heads] f32
-    float* __restrict__ state,                // [num_value_heads, key_dim, val_dim] f32
+    float* __restrict__ state,                // [num_value_heads, key_dim, val_dim] f32 (V contiguous)
     __nv_bfloat16* __restrict__ output,       // [num_value_heads * val_dim] bf16
     int num_key_heads,
     int num_value_heads,
     int key_dim,    // 128
     int val_dim     // 128
 ) {
-    int v_head = blockIdx.x;  // value head index
-    int tid = threadIdx.x;    // 0..127 (one per key dimension)
+    int v_head = blockIdx.x;
+    int val_idx = threadIdx.x & 0x7F;    // threadIdx.x % 128
+    int j_slice = threadIdx.x >> 7;       // threadIdx.x / 128  (0..3)
+    int warp_id = threadIdx.x >> 5;       // threadIdx.x / 32
+    int lane_id = threadIdx.x & 0x1F;     // threadIdx.x % 32
 
-    if (tid >= key_dim) return;
-
-    int k_head = v_head * num_key_heads / num_value_heads;  // GQA mapping
-
-    // Layout: qkv = [q(k_dim * num_key_heads), k(k_dim * num_key_heads), v(val_dim * num_value_heads)]
+    int k_head = v_head * num_key_heads / num_value_heads;
     int q_dim_total = key_dim * num_key_heads;
     int k_dim_total = q_dim_total;
 
-    // Shared memory for q, k, v vectors and reduction scratch
     __shared__ float smem_q[GDR_KEY_DIM];
     __shared__ float smem_k[GDR_KEY_DIM];
-    __shared__ float smem_v[GDR_VAL_DIM];
-    __shared__ float smem_delta[GDR_VAL_DIM];
-    __shared__ float smem_norm[2];  // [q_norm, k_norm]
+    __shared__ float smem_norm[2];
+    __shared__ float warp_norms[GDR_BLOCK_DIM / WARP_SIZE];  // 16
+    __shared__ float s_exp_g;
+    __shared__ float s_beta;
+    __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_VAL_DIM];
+    __shared__ float smem_out_partial[GDR_J_SLICES][GDR_VAL_DIM];
 
-    // Load q, k for this key head
-    float q_val = __bfloat162float(qkv[k_head * key_dim + tid]);
-    float k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + tid]);
-
-    // Load v for this value head
-    float v_val = 0.0f;
-    if (tid < val_dim) {
-        v_val = __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + tid]);
-    }
+    // All j_slices load the same q/k/v (duplicated but cheap)
+    float q_val = __bfloat162float(qkv[k_head * key_dim + val_idx]);
+    float k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + val_idx]);
+    float v_val = __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
 
     // ========================================================================
-    // L2 normalize q and k
+    // L2 normalize q and k — only j_slice=0 contributes to avoid 4× counting
     // ========================================================================
-    float q_sq = q_val * q_val;
+    float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
     q_sq = warp_reduce_sum(q_sq);
-
-    int warp_id = tid / WARP_SIZE;
-    int lane_id = tid % WARP_SIZE;
-    int num_warps = key_dim / WARP_SIZE;  // 4
-
-    __shared__ float warp_sums[4];
-    if (lane_id == 0) warp_sums[warp_id] = q_sq;
+    if (lane_id == 0) warp_norms[warp_id] = q_sq;
     __syncthreads();
 
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < num_warps; i++) total += warp_sums[i];
+    if (threadIdx.x == 0) {
+        float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
         smem_norm[0] = rsqrtf(total + 1e-12f);
     }
 
-    float k_sq = k_val * k_val;
+    float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
     k_sq = warp_reduce_sum(k_sq);
-    if (lane_id == 0) warp_sums[warp_id] = k_sq;
+    if (lane_id == 0) warp_norms[warp_id] = k_sq;
     __syncthreads();
 
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < num_warps; i++) total += warp_sums[i];
+    if (threadIdx.x == 0) {
+        float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
         smem_norm[1] = rsqrtf(total + 1e-12f);
     }
     __syncthreads();
 
     q_val *= smem_norm[0];
     k_val *= smem_norm[1];
-
-    // Scale query by 1/sqrt(key_dim) — matches HF recurrent_gated_delta_rule
     q_val *= rsqrtf((float)key_dim);
 
-    smem_q[tid] = q_val;
-    smem_k[tid] = k_val;
-    if (tid < val_dim) smem_v[tid] = v_val;
-    __syncthreads();
+    // j_slice=0 stores normalized q/k to shared memory for all slices to use
+    if (j_slice == 0) {
+        smem_q[val_idx] = q_val;
+        smem_k[val_idx] = k_val;
+    }
 
     // ========================================================================
     // Compute g and beta for this value head
     // ========================================================================
-    // g = -exp(A_log[h]) * softplus(a[h] + dt_bias[h])
-    // beta = sigmoid(b[h])
-    __shared__ float s_g;
-    __shared__ float s_beta;
-    __shared__ float s_exp_g;
-
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         float a_val = __bfloat162float(a_proj[v_head]);
         float b_val = __bfloat162float(b_proj[v_head]);
         float bias = __bfloat162float(dt_bias[v_head]);
         float a_log = A_log[v_head];
 
         float x = a_val + bias;
-        // softplus(x) = log(1 + exp(x)), with threshold for numerical stability
         float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
-        s_g = -expf(a_log) * softplus_x;
-        s_exp_g = expf(s_g);
+        float g = -expf(a_log) * softplus_x;
+        s_exp_g = expf(g);
         s_beta = 1.0f / (1.0f + expf(-b_val));
     }
     __syncthreads();
@@ -137,90 +116,53 @@ __global__ void gated_delta_rule_decode_kernel(
     float beta = s_beta;
 
     // ========================================================================
-    // State pointer for this head
+    // State pointer — layout [key_dim, val_dim], val_dim contiguous
     // ========================================================================
     float* my_state = state + v_head * key_dim * val_dim;
-    // Thread tid owns row tid: my_state[tid * val_dim + 0..val_dim-1]
+
+    int j_start = j_slice * GDR_J_PER_SLICE;
+    int j_end = j_start + GDR_J_PER_SLICE;
 
     // ========================================================================
-    // Step 1: Decay state
+    // Pass 1: Decay + partial kv_mem (each j_slice handles 32 j-iterations)
     // ========================================================================
-    for (int j = 0; j < val_dim; j++) {
-        my_state[tid * val_dim + j] *= exp_g;
+    float partial_kv = 0.0f;
+    for (int j = j_start; j < j_end; j++) {
+        float s = my_state[j * val_dim + val_idx];
+        s *= exp_g;
+        my_state[j * val_dim + val_idx] = s;
+        partial_kv += s * smem_k[j];
     }
 
-    // ========================================================================
-    // Step 2: kv_mem[tid] = dot(state[tid, :], k[:])
-    //   But state row is [val_dim] and k is [key_dim].
-    //   Wait — state is [key_dim, val_dim]. Row tid = state[tid, :] has val_dim elements.
-    //   k has key_dim elements. The dot product state @ k gives [key_dim] outputs,
-    //   where output[i] = sum_j state[i,j] * k[j] — but k is key_dim and state row is val_dim.
-    //
-    //   Actually, looking at the algorithm more carefully:
-    //   kv_mem = state @ k where state is [key_dim, val_dim] and k is [key_dim].
-    //   This doesn't make sense dimensionally. Let me re-read the plan.
-    //
-    //   Plan says: state[128,128], k[128], v[128]
-    //   kv_mem[128] = state @ k[128]  → matrix-vector: [128,128] @ [128] → [128]
-    //   This means: kv_mem[i] = sum_j(state[i,j] * k[j]) for j in 0..127
-    //   So state row i dotted with k gives kv_mem[i]. key_dim == val_dim == 128.
-    //   state is [key_dim, val_dim] and k is [key_dim].
-    //
-    //   Wait, that's [128,128] @ [128]. If state is [row=key_dim, col=val_dim]
-    //   and k is [key_dim], then state @ k gives [val_dim]???
-    //   No: matrix @ vector where matrix is [M, N] and vector is [N] gives [M].
-    //   Here state is [key_dim, val_dim] = [128, 128], k is... hmm.
-    //
-    //   Actually the delta rule typically has state as [val_dim, key_dim]:
-    //   output = state @ q  → [val_dim, key_dim] @ [key_dim] → [val_dim]
-    //   state += outer(v, k) → [val_dim] outer [key_dim] → [val_dim, key_dim]
-    //   kv_mem = state @ k → [val_dim, key_dim] @ [key_dim] → [val_dim]
-    //   delta = (v - kv_mem) * beta → [val_dim]
-    //
-    //   So actually state should be [val_dim, key_dim]. Let me use that convention.
-    //   With 128 threads = val_dim, each thread owns one row of [val_dim, key_dim].
-    //   Thread tid handles state[tid, 0..key_dim-1].
-    // ========================================================================
-
-    // Reinterpret: state is [val_dim, key_dim], thread tid owns row tid.
-    // kv_mem[tid] = dot(state[tid, :], k[:])
-    float kv_mem = 0.0f;
-    for (int j = 0; j < key_dim; j++) {
-        kv_mem += my_state[tid * key_dim + j] * smem_k[j];
-    }
-
-    // delta[tid] = (v[tid] - kv_mem) * beta
-    float delta_val = (smem_v[tid] - kv_mem) * beta;
-    smem_delta[tid] = delta_val;
+    // Reduce partial kv_mem across j_slices
+    smem_kv_partial[j_slice][val_idx] = partial_kv;
     __syncthreads();
 
-    // ========================================================================
-    // Step 3: Rank-1 update: state[tid, j] += v[tid] * k[j]
-    //   Wait, the plan says: state += outer(k, delta)
-    //   outer(k, delta) has shape [key_dim, val_dim] if k is [key_dim] and delta is [val_dim].
-    //   But we said state is [val_dim, key_dim].
-    //   So: state += outer(delta, k)? Or state^T += outer(k, delta)?
-    //
-    //   Let me use the correct formulation:
-    //   state is [val_dim, key_dim]
-    //   state[i,j] += delta[i] * k[j]
-    //   This is outer(delta, k) = [val_dim, key_dim]. Correct.
-    // ========================================================================
-    float my_delta = smem_delta[tid];
-    for (int j = 0; j < key_dim; j++) {
-        my_state[tid * key_dim + j] += my_delta * smem_k[j];
-    }
+    float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
+                 + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
+
+    float my_delta = (v_val - kv_mem) * beta;
 
     // ========================================================================
-    // Step 4: output[tid] = dot(state[tid, :], q[:])
-    //   output = state @ q → [val_dim, key_dim] @ [key_dim] → [val_dim]
+    // Pass 2: Rank-1 update + partial output
     // ========================================================================
-    float out_val = 0.0f;
-    for (int j = 0; j < key_dim; j++) {
-        out_val += my_state[tid * key_dim + j] * smem_q[j];
+    float partial_out = 0.0f;
+    for (int j = j_start; j < j_end; j++) {
+        float s = my_state[j * val_dim + val_idx];
+        s += my_delta * smem_k[j];
+        my_state[j * val_dim + val_idx] = s;
+        partial_out += s * smem_q[j];
     }
 
-    output[v_head * val_dim + tid] = __float2bfloat16(out_val);
+    // Reduce partial output across j_slices, j_slice=0 writes result
+    smem_out_partial[j_slice][val_idx] = partial_out;
+    __syncthreads();
+
+    if (j_slice == 0) {
+        float out = smem_out_partial[0][val_idx] + smem_out_partial[1][val_idx]
+                   + smem_out_partial[2][val_idx] + smem_out_partial[3][val_idx];
+        output[v_head * val_dim + val_idx] = __float2bfloat16(out);
+    }
 }
 
 extern "C" {
@@ -239,8 +181,8 @@ void gated_delta_rule_decode_cuda(
     int val_dim,
     cudaStream_t stream
 ) {
-    // One block per value head, key_dim threads per block
-    gated_delta_rule_decode_kernel<<<num_value_heads, key_dim, 0, stream>>>(
+    // One block per value head, 512 threads (128 val_dim × 4 j_slices)
+    gated_delta_rule_decode_kernel<<<num_value_heads, GDR_BLOCK_DIM, 0, stream>>>(
         qkv, b_proj, a_proj, dt_bias, A_log,
         state, output,
         num_key_heads, num_value_heads, key_dim, val_dim
