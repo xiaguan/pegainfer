@@ -34,6 +34,7 @@ pub(crate) const ROPE_THETA_QWEN35: f32 = 10_000_000.0;
 
 // Qwen3.5-4B actual model dimensions
 pub(crate) const QWEN35_4B_HIDDEN: usize = 2560;
+pub(crate) const QWEN35_4B_INTERMEDIATE: usize = 9216;
 pub(crate) const QWEN35_4B_Q_HEADS: usize = 16;
 pub(crate) const QWEN35_4B_KV_HEADS: usize = 4;
 pub(crate) const QWEN35_4B_HEAD_DIM: usize = 256;
@@ -43,6 +44,7 @@ pub(crate) const QWEN35_4B_LINEAR_V_HEADS: usize = 32;
 pub(crate) const QWEN35_4B_LINEAR_K_DIM: usize = 128;
 pub(crate) const QWEN35_4B_LINEAR_V_DIM: usize = 128;
 pub(crate) const QWEN35_4B_ROPE_THETA: f32 = 10_000_000.0;
+pub(crate) const QWEN35_4B_VOCAB: usize = 248_320;
 
 pub(crate) fn configure_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.warm_up_time(Duration::from_millis(500));
