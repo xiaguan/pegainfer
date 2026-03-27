@@ -431,10 +431,10 @@ def gdr_chunk_state_qwen35_kernel(
     w_ptr,              # [seq_len, H, K] bf16/fp16
     u_ptr,              # [seq_len, H, V] bf16/fp16
     g_ptr,              # [seq_len, H] fp32 cumulative gate
-    initial_state_ptr,  # [H, V, K] fp32
+    initial_state_ptr,  # [H, K, V] fp32 (V contiguous, matches FLA/decode convention)
     chunk_state_ptr,    # [num_chunks, H, K, V] fp32 scratch
     v_new_ptr,          # [seq_len, H, V] bf16/fp16 scratch
-    final_state_ptr,    # [H, V, K] fp32
+    final_state_ptr,    # [H, K, V] fp32 (V contiguous, matches FLA/decode convention)
     seq_len,
     num_value_heads,
     BLOCK_V: tl.constexpr,
@@ -450,7 +450,7 @@ def gdr_chunk_state_qwen35_kernel(
 
     This stage assumes `g`, `w`, and `u` are already prepared. It stores one
     per-chunk state snapshot in `[K, V]` scratch layout, writes token-level
-    `v_new`, and updates the final decode-compatible state `[H, V, K]`.
+    `v_new`, and updates the final decode-compatible state `[H, K, V]`.
     """
     v_tile = tl.program_id(0)
     v_head = tl.program_id(1)
@@ -458,25 +458,27 @@ def gdr_chunk_state_qwen35_kernel(
     offs_v = v_tile * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < VALUE_DIM
 
+    # State layout: [K, V] per head — V contiguous, matching FLA/decode convention.
+    # h_lo/h_hi are [KEY_BLOCK, BLOCK_V] tiles loaded directly (no transpose).
     p_h0_lo = tl.make_block_ptr(
-        base=initial_state_ptr + v_head * VALUE_DIM * KEY_DIM,
-        shape=(VALUE_DIM, KEY_BLOCK),
-        strides=(KEY_DIM, 1),
-        offsets=(v_tile * BLOCK_V, 0),
-        block_shape=(BLOCK_V, KEY_BLOCK),
+        base=initial_state_ptr + v_head * KEY_DIM * VALUE_DIM,
+        shape=(KEY_DIM, VALUE_DIM),
+        strides=(VALUE_DIM, 1),
+        offsets=(0, v_tile * BLOCK_V),
+        block_shape=(KEY_BLOCK, BLOCK_V),
         order=(1, 0),
     )
     p_h0_hi = tl.make_block_ptr(
-        base=initial_state_ptr + v_head * VALUE_DIM * KEY_DIM,
-        shape=(VALUE_DIM, KEY_DIM),
-        strides=(KEY_DIM, 1),
-        offsets=(v_tile * BLOCK_V, KEY_BLOCK),
-        block_shape=(BLOCK_V, KEY_BLOCK),
+        base=initial_state_ptr + v_head * KEY_DIM * VALUE_DIM,
+        shape=(KEY_DIM, VALUE_DIM),
+        strides=(VALUE_DIM, 1),
+        offsets=(KEY_BLOCK, v_tile * BLOCK_V),
+        block_shape=(KEY_BLOCK, BLOCK_V),
         order=(1, 0),
     )
 
-    h_lo = tl.trans(tl.load(p_h0_lo, boundary_check=(0, 1))).to(tl.float32)
-    h_hi = tl.trans(tl.load(p_h0_hi, boundary_check=(0, 1))).to(tl.float32)
+    h_lo = tl.load(p_h0_lo, boundary_check=(0, 1)).to(tl.float32)
+    h_hi = tl.load(p_h0_hi, boundary_check=(0, 1)).to(tl.float32)
 
     num_chunks = tl.cdiv(seq_len, BLOCK_T)
     t_offsets = tl.arange(0, BLOCK_T)
@@ -582,24 +584,25 @@ def gdr_chunk_state_qwen35_kernel(
         h_lo += tl.dot(k_lo, v_new_mma)
         h_hi += tl.dot(k_hi, v_new_mma)
 
+    # Store final state in [K, V] layout — no transpose, matching decode convention.
     p_ht_lo = tl.make_block_ptr(
-        base=final_state_ptr + v_head * VALUE_DIM * KEY_DIM,
-        shape=(VALUE_DIM, KEY_BLOCK),
-        strides=(KEY_DIM, 1),
-        offsets=(v_tile * BLOCK_V, 0),
-        block_shape=(BLOCK_V, KEY_BLOCK),
+        base=final_state_ptr + v_head * KEY_DIM * VALUE_DIM,
+        shape=(KEY_DIM, VALUE_DIM),
+        strides=(VALUE_DIM, 1),
+        offsets=(0, v_tile * BLOCK_V),
+        block_shape=(KEY_BLOCK, BLOCK_V),
         order=(1, 0),
     )
     p_ht_hi = tl.make_block_ptr(
-        base=final_state_ptr + v_head * VALUE_DIM * KEY_DIM,
-        shape=(VALUE_DIM, KEY_DIM),
-        strides=(KEY_DIM, 1),
-        offsets=(v_tile * BLOCK_V, KEY_BLOCK),
-        block_shape=(BLOCK_V, KEY_BLOCK),
+        base=final_state_ptr + v_head * KEY_DIM * VALUE_DIM,
+        shape=(KEY_DIM, VALUE_DIM),
+        strides=(VALUE_DIM, 1),
+        offsets=(KEY_BLOCK, v_tile * BLOCK_V),
+        block_shape=(KEY_BLOCK, BLOCK_V),
         order=(1, 0),
     )
-    tl.store(p_ht_lo, tl.trans(h_lo).to(p_ht_lo.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_ht_hi, tl.trans(h_hi).to(p_ht_hi.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_ht_lo, h_lo.to(p_ht_lo.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_ht_hi, h_hi.to(p_ht_hi.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
