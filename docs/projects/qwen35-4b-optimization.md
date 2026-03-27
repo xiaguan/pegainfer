@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Qwen3.5-4B is at parity with vLLM on this GPU: TTFT `222ms` vs `222ms` and TPOT `11.78ms` vs `11.67ms` (+1%). The GDR decode kernel was the final bottleneck — a j-loop parallelism rewrite cut it from 37μs to 15μs per layer (−60%), closing the decode gap.
+> **TL;DR:** Qwen3.5-4B is at parity with vLLM on this GPU: TTFT `234ms` vs `229ms` (+2%) and TPOT `11.77ms` vs `11.67ms` (+1%). The GDR decode kernel was the final bottleneck — a j-loop parallelism rewrite cut it from 37μs to 15μs per layer (−60%), closing the decode gap.
 >
-> **Status:** Active. Updated 2026-03-27: TPOT `11.78ms` vs vLLM `11.67ms` (+1%). Decode parity achieved via GDR kernel occupancy fix (#8). Remaining GEMV/MLP work is bandwidth-limited at 80–87% DRAM throughput — further gains require lower-level tuning (vectorization, weight layout).
+> **Status:** Active. Updated 2026-03-27: refreshed `vllm bench serve` comparison. TTFT `234ms` vs vLLM `229ms` (+2%), TPOT `11.77ms` vs `11.67ms` (+1%). Decode parity achieved via GDR kernel occupancy fix (#8). Remaining GEMV/MLP work is bandwidth-limited at 80–87% DRAM throughput — further gains require lower-level tuning (vectorization, weight layout).
 
 ## Goal
 
@@ -41,10 +41,10 @@ Both measured via `vllm bench serve` HTTP client (apples-to-apples). vLLM: torch
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
-| prefill-heavy (2048,1) | TTFT median | 222.18ms | 222.29ms | −0% |
-| prefill-heavy (2048,1) | TTFT p99 | 222.53ms | 9846ms¹ | — |
-| decode-heavy (1,128) | TPOT median | 11.78ms | 11.67ms | +1% |
-| decode-heavy (1,128) | ITL p99 | 12.18ms | 12.01ms | +1% |
+| prefill-heavy (2048,1) | TTFT median | 234.21ms | 229.25ms | +2% |
+| prefill-heavy (2048,1) | TTFT p99 | 375.65ms | 8822ms¹ | — |
+| decode-heavy (1,128) | TPOT median | 11.77ms | 11.67ms | +1% |
+| decode-heavy (1,128) | ITL p99 | 12.23ms | 12.05ms | +1% |
 
 ¹ vLLM P99 is dominated by torch.compile cold-start on the first request; steady-state latency = median.
 
@@ -159,7 +159,7 @@ Decode is fully CUDA Graph'd. Zero GPU allocation after first token. conv1d and 
 
 ### Decode (1,128) — nsys kernel breakdown per decode step
 
-Total GPU kernel time: ~11.8ms/step (matches TPOT 11.78ms — fully GPU-bound, near-zero CPU overhead thanks to CUDA Graph).
+Total GPU kernel time: ~11.8ms/step (matches TPOT 11.77ms — fully GPU-bound, near-zero CPU overhead thanks to CUDA Graph).
 
 | Kernel | Time/step | % | Count/step | Avg each | Notes |
 |--------|-----------|---|------------|----------|-------|
