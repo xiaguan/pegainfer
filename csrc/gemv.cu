@@ -213,6 +213,23 @@ void gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+// Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
+// Safe for CUDA Graph capture and decode path.
+void gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
+                          int M, int N, int K, cudaStream_t stream) {
+  const float h_alpha = 1.0f;
+  const float h_beta = 0.0f;
+  cublasSetStream(g_cublas_handle, stream);
+  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+               M, N, K,
+               &h_alpha,
+               W, CUDA_R_16BF, K,
+               X, CUDA_R_16BF, K,
+               &h_beta,
+               Y, CUDA_R_16BF, M,
+               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 void attention_scores_cuda(const __nv_bfloat16 *q, const __nv_bfloat16 *k_cache, __nv_bfloat16 *scores,
                            int seq_len, int head_dim, float scale,
                            cudaStream_t stream) {

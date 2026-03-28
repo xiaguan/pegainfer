@@ -97,6 +97,8 @@ pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Res
 }
 
 /// GEMM into pre-allocated output buffer (zero allocation).
+/// For seq_len=1, uses the graph-safe cuBLAS handle (no workspace) for lower
+/// latency while preserving numerical parity with the prefill path.
 pub(crate) fn gemm_into(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -124,14 +126,26 @@ pub(crate) fn gemm_into(
     let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
 
     unsafe {
-        ffi::gemm_cuda(
-            w_ptr as *const ffi::Half,
-            x_ptr as *const ffi::Half,
-            y_ptr as *mut ffi::Half,
-            weight.rows as i32,
-            x.seq_len as i32,
-            weight.cols as i32,
-            ctx.stream.cu_stream(),
-        );
+        if x.seq_len == 1 {
+            ffi::gemm_graphsafe_cuda(
+                w_ptr as *const ffi::Half,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                1,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            );
+        } else {
+            ffi::gemm_cuda(
+                w_ptr as *const ffi::Half,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                x.seq_len as i32,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            );
+        }
     }
 }

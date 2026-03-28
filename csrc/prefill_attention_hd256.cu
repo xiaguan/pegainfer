@@ -33,10 +33,11 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
-    int start_pos,
+    const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
     int rotary_dim,
     float rms_eps
 ) {
+    int start_pos = *start_pos_ptr;
     int head_global = blockIdx.x;
     int token = blockIdx.y;
     int d = threadIdx.x;
@@ -116,8 +117,9 @@ __global__ void prefill_v_cache_write_hd256_kernel(
     __nv_bfloat16* __restrict__ v_cache,        // [num_kvheads * max_seq * HD256]
     int num_kv_heads,
     int seq_len,
-    int start_pos
+    const int* __restrict__ start_pos_ptr       // GPU-resident
 ) {
+    int start_pos = *start_pos_ptr;
     int kv_head = blockIdx.x;
     int token = blockIdx.y;
     int d = threadIdx.x;
@@ -168,7 +170,7 @@ void prefill_attention_hd256_prep_cuda(
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
-    int start_pos,
+    const int* start_pos_ptr,
     int rotary_dim,
     float rms_eps,
     cudaStream_t stream
@@ -186,7 +188,7 @@ void prefill_attention_hd256_prep_cuda(
         num_q_heads,
         num_kv_heads,
         seq_len,
-        start_pos,
+        start_pos_ptr,
         rotary_dim,
         rms_eps
     );
@@ -197,7 +199,7 @@ void prefill_attention_hd256_prep_cuda(
         v_cache,
         num_kv_heads,
         seq_len,
-        start_pos
+        start_pos_ptr
     );
 }
 

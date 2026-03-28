@@ -2,9 +2,11 @@ use anyhow::Result;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
+use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;
 use crate::tensor::{DeviceVec, HiddenStates};
@@ -267,5 +269,253 @@ impl Qwen35Model {
         let mut out = HiddenStates::zeros(&self.ctx, x.hidden_dim, x.seq_len)?;
         ops::rms_norm_batch_offset_into(&self.ctx, x, weight, eps, &mut out)?;
         Ok(out)
+    }
+
+    // ── Single-token optimized prefill (zero allocation per step) ───────────
+
+    /// Same numerical result as `prefill_forward(&[token_id], ...)` but uses
+    /// pre-allocated buffers, eliminating ~500 alloc/free pairs per decode step.
+    /// The kernel sequence is CUDA Graph capturable (all pointers are stable).
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn prefill_forward_single_token(
+        &self,
+        token_id: u32,
+        kv_cache: &mut KVCache,
+        recurrent: &mut RecurrentState,
+        bufs: &mut SingleTokenBuffers,
+        graph_state: &mut CudaGraphState,
+    ) -> Result<()> {
+        let c = &self.config;
+        kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
+
+        // H2D copy of token_id and start_pos — BEFORE graph launch
+        let start_pos = kv_cache.len() as i32;
+        self.ctx
+            .stream
+            .memcpy_htod(&[token_id as i32], &mut bufs.token_id_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D token_id failed: {}", e))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&[start_pos], &mut bufs.start_pos_buf)
+            .map_err(|e| anyhow::anyhow!("H2D start_pos failed: {}", e))?;
+
+        // GPU kernel sequence — captured on first call, replayed on subsequent calls
+        if self.enable_cuda_graph {
+            graph_state.run_or_capture(&self.ctx, || {
+                self.single_token_kernels(kv_cache, recurrent, bufs)
+            })?;
+        } else {
+            self.single_token_kernels(kv_cache, recurrent, bufs)?;
+        }
+
+        // CPU state updates (after graph)
+        kv_cache.advance_seq_len(1);
+        recurrent.seq_len += 1;
+
+        Ok(())
+    }
+
+    /// Pure GPU kernel sequence for single-token prefill. Graph-safe:
+    /// no allocation, no CPU-GPU sync, all cuBLAS via graph-safe handle.
+    fn single_token_kernels(
+        &self,
+        kv_cache: &mut KVCache,
+        recurrent: &mut RecurrentState,
+        bufs: &mut SingleTokenBuffers,
+    ) -> Result<()> {
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+
+        // 1. Embedding → hidden_a
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.token_id_gpu,
+            &mut bufs.hidden_a,
+        )?;
+
+        // 2. Process all layers (hidden_a is the persistent hidden state)
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+
+        for layer in &self.layers {
+            // Input layernorm: normed = rms_norm_offset(hidden_a)
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden_a,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+
+            // Attention → attn_results [hidden_size, 1]
+            match &layer.attn {
+                LayerKind::FullAttention(attn) => {
+                    // QKV projections
+                    ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
+                    ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
+                    ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+
+                    let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, full_idx)?;
+                    ops::prefill_attention_hd256_batch_with_scratch(
+                        &self.ctx,
+                        &bufs.q_full,
+                        &bufs.k_attn,
+                        &bufs.v_attn,
+                        &attn.q_norm,
+                        &attn.k_norm,
+                        &self.cos_cache,
+                        &self.sin_cache,
+                        kc,
+                        vc,
+                        &mut bufs.attn_out_full,
+                        &mut bufs.q_prepped,
+                        c.num_attention_heads,
+                        c.num_key_value_heads,
+                        &bufs.start_pos_buf,
+                        c.rotary_dim,
+                        eps,
+                    )?;
+                    full_idx += 1;
+
+                    // O projection → attn_results
+                    ops::gemm_into(
+                        &self.ctx,
+                        &attn.o_proj,
+                        &bufs.attn_out_full,
+                        &mut bufs.attn_results,
+                    );
+                }
+                LayerKind::LinearAttention(attn) => {
+                    let layer_state = &mut recurrent.layers[linear_idx];
+
+                    // Projections
+                    ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
+                    ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
+                    ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
+                    ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
+
+                    // Conv1d
+                    ops::conv1d_prefill_batch_into(
+                        &self.ctx,
+                        &bufs.qkv,
+                        &attn.conv1d_weight,
+                        &mut layer_state.conv_state,
+                        &mut bufs.qkv_conv,
+                        c.linear_conv_kernel_dim,
+                    );
+
+                    // GDR chunkwise
+                    ops::gated_delta_rule_prefill_chunkwise_into(
+                        &self.ctx,
+                        &bufs.qkv_conv,
+                        &bufs.b_proj,
+                        &bufs.a_proj,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut layer_state.state,
+                        &mut bufs.gdr_scratch,
+                        &mut bufs.gdr_out,
+                        c.linear_num_key_heads,
+                        c.linear_num_value_heads,
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
+                    )?;
+
+                    // Gated RMSNorm
+                    ops::rms_norm_gated_batch_into(
+                        &self.ctx,
+                        &bufs.gdr_out,
+                        &attn.norm_weight,
+                        &bufs.z,
+                        &mut bufs.normed_gated,
+                        c.linear_num_value_heads,
+                        c.linear_value_head_dim,
+                        eps,
+                    );
+                    linear_idx += 1;
+
+                    // Out projection → attn_results
+                    ops::gemm_into(
+                        &self.ctx,
+                        &attn.out_proj,
+                        &bufs.normed_gated,
+                        &mut bufs.attn_results,
+                    );
+                }
+            }
+
+            // Residual 1: hidden_mid = hidden_a + attn_results
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden_a,
+                &bufs.attn_results,
+                &mut bufs.hidden_mid,
+            )?;
+
+            // Post-attention layernorm
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+
+            // MLP
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.gate_proj,
+                &bufs.normed,
+                &mut bufs.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.up_proj,
+                &bufs.normed,
+                &mut bufs.up_out,
+            );
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.down_proj,
+                &bufs.act_out,
+                &mut bufs.mlp_out,
+            );
+
+            // Residual 2: hidden_a = hidden_mid + mlp_out (write back for next layer)
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &bufs.mlp_out,
+                &mut bufs.hidden_a,
+            )?;
+        }
+
+        // 3. Extract last hidden → DeviceVec for final norm + LM head
+        // For seq_len=1, hidden_a.data has exactly hidden_size elements.
+        self.ctx
+            .stream
+            .memcpy_dtod(&bufs.hidden_a.data, &mut bufs.last_normed.data)
+            .map_err(|e| anyhow::anyhow!("D2D copy failed: {}", e))?;
+
+        // Final norm (1+weight offset)
+        ops::rms_norm_offset_into(
+            &self.ctx,
+            &bufs.last_normed,
+            &self.norm,
+            eps,
+            &mut bufs.normed_out,
+        )?;
+
+        // LM head (tied embeddings) → logits
+        ops::gemv(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.normed_out,
+            &mut bufs.logits,
+        )?;
+
+        Ok(())
     }
 }

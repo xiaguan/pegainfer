@@ -1,12 +1,12 @@
 //! Qwen3.5 model: mixed full attention + linear attention transformer.
 
 pub(crate) mod config;
-mod decode;
 mod decode_buffers;
 mod forward;
 mod prefill;
 pub mod prefill_buffers;
 mod recurrent_state;
+mod single_token_buffers;
 mod weights;
 
 pub use forward::Qwen35State;

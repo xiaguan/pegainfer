@@ -4,6 +4,7 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
+use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
@@ -15,6 +16,7 @@ use crate::tensor::{DeviceContext, DeviceVec};
 pub struct Qwen35State {
     pub(super) ctx: DeviceContext,
     pub(super) decode_bufs: DecodeBuffers35,
+    pub(super) single_token_bufs: SingleTokenBuffers,
     pub(super) kv_cache: KVCache,
     pub(super) recurrent_state: RecurrentState,
     pub(super) graph_state: CudaGraphState,
@@ -27,12 +29,13 @@ impl GenerationState for Qwen35State {
     fn logits(&self) -> &DeviceVec {
         self.prefill_logits
             .as_ref()
-            .unwrap_or(&self.decode_bufs.logits)
+            .unwrap_or(&self.single_token_bufs.logits)
     }
 
     fn reset(&mut self) -> Result<()> {
         self.kv_cache.reset();
         self.recurrent_state.reset(&self.ctx)?;
+        self.graph_state = CudaGraphState::new();
         self.prefill_logits = None;
         Ok(())
     }
@@ -45,6 +48,7 @@ impl ModelForward for Qwen35Model {
         Ok(Qwen35State {
             ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers35::new(&self.ctx, &self.config)?,
+            single_token_bufs: SingleTokenBuffers::new(&self.ctx, &self.config)?,
             kv_cache: KVCache::new(
                 self.config.num_full_attention_layers(),
                 self.config.num_key_value_heads,
@@ -57,11 +61,11 @@ impl ModelForward for Qwen35Model {
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         if tokens.len() == 1 {
-            self.decode_one_token(
+            self.prefill_forward_single_token(
                 tokens[0],
                 &mut state.kv_cache,
                 &mut state.recurrent_state,
-                &mut state.decode_bufs,
+                &mut state.single_token_bufs,
                 &mut state.graph_state,
             )?;
             state.prefill_logits = None;
@@ -83,7 +87,7 @@ impl ModelForward for Qwen35Model {
         let logits = state
             .prefill_logits
             .as_ref()
-            .unwrap_or(&state.decode_bufs.logits);
+            .unwrap_or(&state.single_token_bufs.logits);
         ops::gpu_sample_into(
             &self.ctx,
             logits,

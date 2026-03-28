@@ -100,7 +100,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     output: &mut HiddenStates,
     num_q_heads: usize,
     num_kv_heads: usize,
-    start_pos: usize,
+    start_pos_buf: &CudaSlice<i32>,
 ) -> Result<()> {
     let seq_len = q_batch.seq_len;
     let q_dim = q_batch.hidden_dim;
@@ -115,6 +115,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
     let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (sp_ptr, _gsp) = start_pos_buf.device_ptr(&ctx.stream);
 
     let result = unsafe {
         ffi::flash_attention_prefill_hd256_cuda(
@@ -126,7 +127,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
             num_kv_heads as i32,
             gqa_ratio as i32,
             seq_len as i32,
-            start_pos as i32,
+            sp_ptr as *const i32,
             q_dim as i32,
             ctx.stream.cu_stream(),
         )
@@ -156,6 +157,56 @@ pub fn prefill_attention_hd256_batch(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let q_dim = num_q_heads * 256;
+    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, q_full_batch.seq_len)?;
+    // Allocate temporary GPU scalar for start_pos
+    let start_pos_buf: CudaSlice<i32> = ctx
+        .stream
+        .clone_htod(&[start_pos as i32])
+        .map_err(|e| anyhow::anyhow!("start_pos H2D failed: {e}"))?;
+    prefill_attention_hd256_batch_with_scratch(
+        ctx,
+        q_full_batch,
+        k_batch,
+        v_batch,
+        q_norm,
+        k_norm,
+        cos_cache,
+        sin_cache,
+        k_cache,
+        v_cache,
+        output,
+        &mut q_prepped,
+        num_q_heads,
+        num_kv_heads,
+        &start_pos_buf,
+        rotary_dim,
+        rms_eps,
+    )
+}
+
+/// Same as `prefill_attention_hd256_batch` but uses pre-allocated scratch buffers.
+/// `start_pos_buf` is a GPU-resident `i32` for CUDA Graph safety.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd256_batch_with_scratch(
+    ctx: &DeviceContext,
+    q_full_batch: &HiddenStates,
+    k_batch: &HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm: &DeviceVec,
+    k_norm: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut HiddenStates,
+    q_prepped: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    start_pos_buf: &CudaSlice<i32>,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
     let seq_len = q_full_batch.seq_len;
     let q_dim = num_q_heads * 256;
     let kv_dim = num_kv_heads * 256;
@@ -167,8 +218,7 @@ pub fn prefill_attention_hd256_batch(
     assert_eq!(v_batch.seq_len, seq_len);
     assert_eq!(output.hidden_dim, q_dim);
     assert_eq!(output.seq_len, seq_len);
-
-    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+    assert_eq!(q_prepped.hidden_dim, q_dim);
 
     unsafe {
         let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
@@ -181,6 +231,7 @@ pub fn prefill_attention_hd256_batch(
         let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
         let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
         let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+        let (sp_ptr, _gsp) = start_pos_buf.device_ptr(&ctx.stream);
 
         ffi::prefill_attention_hd256_prep_cuda(
             qf_ptr as *const ffi::Half,
@@ -196,7 +247,7 @@ pub fn prefill_attention_hd256_batch(
             num_q_heads as i32,
             num_kv_heads as i32,
             seq_len as i32,
-            start_pos as i32,
+            sp_ptr as *const i32,
             rotary_dim as i32,
             rms_eps,
             ctx.stream.cu_stream(),
@@ -205,13 +256,13 @@ pub fn prefill_attention_hd256_batch(
 
     flash_attention_prefill_hd256_into(
         ctx,
-        &q_prepped,
+        q_prepped,
         k_cache,
         v_cache,
         output,
         num_q_heads,
         num_kv_heads,
-        start_pos,
+        start_pos_buf,
     )?;
 
     unsafe {
@@ -307,63 +358,4 @@ pub fn fused_attention_decode_into(
     result.result()?;
 
     Ok(())
-}
-
-/// Fused GQA Attention HD256 — decode variant (reads pos/seq_len from decode_meta).
-/// q_full: interleaved [head0_q(256), head0_gate(256), head1_q(256), ...] = [num_qheads * 2 * 256]
-/// Output already gated: output *= sigmoid(gate).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fused_attention_hd256_decode_into(
-    ctx: &DeviceContext,
-    q_full: &DeviceVec,
-    k_full: &DeviceVec,
-    v_full: &DeviceVec,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_cache_base: &DeviceVec,
-    sin_cache_base: &DeviceVec,
-    decode_meta: &CudaSlice<i32>,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    output: &mut DeviceVec,
-    num_qheads: usize,
-    num_kvheads: usize,
-    rotary_dim: usize,
-    scale: f32,
-    rms_eps: f32,
-) {
-    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
-    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
-    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gc) = cos_cache_base.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gs) = sin_cache_base.data.device_ptr(&ctx.stream);
-    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
-    let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-    let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::fused_gqa_attention_hd256_decode(
-            q_ptr as *const ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            meta_ptr as *const i32,
-            kc_ptr as *mut ffi::Half,
-            vc_ptr as *mut ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_qheads as i32,
-            num_kvheads as i32,
-            (num_qheads / num_kvheads) as i32,
-            rotary_dim as i32,
-            scale,
-            rms_eps,
-            ctx.stream.cu_stream(),
-        );
-    }
 }

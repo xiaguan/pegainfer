@@ -12,7 +12,7 @@ def flash_attention_prefill_hd256_kernel(
     num_kv_heads,
     gqa_ratio,
     seq_len,
-    start_pos,
+    start_pos_ptr,      # *i32 pointer — GPU-resident for CUDA Graph safety
     q_dim,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -26,6 +26,8 @@ def flash_attention_prefill_hd256_kernel(
     HEAD_DIM=256 is split into four 64-wide chunks to keep register pressure
     manageable while preserving the same Q / cache layouts used by the HD128 path.
     """
+    start_pos = tl.load(start_pos_ptr).to(tl.int32)
+
     MAX_SEQ: tl.constexpr = 4096
     QTR_HD: tl.constexpr = HEAD_DIM // 4
     scale = 1.44269504 / tl.sqrt(float(HEAD_DIM))  # log2(e) / sqrt(HEAD_DIM)

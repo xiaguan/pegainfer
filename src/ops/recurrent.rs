@@ -5,41 +5,6 @@ use crate::ffi;
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
-/// Causal depthwise conv1d decode (single step).
-/// Updates conv_state in-place. Applies SiLU activation.
-pub fn conv1d_decode_into(
-    ctx: &DeviceContext,
-    x: &DeviceVec,
-    conv_weight: &DeviceVec,
-    conv_state: &mut DeviceVec,
-    out: &mut DeviceVec,
-    kernel_size: usize,
-) -> Result<()> {
-    let num_channels = x.len;
-    assert_eq!(out.len, num_channels);
-    assert_eq!(conv_weight.len, num_channels * kernel_size);
-    assert_eq!(conv_state.len, num_channels * (kernel_size - 1));
-
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
-    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
-    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::conv1d_decode_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            s_ptr as *mut ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_channels as i32,
-            kernel_size as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-
-    Ok(())
-}
-
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conv1d_prefill_batch_into(
@@ -73,54 +38,6 @@ pub(crate) fn conv1d_prefill_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-}
-
-/// Gated delta rule recurrent decode (single step).
-/// qkv: [q_dim + k_dim + v_dim] after conv1d+SiLU
-/// b_proj, a_proj: [num_value_heads] bf16 (from gemv)
-/// state: [num_value_heads * key_dim * val_dim] f32 (updated in-place)
-/// output: [num_value_heads * val_dim] bf16
-#[allow(clippy::too_many_arguments)]
-pub fn gated_delta_rule_decode_into(
-    ctx: &DeviceContext,
-    qkv: &DeviceVec,
-    b_proj: &DeviceVec,
-    a_proj: &DeviceVec,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
-    state: &mut CudaSlice<f32>,
-    output: &mut DeviceVec,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
-) -> Result<()> {
-    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
-    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
-    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
-    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::gated_delta_rule_decode_cuda(
-            qkv_ptr as *const ffi::Half,
-            b_ptr as *const ffi::Half,
-            a_ptr as *const ffi::Half,
-            dt_ptr as *const ffi::Half,
-            alog_ptr as *const f32,
-            s_ptr as *mut f32,
-            o_ptr as *mut ffi::Half,
-            num_key_heads as i32,
-            num_value_heads as i32,
-            key_dim as i32,
-            val_dim as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -4,11 +4,10 @@ use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
-    CONV_KERNEL_SIZE, EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS,
-    QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
-    QWEN35_4B_LINEAR_V_HEADS, QWEN35_4B_Q_HEADS, QWEN35_4B_ROPE_THETA, QWEN35_4B_ROTARY_DIM,
-    configure_group, device_vec, f32_slice, hidden_states, iter_sync, positive_device_vec,
-    rope_cache, zero_f32_slice,
+    EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS, QWEN35_4B_LINEAR_K_DIM,
+    QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM, QWEN35_4B_LINEAR_V_HEADS, QWEN35_4B_Q_HEADS,
+    QWEN35_4B_ROPE_THETA, QWEN35_4B_ROTARY_DIM, configure_group, f32_slice, hidden_states,
+    iter_sync, positive_device_vec, rope_cache, zero_f32_slice,
 };
 
 pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
@@ -18,68 +17,6 @@ pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("ops_qwen35_state");
     configure_group(&mut group);
-
-    group.throughput(Throughput::Elements(conv_channels as u64));
-    group.bench_function("conv1d_decode_into", |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let conv_x = device_vec(&ctx, conv_channels).expect("failed to allocate conv input");
-        let conv_weight = device_vec(&ctx, conv_channels * CONV_KERNEL_SIZE)
-            .expect("failed to allocate conv weight");
-        let mut conv_state = DeviceVec::zeros(&ctx, conv_channels * (CONV_KERNEL_SIZE - 1))
-            .expect("failed to allocate conv state");
-        let mut conv_out =
-            DeviceVec::zeros(&ctx, conv_channels).expect("failed to allocate conv out");
-        iter_sync(b, &ctx, || {
-            ops::conv1d_decode_into(
-                &ctx,
-                &conv_x,
-                &conv_weight,
-                &mut conv_state,
-                &mut conv_out,
-                CONV_KERNEL_SIZE,
-            )
-            .expect("conv1d_decode_into failed");
-        });
-    });
-
-    // GDR state: v_heads × k_dim × v_dim = 32 × 128 × 128 = 524288 f32
-    group.throughput(Throughput::Elements(
-        (QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM) as u64,
-    ));
-    group.bench_function("gated_delta_rule_decode_into", |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let qkv = device_vec(&ctx, conv_channels).expect("failed to allocate qkv");
-        let b_proj = device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate b_proj");
-        let a_proj = device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_proj");
-        let dt_bias = positive_device_vec(&ctx, QWEN35_4B_LINEAR_V_HEADS)
-            .expect("failed to allocate dt_bias");
-        let a_log = f32_slice(&ctx, QWEN35_4B_LINEAR_V_HEADS).expect("failed to allocate a_log");
-        let mut state = zero_f32_slice(
-            &ctx,
-            QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM,
-        )
-        .expect("failed to allocate recurrent state");
-        let mut recurrent_out =
-            DeviceVec::zeros(&ctx, QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM)
-                .expect("failed to allocate recurrent out");
-        iter_sync(b, &ctx, || {
-            ops::gated_delta_rule_decode_into(
-                &ctx,
-                &qkv,
-                &b_proj,
-                &a_proj,
-                &dt_bias,
-                &a_log,
-                &mut state,
-                &mut recurrent_out,
-                QWEN35_4B_LINEAR_K_HEADS,
-                QWEN35_4B_LINEAR_V_HEADS,
-                QWEN35_4B_LINEAR_K_DIM,
-                QWEN35_4B_LINEAR_V_DIM,
-            )
-            .expect("gated_delta_rule_decode_into failed");
-        });
-    });
 
     for &seq_len in &[128usize, 512, 2048] {
         group.throughput(Throughput::Elements(
