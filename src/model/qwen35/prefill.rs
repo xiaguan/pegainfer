@@ -405,8 +405,8 @@ impl Qwen35Model {
                         c.linear_conv_kernel_dim,
                     );
 
-                    // GDR chunkwise
-                    ops::gated_delta_rule_prefill_chunkwise_into(
+                    // GDR decode (fused single-step kernel)
+                    ops::gated_delta_rule_decode_into(
                         &self.ctx,
                         &bufs.qkv_conv,
                         &bufs.b_proj,
@@ -414,7 +414,6 @@ impl Qwen35Model {
                         &attn.dt_bias,
                         &attn.a_log,
                         &mut layer_state.state,
-                        &mut bufs.gdr_scratch,
                         &mut bufs.gdr_out,
                         c.linear_num_key_heads,
                         c.linear_num_value_heads,

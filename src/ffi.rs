@@ -289,6 +289,22 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Gated delta rule recurrent decode (single step)
+    pub(crate) fn gated_delta_rule_decode_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state: *mut f32,
+        output: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        stream: CUstream,
+    );
+
     // Causal depthwise conv1d prefill (parallel over sequence)
     pub(crate) fn conv1d_prefill_cuda(
         x_seq: *const Half,

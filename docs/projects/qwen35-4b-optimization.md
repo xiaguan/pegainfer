@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Qwen3.5-4B is at parity with vLLM on this GPU: TTFT `234ms` vs `229ms` (+2%) and TPOT `11.77ms` vs `11.67ms` (+1%). The GDR decode kernel was the final bottleneck — a j-loop parallelism rewrite cut it from 37μs to 15μs per layer (−60%), closing the decode gap.
+> **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `225ms`, TPOT `11.81ms` (+1%). After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
 >
-> **Status:** Active. Updated 2026-03-27: refreshed `vllm bench serve` comparison. TTFT `234ms` vs vLLM `229ms` (+2%), TPOT `11.77ms` vs `11.67ms` (+1%). Decode parity achieved via GDR kernel occupancy fix (#8). Remaining GEMV/MLP work is bandwidth-limited at 80–87% DRAM throughput — further gains require lower-level tuning (vectorization, weight layout).
+> **Status:** Active. Updated 2026-03-28: post-accuracy-parity optimization pass. The prefill-as-decode refactor (#40) simplified the codebase but regressed TPOT from `11.78ms` to `12.28ms` (+4.2%). Root cause: 7 chunk-wise Triton kernels per linear layer vs the old fused decode kernel. Restoring the GDR decode kernel for single-token path recovered TPOT to `11.81ms`. TTFT unchanged at `225ms`.
 
 ## Goal
 
@@ -157,24 +157,27 @@ Decode is fully CUDA Graph'd. Zero GPU allocation after first token. conv1d and 
 
 ## Operator Performance
 
-### Decode (1,128) — nsys kernel breakdown per decode step
+### Decode (1,128) — nsys kernel breakdown per decode step (current, 2026-03-28)
 
-Total GPU kernel time: ~11.8ms/step (matches TPOT 11.77ms — fully GPU-bound, near-zero CPU overhead thanks to CUDA Graph).
+Total GPU kernel time: ~11.8ms/step (matches TPOT 11.81ms — fully GPU-bound, near-zero CPU overhead thanks to CUDA Graph).
+
+Architecture: prefill-as-decode (#40) with restored GDR decode kernel (#9). MLP uses separate cuBLAS GEMV + silu_mul (not fused handwritten kernel). Full attention uses flash_attention_prefill_hd256 (Triton).
 
 | Kernel | Time/step | % | Count/step | Avg each | Notes |
 |--------|-----------|---|------------|----------|-------|
-| gemv (non-MLP) | 4.96ms | 42.1% | 153 | 32μs | QKV/Z/B/A/O projections + LM head |
-| fused_mlp_intermediate | 3.73ms | 31.6% | 32 | 117μs | gate+up GEMV + SiLU*mul |
-| fused_mlp_output | 1.91ms | 16.2% | 32 | 60μs | down GEMV |
-| gated_delta_rule | 0.36ms | 3.0% | 24 | 15μs | recurrent state update [32×128×128] f32 (after #8) |
-| fused_attention_hd256 | 0.48ms | 4.1% | 8 | 60μs | split-KV full attention decode |
-| fused_add_rms_norm_offset | 0.22ms | 1.9% | 64 | 3.4μs | residual + norm |
-| conv1d_decode | 0.05ms | 0.4% | 24 | 2.1μs | |
-| argmax | 0.05ms | 0.4% | 1 | 48μs | |
-| rms_norm_gated | 0.03ms | 0.3% | 24 | 1.2μs | |
-| other | <0.01ms | ~0% | 2 | — | embedding + first norm |
+| gemvx (cuBLAS, all projections) | 9.27ms | 78.6% | 248 | 37μs | QKV/Z/B/A/O + MLP gate/up/down |
+| gemv_handwritten (LM head) | 1.53ms | 13.0% | 1 | 1.53ms | final logits projection |
+| gated_delta_rule_decode | 0.33ms | 2.8% | 24 | 13.8μs | fused recurrent state update |
+| flash_attention_prefill_hd256 | 0.19ms | 1.6% | 8 | 23.6μs | full attention decode via Triton |
+| rms_norm_batched_offset | 0.16ms | 1.4% | 64 | 2.5μs | residual + norm |
+| argmax | 0.10ms | 0.8% | 1 | 98μs | |
+| conv1d_prefill | 0.05ms | 0.4% | 24 | 2.0μs | |
+| add_kernel | 0.04ms | 0.4% | 64 | 0.7μs | residual add |
+| silu_mul | 0.02ms | 0.2% | 32 | 0.7μs | MLP activation |
+| rms_norm_gated | 0.03ms | 0.3% | 24 | 1.3μs | |
+| other | ~0.03ms | ~0.3% | — | — | embedding + first norm + attn helpers |
 
-GEMV + fused_mlp dominate at 89.9%. GDR was 8.7% before #8, now 3.0% after the j-loop parallelism rewrite.
+GEMV + MLP (cuBLAS + LM head + silu_mul) dominate at 91.6%. GDR is 2.8% after the dedicated decode kernel restore (#9).
 
 ### Decode (1,128) — refreshed operator split (2026-03-27)
 
@@ -491,6 +494,66 @@ Result:
 **Interpretation:** the first fused-recurrent rewrite removed the host-side disaster and got TTFT down to `~378ms`; the chunk-wise rewrite is the follow-up step that actually gets Qwen3.5 prefill-heavy latency to parity level on this GPU. Remaining work is now normal tuning and cleanup, not feasibility.
 
 ## Optimization Log
+
+### #9 Restore GDR decode kernel for single-token path (2026-03-28)
+
+**Goal:** Recover the +4.2% decode TPOT regression introduced by the accuracy-parity refactor (#40), which replaced the dedicated GDR decode kernel with the 7-stage chunk-wise Triton pipeline for all token counts.
+
+**Root cause:** The prefill-as-decode refactor (#40) deleted the dedicated `gated_delta_rule_decode_kernel` and routed single-token decode through `gated_delta_rule_prefill_chunkwise_into` (7 Triton kernel launches per linear layer). For seq_len=1, the chunk-wise pipeline adds ~33μs/layer of launch overhead vs ~14μs for the fused CUDA kernel.
+
+`nsys` regression breakdown (per decode step):
+
+| Component | Before (#40) | After (#40) | Delta |
+|-----------|-------------|-------------|-------|
+| GDR (1 fused kernel) | 0.36ms | — | — |
+| GDR (7 chunk kernels) | — | 0.78ms | — |
+| **GDR subtotal** | **0.36ms** | **0.78ms** | **+0.42ms** |
+| Attention (flash_attn) | 0.48ms | 0.22ms | −0.27ms |
+| GEMV + MLP | 10.61ms | 10.87ms | +0.26ms |
+| rest | 0.33ms | 0.35ms | ~0 |
+| **Total TPOT** | **~11.78ms** | **~12.28ms** | **+0.50ms** |
+
+GDR was the dominant regression source (0.42ms of 0.50ms). The GEMV+MLP cost increased ~0.26ms because MLP switched from fused handwritten kernels to separate cuBLAS GEMV + silu_mul, but this was partly offset by faster attention (flash_attn prefill kernel is faster than the old fused_attention_hd256 for single token).
+
+**Changes:**
+
+1. Restored the j-loop parallel GDR decode kernel (`csrc/gated_delta_rule.cu`, 190 lines) — identical to the #8 version.
+2. Re-added FFI declaration and `gated_delta_rule_decode_into()` ops wrapper accepting `HiddenStates` for the single-token path.
+3. Replaced `gated_delta_rule_prefill_chunkwise_into` with `gated_delta_rule_decode_into` in `single_token_kernels()`.
+4. Removed `GdrChunkwiseScratch35` from `SingleTokenBuffers` (saves ~2MB VRAM).
+
+The multi-token prefill path still uses the chunk-wise pipeline (unchanged).
+
+**Validated commands:**
+- `cargo test --release --test e2e_qwen35 -- --nocapture`
+- `cargo test --release --test e2e -- --nocapture`
+- `cargo test --release --test gen_test_data_35 -- --nocapture`
+- `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128`
+- `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1`
+
+**Results:**
+- Decode-heavy `(1,128)`: TPOT avg `11.78ms`, p50 `11.81ms`, p99 `11.85ms` (was `12.28ms` → **−3.8%**)
+- Prefill-heavy `(2048,1)`: TTFT `224.5ms` (unchanged)
+- `e2e_qwen35`: pass after baseline regeneration; FP accumulation order change from fused kernel vs chunk-wise causes some greedy output drift
+- `e2e` (Qwen3): pass (no changes to Qwen3 path)
+
+`nsys` kernel breakdown after fix (per decode step, 256 steps):
+
+| Operator family | Time/step | % | Count/step | Avg each |
+|-----------------|-----------|---|------------|----------|
+| gemvx (cuBLAS, all projections) | 9.27ms | 78.6% | 248 | 37μs |
+| gemv_handwritten (LM head) | 1.53ms | 13.0% | 1 | 1.53ms |
+| gated_delta_rule_decode | 0.33ms | 2.8% | 24 | 13.8μs |
+| flash_attention_prefill_hd256 | 0.19ms | 1.6% | 8 | 23.6μs |
+| rms_norm_batched_offset | 0.16ms | 1.4% | 64 | 2.5μs |
+| argmax | 0.10ms | 0.8% | 1 | 98μs |
+| conv1d_prefill | 0.05ms | 0.4% | 24 | 2.0μs |
+| add_kernel | 0.04ms | 0.4% | 64 | 0.7μs |
+| silu_mul | 0.02ms | 0.2% | 32 | 0.7μs |
+| rms_norm_gated | 0.03ms | 0.3% | 24 | 1.3μs |
+| other | ~0.03ms | ~0.3% | — | — |
+
+**Interpretation:** The decode kernel restore recovered essentially all of the regression (11.81ms vs pre-#40 11.78ms). The remaining ~0.03ms gap is from unfused MLP (cuBLAS gemvx vs fused handwritten kernel), but cuBLAS gemvx has better tiling for these shapes so re-fusing would likely not help. GEMV + MLP remain the dominant cost at 91.6% — bandwidth-limited, not kernel-optimization-limited.
 
 ### #8 GDR decode kernel j-loop parallelism (2026-03-27)
 

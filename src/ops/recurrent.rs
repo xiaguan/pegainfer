@@ -5,6 +5,57 @@ use crate::ffi;
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
+/// Gated delta rule recurrent decode (single step, seq_len=1).
+/// Fused CUDA kernel: L2-norm q/k, compute g/beta, decay + rank-1 state update, output.
+/// ~15μs/layer on RTX 5070 Ti vs ~33μs for the 7-stage chunk-wise pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_rule_decode_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> Result<()> {
+    debug_assert_eq!(qkv.seq_len, 1);
+    debug_assert_eq!(b_proj.seq_len, 1);
+    debug_assert_eq!(a_proj.seq_len, 1);
+    debug_assert_eq!(output.seq_len, 1);
+
+    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gated_delta_rule_decode_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            s_ptr as *mut f32,
+            o_ptr as *mut ffi::Half,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            key_dim as i32,
+            val_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conv1d_prefill_batch_into(

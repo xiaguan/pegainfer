@@ -7,7 +7,6 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use super::prefill_buffers::GdrChunkwiseScratch35;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// All HiddenStates(seq_len=1) buffers needed for one prefill step.
@@ -58,9 +57,6 @@ pub(super) struct SingleTokenBuffers {
 
     // ── Residual intermediate [hidden_size, 1] ──────────────────────
     pub hidden_mid: HiddenStates,
-
-    // ── GDR chunkwise scratch (seq_len=1, reused across layers) ─────
-    pub gdr_scratch: GdrChunkwiseScratch35,
 
     // ── Final outputs ───────────────────────────────────────────────
     pub last_normed: DeviceVec,
@@ -114,8 +110,6 @@ impl SingleTokenBuffers {
             mlp_out: HiddenStates::zeros(ctx, h, 1)?,
 
             hidden_mid: HiddenStates::zeros(ctx, h, 1)?,
-
-            gdr_scratch: GdrChunkwiseScratch35::new(ctx, c, 1)?,
 
             last_normed: DeviceVec::zeros(ctx, h)?,
             normed_out: DeviceVec::zeros(ctx, h)?,

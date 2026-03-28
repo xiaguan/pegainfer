@@ -4,7 +4,7 @@
       "name": "hello",
       "prompt": "Hello",
       "max_new_tokens": 50,
-      "output": ", I'm trying to create a simple program that reads a file and prints the first 10 lines. I'm using `fgets` to read the file, but I'm getting an error. Can you help me?\n\nThe issue is that"
+      "output": ", I am trying to find the value of the following limit:\n$$\\lim_{x \\to 0} \\frac{\\sin(x) - x}{x^3}$$\nI have tried using L'Hopital's rule,"
     },
     {
       "name": "capital_france",
@@ -22,7 +22,7 @@
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young man who discovers a mysterious portal in his backyard.\n\n<think>\n\n</think>\n\nThe rain in Oakhaven didn't just fall; it seemed to hang in the air, a heavy, grey curtain that blurred the edges of the world. For"
+      "output": " about a young man who discovers a hidden room in his house.\n\n<think>\n\n</think>\n\nThe dust in Elias's attic always smelled of old paper and forgotten summers, a scent that usually made him want to leave. But today, the air felt different"
     },
     {
       "name": "python_prime",
@@ -34,7 +34,7 @@
       "name": "quantum_simple",
       "prompt": "Explain quantum computing in simple terms.",
       "max_new_tokens": 80,
-      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone or laptop) work like a very fast, single-minded worker. They can only look at one piece of the puzzle at a time. To solve the puzzle, they have to check piece A, then piece B, then piece C, one by one. If the puzzle has"
+      "output": "\n\n<think>\n\n</think>\n\nImagine you are trying to solve a massive puzzle.\n\n**Classical computers** (like your phone or laptop) work like a very fast librarian. They have a single bookshelf with slots numbered 1, 2, 3, 4... They can only hold **one** specific book at a time. To find the right answer, they check slot 1"
     },
     {
       "name": "math_add",

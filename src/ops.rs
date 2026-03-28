@@ -32,4 +32,4 @@ pub(crate) use attention::flash_attention_prefill_hd256_into;
 pub(crate) use elementwise::{add_batch_into, extract_vec, silu_mul_batch_into};
 pub(crate) use linear::{gemm_into, linear};
 pub(crate) use norm::{rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into};
-pub(crate) use recurrent::conv1d_prefill_batch_into;
+pub(crate) use recurrent::{conv1d_prefill_batch_into, gated_delta_rule_decode_into};
