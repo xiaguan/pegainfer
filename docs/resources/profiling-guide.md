@@ -117,3 +117,16 @@ fused_mlp_output_kernel           61.7μs           61.8μs          1.0x
 ```
 
 MLP and GEMV are completely flat. Attention decode is O(seq_len). If other kernels also show growth, there is an unexpected context dependency to investigate.
+
+## CUDA Toolkit Version Impact
+
+nvcc version matters. Measured on RTX 5070 Ti (sm_120) with Qwen3.5-4B, same code, same GPU, only nvcc changed (2026-03-28):
+
+| | CUDA 13.1 (V13.1.115) | CUDA 12.8 (V12.8.93) | regression |
+|--|------------------------|----------------------|------------|
+| Decode TPOT (1,128) | 11.81ms | 12.18ms | **+3.1%** |
+| Prefill TTFT (2048,1) | 224.5ms | 229.4ms | **+2.2%** |
+
+Decode is hit harder because the hotpath is custom CUDA kernels (GDR decode, handwritten GEMV, fused MLP) where nvcc codegen quality directly matters. Prefill is less affected because the heavy compute is Triton AOT and cuBLAS — nvcc only compiles auxiliary kernels.
+
+**Practical rule:** always build with the latest CUDA toolkit that supports your SM target. For sm_120 (Blackwell), CUDA 13.1 is the native toolkit; 12.8 can target it but generates worse code.
