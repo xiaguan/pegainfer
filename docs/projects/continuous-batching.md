@@ -264,6 +264,14 @@ Key differences from single-request decode:
 
 No CUDA Graph yet (Step 3).
 
+#### Step 3 prerequisites
+
+**`qk_norm_rope_batched_decode_cuda` uses a CPU loop.** Current implementation launches one kernel per request (`for i in 0..batch_size { launch(...) }`). CUDA Graph capture bakes a fixed number of kernel launches — the graph would always replay `batch_size` launches regardless of the bucket size it was captured for. Must rewrite as a single launch with grid `(num_q_heads + num_kv_heads, batch_size)` and positions read from `positions[blockIdx.y]`.
+
+**`fused_add_rms_norm_batched_cuda` also uses a CPU loop.** Same issue — launches one `fused_add_rms_norm_kernel` per batch element. Rewrite as a single kernel with `blockIdx.x` indexing into batch, like `rms_norm_batched_kernel` already does.
+
+**Padding strategy for FlashInfer.** Bucket graphs pad batch to bucket size. Padding requests need valid FlashInfer metadata to avoid illegal memory access. Plan: reserve one "padding page" in KvPool, point all padding requests to it with `seq_len=1`. KV append writes garbage to the padding page (harmless), attention produces garbage output (discarded).
+
 ### Phase 3: Multi-Request Server Engine
 
 - Replace single `Mutex<State>` with scheduler-driven request pipeline
