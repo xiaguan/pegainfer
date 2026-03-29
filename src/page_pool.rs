@@ -25,6 +25,12 @@ pub(crate) struct OwnedPagePermit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PageId(usize);
 
+impl PageId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 impl PagePool {
     pub(crate) fn new(capacity_pages: usize) -> Self {
         let free_list = (0..capacity_pages).rev().map(PageId).collect();

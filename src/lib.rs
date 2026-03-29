@@ -1,5 +1,7 @@
 mod ffi;
 pub mod http_server;
+#[allow(dead_code)]
+pub(crate) mod kv_pool;
 pub mod logging;
 pub mod model;
 pub mod ops;
