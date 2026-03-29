@@ -1,8 +1,8 @@
 # Project: Continuous Batching
 
-> **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1: PagedAttention (memory management). Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
+> **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 (PagedAttention) in progress.
+> **Status:** Active. Phase 1 in progress: top-level `PagePool` abstraction landed; KV-specific wrappers and kernel integration are pending.
 
 ## Motivation
 
@@ -39,6 +39,13 @@ Key components:
 - **Paged prefill**: gather pages → contiguous buffer → existing Triton FA kernel
 
 Applies to full attention layers only (8 in Qwen3.5, 36 in Qwen3). Linear attention layers use `RecurrentState` (unchanged).
+
+Current slice:
+- `PagePool`: a top-level, generic fixed-page allocator with RAII-owned permits modeled after `tokio::Semaphore`'s owned permit semantics.
+- Not in scope yet: KV backing storage, per-request page tables, FlashInfer metadata, or any runtime integration.
+
+Next action:
+- Layer `KvPagePool` and per-request paged KV metadata on top of `PagePool` without changing the allocator interface.
 
 ### Phase 2: Scheduler + Batch Decode
 

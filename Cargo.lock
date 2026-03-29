@@ -1364,6 +1364,7 @@ dependencies = [
  "logforth",
  "memmap2",
  "ndarray",
+ "parking_lot",
  "rand 0.10.0",
  "safetensors",
  "serde",

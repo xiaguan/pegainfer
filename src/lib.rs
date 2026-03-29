@@ -3,6 +3,8 @@ pub mod http_server;
 pub mod logging;
 pub mod model;
 pub mod ops;
+#[allow(dead_code)]
+pub(crate) mod page_pool;
 pub mod sampler;
 pub mod server_engine;
 pub mod tensor;
