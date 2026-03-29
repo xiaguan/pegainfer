@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 in progress: top-level `PagePool` abstraction landed; KV-specific wrappers and kernel integration are pending.
+> **Status:** Active. Phase 1 in progress: `PagePool` landed, `OwnedPagePermit::try_grow` next, then `KvPagePool` + `PagedKvCache`.
 
 ## Motivation
 
@@ -40,12 +40,36 @@ Key components:
 
 Applies to full attention layers only (8 in Qwen3.5, 36 in Qwen3). Linear attention layers use `RecurrentState` (unchanged).
 
-Current slice:
-- `PagePool`: a top-level, generic fixed-page allocator with RAII-owned permits modeled after `tokio::Semaphore`'s owned permit semantics.
-- Not in scope yet: KV backing storage, per-request page tables, FlashInfer metadata, or any runtime integration.
+#### Decision: page-first memory layout
 
-Next action:
-- Layer `KvPagePool` and per-request paged KV metadata on top of `PagePool` without changing the allocator interface.
+Each physical page is a contiguous chunk containing **all layers'** K/V for `page_size` tokens:
+
+```
+page_i: [L0_K | L0_V | L1_K | L1_V | ... | L7_K | L7_V]
+         └─ page_size × num_kv_heads × head_dim each ─┘
+```
+
+Single `cudaMalloc` backing buffer. Kernel addressing: `base + page_id × page_stride + layer × layer_kv_offset`.
+
+Why not layer-first (per-layer buffer, pages indexed within each):
+- layer-first requires 2×N separate allocations (72 for Qwen3)
+- "freeing a page" only recycles an ID, not a contiguous memory region
+- kernel needs a per-layer pointer array instead of base + strides
+- paged attention already does random access by page index, so cross-page contiguity within a layer buys nothing
+
+Page-first gives: true allocation atomicity, single buffer, pool fully decoupled from KV semantics, simpler kernel interface.
+
+#### Progress
+
+Done:
+- `PagePool`: generic fixed-page allocator, RAII `OwnedPagePermit`, `try_acquire_many(n)`.
+
+Next steps (in order):
+1. `OwnedPagePermit::try_grow(n)` — permit supports incremental page acquisition (decode grows KV one page at a time).
+2. `KvPagePool` — wraps `PagePool` + single backing `CudaSlice<bf16>`, page-first layout, stride constants, `fn k_ptr(layer, page_id)` / `fn v_ptr(layer, page_id)` addressing.
+3. `PagedKvCache` (per-request) — holds `OwnedPagePermit` + `seq_len`, `ensure_capacity(new_seq_len)` grows permit on page boundary crossing, builds GPU metadata (`page_indices`, `last_page_len`) for FlashInfer decode kernel.
+
+Not in scope yet: FlashInfer kernel integration, prefill gather, or any runtime wiring.
 
 ### Phase 2: Scheduler + Batch Decode
 
@@ -66,15 +90,20 @@ Next action:
 
 ```
 Phase 1 (PagedAttention):
-  PagePool (shared GPU buffer)
-    ├── alloc_pages(n) → Vec<page_id>
-    └── free_pages(Vec<page_id>)
+  PagePool (generic allocator, no GPU knowledge)
+    ├── try_acquire_many(n) → OwnedPagePermit
+    └── OwnedPagePermit::try_grow(n) → bool
 
-  PagedKVCache (per-request)
-    ├── page_tables: [num_full_attn_layers] → page indices
-    ├── append_token(layer, k, v)
-    ├── build_gpu_metadata() → (indices, indptr, last_page_len)
-    └── reset() → return pages to pool
+  KvPagePool (shared GPU backing, page-first layout)
+    ├── buffer: CudaSlice<bf16>  [num_pages × page_stride]
+    ├── k_ptr(layer, page_id) → *mut bf16
+    └── v_ptr(layer, page_id) → *mut bf16
+
+  PagedKvCache (per-request)
+    ├── permit: OwnedPagePermit  (RAII, auto-returns pages)
+    ├── seq_len: usize
+    ├── ensure_capacity(new_seq_len) → grow permit if needed
+    └── gpu_metadata() → (page_indices, last_page_len)
 
 Phase 2 (Scheduler):
   Scheduler

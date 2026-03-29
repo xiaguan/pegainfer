@@ -81,6 +81,26 @@ impl OwnedPagePermit {
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
+
+    /// Try to acquire `n` more pages, appending them to this permit.
+    /// Returns `true` on success. On failure the permit is unchanged.
+    pub(crate) fn try_grow(&mut self, n: usize) -> bool {
+        if n == 0 {
+            return true;
+        }
+
+        let mut free_list = self.inner.free_list.lock();
+        if free_list.len() < n {
+            return false;
+        }
+
+        self.pages.reserve(n);
+        for _ in 0..n {
+            self.pages
+                .push(free_list.pop().expect("free_list length checked above"));
+        }
+        true
+    }
 }
 
 impl Drop for OwnedPagePermit {
@@ -147,5 +167,27 @@ mod tests {
         let _permit = pool.try_acquire_many(1).expect("acquire should succeed");
 
         assert!(pool.try_acquire_many(2).is_none());
+    }
+
+    #[test]
+    fn try_grow_extends_permit_and_returns_all_on_drop() {
+        let pool = PagePool::new(4);
+
+        {
+            let mut permit = pool.try_acquire_many(1).expect("initial acquire");
+            assert_eq!(permit.pages(), &[PageId(0)]);
+
+            assert!(permit.try_grow(2));
+            assert_eq!(permit.pages(), &[PageId(0), PageId(1), PageId(2)]);
+            assert_eq!(pool.available_pages(), 1);
+
+            // grow beyond remaining capacity fails, permit unchanged
+            assert!(!permit.try_grow(2));
+            assert_eq!(permit.len(), 3);
+            assert_eq!(pool.available_pages(), 1);
+        }
+
+        // all 4 pages back after drop
+        assert_eq!(pool.available_pages(), 4);
     }
 }
