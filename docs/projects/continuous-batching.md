@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 done. Phase 2 Steps 1-2 done (batched forward + correctness verified). Next: Step 3 (bucket CUDA Graphs).
+> **Status:** Active. Phase 1 done. Phase 2 Steps 1-3 done (batched forward + correctness + bucket CUDA Graphs). Next: Step 4 (scheduler loop).
 
 ## Motivation
 
@@ -244,7 +244,7 @@ Qwen3 only (Qwen3.5 deferred). Target: vLLM-equivalent continuous batching.
 |------|------|--------|
 | 1 | **Batched forward** — `Qwen3Model::batch_decode()` handles bs>1. `HiddenStates [dim, bs]`, batched GEMM/RMSNorm/RoPE/embedding, FlashInfer BatchDecode with real bs>1. MLP decomposed into GEMM + SiLU-mul + GEMM. | **Done** |
 | 2 | **Correctness test** — 2 requests in batch == 2 sequential single-request (greedy 10-token parity). | **Done** |
-| 3 | **Bucket CUDA Graphs** — per-bucket capture/replay, batched `DecodeBuffers`. | — |
+| 3 | **Bucket CUDA Graphs** — per-bucket capture/replay, batched `DecodeBuffers`. | **Done** |
 | 4 | **Scheduler loop** — request queue (FCFS), prefill-priority step loop, `submit()` + retire, admission control. | — |
 | 5 | **Server integration** — `GenericServerEngine` wired to scheduler, `submit()` + await, streaming output per request. | — |
 
@@ -262,15 +262,27 @@ Key differences from single-request decode:
 - **Fused add+RMSNorm**: batched version launches one block per batch element.
 - **Sampling**: per-request loop (extract logits slice, sample independently).
 
-No CUDA Graph yet (Step 3).
+#### Step 3: Bucket CUDA Graphs (Done)
 
-#### Step 3 prerequisites
+Per-bucket graph capture/replay for batch decode, matching vLLM's approach.
 
-**`qk_norm_rope_batched_decode_cuda` uses a CPU loop.** Current implementation launches one kernel per request (`for i in 0..batch_size { launch(...) }`). CUDA Graph capture bakes a fixed number of kernel launches — the graph would always replay `batch_size` launches regardless of the bucket size it was captured for. Must rewrite as a single launch with grid `(num_q_heads + num_kv_heads, batch_size)` and positions read from `positions[blockIdx.y]`.
+**Prerequisites resolved:**
 
-**`fused_add_rms_norm_batched_cuda` also uses a CPU loop.** Same issue — launches one `fused_add_rms_norm_kernel` per batch element. Rewrite as a single kernel with `blockIdx.x` indexing into batch, like `rms_norm_batched_kernel` already does.
+1. **`qk_norm_rope_batched_decode_cuda` CPU loop → single launch.** Changed kernel position computation from `pos = *start_pos_d + token` to `pos = start_pos_d ? start_pos_d[token] : (start_pos + token)`. All three call sites (prefill, single decode, batched decode) work with the same kernel. Batched wrapper now launches `grid(heads, batch_size)` in one call.
 
-**Padding strategy for FlashInfer.** Bucket graphs pad batch to bucket size. Padding requests need valid FlashInfer metadata to avoid illegal memory access. Plan: reserve one "padding page" in KvPool, point all padding requests to it with `seq_len=1`. KV append writes garbage to the padding page (harmless), attention produces garbage output (discarded).
+2. **`fused_add_rms_norm_batched_cuda` CPU loop → single launch.** New `fused_add_rms_norm_batched_kernel` with `blockIdx.x` as batch index (same pattern as `rms_norm_batched_kernel`). Replaces per-element CPU loop.
+
+3. **Padding page for FlashInfer.** `KvPool` reserves one page at construction (`padding_permit`). Padding slots in bucket metadata point to this page with `seq_len=1, last_page_len=1`. KV append writes harmless garbage; attention output is discarded.
+
+**Bucket graph implementation:**
+
+- Buckets: `[1, 2, 4, 8, 16, 32, 64]`. Actual batch padded to nearest bucket.
+- One `CudaGraphState` per bucket, stored in `BatchDecodeBuffers`.
+- `batch_decode()` pads `token_ids`, `positions`, and FlashInfer CSR metadata to bucket size, then runs `graph.run_or_capture()` — captures on first use of each bucket, replays on subsequent.
+- `select_tokens_batch()` only samples the first `real_bs` logit slices — padding outputs ignored.
+- Graph/buffer split-borrow resolved via `std::mem::take` on the graphs Vec.
+
+**Correctness:** `batch_decode_graph_matches_sequential` test: 2 prompts × 10 decode steps with CUDA Graph = identical greedy output to sequential single-request decode.
 
 ### Phase 3: Multi-Request Server Engine
 

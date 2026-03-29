@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use super::batch_decode_buffers::BatchDecodeBuffers;
+use super::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers, bucket_for};
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
@@ -36,8 +36,8 @@ impl Qwen3Model {
 
     /// Batch decode step: N requests, 1 new token each, one forward pass.
     ///
-    /// Each request's token_id and kv_state are independent; they share weights.
-    /// No CUDA Graph — that's Step 3 (bucket graphs).
+    /// When `enable_cuda_graph` is set, pads to the nearest bucket size and
+    /// uses per-bucket CUDA Graph capture/replay.
     pub(crate) fn batch_decode(
         &self,
         token_ids: &[u32],
@@ -57,11 +57,21 @@ impl Qwen3Model {
             positions.push(pos as i32);
         }
 
-        // Set batch size on all buffers
-        bufs.set_batch_size(bs);
+        // Pad to bucket size for CUDA Graph stability
+        let padded_bs = if self.enable_cuda_graph {
+            bucket_for(bs)
+        } else {
+            bs
+        };
 
-        // Sync metadata to GPU
-        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+        // Set batch size on all buffers (padded — kernels run at bucket width)
+        bufs.set_batch_size(padded_bs);
+
+        // Sync metadata to GPU (pad token_ids/positions with 0 for padding slots)
+        let mut token_ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+        token_ids_i32.resize(padded_bs, 0);
+        positions.resize(padded_bs, 0);
+
         self.ctx
             .stream
             .memcpy_htod(&token_ids_i32, &mut bufs.token_ids_d)?;
@@ -70,10 +80,25 @@ impl Qwen3Model {
             .memcpy_htod(&positions, &mut bufs.positions_d)?;
 
         let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
-        bufs.sync_paged_meta(&self.ctx, &kv_refs)?;
+        bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
 
-        // Forward pass
-        self.batch_decode_kernels(kv_states[0].buffer(), kv_states[0].layout(), bs, bufs)
+        // Forward pass — with or without CUDA Graph
+        let kv_buffer = kv_states[0].buffer();
+        let layout = *kv_states[0].layout();
+        if self.enable_cuda_graph {
+            let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
+            // Take graphs out of bufs to avoid split-borrow conflict with closure
+            let mut graphs = std::mem::take(&mut bufs.graphs);
+            let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, bufs)
+            });
+            bufs.graphs = graphs;
+            result?;
+        } else {
+            self.batch_decode_kernels(kv_buffer, &layout, padded_bs, bufs)?;
+        }
+
+        Ok(())
     }
 
     fn batch_decode_kernels(
@@ -304,26 +329,27 @@ mod tests {
         let mut first_tokens = Vec::with_capacity(bs);
 
         for (i, prompt) in prompts.iter().enumerate() {
-            // Use create_state for prefill (reuses the single-request path)
             let mut state = model.create_state().unwrap();
             model.forward(*prompt, &mut state).unwrap();
             let token = model.select_token(&mut state, &params, &mut rng).unwrap();
             first_tokens.push(token);
-
-            // Transfer KV state: the prefill wrote to state.kv_state.
-            // We need to use that same kv_state for batch decode.
-            // Swap our empty kv_state with the one from the single-request state.
             std::mem::swap(&mut kv_states[i], &mut state.kv_state);
         }
 
         let mut all_tokens: Vec<Vec<u32>> = first_tokens.iter().map(|&t| vec![t]).collect();
 
-        // Batch decode
+        // Allocate buffers at bucket size (graph padding may exceed actual bs)
+        let max_bs = if model.enable_cuda_graph {
+            bucket_for(bs)
+        } else {
+            bs
+        };
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
             &model.config,
-            bs,
+            max_bs,
             model.kv_pool.capacity_pages(),
+            model.kv_pool.padding_page_id(),
         )
         .unwrap();
 
@@ -378,6 +404,42 @@ mod tests {
         assert_eq!(
             batch_results[1], seq_b,
             "Request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
+            batch_results[1], seq_b
+        );
+    }
+
+    #[test]
+    fn batch_decode_graph_matches_sequential() {
+        let model_path = get_model_path();
+        let model = Qwen3Model::from_safetensors_with_runtime(
+            &model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph: true,
+            },
+        )
+        .unwrap();
+
+        let prompt_a: Vec<u32> = vec![9707]; // "Hello"
+        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
+
+        let num_steps = 10;
+        let seed = 42;
+
+        // Sequential reference (uses single-request CUDA Graph)
+        let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
+        let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
+
+        // Batch with bucket CUDA Graph
+        let batch_results = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
+
+        assert_eq!(
+            batch_results[0], seq_a,
+            "Graph request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
+            batch_results[0], seq_a
+        );
+        assert_eq!(
+            batch_results[1], seq_b,
+            "Graph request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
             batch_results[1], seq_b
         );
     }

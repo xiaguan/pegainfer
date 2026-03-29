@@ -62,8 +62,11 @@ __global__ void prefill_qk_norm_rope_kernel(
     __syncthreads();
 
     int half = head_dim / 2;
-    int actual_start_pos = start_pos_d ? __ldg(start_pos_d) : start_pos;
-    int pos = actual_start_pos + token;
+    // When start_pos_d is non-null, each token reads its own position from the array.
+    // Single decode: start_pos_d = &decode_meta[1], token=0 → start_pos_d[0].
+    // Batched decode: start_pos_d = positions, token=batch_idx → positions[batch_idx].
+    // Prefill: start_pos_d = nullptr → start_pos + token (sequential within sequence).
+    int pos = start_pos_d ? __ldg(start_pos_d + token) : (start_pos + token);
 
     __nv_bfloat16 result;
     if (d < half) {
@@ -251,22 +254,16 @@ void qk_norm_rope_batched_decode_cuda(
     int q_dim = num_q_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
 
-    // Reuse prefill kernel: blockIdx.y = batch index, position from positions[batch_idx]
-    // start_pos=0, start_pos_d=nullptr — but the kernel computes pos = start_pos + token.
-    // We need pos = positions[token] instead.
-    // Simplest: launch per-request (batch_size is small, typically <64).
-    for (int i = 0; i < batch_size; i++) {
-        dim3 grid(num_q_heads + num_kv_heads, 1);
-        prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
-            q + i * q_dim, k + i * kv_dim,
-            q_norm_weight, k_norm_weight,
-            cos_cache, sin_cache,
-            num_q_heads, num_kv_heads, head_dim,
-            /*seq_len=*/1, q_dim, kv_dim,
-            /*start_pos=*/0, /*start_pos_d=*/positions + i,
-            rms_eps
-        );
-    }
+    // Single launch: blockIdx.y = batch index, positions[batch_idx] via start_pos_d array.
+    dim3 grid(num_q_heads + num_kv_heads, batch_size);
+    prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim,
+        /*seq_len=*/batch_size, q_dim, kv_dim,
+        /*start_pos=*/0, /*start_pos_d=*/positions,
+        rms_eps
+    );
 }
 
 } // extern "C"

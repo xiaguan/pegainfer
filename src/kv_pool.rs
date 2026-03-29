@@ -50,6 +50,10 @@ struct KvPoolInner {
     pool: PagePool,
     buffer: CudaSlice<bf16>,
     layout: KvLayout,
+    /// Reserved page for bucket CUDA Graph padding. FlashInfer metadata for
+    /// padding slots points here with seq_len=1. KV append writes harmless
+    /// garbage; attention output is discarded.
+    padding_permit: OwnedPagePermit,
 }
 
 /// Shared KV backing storage with page-based allocation.
@@ -85,11 +89,17 @@ impl KvPool {
             .alloc_zeros(total_elements)
             .map_err(|e| anyhow::anyhow!("KvPool alloc failed: {e}"))?;
 
+        let pool = PagePool::new(num_pages);
+        let padding_permit = pool
+            .try_acquire_many(1)
+            .expect("pool must have at least 1 page for padding");
+
         Ok(Self {
             inner: Arc::new(KvPoolInner {
-                pool: PagePool::new(num_pages),
+                pool,
                 buffer,
                 layout,
+                padding_permit,
             }),
         })
     }
@@ -113,6 +123,11 @@ impl KvPool {
 
     pub(crate) fn available_pages(&self) -> usize {
         self.inner.pool.available_pages()
+    }
+
+    /// Page index reserved for bucket CUDA Graph padding.
+    pub(crate) fn padding_page_id(&self) -> i32 {
+        self.inner.padding_permit.pages()[0].index() as i32
     }
 }
 
@@ -289,7 +304,8 @@ mod tests {
 
     #[test]
     fn kv_state_lifecycle() {
-        let pool = test_pool(16, 4); // page_size=16, 4 pages → 64 tokens max
+        // 5 pages total: 1 reserved for padding, 4 available for requests
+        let pool = test_pool(16, 5);
         let mut kv = pool.alloc();
 
         // Starts empty
@@ -333,16 +349,18 @@ mod tests {
 
     #[test]
     fn kv_state_out_of_pages() {
-        let pool = test_pool(16, 2); // 2 pages → 32 tokens max
+        // 3 pages total: 1 padding, 2 available → 32 tokens max
+        let pool = test_pool(16, 3);
         let mut kv = pool.alloc();
 
-        kv.ensure_capacity(32).unwrap(); // exactly fits
+        kv.ensure_capacity(32).unwrap(); // exactly fits 2 pages
         assert!(kv.ensure_capacity(33).is_err()); // needs 3rd page
     }
 
     #[test]
     fn kv_state_drop_returns_pages() {
-        let pool = test_pool(16, 4);
+        // 5 pages total: 1 padding, 4 available
+        let pool = test_pool(16, 5);
         {
             let mut kv = pool.alloc();
             kv.ensure_capacity(20).unwrap(); // 2 pages

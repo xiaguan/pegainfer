@@ -6,7 +6,24 @@ use cudarc::driver::CudaSlice;
 
 use super::config::Config;
 use crate::kv_pool::KvState;
+use crate::model::cuda_graph::CudaGraphState;
 use crate::tensor::{DeviceContext, HiddenStates};
+
+/// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
+pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+
+/// Find the smallest bucket >= `bs`. Panics if bs > largest bucket.
+pub(crate) fn bucket_for(bs: usize) -> usize {
+    for &b in BATCH_BUCKETS {
+        if b >= bs {
+            return b;
+        }
+    }
+    panic!(
+        "batch size {bs} exceeds largest bucket {}",
+        BATCH_BUCKETS.last().unwrap()
+    );
+}
 
 /// Pre-allocated buffers for batch decode. All tensors are sized for `max_batch_size`.
 ///
@@ -44,6 +61,12 @@ pub(crate) struct BatchDecodeBuffers {
     // Per-request sampling scratch (reused across requests in a loop)
     pub(crate) sample_probs: CudaSlice<f32>,
     pub(crate) sample_out: CudaSlice<i32>,
+
+    /// Padding page index for bucket CUDA Graph. Padding slots point here.
+    padding_page_id: i32,
+
+    /// One CudaGraphState per bucket (indexed by BATCH_BUCKETS position).
+    pub(crate) graphs: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeBuffers {
@@ -52,6 +75,7 @@ impl BatchDecodeBuffers {
         config: &Config,
         max_batch_size: usize,
         max_total_pages: usize,
+        padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
@@ -74,8 +98,8 @@ impl BatchDecodeBuffers {
             logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
-            // Paged attention: worst case all requests use max_total_pages
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages)?,
+            // Paged attention: worst case all requests use max_total_pages + padding slots
+            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
@@ -83,6 +107,11 @@ impl BatchDecodeBuffers {
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
             sample_probs: ctx.stream.alloc_zeros(config.vocab_size)?,
             sample_out: ctx.stream.alloc_zeros(1)?,
+            padding_page_id,
+            graphs: BATCH_BUCKETS
+                .iter()
+                .map(|_| CudaGraphState::new())
+                .collect(),
         })
     }
 
@@ -104,18 +133,23 @@ impl BatchDecodeBuffers {
     }
 
     /// Sync paged attention metadata from multiple KvStates to GPU buffers.
+    ///
+    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
     pub(crate) fn sync_paged_meta(
         &mut self,
         ctx: &DeviceContext,
         kv_states: &[&KvState],
+        padded_bs: usize,
     ) -> Result<()> {
-        let bs = kv_states.len();
+        let real_bs = kv_states.len();
+        debug_assert!(padded_bs >= real_bs);
 
         // Build concatenated page_indices and CSR indptr
         let mut all_page_indices = Vec::new();
         let mut indptr = vec![0i32];
-        let mut last_page_lens = Vec::with_capacity(bs);
-        let mut chunk_sizes = Vec::with_capacity(bs);
+        let mut last_page_lens = Vec::with_capacity(padded_bs);
+        let mut chunk_sizes = Vec::with_capacity(padded_bs);
 
         for kv in kv_states {
             let pages = kv.page_indices_i32();
@@ -125,9 +159,16 @@ impl BatchDecodeBuffers {
             chunk_sizes.push(kv.seq_len() as i32);
         }
 
-        // Non-partition: request_indices = [0, 1, ..., bs-1], kv_tile_indices = [0, 0, ..., 0]
-        let request_indices: Vec<i32> = (0..bs as i32).collect();
-        let kv_tile_indices = vec![0i32; bs];
+        // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1
+        for _ in real_bs..padded_bs {
+            all_page_indices.push(self.padding_page_id);
+            indptr.push(all_page_indices.len() as i32);
+            last_page_lens.push(1);
+            chunk_sizes.push(1);
+        }
+
+        let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
+        let kv_tile_indices = vec![0i32; padded_bs];
 
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
