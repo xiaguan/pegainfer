@@ -1,5 +1,7 @@
 //! Qwen3 model: full attention transformer.
 
+pub(crate) mod batch_decode;
+pub(crate) mod batch_decode_buffers;
 mod config;
 mod decode;
 mod decode_buffers;

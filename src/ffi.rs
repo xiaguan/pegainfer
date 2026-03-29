@@ -42,6 +42,17 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub(crate) fn fused_add_rms_norm_batched_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        batch_size: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
     pub(crate) fn silu_mul_triton_aot_cuda(
         gate: *const Half,
         up: *const Half,
@@ -367,6 +378,23 @@ unsafe extern "C" {
         num_kv_heads: i32,
         head_dim: i32,
         decode_meta: *const i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Batched QK RMSNorm + RoPE for decode with per-request positions.
+    pub(crate) fn qk_norm_rope_batched_decode_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        batch_size: i32,
         rms_eps: f32,
         stream: CUstream,
     );

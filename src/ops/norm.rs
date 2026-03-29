@@ -71,6 +71,40 @@ pub fn fused_add_rms_norm_into(
     Ok(())
 }
 
+/// Batched fused add + RMSNorm for HiddenStates.
+/// hidden[i] += residual[i]; out[i] = rms_norm(hidden[i], weight) for each batch element.
+pub(crate) fn fused_add_rms_norm_batch_into(
+    ctx: &DeviceContext,
+    hidden: &mut HiddenStates,
+    residual: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(hidden.hidden_dim, residual.hidden_dim);
+    assert_eq!(hidden.hidden_dim, out.hidden_dim);
+    assert_eq!(hidden.seq_len, residual.seq_len);
+    assert_eq!(hidden.seq_len, out.seq_len);
+    assert_eq!(weight.len, hidden.hidden_dim);
+    let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::fused_add_rms_norm_batched_cuda(
+            h_ptr as *mut ffi::Half,
+            r_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            hidden.hidden_dim as i32,
+            hidden.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+    Ok(())
+}
+
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).
 pub(crate) fn rms_norm_batch_into(
     ctx: &DeviceContext,

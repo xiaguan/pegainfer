@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 done for Qwen3 (fully paged, graph reuse, perf audited). Next: Qwen3.5 paged migration (8 full-attn layers, HD256), then Phase 2 (batch decode).
+> **Status:** Active. Phase 1 done. Phase 2 Steps 1-2 done (batched forward + correctness verified). Next: Step 3 (bucket CUDA Graphs).
 
 ## Motivation
 
@@ -229,11 +229,40 @@ Changed 3 things vs Step 1 (one variable at a time principle):
 
 ### Phase 2: Scheduler + Batch Decode
 
-- Request queue with admission control
-- Batch decode: process N requests' tokens in one forward pass
-- GEMV → batched GEMM when batch_size > 1 (cuBLAS handles this)
-- Recurrent state pool for Qwen3.5 linear attention layers
-- CUDA Graph per batch-size or FlashInfer's `block_valid_mask` pattern
+Qwen3 only (Qwen3.5 deferred). Target: vLLM-equivalent continuous batching.
+
+**Decisions:**
+- **CUDA Graph**: Bucket graphs (like vLLM). Pre-defined batch-size buckets (1, 2, 4, 8, 16, 32, 64), one captured graph per bucket. Actual batch padded to nearest bucket.
+- **Scheduling**: Dynamic. Requests enter/leave batch at step boundaries. FCFS, no preemption.
+- **Prefill policy**: Serial (one request at a time). Prefill-priority — always prefill pending requests before resuming decode.
+- **Decode interruption**: Finish current decode step, then switch to prefill.
+- **Admission control**: Reject when KvPool full (no queuing behind memory pressure).
+
+**Steps:**
+
+| Step | What | Status |
+|------|------|--------|
+| 1 | **Batched forward** — `Qwen3Model::batch_decode()` handles bs>1. `HiddenStates [dim, bs]`, batched GEMM/RMSNorm/RoPE/embedding, FlashInfer BatchDecode with real bs>1. MLP decomposed into GEMM + SiLU-mul + GEMM. | **Done** |
+| 2 | **Correctness test** — 2 requests in batch == 2 sequential single-request (greedy 10-token parity). | **Done** |
+| 3 | **Bucket CUDA Graphs** — per-bucket capture/replay, batched `DecodeBuffers`. | — |
+| 4 | **Scheduler loop** — request queue (FCFS), prefill-priority step loop, `submit()` + retire, admission control. | — |
+| 5 | **Server integration** — `GenericServerEngine` wired to scheduler, `submit()` + await, streaming output per request. | — |
+
+#### Step 1-2: Batched forward + correctness (Done)
+
+New files:
+- `batch_decode_buffers.rs`: `BatchDecodeBuffers` — `HiddenStates`-based buffers for bs>1 (reuses `seq_len` dimension as batch dimension).
+- `batch_decode.rs`: `batch_decode()`, `select_tokens_batch()` — full forward pass for N requests.
+
+Key differences from single-request decode:
+- **GEMM** everywhere instead of GEMV (cuBLAS handles the batch dimension automatically).
+- **MLP** decomposed: `gemm(gate)` + `gemm(up)` + `silu_mul` + `gemm(down)` (single-request uses a fused GEMV+SiLU+GEMV kernel).
+- **FlashInfer BatchDecode** with real `batch_size>1` — `page_indptr`, `last_page_len`, `kv_chunk_size` are per-request CSR arrays.
+- **QK norm + RoPE**: batched kernel with per-request positions (GPU array).
+- **Fused add+RMSNorm**: batched version launches one block per batch element.
+- **Sampling**: per-request loop (extract logits slice, sample independently).
+
+No CUDA Graph yet (Step 3).
 
 ### Phase 3: Multi-Request Server Engine
 

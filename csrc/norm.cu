@@ -319,6 +319,18 @@ void rms_norm_batched_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
       x, weight, out, hidden_dim, eps);
 }
 
+void fused_add_rms_norm_batched_cuda(
+    __nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+    const __nv_bfloat16 *weight, __nv_bfloat16 *out,
+    int hidden_dim, int batch_size, float eps, cudaStream_t stream) {
+  // Each block handles one vector in the batch (same kernel, offset pointers).
+  for (int i = 0; i < batch_size; i++) {
+    fused_add_rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(
+        hidden + i * hidden_dim, residual + i * hidden_dim,
+        weight, out + i * hidden_dim, hidden_dim, eps);
+  }
+}
+
 // ============================================================================
 // RMSNorm with (1+weight) offset — Qwen3.5 / Gemma style
 // out[i] = x[i] * (1 + weight[i]) / sqrt(mean(x^2) + eps)

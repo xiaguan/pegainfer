@@ -227,4 +227,46 @@ void prefill_qk_norm_rope_only_cuda(
     );
 }
 
+// ============================================================================
+// Batched QK norm + RoPE for decode: per-request positions from GPU array.
+//
+// Q layout: [q_dim, batch_size], K layout: [kv_dim, batch_size]
+// Grid: (num_q_heads + num_kv_heads, batch_size), Block: head_dim
+// ============================================================================
+void qk_norm_rope_batched_decode_cuda(
+    __nv_bfloat16* q,                    // [q_dim * batch_size] in-place
+    __nv_bfloat16* k,                    // [kv_dim * batch_size] in-place
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,                // [batch_size] per-request positions on GPU
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int batch_size,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Reuse prefill kernel: blockIdx.y = batch index, position from positions[batch_idx]
+    // start_pos=0, start_pos_d=nullptr — but the kernel computes pos = start_pos + token.
+    // We need pos = positions[token] instead.
+    // Simplest: launch per-request (batch_size is small, typically <64).
+    for (int i = 0; i < batch_size; i++) {
+        dim3 grid(num_q_heads + num_kv_heads, 1);
+        prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+            q + i * q_dim, k + i * kv_dim,
+            q_norm_weight, k_norm_weight,
+            cos_cache, sin_cache,
+            num_q_heads, num_kv_heads, head_dim,
+            /*seq_len=*/1, q_dim, kv_dim,
+            /*start_pos=*/0, /*start_pos_d=*/positions + i,
+            rms_eps
+        );
+    }
+}
+
 } // extern "C"
