@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 done for Qwen3 (fully paged prefill + decode). Next: Qwen3.5 paged migration (8 full-attn layers, HD256), then Phase 2 (batch decode).
+> **Status:** Active. Phase 1 done for Qwen3 (fully paged, graph reuse, perf audited). Next: Qwen3.5 paged migration (8 full-attn layers, HD256), then Phase 2 (batch decode).
 
 ## Motivation
 
@@ -97,6 +97,8 @@ FlashInfer's `paged_kv_t` uses separate `k_data`/`v_data` pointers with custom s
 
 FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged layout. For paged KV at bs=1, we use `BatchDecodeWithPagedKVCacheDispatched` with `batch_size=1`, `partition_kv=false`. The kernel template always accesses `request_indices`/`kv_tile_indices` (even when not partitioning), so we provide trivial GPU arrays `[0]`.
 
+**Occupancy caveat:** Non-partition grid = `(batch_size, num_kv_heads)` = `(1, 8)`. On RTX 5070 Ti (48 SMs), 40 SMs idle. At ctx>500, this causes ~2× per-kernel slowdown vs split-K approaches. Enabling `partition_kv=true` would fix this (equivalent to split-K) but requires `tmp_v`/`tmp_s` buffers, merge kernel, and `block_valid_mask` for CUDA Graph stability. Deferred until Phase 2 proves insufficient — batch decode naturally increases grid occupancy.
+
 - Paged attention wired into Qwen3 decode path as the **only** decode attention. `KvPool` always created, `KvState` per-request.
 - FlashInfer decode kernel validated end-to-end: 10-token single-prompt generation passes, determinism verified. 50-token multi-token prompt generation produces coherent output (confirms kernel correctness), but differs from baseline (prefill→paged gap, see below).
 - Prefill→paged scatter: after prefill writes to contiguous KV cache, `scatter_kv_to_paged` copies all layers into paged layout via FlashInfer's `AppendPagedKVCache` kernel. Bridges HND (contiguous) → NHD (paged) per-layer.
@@ -112,6 +114,29 @@ FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged 
 | Old path (Triton split-KV + CUDA Graph) | 11.81ms | — |
 | FlashInfer paged, no CUDA Graph | 11.30ms | −4.3% |
 | FlashInfer paged + CUDA Graph | **10.56ms** | **−10.6%** |
+
+#### Post-migration performance audit (2026-03-29)
+
+Profiled Qwen3-4B after full paged migration. Two issues found and one resolved:
+
+**1. CUDA Graph per-request rebuild (fixed).** `reset()` destroyed `CudaGraphState` between requests, causing re-capture + re-instantiate every request (~2.4ms: capture 0.9ms + instantiate 1.5ms + destroy 0.3ms). Graph topology is identical across requests — same kernels, same buffer pointers — only metadata values change (updated via `memcpy_htod` before launch). Fix: keep graph across `reset()` and after prefill. Impact on in=1,out=1 TTFT: 13.1ms → 10.5ms (−20%).
+
+**2. FlashInfer bs=1 occupancy (known, deferred).** `BatchDecodeWithPagedKVCacheDispatched` with `partition_kv=false` uses grid `(batch_size, num_kv_heads)` = `(1, 8)` = 8 blocks on 48 SMs. At ctx=1024+, each block serially scans all KV tokens — only 17% SM utilization. The old Triton split-K kernel distributed chunks across more blocks. Result: FlashInfer decode kernel is ~2× slower per-layer at same context (43.5μs vs ~22μs at ctx≈1088), accounting for ~800μs TPOT regression (12.06ms vs old 11.18ms at in=1024,out=256).
+
+Fix would be enabling partition-KV (split-K equivalent: `tmp_v`/`tmp_s` buffers, merge kernel, `block_valid_mask` for CUDA Graph). **Deferred** — once batch decode is live (Phase 2), grid = `(bs, 8)` naturally fills SMs for bs≥6. The 800μs bs=1 regression is acceptable (still within 5% of vLLM).
+
+**3. Pool capacity (fixed).** `num_pages` was 128 (exactly 2048 tokens). Any decode beyond 2048 OOM'd. Increased to 2048 pages (32K tokens, matching `max_position_embeddings`).
+
+Updated Qwen3-4B benchmarks (in-process, post-fixes):
+
+| Config | Metric | Old (3/13) | Paged + fixes | vs old | vs vLLM 0.17.1 |
+|--------|--------|-----------|---------------|--------|----------------|
+| in=1, out=1 | TTFT | 11.89ms | **10.47ms** | −12% | −46% (19.29ms) |
+| in=1, out=512 | TPOT | 10.61ms | **10.83ms** | +2% | −5% (11.46ms) |
+| in=1024, out=256 | TPOT | 11.18ms | **12.06ms** | +8%¹ | +5% (11.51ms) |
+| in=2048, out=32 | TTFT | 213ms | **194ms** | −9% | −15% (228ms) |
+
+¹ FlashInfer bs=1 occupancy issue — see item 2 above.
 
 #### Fully paged KV for Qwen3 (Done)
 

@@ -196,8 +196,8 @@ impl Qwen3Model {
         info!("GPU model loaded successfully");
 
         let page_size = 16;
-        // Enough pages for ~2048 tokens at page_size=16 = 128 pages
-        let num_pages = 128;
+        // Enough pages for max_position_embeddings (32768) at page_size=16
+        let num_pages = 2048;
         let kv_pool = crate::kv_pool::KvPool::new(
             &ctx,
             config.num_hidden_layers,

@@ -35,7 +35,9 @@ impl GenerationState for Qwen3State {
 
     fn reset(&mut self) -> Result<()> {
         self.kv_state.reset();
-        self.graph_state = CudaGraphState::new();
+        // graph_state is intentionally kept — topology is identical across
+        // requests (same kernels, same buffer pointers). Only metadata values
+        // change, and those are updated via memcpy_htod before each launch.
         self.prefill_logits = None;
         Ok(())
     }
@@ -73,9 +75,8 @@ impl ModelForward for Qwen3Model {
             let hidden = self.process_all_layers_batch(hidden, start_pos, &mut state.kv_state)?;
             let logits = self.compute_logits_batch(&hidden)?;
             state.prefill_logits = Some(logits);
-
-            // Invalidate graph — page layout changed after prefill
-            state.graph_state = CudaGraphState::new();
+            // Graph is kept — page metadata is updated via memcpy_htod before
+            // each decode launch, so replay reads the correct post-prefill state.
         }
         Ok(())
     }
