@@ -39,23 +39,28 @@ pub(crate) struct DecodeBuffers {
     pub(crate) sample_probs: CudaSlice<f32>,
     /// Pre-allocated sampling output (1 element, token id)
     pub(crate) sample_out: CudaSlice<i32>,
-    /// Split-KV partial output accumulator: [num_qheads * NUM_KV_SPLITS * HEAD_DIM] f32
-    pub(crate) partial_out: CudaSlice<f32>,
-    /// Split-KV partial max: [num_qheads * NUM_KV_SPLITS] f32
-    pub(crate) partial_m: CudaSlice<f32>,
-    /// Split-KV partial sum: [num_qheads * NUM_KV_SPLITS] f32
-    pub(crate) partial_l: CudaSlice<f32>,
+
+    // -- Paged attention metadata (CUDA Graph safe) --
+    // Updated via memcpy_htod before each decode step.
+    /// GPU page indices for this request [max_pages capacity]
+    pub(crate) page_indices_d: CudaSlice<i32>,
+    /// GPU page indptr [2]: [0, num_pages] for batch_size=1
+    pub(crate) page_indptr_d: CudaSlice<i32>,
+    /// GPU last page occupancy [1]
+    pub(crate) last_page_len_d: CudaSlice<i32>,
+    /// GPU request indices [1]: constant [0] for batch_size=1
+    pub(crate) request_indices_d: CudaSlice<i32>,
+    /// GPU KV tile indices [1]: constant [0] for non-partition
+    pub(crate) kv_tile_indices_d: CudaSlice<i32>,
+    /// GPU KV chunk size [1]: [seq_len], updated per step
+    pub(crate) kv_chunk_size_d: CudaSlice<i32>,
 }
 
 impl DecodeBuffers {
-    /// NUM_KV_SPLITS must match the Triton AOT compile-time constant.
-    const NUM_KV_SPLITS: usize = 4;
-
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config, max_pages: usize) -> Result<Self> {
         let h = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let num_qheads = config.num_attention_heads;
 
         Ok(Self {
             normed: DeviceVec::zeros(ctx, h)?,
@@ -80,18 +85,59 @@ impl DecodeBuffers {
                 .stream
                 .alloc_zeros(1)
                 .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?,
-            partial_out: ctx
+            // Paged attention metadata — pre-allocated for CUDA Graph pointer stability
+            page_indices_d: ctx
                 .stream
-                .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS * config.head_dim)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_out failed: {}", e))?,
-            partial_m: ctx
+                .alloc_zeros(max_pages)
+                .map_err(|e| anyhow::anyhow!("Alloc page_indices_d failed: {}", e))?,
+            page_indptr_d: ctx
                 .stream
-                .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_m failed: {}", e))?,
-            partial_l: ctx
+                .alloc_zeros(2)
+                .map_err(|e| anyhow::anyhow!("Alloc page_indptr_d failed: {}", e))?,
+            last_page_len_d: ctx
                 .stream
-                .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {}", e))?,
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc last_page_len_d failed: {}", e))?,
+            request_indices_d: ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("Alloc request_indices_d failed: {}", e))?,
+            kv_tile_indices_d: ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("Alloc kv_tile_indices_d failed: {}", e))?,
+            kv_chunk_size_d: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc kv_chunk_size_d failed: {}", e))?,
         })
+    }
+
+    /// Sync paged attention metadata from KvState to pre-allocated GPU buffers.
+    /// Must be called BEFORE CUDA Graph capture/replay.
+    pub(crate) fn sync_paged_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_state: &crate::kv_pool::KvState,
+    ) -> Result<()> {
+        let page_indices = kv_state.page_indices_i32();
+        let num_pages = kv_state.num_pages() as i32;
+        let last_page_len = kv_state.last_page_len() as i32;
+        let seq_len = kv_state.seq_len() as i32;
+
+        ctx.stream
+            .memcpy_htod(&page_indices, &mut self.page_indices_d)
+            .map_err(|e| anyhow::anyhow!("sync page_indices failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&[0i32, num_pages], &mut self.page_indptr_d)
+            .map_err(|e| anyhow::anyhow!("sync page_indptr failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&[last_page_len], &mut self.last_page_len_d)
+            .map_err(|e| anyhow::anyhow!("sync last_page_len failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&[seq_len], &mut self.kv_chunk_size_d)
+            .map_err(|e| anyhow::anyhow!("sync kv_chunk_size failed: {e}"))?;
+
+        Ok(())
     }
 }

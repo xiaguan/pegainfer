@@ -2,7 +2,8 @@ use anyhow::Result;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::kv_pool::KvState;
+use crate::kv_pool::{KvLayout, KvState};
+use crate::model::cuda_graph::CudaGraphState;
 use crate::ops;
 
 impl Qwen3Model {
@@ -12,6 +13,7 @@ impl Qwen3Model {
         token_id: u32,
         kv_state: &mut KvState,
         bufs: &mut DecodeBuffers,
+        graph_state: &mut CudaGraphState,
     ) -> Result<()> {
         let pos = kv_state.seq_len();
 
@@ -21,7 +23,9 @@ impl Qwen3Model {
         kv_state.ensure_capacity(pos + 1)?;
         kv_state.advance(1);
 
-        // Upload GPU metadata (embedding kernel reads token_id from here)
+        // --- Sync metadata to GPU (before graph — stable pointers, varying data) ---
+
+        // decode_meta: [token_id, position, seq_len_after]
         self.ctx
             .stream
             .memcpy_htod(
@@ -30,12 +34,30 @@ impl Qwen3Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
-        self.decode_kernels_paged(kv_state, bufs)?;
+        // Paged attention metadata
+        bufs.sync_paged_meta(&self.ctx, kv_state)?;
+
+        // --- GPU kernels (captured into CUDA Graph on first call) ---
+        let layout = *kv_state.layout();
+        if self.enable_cuda_graph {
+            let kv_buffer = kv_state.buffer();
+            graph_state.run_or_capture(&self.ctx, || {
+                self.decode_kernels_paged(kv_buffer, &layout, bufs)
+            })?;
+        } else {
+            let kv_buffer = kv_state.buffer();
+            self.decode_kernels_paged(kv_buffer, &layout, bufs)?;
+        }
 
         Ok(())
     }
 
-    fn decode_kernels_paged(&self, kv_state: &KvState, bufs: &mut DecodeBuffers) -> Result<()> {
+    fn decode_kernels_paged(
+        &self,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &KvLayout,
+        bufs: &mut DecodeBuffers,
+    ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_layers = self.layers.len();
 
@@ -54,12 +76,8 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        let desc = kv_state.desc();
-        // RoPE position = index of the new token = seq_len - 1 (after advance)
-        let position = kv_state.seq_len() - 1;
-
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.decode_layer_paged(layer_idx, layer, &desc, position, bufs)?;
+            self.decode_layer_paged(layer_idx, layer, kv_buffer, layout, bufs)?;
 
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
@@ -90,8 +108,8 @@ impl Qwen3Model {
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
-        desc: &crate::kv_pool::KvDesc<'_>,
-        position: usize,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &KvLayout,
         bufs: &mut DecodeBuffers,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -116,7 +134,7 @@ impl Qwen3Model {
             &mut bufs.v,
         )?;
 
-        // QK RMSNorm + RoPE (in-place)
+        // QK RMSNorm + RoPE (reads position from decode_meta[1])
         ops::qk_norm_rope_into(
             &self.ctx,
             &mut bufs.q,
@@ -125,21 +143,28 @@ impl Qwen3Model {
             &layer.attention.k_norm,
             &self.cos_cache,
             &self.sin_cache,
+            &bufs.decode_meta,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             self.config.head_dim,
-            position,
             eps,
         );
 
-        // KV append + paged attention (FlashInfer)
+        // KV append + paged attention (FlashInfer, pre-allocated metadata)
         ops::paged_attention_decode_into(
             &self.ctx,
             &bufs.q,
             &bufs.k,
             &bufs.v,
-            desc,
+            kv_buffer,
+            layout,
             layer_idx,
+            &bufs.page_indices_d,
+            &bufs.page_indptr_d,
+            &bufs.last_page_len_d,
+            &bufs.request_indices_d,
+            &bufs.kv_tile_indices_d,
+            &bufs.kv_chunk_size_d,
             &mut bufs.attn_out,
             self.config.num_attention_heads,
         )?;

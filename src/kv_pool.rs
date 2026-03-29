@@ -135,6 +135,40 @@ impl KvState {
         self.seq_len
     }
 
+    pub(crate) fn num_pages(&self) -> usize {
+        self.permit.pages().len()
+    }
+
+    pub(crate) fn last_page_len(&self) -> usize {
+        if self.seq_len == 0 {
+            0
+        } else {
+            let rem = self.seq_len % self.pool.inner.layout.page_size;
+            if rem == 0 {
+                self.pool.inner.layout.page_size
+            } else {
+                rem
+            }
+        }
+    }
+
+    /// Page indices as i32 for GPU upload.
+    pub(crate) fn page_indices_i32(&self) -> Vec<i32> {
+        self.permit
+            .pages()
+            .iter()
+            .map(|p| p.index() as i32)
+            .collect()
+    }
+
+    pub(crate) fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.pool.inner.buffer
+    }
+
+    pub(crate) fn layout(&self) -> &KvLayout {
+        &self.pool.inner.layout
+    }
+
     /// Ensure capacity for at least `token_count` tokens total.
     pub(crate) fn ensure_capacity(&mut self, token_count: usize) -> Result<()> {
         let needed = pages_needed(token_count, self.pool.inner.layout.page_size);
@@ -159,23 +193,12 @@ impl KvState {
 
     /// Build kernel-facing metadata for this request's KV.
     pub(crate) fn desc(&self) -> KvDesc<'_> {
-        let pages = self.permit.pages();
-        let last_page_len = if self.seq_len == 0 {
-            0
-        } else {
-            let rem = self.seq_len % self.pool.inner.layout.page_size;
-            if rem == 0 {
-                self.pool.inner.layout.page_size
-            } else {
-                rem
-            }
-        };
         KvDesc {
             layout: self.pool.inner.layout,
             buffer: &self.pool.inner.buffer,
-            pages,
+            pages: self.permit.pages(),
             seq_len: self.seq_len,
-            last_page_len,
+            last_page_len: self.last_page_len(),
         }
     }
 

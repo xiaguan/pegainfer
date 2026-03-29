@@ -20,7 +20,7 @@ fn paged_attention_single_token_decode() {
     let model = Qwen3Model::from_safetensors_with_runtime(
         &model_path,
         ModelRuntimeConfig {
-            enable_cuda_graph: false,
+            enable_cuda_graph: true,
         },
     )
     .expect("Failed to load model");

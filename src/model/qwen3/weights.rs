@@ -3,7 +3,6 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::Config;
-use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
     load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards, precompute_rope,
@@ -217,88 +216,17 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
-            // CUDA Graph disabled: paged attention metadata allocs per-call
-            enable_cuda_graph: false,
+            enable_cuda_graph: _runtime.enable_cuda_graph,
             kv_pool,
         };
 
         if model.enable_cuda_graph {
-            debug!("Preloading decode-path Triton kernels before CUDA Graph capture");
-            model.preload_decode_triton_kernels()?;
-            debug!("Decode path CUDA Graph is enabled");
+            debug!("Decode path CUDA Graph is enabled (captures on first decode step)");
         } else {
             debug!("Decode path CUDA Graph is disabled");
         }
 
         Ok(model)
-    }
-
-    fn preload_decode_triton_kernels(&self) -> Result<()> {
-        let hidden_size = self.config.hidden_size;
-        let q_dim = self.config.num_attention_heads * self.config.head_dim;
-        let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
-        let cache_len = self.config.num_key_value_heads * 4096 * self.config.head_dim;
-        let dummy_token_id = 0_i32;
-        let dummy_pos = 0_i32;
-        let dummy_seq_len = 1_i32;
-
-        let decode_meta = self
-            .ctx
-            .stream
-            .clone_htod(&[dummy_token_id, dummy_pos, dummy_seq_len])
-            .map_err(|e| anyhow::anyhow!("Preload decode_meta H2D failed: {}", e))?;
-        let mut embed_out = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        ops::embedding_decode_into(&self.ctx, &self.embed_tokens, &decode_meta, &mut embed_out)?;
-
-        let layer0 = &self.layers[0];
-        let q = DeviceVec::zeros(&self.ctx, q_dim)?;
-        let k = DeviceVec::zeros(&self.ctx, kv_dim)?;
-        let v = DeviceVec::zeros(&self.ctx, kv_dim)?;
-        let mut k_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
-        let mut v_cache = DeviceVec::zeros(&self.ctx, cache_len)?;
-        let mut out = DeviceVec::zeros(&self.ctx, q_dim)?;
-
-        let num_qheads = self.config.num_attention_heads;
-        let head_dim = self.config.head_dim;
-        let num_kv_splits = 4usize;
-        let mut partial_out = self
-            .ctx
-            .stream
-            .alloc_zeros::<f32>(num_qheads * num_kv_splits * head_dim)
-            .map_err(|e| anyhow::anyhow!("Alloc partial_out failed: {}", e))?;
-        let mut partial_m = self
-            .ctx
-            .stream
-            .alloc_zeros::<f32>(num_qheads * num_kv_splits)
-            .map_err(|e| anyhow::anyhow!("Alloc partial_m failed: {}", e))?;
-        let mut partial_l = self
-            .ctx
-            .stream
-            .alloc_zeros::<f32>(num_qheads * num_kv_splits)
-            .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {}", e))?;
-
-        ops::fused_attention_decode_into(
-            &self.ctx,
-            &q,
-            &k,
-            &v,
-            &layer0.attention.q_norm,
-            &layer0.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
-            &decode_meta,
-            &mut k_cache,
-            &mut v_cache,
-            &mut out,
-            &mut partial_out,
-            &mut partial_m,
-            &mut partial_l,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-        )?;
-
-        self.ctx.sync()?;
-        Ok(())
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {

@@ -13,7 +13,7 @@ mod tests;
 
 // pub re-exports
 pub use attention::{
-    fused_attention_decode_into, prefill_attention_batch, prefill_attention_hd256_batch,
+    prefill_attention_batch, prefill_attention_hd256_batch,
     prefill_attention_hd256_batch_with_scratch,
 };
 pub use elementwise::{add_batch, silu_mul_batch};

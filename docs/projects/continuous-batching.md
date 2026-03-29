@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1: FlashInfer paged attention landed for Qwen3 decode (bs=1). Exact greedy parity with baseline, TPOT ~11.26ms. Next: CUDA Graph re-enable, batch decode (Phase 2).
+> **Status:** Active. Phase 1 complete: FlashInfer paged attention + CUDA Graph for Qwen3 decode. TPOT 10.56ms (p50), 10.6% faster than pre-paged baseline. Next: Phase 2 (batch decode).
 
 ## Motivation
 
@@ -97,16 +97,23 @@ FlashInfer's `paged_kv_t` uses separate `k_data`/`v_data` pointers with custom s
 
 FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged layout. For paged KV at bs=1, we use `BatchDecodeWithPagedKVCacheDispatched` with `batch_size=1`, `partition_kv=false`. The kernel template always accesses `request_indices`/`kv_tile_indices` (even when not partitioning), so we provide trivial GPU arrays `[0]`.
 
-- Paged attention wired into Qwen3 decode path as the **only** decode attention. `KvPool` always created, `KvState` per-request, CUDA Graph disabled (Phase 1: metadata arrays allocated per-call).
+- Paged attention wired into Qwen3 decode path as the **only** decode attention. `KvPool` always created, `KvState` per-request.
 - FlashInfer decode kernel validated end-to-end: 10-token single-prompt generation passes, determinism verified. 50-token multi-token prompt generation produces coherent output (confirms kernel correctness), but differs from baseline (prefill→paged gap, see below).
-
 - Prefill→paged scatter: after prefill writes to contiguous KV cache, `scatter_kv_to_paged` copies all layers into paged layout via FlashInfer's `AppendPagedKVCache` kernel. Bridges HND (contiguous) → NHD (paged) per-layer.
+- **CUDA Graph re-enabled** for paged attention decode. Two blockers resolved:
+  1. **Per-call GPU allocations** — 6× `clone_htod` in `paged_attention_decode_into` replaced with pre-allocated `CudaSlice<i32>` buffers in `DecodeBuffers`. Updated via `memcpy_htod` before graph capture/replay (stable pointers, varying data).
+  2. **RoPE position as kernel parameter** — `qk_norm_rope_cuda` modified to read position from `decode_meta[1]` (device memory) instead of a baked-in int. Kernel reads via `__ldg(start_pos_d)` when pointer is non-null; prefill path passes `nullptr` (unchanged).
+- Dead code removed: old Triton split-KV scratch buffers (`partial_out/m/l`) and `preload_decode_triton_kernels()`.
 
-**Result:** Full e2e greedy parity with baseline on Qwen3-4B. All 45 tests pass. TPOT ~11.26ms (88.8 tok/s).
+**Result:** Full e2e greedy parity on Qwen3-4B. All 46 tests pass.
 
-Next:
-- Re-enable CUDA Graph with pre-allocated metadata buffers.
-- Phase 2: batch decode (multiple requests sharing KvPool).
+| Configuration | TPOT p50 | vs baseline |
+|---|---|---|
+| Old path (Triton split-KV + CUDA Graph) | 11.81ms | — |
+| FlashInfer paged, no CUDA Graph | 11.30ms | −4.3% |
+| FlashInfer paged + CUDA Graph | **10.56ms** | **−10.6%** |
+
+Phase 1 complete. Next: Phase 2 (batch decode).
 
 ### Phase 2: Scheduler + Batch Decode
 

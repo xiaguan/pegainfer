@@ -208,39 +208,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA Attention — decode variant (Triton AOT, split-KV, HEAD_DIM=128)
-    // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
-    // Writes partial results to partial_out/m/l (FP32). Call attention_decode_reduce after.
-    pub(crate) fn fused_gqa_attention_decode(
-        q_full: *const Half,
-        k_full: *const Half,
-        v_full: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache_base: *const Half,
-        sin_cache_base: *const Half,
-        decode_meta: *const i32,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // Attention reduce: merge split-KV partials into final bf16 output.
-    pub(crate) fn attention_decode_reduce(
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        output: *mut Half,
-        num_qheads: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // ========================================================================
     // Qwen3.5 kernels
     // ========================================================================
@@ -418,7 +385,8 @@ unsafe extern "C" {
     // Paged attention (FlashInfer)
     // ========================================================================
 
-    // QK RMSNorm + RoPE for decode (seq_len=1). Modifies q and k in-place.
+    // QK RMSNorm + RoPE for decode (seq_len=1, CUDA Graph safe).
+    // Reads position from decode_meta[1] on device.
     pub(crate) fn qk_norm_rope_cuda(
         q: *mut Half,
         k: *mut Half,
@@ -429,7 +397,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
-        position: i32,
+        decode_meta: *const i32,
         rms_eps: f32,
         stream: CUstream,
     );

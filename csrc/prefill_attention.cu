@@ -17,7 +17,9 @@ __global__ void prefill_qk_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ cos_cache,      // [max_pos * head_dim]
     const __nv_bfloat16* __restrict__ sin_cache,
     int num_q_heads, int num_kv_heads, int head_dim,
-    int seq_len, int q_dim, int kv_dim, int start_pos, float eps
+    int seq_len, int q_dim, int kv_dim, int start_pos,
+    const int* start_pos_d,  // if non-null, *start_pos_d overrides start_pos (CUDA Graph safe)
+    float eps
 ) {
     int head_global = blockIdx.x;
     int token = blockIdx.y;
@@ -60,7 +62,8 @@ __global__ void prefill_qk_norm_rope_kernel(
     __syncthreads();
 
     int half = head_dim / 2;
-    int pos = start_pos + token;
+    int actual_start_pos = start_pos_d ? __ldg(start_pos_d) : start_pos;
+    int pos = actual_start_pos + token;
 
     __nv_bfloat16 result;
     if (d < half) {
@@ -146,7 +149,7 @@ void prefill_attention_prep_cuda(
         q_batch, k_batch, q_norm_weight, k_norm_weight,
         cos_cache, sin_cache,
         num_q_heads, num_kv_heads, head_dim,
-        seq_len, q_dim, kv_dim, start_pos, rms_eps
+        seq_len, q_dim, kv_dim, start_pos, /*start_pos_d=*/nullptr, rms_eps
     );
 
     // Step 2: Write K, V to cache
@@ -160,8 +163,8 @@ void prefill_attention_prep_cuda(
 // ============================================================================
 // C API: QK norm + RoPE only (no cache write) for decode with paged attention.
 //
-// Reuses prefill_qk_norm_rope_kernel with seq_len=1.
-// Modifies q and k in-place.
+// CUDA Graph safe: reads position from decode_meta[1] on device.
+// decode_meta layout: [token_id, position, seq_len] as int32 on GPU.
 // ============================================================================
 void qk_norm_rope_cuda(
     __nv_bfloat16* q,                    // [num_q_heads * head_dim] in-place
@@ -173,7 +176,7 @@ void qk_norm_rope_cuda(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    int position,                        // current token position
+    const int* decode_meta,              // GPU: [token_id, position, seq_len]
     float rms_eps,
     cudaStream_t stream
 ) {
@@ -185,7 +188,9 @@ void qk_norm_rope_cuda(
         q, k, q_norm_weight, k_norm_weight,
         cos_cache, sin_cache,
         num_q_heads, num_kv_heads, head_dim,
-        /*seq_len=*/1, q_dim, kv_dim, /*start_pos=*/position, rms_eps
+        /*seq_len=*/1, q_dim, kv_dim, /*start_pos=*/0,
+        /*start_pos_d=*/decode_meta + 1,  // points to position field
+        rms_eps
     );
 }
 

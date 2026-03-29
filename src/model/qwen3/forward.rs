@@ -5,6 +5,7 @@ use rand::rngs::StdRng;
 use super::decode_buffers::DecodeBuffers;
 use super::weights::Qwen3Model;
 use crate::kv_pool::KvState;
+use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
@@ -18,6 +19,8 @@ pub struct Qwen3State {
     pub(super) kv_cache: KVCache,
     /// Paged KV state — used by decode path (FlashInfer).
     pub(super) kv_state: KvState,
+    /// CUDA Graph state for decode path — captures on first token, replays after.
+    pub(super) graph_state: CudaGraphState,
     /// Logits from multi-token prefill (None after decode path — logits are in decode_bufs).
     pub(super) prefill_logits: Option<DeviceVec>,
 }
@@ -36,6 +39,7 @@ impl GenerationState for Qwen3State {
     fn reset(&mut self) -> Result<()> {
         self.kv_cache.reset();
         self.kv_state.reset();
+        self.graph_state = CudaGraphState::new();
         self.prefill_logits = None;
         Ok(())
     }
@@ -46,19 +50,29 @@ impl ModelForward for Qwen3Model {
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
-            decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
+            decode_bufs: DecodeBuffers::new(
+                &self.ctx,
+                &self.config,
+                self.kv_pool.capacity_pages(),
+            )?,
             kv_cache: KVCache::new(
                 self.config.num_hidden_layers,
                 self.config.num_key_value_heads,
             ),
             kv_state: self.kv_pool.alloc(),
+            graph_state: CudaGraphState::new(),
             prefill_logits: None,
         })
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         if tokens.len() == 1 {
-            self.decode_one_token(tokens[0], &mut state.kv_state, &mut state.decode_bufs)?;
+            self.decode_one_token(
+                tokens[0],
+                &mut state.kv_state,
+                &mut state.decode_bufs,
+                &mut state.graph_state,
+            )?;
             state.prefill_logits = None;
         } else {
             // Prefill uses contiguous KV cache, then scatters into paged layout.
@@ -74,6 +88,9 @@ impl ModelForward for Qwen3Model {
             state.kv_state.advance(seq_len);
             let desc = state.kv_state.desc();
             ops::scatter_kv_to_paged(&self.ctx, &state.kv_cache, &desc)?;
+
+            // Invalidate graph — page layout changed after prefill scatter
+            state.graph_state = CudaGraphState::new();
         }
         Ok(())
     }

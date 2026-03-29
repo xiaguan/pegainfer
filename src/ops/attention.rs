@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
 
 use crate::ffi;
 use crate::kv_pool::KvDesc;
@@ -281,91 +282,13 @@ pub fn prefill_attention_hd256_batch_with_scratch(
     Ok(())
 }
 
-/// Fused GQA Attention for decode (Triton AOT, split-KV, HEAD_DIM=128).
-/// Reads pos/seq_len from decode_meta — CUDA Graph safe.
-/// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
-/// decode_meta: [token_id, current_pos, seq_len] on GPU.
-/// partial_out/m/l: pre-allocated FP32 scratch for split-KV intermediates.
-#[allow(clippy::too_many_arguments)]
-pub fn fused_attention_decode_into(
-    ctx: &DeviceContext,
-    q_full: &DeviceVec,
-    k_full: &DeviceVec,
-    v_full: &DeviceVec,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_cache_base: &DeviceVec,
-    sin_cache_base: &DeviceVec,
-    decode_meta: &CudaSlice<i32>,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    output: &mut DeviceVec,
-    partial_out: &mut CudaSlice<f32>,
-    partial_m: &mut CudaSlice<f32>,
-    partial_l: &mut CudaSlice<f32>,
-    num_qheads: usize,
-    num_kvheads: usize,
-) -> Result<()> {
-    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
-    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
-    let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gcos) = cos_cache_base.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gsin) = sin_cache_base.data.device_ptr(&ctx.stream);
-    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
-    let (k_cache_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-    let (v_cache_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (partial_out_ptr, _gpo) = partial_out.device_ptr_mut(&ctx.stream);
-    let (partial_m_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
-    let (partial_l_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
-
-    // Phase 1: split-KV attention (writes partials)
-    let result = unsafe {
-        ffi::fused_gqa_attention_decode(
-            q_ptr as *const ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            q_norm_ptr as *const ffi::Half,
-            k_norm_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            meta_ptr as *const i32,
-            k_cache_ptr as *mut ffi::Half,
-            v_cache_ptr as *mut ffi::Half,
-            partial_out_ptr as *mut f32,
-            partial_m_ptr as *mut f32,
-            partial_l_ptr as *mut f32,
-            num_qheads as i32,
-            num_kvheads as i32,
-            (num_qheads / num_kvheads) as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-
-    // Phase 2: reduce partials → final bf16 output
-    let result = unsafe {
-        ffi::attention_decode_reduce(
-            partial_out_ptr as *mut f32,
-            partial_m_ptr as *mut f32,
-            partial_l_ptr as *mut f32,
-            out_ptr as *mut ffi::Half,
-            num_qheads as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-
-    Ok(())
-}
-
 // ============================================================================
 // Paged attention decode (FlashInfer)
 // ============================================================================
 
-/// QK RMSNorm + RoPE for a single decode token. Modifies q and k in-place.
+/// QK RMSNorm + RoPE for a single decode token (CUDA Graph safe).
+///
+/// Reads position from `decode_meta[1]` on device. Modifies q and k in-place.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qk_norm_rope_into(
     ctx: &DeviceContext,
@@ -375,10 +298,10 @@ pub(crate) fn qk_norm_rope_into(
     k_norm_weight: &DeviceVec,
     cos_cache: &DeviceVec,
     sin_cache: &DeviceVec,
+    decode_meta: &CudaSlice<i32>,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    position: usize,
     rms_eps: f32,
 ) {
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
@@ -387,6 +310,7 @@ pub(crate) fn qk_norm_rope_into(
     let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (meta_ptr, _gm) = decode_meta.device_ptr(&ctx.stream);
 
     unsafe {
         ffi::qk_norm_rope_cuda(
@@ -399,7 +323,7 @@ pub(crate) fn qk_norm_rope_into(
             num_q_heads as i32,
             num_kv_heads as i32,
             head_dim as i32,
-            position as i32,
+            meta_ptr as *const i32,
             rms_eps,
             ctx.stream.cu_stream(),
         );
@@ -408,20 +332,27 @@ pub(crate) fn qk_norm_rope_into(
 
 /// Append one K/V token to paged cache, then run FlashInfer paged attention decode.
 ///
-/// Pipeline: KV append → paged attention. Caller must run `qk_norm_rope_into`
-/// on q/k before this call.
+/// All GPU metadata (`page_indices_d` through `kv_chunk_size_d`) must be
+/// pre-allocated and updated via `memcpy_htod` before this call.
+/// This makes the function CUDA Graph safe — no GPU allocations inside.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paged_attention_decode_into(
     ctx: &DeviceContext,
     q: &DeviceVec,
     k: &DeviceVec,
     v: &DeviceVec,
-    desc: &KvDesc<'_>,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &crate::kv_pool::KvLayout,
     layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    kv_tile_indices_d: &CudaSlice<i32>,
+    kv_chunk_size_d: &CudaSlice<i32>,
     output: &mut DeviceVec,
     num_qo_heads: usize,
 ) -> Result<()> {
-    let layout = desc.layout();
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
@@ -431,24 +362,7 @@ pub(crate) fn paged_attention_decode_into(
     let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
     let stride_page = layout.page_stride as i64;
 
-    // Upload small metadata arrays to GPU.
-    // Phase 1: allocate per-call. Phase 2 will pre-allocate in KvState.
-    let page_indices_i32: Vec<i32> = desc
-        .page_indices()
-        .iter()
-        .map(|p| p.index() as i32)
-        .collect();
-    let page_indices_d: CudaSlice<i32> = ctx.stream.clone_htod(&page_indices_i32)?;
-    let num_pages = desc.num_pages() as i32;
-    let page_indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32, num_pages])?;
-    let last_page_len_d: CudaSlice<i32> = ctx.stream.clone_htod(&[desc.last_page_len() as i32])?;
-
-    // Trivial plan metadata for batch_size=1, non-partition
-    let request_indices_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32])?;
-    let kv_tile_indices_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32])?;
-    let kv_chunk_size_d: CudaSlice<i32> = ctx.stream.clone_htod(&[desc.seq_len() as i32])?;
-
-    let (buf_ptr, _gbuf) = desc.buffer().device_ptr(&ctx.stream);
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
     let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
