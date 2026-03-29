@@ -232,4 +232,23 @@ impl Qwen3Model {
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
+
+    /// Allocate a fresh (empty) per-request KV state from the shared pool.
+    pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
+        self.kv_pool.alloc()
+    }
+
+    /// Create pre-allocated batch decode buffers.
+    pub(crate) fn create_batch_decode_bufs(
+        &self,
+        max_batch_size: usize,
+    ) -> anyhow::Result<super::batch_decode_buffers::BatchDecodeBuffers> {
+        super::batch_decode_buffers::BatchDecodeBuffers::new(
+            &self.ctx,
+            &self.config,
+            max_batch_size,
+            self.kv_pool.capacity_pages(),
+            self.kv_pool.padding_page_id(),
+        )
+    }
 }

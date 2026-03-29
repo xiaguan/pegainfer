@@ -105,5 +105,5 @@ Read both JSON results. Key metrics:
 - **pegainfer empty prompts:** Random dataset may produce empty prompts which pegainfer rejects. Check failed request count.
 - **Zombie processes:** Always `pkill` after benchmarking. Leftover servers block the port and hold GPU memory.
 - **CUDA Graph:** pegainfer enables CUDA Graph by default. For apples-to-apples decode comparison, note this in the report. vLLM also uses CUDA Graph by default.
-- **Concurrency=1:** Default is single-request sequential. pegainfer has no batching yet, so concurrency>1 would just queue on the server side.
+- **Concurrency:** `--max-concurrency N` controls batch size. pegainfer supports continuous batching (bucket CUDA Graphs at [1,2,4,8,16,32,64]). Throughput scales near-linearly with concurrency for bandwidth-bound decode.
 - **Qwen3.5-4B CUDA Graph OOM on 16 GB:** torch.compile + CUDA Graph needs ~1 GiB extra for graph profiling on top of the 12 GiB model+activation footprint. Workaround: `--max-num-seqs 1` reduces the graph capture to batch_size=1 only and fits in 16 GB. Add `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for marginal help.

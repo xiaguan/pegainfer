@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::server_engine::{CompleteOutput, StreamDelta};
+use crate::server_engine::StreamDelta;
 
 // OpenAI-compatible /v1/completions request
 #[derive(Debug, Deserialize)]
@@ -68,22 +68,28 @@ struct Usage {
 }
 
 impl CompletionResponse {
-    pub(super) fn from_output(model: String, created: u64, output: CompleteOutput) -> Self {
+    pub(super) fn from_parts(
+        model: String,
+        created: u64,
+        text: String,
+        finish_reason: crate::server_engine::FinishReason,
+        usage: crate::server_engine::Usage,
+    ) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4()),
             object: "text_completion",
             created,
             model,
             choices: vec![Choice {
-                text: output.text,
+                text,
                 index: 0,
                 logprobs: None,
-                finish_reason: output.finish_reason.as_openai_str().to_string(),
+                finish_reason: finish_reason.as_openai_str().to_string(),
             }],
             usage: Usage {
-                prompt_tokens: output.usage.prompt_tokens,
-                completion_tokens: output.usage.completion_tokens,
-                total_tokens: output.usage.total_tokens,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
             },
         }
     }
@@ -112,7 +118,7 @@ impl StreamChunk {
         request_id: &str,
         created: u64,
         model: &str,
-        delta: StreamDelta,
+        delta: &StreamDelta,
     ) -> Self {
         Self {
             id: request_id.to_string(),
@@ -120,7 +126,7 @@ impl StreamChunk {
             created,
             model: model.to_string(),
             choices: vec![StreamChoice {
-                text: delta.text_delta,
+                text: delta.text_delta.clone(),
                 index: 0,
                 logprobs: None,
                 finish_reason: delta

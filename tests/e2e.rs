@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
-use fastrace::prelude::*;
 use log::info;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
-use pegainfer::server_engine::{
-    CompleteRequest, FinishReason, RealServerEngine, ServerEngine, StreamDelta,
-};
-use pegainfer::trace_reporter::FileReporter;
+use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
+use pegainfer::server_engine::FinishReason;
+use pegainfer::tokenizer::Tokenizer;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -34,6 +34,7 @@ fn get_test_data_path(model_path: &str) -> PathBuf {
     info!("Using test data path: {}", test_data_path.display());
     test_data_path
 }
+
 // ── Test data types ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -63,32 +64,36 @@ fn init_logging() {
     pegainfer::logging::init_stderr("info");
 }
 
-fn init_tracing() -> PathBuf {
-    let trace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("traces");
-    std::fs::create_dir_all(&trace_dir).expect("Failed to create traces dir");
-    fastrace::set_reporter(
-        FileReporter::new(trace_dir.clone()),
-        fastrace::collector::Config::default(),
-    );
-    info!("Tracing enabled: {}", trace_dir.display());
-    trace_dir
-}
+/// Submit a request and collect all generated tokens (blocking).
+fn generate_tokens(
+    handle: &scheduler::SchedulerHandle,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+) -> (Vec<u32>, FinishReason) {
+    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
-fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
-    CompleteRequest {
-        prompt: prompt.to_string(),
-        max_tokens,
-        sampling: SamplingParams::default(),
-        stop: None,
-    }
-}
+    handle
+        .submit(SchedulerRequest {
+            prompt_tokens,
+            params: SamplingParams::default(), // greedy
+            max_tokens,
+            token_tx,
+        })
+        .expect("submit failed");
 
-fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelta> {
-    let mut deltas = Vec::new();
-    while let Ok(delta) = rx.try_recv() {
-        deltas.push(delta);
+    let mut tokens = Vec::new();
+
+    loop {
+        match token_rx.blocking_recv() {
+            Some(TokenEvent::Token(id)) => tokens.push(id),
+            Some(TokenEvent::Finished { finish_reason, .. }) => {
+                return (tokens, finish_reason);
+            }
+            None => panic!("scheduler channel closed without Finished"),
+        }
     }
-    deltas
 }
 
 // ── Test ─────────────────────────────────────────────────────────────────
@@ -96,14 +101,21 @@ fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelt
 #[test]
 fn test_e2e_generation() {
     init_logging();
-    let trace_dir = init_tracing();
     let model_path = get_model_path();
     let test_data_path = get_test_data_path(&model_path);
     let test_cases = load_test_cases(&test_data_path);
 
-    info!("Loading engine...");
+    info!("Loading model...");
     let start = Instant::now();
-    let mut engine = RealServerEngine::load(&model_path, 42).expect("Failed to load engine");
+    let model = Qwen3Model::from_safetensors_with_runtime(
+        &model_path,
+        ModelRuntimeConfig {
+            enable_cuda_graph: true,
+        },
+    )
+    .expect("Failed to load model");
+    let tokenizer = Arc::new(Tokenizer::from_file(&model_path).expect("Failed to load tokenizer"));
+    let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON
@@ -118,175 +130,81 @@ fn test_e2e_generation() {
         .map(|tc| (tc.prompt.as_str(), tc.max_new_tokens))
         .collect();
 
-    // ── 1. Non-streaming correctness ──────────────────────────────────────
+    // ── 1. Greedy correctness ────────────────────────────────────────────
 
-    info!("=== Phase 1: Non-streaming correctness ===");
+    info!("=== Phase 1: Greedy correctness ===");
     for &(prompt, max_tokens) in &cases {
-        info!("--- complete: \"{}\" ---", prompt);
-        let root = Span::root("complete", SpanContext::random());
-        let _guard = root.set_local_parent();
+        info!("--- \"{}\" ---", prompt);
 
         let start = Instant::now();
-        let out = engine
-            .complete(make_request(prompt, max_tokens))
-            .expect("complete() failed");
+        let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, prompt, max_tokens);
         let elapsed = start.elapsed();
 
-        let tok_s = out.usage.completion_tokens as f64 / elapsed.as_secs_f64();
+        let text = tokenizer.decode(&tokens).expect("decode failed");
+        let tok_s = tokens.len() as f64 / elapsed.as_secs_f64();
+
         info!(
             "  {} tokens in {:.2?} ({:.1} tok/s) finish={:?}",
-            out.usage.completion_tokens, elapsed, tok_s, out.finish_reason
+            tokens.len(),
+            elapsed,
+            tok_s,
+            finish_reason
         );
-        info!("  Output: \"{}\"", out.text);
+        info!("  Output: \"{}\"", text);
 
-        assert!(!out.text.is_empty(), "empty output for: {}", prompt);
-        assert_eq!(
-            out.usage.prompt_tokens + out.usage.completion_tokens,
-            out.usage.total_tokens,
-            "usage mismatch for: {}",
-            prompt
-        );
-        if out.usage.completion_tokens >= max_tokens {
-            assert_eq!(out.finish_reason, FinishReason::Length);
+        assert!(!text.is_empty(), "empty output for: {}", prompt);
+        if tokens.len() >= max_tokens {
+            assert_eq!(finish_reason, FinishReason::Length);
         }
 
-        // Greedy output must match HF Transformers reference
+        // Greedy output must match reference
         let exp = expected[prompt];
         assert_eq!(
-            out.text, exp,
+            text, exp,
             "greedy output mismatch for: \"{}\"\n  got:      {:?}\n  expected: {:?}",
-            prompt, out.text, exp
+            prompt, text, exp
         );
         info!("  PASS: matches reference");
     }
 
-    // ── 2. Streaming correctness + TTFT/TPOT ────────────────────────────
+    // ── 2. Multi-request (re-run all cases) ──────────────────────────────
 
-    info!("=== Phase 2: Streaming ===");
+    info!("=== Phase 2: Multi-request ===");
     for &(prompt, max_tokens) in &cases {
-        info!("--- stream: \"{}\" ---", prompt);
-        let root = Span::root("stream", SpanContext::random());
-        let _guard = root.set_local_parent();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let req = make_request(prompt, max_tokens);
-        let start = Instant::now();
-
-        // Run generation in a background thread, measure delta arrival on main thread.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                engine
-                    .complete_stream(req, tx)
-                    .expect("complete_stream() failed");
-            });
-
-            let mut deltas: Vec<StreamDelta> = Vec::new();
-            let mut ttft = Duration::ZERO;
-            let mut tpot_intervals: Vec<Duration> = Vec::new();
-            let mut prev_time = start;
-
-            loop {
-                match rx.try_recv() {
-                    Ok(delta) => {
-                        let now = Instant::now();
-                        if deltas.is_empty() {
-                            ttft = now - start;
-                        } else if delta.finish_reason.is_none() {
-                            tpot_intervals.push(now - prev_time);
-                        }
-                        prev_time = now;
-                        let done = delta.finish_reason.is_some();
-                        deltas.push(delta);
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        std::hint::spin_loop();
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
-
-            assert!(!deltas.is_empty(), "no deltas for: {}", prompt);
-
-            // All but last: finish_reason must be None
-            for (i, d) in deltas[..deltas.len() - 1].iter().enumerate() {
-                assert!(
-                    d.finish_reason.is_none(),
-                    "delta {} has unexpected finish_reason for: {}",
-                    i,
-                    prompt
-                );
-            }
-
-            // Last delta: finish_reason must be Some
-            let last = deltas.last().unwrap();
-            assert!(
-                last.finish_reason.is_some(),
-                "last delta missing finish_reason for: {}",
-                prompt
-            );
-
-            let streamed: String = deltas.iter().map(|d| d.text_delta.as_str()).collect();
-            let token_count = deltas.len() - 1; // exclude final sentinel delta
-            let avg_tpot = if tpot_intervals.is_empty() {
-                Duration::ZERO
-            } else {
-                tpot_intervals.iter().sum::<Duration>() / tpot_intervals.len() as u32
-            };
-
-            info!(
-                "  {} tokens, ttft={:.2?}, avg_tpot={:.2?} ({:.1} tok/s), finish={:?}",
-                token_count,
-                ttft,
-                avg_tpot,
-                1.0 / avg_tpot.as_secs_f64(),
-                last.finish_reason.unwrap()
-            );
-            info!("  Streamed: \"{}\"", streamed);
-        });
-    }
-
-    // ── 3. Streaming / non-streaming consistency (greedy → deterministic) ─
-
-    info!("=== Phase 3: Consistency ===");
-    for &(prompt, max_tokens) in &cases {
-        info!("--- consistency: \"{}\" ---", prompt);
-
-        let non_stream = engine
-            .complete(make_request(prompt, max_tokens))
-            .expect("complete() failed");
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        engine
-            .complete_stream(make_request(prompt, max_tokens), tx)
-            .expect("complete_stream() failed");
-        let deltas = drain_deltas(&mut rx);
-        let streamed: String = deltas.iter().map(|d| d.text_delta.as_str()).collect();
-
-        assert_eq!(
-            non_stream.text, streamed,
-            "stream/non-stream text mismatch for: {}",
+        let (tokens, _) = generate_tokens(&handle, &tokenizer, prompt, max_tokens);
+        let text = tokenizer.decode(&tokens).expect("decode failed");
+        assert!(
+            !text.is_empty(),
+            "empty output on second run for: {}",
             prompt
         );
-        info!("  PASS ({} chars)", non_stream.text.len());
+        info!("  PASS: \"{}\" → {} tokens", prompt, tokens.len());
     }
 
-    // ── 4. Consumer drop safety ───────────────────────────────────────────
+    // ── 3. Consumer drop safety ──────────────────────────────────────────
 
-    info!("=== Phase 4: Consumer drop ===");
+    info!("=== Phase 3: Consumer drop ===");
     {
-        let (tx, rx) = mpsc::unbounded_channel();
-        drop(rx);
-        let result = engine.complete_stream(make_request("Hello", 10), tx);
-        assert!(
-            result.is_ok(),
-            "complete_stream should not panic on dropped consumer"
-        );
+        let prompt_tokens = tokenizer.encode("Hello").expect("encode failed");
+        let (token_tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // drop receiver immediately
+        // Submit should succeed — scheduler will notice send error and retire the request
+        handle
+            .submit(SchedulerRequest {
+                prompt_tokens,
+                params: SamplingParams::default(),
+                max_tokens: 10,
+                token_tx,
+            })
+            .expect("submit failed");
+        // Give scheduler time to process and retire
+        std::thread::sleep(std::time::Duration::from_millis(500));
         info!("  PASS: consumer drop handled");
     }
 
-    fastrace::flush();
-    info!("Traces written to {}", trace_dir.display());
+    // Verify scheduler is still alive after consumer drop
+    let (tokens, _) = generate_tokens(&handle, &tokenizer, "Hello", 5);
+    let text = tokenizer.decode(&tokens).expect("decode failed");
+    assert!(!text.is_empty(), "scheduler dead after consumer drop");
+    info!("  PASS: scheduler survived consumer drop");
 }

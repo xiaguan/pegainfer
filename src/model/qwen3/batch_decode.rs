@@ -8,15 +8,14 @@ use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
 
 impl Qwen3Model {
-    /// Sample one token per request from batch logits.
-    /// Returns a Vec of token IDs, one per request.
-    pub(crate) fn select_tokens_batch(
+    /// Sample one token per request, each with its own sampling params.
+    pub(crate) fn select_tokens_batch_varied(
         &self,
         bufs: &mut BatchDecodeBuffers,
-        batch_size: usize,
-        params: &crate::sampler::SamplingParams,
+        params: &[&crate::sampler::SamplingParams],
         rng: &mut rand::rngs::StdRng,
     ) -> Result<Vec<u32>> {
+        let batch_size = params.len();
         let mut tokens = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
@@ -26,7 +25,7 @@ impl Qwen3Model {
                 &logits_i,
                 &mut bufs.sample_probs,
                 &mut bufs.sample_out,
-                params,
+                params[i],
                 random_val,
             )?;
             tokens.push(token);
@@ -359,8 +358,9 @@ mod tests {
             model
                 .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
+            let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
             let tokens = model
-                .select_tokens_batch(&mut bufs, bs, &params, &mut rng)
+                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
                 .unwrap();
             for (i, &tok) in tokens.iter().enumerate() {
                 all_tokens[i].push(tok);

@@ -8,6 +8,7 @@ pub mod ops;
 #[allow(dead_code)]
 pub(crate) mod page_pool;
 pub mod sampler;
+pub mod scheduler;
 pub mod server_engine;
 pub mod tensor;
 pub mod tokenizer;

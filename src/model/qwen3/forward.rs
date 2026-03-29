@@ -26,6 +26,14 @@ pub struct Qwen3State {
 // We only access state from the single inference thread.
 unsafe impl Send for Qwen3State {}
 
+impl Qwen3State {
+    /// Swap out the KV state, replacing it with `replacement`.
+    /// Returns the previous KV state (e.g. prefilled pages for the active set).
+    pub(crate) fn take_kv_state(&mut self, replacement: KvState) -> KvState {
+        std::mem::replace(&mut self.kv_state, replacement)
+    }
+}
+
 impl GenerationState for Qwen3State {
     fn logits(&self) -> &DeviceVec {
         self.prefill_logits
