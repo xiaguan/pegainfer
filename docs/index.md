@@ -2,7 +2,7 @@
 
 | Path | TL;DR |
 | --- | --- |
-| `projects/continuous-batching.md` | Phase 1 done (Qwen3 fully paged, graph reuse, perf audited). bs=1 TPOT 12.06ms (+5% vs vLLM, occupancy-limited — deferred to Phase 2). Next: Qwen3.5 paged migration, then batch decode |
+| `projects/continuous-batching.md` | Phase 1 done. Phase 2 Steps 1-2 done (batched forward + correctness). Next: Step 3 bucket CUDA Graphs, then scheduler |
 | `projects/nonstandard-attention-milestone.md` | Milestone direction: pegainfer focuses on non-standard attention models, with emphasis on model-family readiness, service experience, framework debt repayment, and disciplined evaluation |
 | `projects/qwen35-4b-accuracy.md` | Qwen3.5-4B HF parity work: major decode-state bugs are fixed, `conv1d` now matches HF's bf16 pre-`SiLU` rounding, exact HF matches improved to 11/13, and only two small-logit-drift cases remain |
 | `projects/qwen35-4b-optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 225ms, TPOT 11.81ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9) |
