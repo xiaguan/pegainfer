@@ -6,96 +6,6 @@ use crate::ffi;
 use crate::kv_pool::KvDesc;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
-/// Batched prefill attention with FlashInfer.
-///
-/// Pipeline:
-///   1. QK norm + RoPE + KV cache write (CUDA kernel, in-place on q_batch/k_batch)
-///   2. FlashInfer SinglePrefill (causal, kNone — RoPE already applied)
-///
-/// K/V cache is contiguous HND; FlashInfer reads it via custom strides.
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_attention_batch(
-    ctx: &DeviceContext,
-    q_batch: &mut HiddenStates,
-    k_batch: &mut HiddenStates,
-    v_batch: &HiddenStates,
-    q_norm: &DeviceVec,
-    k_norm: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    start_pos: usize,
-    rms_eps: f32,
-) -> Result<()> {
-    let seq_len = q_batch.seq_len;
-    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-
-    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
-    let kv_len = start_pos + seq_len;
-    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    {
-        let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
-        let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
-        let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
-        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
-        let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-        let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            // Step 1: QK norm + RoPE, KV cache write (contiguous HND)
-            ffi::prefill_attention_prep_cuda(
-                q_ptr as *mut ffi::Half,
-                k_ptr as *mut ffi::Half,
-                v_ptr as *const ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                kc_ptr as *mut ffi::Half,
-                vc_ptr as *mut ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                seq_len as i32,
-                start_pos as i32,
-                rms_eps,
-                ctx.stream.cu_stream(),
-            );
-
-            // Step 2: FlashInfer SinglePrefill (reads contiguous HND via strides)
-            let result = ffi::single_prefill_cuda(
-                q_ptr as *const ffi::Half,
-                o_ptr as *mut ffi::Half,
-                kc_ptr as *const ffi::Half,
-                vc_ptr as *const ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                seq_len as i32,
-                kv_len as i32,
-                max_seq_len as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            );
-            if result != 0 {
-                anyhow::bail!("single_prefill_cuda failed with error {result}");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// FlashAttention-2 prefill for HEAD_DIM=256 with precomputed Q and KV cache.
 /// Q / output layout: HiddenStates [q_dim, seq_len] in column-major token-major storage.
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +198,219 @@ pub fn prefill_attention_hd256_batch_with_scratch(
 }
 
 // ============================================================================
+// Paged prefill (FlashInfer BatchPrefillWithPagedKVCache)
+// ============================================================================
+
+/// Pre-computed GPU metadata for paged prefill attention.
+///
+/// Built once per prefill call via `PrefillPagedPlan::new()`, shared across all layers.
+pub(crate) struct PrefillPagedPlan {
+    page_indices_d: CudaSlice<i32>,
+    page_indptr_d: CudaSlice<i32>,
+    last_page_len_d: CudaSlice<i32>,
+    batch_indices_d: CudaSlice<i32>,
+    positions_d: CudaSlice<i32>,
+    q_indptr_d: CudaSlice<i32>,
+    request_indices_d: CudaSlice<i32>,
+    qo_tile_indices_d: CudaSlice<i32>,
+    kv_tile_indices_d: CudaSlice<i32>,
+    kv_chunk_size_d: CudaSlice<i32>,
+    total_num_rows_d: CudaSlice<u32>,
+    num_tiles: i32,
+}
+
+impl PrefillPagedPlan {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        desc: &KvDesc<'_>,
+        start_pos: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let kv_len = start_pos + seq_len;
+
+        let page_indices_i32: Vec<i32> = desc
+            .page_indices()
+            .iter()
+            .map(|p| p.index() as i32)
+            .collect();
+        let page_indices_d = ctx.stream.clone_htod(&page_indices_i32)?;
+        let page_indptr_d = ctx.stream.clone_htod(&[0i32, desc.num_pages() as i32])?;
+        let last_page_len_d = ctx.stream.clone_htod(&[desc.last_page_len() as i32])?;
+
+        let batch_indices_d = ctx.stream.clone_htod(&vec![0i32; seq_len])?;
+        let positions: Vec<i32> = (start_pos as i32..(start_pos + seq_len) as i32).collect();
+        let positions_d = ctx.stream.clone_htod(&positions)?;
+
+        let num_tiles = unsafe {
+            ffi::batch_prefill_paged_num_tiles(
+                seq_len as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            )
+        };
+
+        let q_indptr_d = ctx.stream.clone_htod(&[0i32, seq_len as i32])?;
+        let request_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
+        let qo_tile_indices: Vec<i32> = (0..num_tiles).collect();
+        let qo_tile_indices_d = ctx.stream.clone_htod(&qo_tile_indices)?;
+        let kv_tile_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
+        let kv_chunk_size_d = ctx.stream.clone_htod(&[kv_len as i32])?;
+        let total_num_rows_d = ctx.stream.clone_htod(&[seq_len as u32])?;
+
+        Ok(Self {
+            page_indices_d,
+            page_indptr_d,
+            last_page_len_d,
+            batch_indices_d,
+            positions_d,
+            q_indptr_d,
+            request_indices_d,
+            qo_tile_indices_d,
+            kv_tile_indices_d,
+            kv_chunk_size_d,
+            total_num_rows_d,
+            num_tiles,
+        })
+    }
+}
+
+/// Per-layer paged prefill: QK norm + RoPE, append K/V to paged, batch prefill attention.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_attention_paged_into(
+    ctx: &DeviceContext,
+    q_batch: &mut HiddenStates,
+    k_batch: &mut HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm: &DeviceVec,
+    k_norm: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &crate::kv_pool::KvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q_batch.seq_len;
+    let kv_len = start_pos + seq_len;
+    let kv_dim = num_kv_heads * head_dim;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let k_offset = (layer * layout.layer_stride) as i64;
+    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
+    let stride_page = layout.page_stride as i64;
+
+    let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (bi_ptr, _) = plan.batch_indices_d.device_ptr(&ctx.stream);
+    let (pos_ptr, _) = plan.positions_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+
+    let stream = ctx.stream.cu_stream();
+
+    unsafe {
+        ffi::prefill_qk_norm_rope_only_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            seq_len as i32,
+            start_pos as i32,
+            rms_eps,
+            stream,
+        );
+
+        let src_stride_n = kv_dim as i64;
+        let src_stride_h = head_dim as i64;
+
+        let result = ffi::paged_kv_scatter_cuda(
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            bi_ptr as *const i32,
+            pos_ptr as *const i32,
+            seq_len as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            stride_page,
+            src_stride_n,
+            src_stride_h,
+            stream,
+        );
+        if result != 0 {
+            anyhow::bail!("paged_kv_scatter_cuda failed for layer {layer} with error {result}");
+        }
+
+        let result = ffi::batch_prefill_paged_cuda(
+            q_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            seq_len as i32,
+            kv_len as i32,
+            plan.num_tiles,
+            stride_page,
+            sm_scale,
+            stream,
+        );
+        if result != 0 {
+            anyhow::bail!("batch_prefill_paged_cuda failed for layer {layer} with error {result}");
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Paged attention decode (FlashInfer)
 // ============================================================================
 
@@ -431,95 +554,6 @@ pub(crate) fn paged_attention_decode_into(
     };
     if result != 0 {
         anyhow::bail!("paged_attention_decode_cuda failed with error {result}");
-    }
-
-    Ok(())
-}
-
-/// Scatter contiguous KV cache into paged layout after prefill.
-///
-/// Iterates over all layers, copying each layer's K/V from contiguous HND
-/// buffers into the page-first paged layout.
-pub(crate) fn scatter_kv_to_paged(
-    ctx: &DeviceContext,
-    kv_cache: &crate::model::kv_cache::KVCache,
-    desc: &KvDesc<'_>,
-) -> Result<()> {
-    let layout = desc.layout();
-    let seq_len = desc.seq_len();
-    if seq_len == 0 {
-        return Ok(());
-    }
-
-    let head_dim = layout.head_dim;
-    let num_kv_heads = layout.num_kv_heads;
-    let page_size = layout.page_size;
-    let max_seq_len = kv_cache.max_seq_len();
-
-    // Source strides (HND per-layer): k[head, pos, dim]
-    let src_stride_n = head_dim as i64;
-    let src_stride_h = (max_seq_len * head_dim) as i64;
-
-    // GPU metadata (same for all layers)
-    let page_indices_d: CudaSlice<i32> = ctx.stream.clone_htod(
-        &desc
-            .page_indices()
-            .iter()
-            .map(|p| p.index() as i32)
-            .collect::<Vec<_>>(),
-    )?;
-    let num_pages = desc.num_pages() as i32;
-    let page_indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32, num_pages])?;
-    let last_page_len_d: CudaSlice<i32> = ctx.stream.clone_htod(&[desc.last_page_len() as i32])?;
-
-    // batch_indices = [0, 0, ..., 0], positions = [0, 1, 2, ..., seq_len-1]
-    let batch_indices: Vec<i32> = vec![0i32; seq_len];
-    let positions: Vec<i32> = (0..seq_len as i32).collect();
-    let batch_indices_d: CudaSlice<i32> = ctx.stream.clone_htod(&batch_indices)?;
-    let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions)?;
-
-    let (buf_ptr, _gbuf) = desc.buffer().device_ptr(&ctx.stream);
-    let (pi_ptr, _) = page_indices_d.device_ptr(&ctx.stream);
-    let (pip_ptr, _) = page_indptr_d.device_ptr(&ctx.stream);
-    let (lpl_ptr, _) = last_page_len_d.device_ptr(&ctx.stream);
-    let (bi_ptr, _) = batch_indices_d.device_ptr(&ctx.stream);
-    let (pos_ptr, _) = positions_d.device_ptr(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-
-    for layer in 0..layout.num_layers {
-        let k_offset = (layer * layout.layer_stride) as i64;
-        let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-        let stride_page = layout.page_stride as i64;
-
-        let (k_cache, v_cache) = kv_cache.get_cache(layer);
-        let (sk_ptr, _gsk) = k_cache.data.device_ptr(&ctx.stream);
-        let (sv_ptr, _gsv) = v_cache.data.device_ptr(&ctx.stream);
-
-        let result = unsafe {
-            ffi::paged_kv_scatter_cuda(
-                buf_ptr as *const ffi::Half,
-                k_offset,
-                v_offset,
-                pi_ptr as *const i32,
-                pip_ptr as *const i32,
-                lpl_ptr as *const i32,
-                sk_ptr as *const ffi::Half,
-                sv_ptr as *const ffi::Half,
-                bi_ptr as *const i32,
-                pos_ptr as *const i32,
-                seq_len as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                page_size as i32,
-                stride_page,
-                src_stride_n,
-                src_stride_h,
-                stream,
-            )
-        };
-        if result != 0 {
-            anyhow::bail!("paged_kv_scatter_cuda failed for layer {layer} with error {result}");
-        }
     }
 
     Ok(())

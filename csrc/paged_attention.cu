@@ -226,6 +226,130 @@ int paged_kv_scatter_cuda(
 }
 
 // ---------------------------------------------------------------------------
+// Batch prefill with paged KV cache — wraps FlashInfer BatchPrefillWithPagedKVCache.
+//
+// Reads Q from col-major [q_dim, seq_len] layout (= HiddenStates).
+// Reads K/V from paged layout (page-first, NHD within each block).
+// No RoPE inside (caller does RoPE beforehand via prefill_qk_norm_rope_only_cuda).
+// Causal mask, no split-KV (partition_kv=false).
+//
+// Plan metadata (request_indices, qo_tile_indices, etc.) is pre-computed by Rust
+// and passed as GPU arrays. This avoids per-call GPU allocations.
+// ---------------------------------------------------------------------------
+using BatchPrefillParamsT = BatchPrefillPagedParams<DType, DType, DType, IdType>;
+
+// Return the number of Q tiles for given dimensions (needed to size plan arrays).
+int32_t batch_prefill_paged_num_tiles(
+    int32_t  seq_len,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim)
+{
+    uint32_t group_size = num_qo_heads / num_kv_heads;
+    int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
+    uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
+    return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
+}
+
+int batch_prefill_paged_cuda(
+    // Q and output (HiddenStates col-major: [q_dim, seq_len])
+    void*    q,
+    void*    output,
+    // KV pool buffer (entire pool)
+    void*    kv_data,
+    int64_t  k_offset_elems,
+    int64_t  v_offset_elems,
+    // Paged KV metadata (GPU arrays)
+    int32_t* page_indices,
+    int32_t* page_indptr,
+    int32_t* last_page_len_d,
+    // Batch prefill plan metadata (GPU arrays, pre-allocated by Rust)
+    int32_t* q_indptr,             // [2]: [0, seq_len]
+    int32_t* request_indices,      // [num_tiles]: all zeros
+    int32_t* qo_tile_indices,      // [num_tiles]: [0, 1, ..., num_tiles-1]
+    int32_t* kv_tile_indices,      // [num_tiles]: all zeros
+    int32_t* kv_chunk_size_ptr,    // [1]: kv_len
+    uint32_t* total_num_rows,      // [1]: seq_len
+    // Dimensions
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  page_size,
+    int32_t  seq_len,
+    int32_t  kv_len,
+    int32_t  padded_batch_size,    // = num_tiles
+    int64_t  stride_page,
+    float    sm_scale,
+    // Stream
+    void*    stream)
+{
+    auto paged_kv = make_paged_kv(
+        kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indptr, last_page_len_d,
+        num_kv_heads, head_dim, page_size, /*batch_size=*/1, stride_page);
+
+    uint32_t q_stride_n = num_qo_heads * head_dim;
+    uint32_t q_stride_h = head_dim;
+
+    BatchPrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        paged_kv,
+        /*maybe_custom_mask=*/nullptr,
+        q_indptr,
+        /*maybe_mask_indptr=*/nullptr,
+        /*maybe_q_rope_offset=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        q_stride_n,
+        q_stride_h,
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    params.request_indices   = request_indices;
+    params.qo_tile_indices   = qo_tile_indices;
+    params.kv_tile_indices   = kv_tile_indices;
+    params.merge_indptr      = nullptr;
+    params.o_indptr          = q_indptr;  // same as q_indptr for non-partition: [0, seq_len]
+    params.block_valid_mask  = nullptr;
+    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
+    params.max_total_num_rows = seq_len;
+    params.total_num_rows    = total_num_rows;
+    params.padded_batch_size = padded_batch_size;
+    params.partition_kv      = false;
+
+    // Determine CTA tile size and dispatch
+    uint32_t group_size = num_qo_heads / num_kv_heads;
+    int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
+    uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
+
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int result = 0;
+    DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
+        result = static_cast<int>(
+            BatchPrefillWithPagedKVCacheDispatched<
+                CTA_TILE_Q,
+                /*HEAD_DIM_QK=*/128,
+                /*HEAD_DIM_VO=*/128,
+                PosEncodingMode::kNone,
+                /*USE_FP16_QK_REDUCTION=*/false,
+                MaskMode::kCausal,
+                Variant,
+                BatchPrefillParamsT>(
+                params,
+                /*tmp_v=*/nullptr,
+                /*tmp_s=*/nullptr,
+                /*enable_pdl=*/false,
+                s));
+    });
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Single-request prefill — wraps FlashInfer SinglePrefillWithKVCache.
 //
 // Reads Q from col-major [q_dim, seq_len] layout (= HiddenStates).

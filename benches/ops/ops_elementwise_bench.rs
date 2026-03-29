@@ -1,5 +1,3 @@
-use std::hint::black_box;
-
 use criterion::{BenchmarkId, Criterion, Throughput};
 use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
@@ -135,16 +133,6 @@ pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
             });
         },
     );
-
-    group.throughput(Throughput::Elements((VECTOR_DIM * 4) as u64));
-    group.bench_function(BenchmarkId::new("argmax", VECTOR_DIM * 4), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let argmax_x = device_vec(&ctx, VECTOR_DIM * 4).expect("failed to allocate argmax input");
-        iter_sync(b, &ctx, || {
-            let token = ops::argmax(&ctx, &argmax_x).expect("argmax failed");
-            black_box(token);
-        });
-    });
 
     group.finish();
 }

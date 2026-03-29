@@ -125,17 +125,14 @@ unsafe extern "C" {
 
     pub(crate) fn cublas_init();
 
-    // Prefill attention preparation: QK norm + RoPE + KV cache write.
-    pub(crate) fn prefill_attention_prep_cuda(
+    // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
+    pub(crate) fn prefill_qk_norm_rope_only_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
-        v_batch: *const Half,
         q_norm_weight: *const Half,
         k_norm_weight: *const Half,
         cos_cache: *const Half,
         sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -209,17 +206,6 @@ unsafe extern "C" {
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub(crate) fn rms_norm_offset_cuda(
         x: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
-
-    // Fused add + (1+weight) RMSNorm
-    pub(crate) fn fused_add_rms_norm_offset_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
         weight: *const Half,
         out: *mut Half,
         n: i32,
@@ -425,18 +411,38 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    // Single-request prefill (FlashInfer SinglePrefill, contiguous HND KV, no RoPE).
-    pub(crate) fn single_prefill_cuda(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
+    // Return the number of Q tiles for batch prefill (needed to size plan arrays).
+    pub(crate) fn batch_prefill_paged_num_tiles(
+        seq_len: i32,
         num_qo_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
+    ) -> i32;
+
+    // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
+    pub(crate) fn batch_prefill_paged_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         seq_len: i32,
         kv_len: i32,
-        max_seq_len: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;

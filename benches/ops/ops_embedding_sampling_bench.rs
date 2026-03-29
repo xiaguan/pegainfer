@@ -47,13 +47,17 @@ pub(crate) fn bench_embedding_sampling_ops(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(VOCAB_SIZE as u64));
-    group.bench_function(BenchmarkId::new("gpu_sample", VOCAB_SIZE), |b| {
+    group.bench_function(BenchmarkId::new("gpu_sample_into", VOCAB_SIZE), |b| {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         let logits = DeviceVec::zeros(&ctx, VOCAB_SIZE).expect("failed to allocate logits");
         let mut probs: CudaSlice<f32> = ctx
             .stream
             .alloc_zeros(VOCAB_SIZE)
             .expect("failed to allocate probs scratch");
+        let mut out_gpu: CudaSlice<i32> = ctx
+            .stream
+            .alloc_zeros(1)
+            .expect("failed to allocate output token");
         let params = SamplingParams {
             temperature: 0.8,
             top_k: 50,
@@ -61,8 +65,9 @@ pub(crate) fn bench_embedding_sampling_ops(c: &mut Criterion) {
             ..Default::default()
         };
         iter_sync(b, &ctx, || {
-            let token = ops::gpu_sample(&ctx, &logits, &mut probs, &params, 0.37)
-                .expect("gpu_sample failed");
+            let token =
+                ops::gpu_sample_into(&ctx, &logits, &mut probs, &mut out_gpu, &params, 0.37)
+                    .expect("gpu_sample_into failed");
             black_box(token);
         });
     });

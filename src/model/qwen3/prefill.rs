@@ -1,8 +1,9 @@
 use anyhow::Result;
 
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::model::kv_cache::KVCache;
+use crate::kv_pool::KvState;
 use crate::ops;
+use crate::ops::PrefillPagedPlan;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -75,7 +76,7 @@ impl Qwen3Model {
         &self,
         mut hidden: HiddenStates,
         start_pos: usize,
-        kv_cache: &mut KVCache,
+        kv_state: &mut KvState,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
         let num_heads = self.config.num_attention_heads;
@@ -84,6 +85,22 @@ impl Qwen3Model {
         let inter_dim = self.config.intermediate_size;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
+
+        // Allocate pages and advance before building the plan.
+        kv_state.ensure_capacity(start_pos + seq_len)?;
+        kv_state.advance(seq_len);
+
+        // Build paged prefill plan once — shared across all layers.
+        let desc = kv_state.desc();
+        let plan = PrefillPagedPlan::new(
+            &self.ctx,
+            &desc,
+            start_pos,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
 
         // Allocate all intermediates once — eliminates ~11k cuMemAllocAsync calls.
         let mut bufs = PrefillBuffers::new(
@@ -96,19 +113,16 @@ impl Qwen3Model {
         )?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_layer_batch(
+            self.forward_layer_batch_paged(
                 layer_idx,
                 layer,
                 &mut hidden,
                 start_pos,
-                kv_cache,
+                kv_state.buffer(),
+                kv_state.layout(),
+                &plan,
                 &mut bufs,
             )?;
-        }
-
-        // Increment sequence length AFTER all layers processed
-        for _ in 0..seq_len {
-            kv_cache.increment_seq_len();
         }
 
         Ok(hidden)
@@ -125,20 +139,21 @@ impl Qwen3Model {
         ops::linear(&self.ctx, &normed, self.output_projection())
     }
 
-    fn forward_layer_batch(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_batch_paged(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
         start_pos: usize,
-        kv_cache: &mut KVCache,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &crate::kv_pool::KvLayout,
+        plan: &PrefillPagedPlan,
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-
-        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
         // 1. RMSNorm → bufs.normed
         ops::rms_norm_batch_into(
@@ -169,9 +184,8 @@ impl Qwen3Model {
             &mut bufs.v_batch,
         );
 
-        // 3. FlashAttention-2 (Triton) → bufs.attn_output
-        let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-        ops::prefill_attention_batch(
+        // 3. Paged prefill: norm+RoPE → append K/V to paged → batch attention
+        ops::prefill_attention_paged_into(
             &self.ctx,
             &mut bufs.q_batch,
             &mut bufs.k_batch,
@@ -180,8 +194,10 @@ impl Qwen3Model {
             &layer.attention.k_norm,
             &self.cos_cache,
             &self.sin_cache,
-            k_cache_layer,
-            v_cache_layer,
+            kv_buffer,
+            layout,
+            layer_idx,
+            plan,
             &mut bufs.attn_output,
             num_heads,
             num_kv_heads,

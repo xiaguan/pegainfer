@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 in progress. Qwen3 decode done (FlashInfer paged + CUDA Graph, TPOT 10.56ms). Prefill Step 1 done: Triton FA2 → FlashInfer SinglePrefill (contiguous KV, kNone). Next: Step 2, paged KV write.
+> **Status:** Active. Phase 1 in progress. Qwen3 decode done (FlashInfer paged + CUDA Graph, TPOT 10.56ms). Prefill Step 2 done: contiguous KV eliminated, prefill writes directly to paged. Next: dead code cleanup, then Phase 2 (batch decode).
 
 ## Motivation
 
@@ -105,7 +105,7 @@ FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged 
   2. **RoPE position as kernel parameter** — `qk_norm_rope_cuda` modified to read position from `decode_meta[1]` (device memory) instead of a baked-in int. Kernel reads via `__ldg(start_pos_d)` when pointer is non-null; prefill path passes `nullptr` (unchanged).
 - Dead code removed: old Triton split-KV scratch buffers (`partial_out/m/l`) and `preload_decode_triton_kernels()`.
 
-**Result:** Full e2e greedy parity on Qwen3-4B. All 46 tests pass.
+**Result:** Full e2e greedy parity on Qwen3-4B. All tests pass.
 
 | Configuration | TPOT p50 | vs baseline |
 |---|---|---|
@@ -113,23 +113,18 @@ FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged 
 | FlashInfer paged, no CUDA Graph | 11.30ms | −4.3% |
 | FlashInfer paged + CUDA Graph | **10.56ms** | **−10.6%** |
 
-#### Remaining: fully paged KV for Qwen3
+#### Fully paged KV for Qwen3 (Done)
 
-Goal: **eliminate contiguous KVCache entirely**. Prefill writes directly to paged layout, attention reads from paged. No scatter step.
+Contiguous KVCache eliminated. Prefill writes directly to paged layout, attention reads from paged. No scatter step.
 
-Current Qwen3 prefill flow (Step 1 done — FlashInfer attention, still contiguous KV):
+Qwen3 prefill flow (Step 2 — fully paged):
 ```
-QKV projections → prefill_attention_prep_cuda (QK norm + RoPE + KV write to contiguous HND)
-               → single_prefill_cuda (FlashInfer, reads contiguous HND via strides)
-               → [after all layers] scatter_kv_to_paged (contiguous → paged, per-layer copy)
+QKV projections → prefill_qk_norm_rope_only_cuda (QK norm + RoPE, in-place on q/k)
+               → paged_kv_scatter_cuda (write normed+RoPE'd K and raw V to paged NHD per layer)
+               → batch_prefill_paged_cuda (FlashInfer BatchPrefillWithPagedKVCache, reads paged KV, kNone)
 ```
 
-Target flow (Step 2 — fully paged, external RoPE retained):
-```
-QKV projections → prefill_attention_prep_cuda (QK norm + RoPE, in-place on q/k)
-               → AppendPagedKVCache (write normed+RoPE'd K and raw V to paged NHD per layer)
-               → BatchPrefillWithPagedKVCache (reads paged KV, kNone)
-```
+`Qwen3State` no longer contains a contiguous `KVCache`. `KvState` is used for both prefill and decode. `PrefillPagedPlan` pre-allocates all GPU metadata once per prefill call (page indices, tile plan, positions), shared across all 36 layers.
 
 **FlashInfer prefill API** (`prefill.cuh`): `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, Variant, Params>`. Uses same `paged_kv_t` as decode. Supports causal mask, GQA, bf16, HEAD_DIM=128. Confirmed working on sm_120.
 
@@ -156,7 +151,7 @@ QKV projections → prefill_attention_prep_cuda (QK norm + RoPE, in-place on q/k
 | Step | Change | Status | Result |
 |------|--------|--------|--------|
 | 1 | Prefill: Triton FA2 → FlashInfer (still contiguous KV, external RoPE, kNone) | **Done** | 5/6 exact match, 1/6 precision diff. Prefill 3-6% faster. |
-| 2 | Prefill: contiguous KV write → paged KV write + scatter removed | **Next** | |
+| 2 | Prefill: contiguous KV write → paged KV write + scatter removed | **Done** | 6/6 greedy parity. Contiguous KVCache eliminated from Qwen3. |
 | ~3~ | ~Decode: kNone → kRoPELlama + norm-only kernel~ | Deferred | kNone + external RoPE works; fused RoPE is optional perf tweak |
 | ~4~ | ~Prefill: external RoPE → kRoPELlama + norm-only kernel~ | Deferred | Same rationale as Step 3 |
 
@@ -180,6 +175,19 @@ Implementation: `single_prefill_cuda` C wrapper in `csrc/paged_attention.cu` + R
 Peak throughput at seq_len=1024: 10028 → 10678 tok/s (+6.5%).
 
 **Deferred: Qwen3.5** (both decode and prefill) — lower priority until Qwen3 is validated.
+
+#### Step 2: Contiguous KV → Paged KV (prefill writes directly to paged)
+
+Changed 3 things vs Step 1 (one variable at a time principle):
+1. **Prep kernel**: `prefill_qk_norm_rope_only_cuda` — same QK RMSNorm + RoPE, but no contiguous KV cache write.
+2. **KV write**: `paged_kv_scatter_cuda` (FlashInfer `AppendPagedKVCache`) per layer — writes col-major K/V from prep output directly to paged NHD layout. Source strides: `stride_n = kv_dim`, `stride_h = head_dim` (vs HND's `stride_n = head_dim`, `stride_h = max_seq × head_dim`).
+3. **Attention**: `batch_prefill_paged_cuda` (FlashInfer `BatchPrefillWithPagedKVCache`) — reads from paged KV via `paged_kv_t`, same as decode. `PrefillPagedPlan` pre-computes all tile metadata (CTA_TILE_Q dispatched via `FA2DetermineCtaTileQ`).
+
+**Key architectural change:** `Qwen3State` no longer contains a contiguous `KVCache`. `process_all_layers_batch` takes `&mut KvState` directly. Pages are allocated and advanced before layers run; `PrefillPagedPlan` (GPU metadata) is built once and shared across all 36 layers.
+
+**Pitfall: `o_indptr` must be non-null.** FlashInfer's `BatchPrefillWithPagedKVCacheKernel` always reads `o_indptr[request_idx]` to compute the output base pointer, even when `partition_kv=false`. Setting it to `nullptr` causes illegal memory access. Fix: set `o_indptr = q_indptr` (both are `[0, seq_len]` for single-request non-partition).
+
+**Result:** 6/6 greedy parity with Step 1 baselines. All 46 tests pass.
 
 ### Phase 2: Scheduler + Batch Decode
 

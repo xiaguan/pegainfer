@@ -63,21 +63,8 @@ impl KVCache {
         Ok(())
     }
 
-    pub(crate) fn increment_seq_len(&mut self) {
-        self.seq_len += 1;
-    }
-
     pub(crate) fn advance_seq_len(&mut self, count: usize) {
         self.seq_len += count;
-    }
-
-    pub(crate) fn max_seq_len(&self) -> usize {
-        self.max_seq_len
-    }
-
-    /// Get immutable references to K/V cache for a layer (for scatter).
-    pub(crate) fn get_cache(&self, layer: usize) -> (&DeviceVec, &DeviceVec) {
-        (&self.k_cache[layer], &self.v_cache[layer])
     }
 
     /// Reset sequence length to 0 for reuse across requests.
