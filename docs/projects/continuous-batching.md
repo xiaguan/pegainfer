@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 in progress. Qwen3 decode done (FlashInfer paged + CUDA Graph, TPOT 10.56ms). Prefill Step 2 done: contiguous KV eliminated, prefill writes directly to paged. Next: dead code cleanup, then Phase 2 (batch decode).
+> **Status:** Active. Phase 1 done for Qwen3 (fully paged prefill + decode). Next: Qwen3.5 paged migration (8 full-attn layers, HD256), then Phase 2 (batch decode).
 
 ## Motivation
 
@@ -174,7 +174,20 @@ Implementation: `single_prefill_cuda` C wrapper in `csrc/paged_attention.cu` + R
 
 Peak throughput at seq_len=1024: 10028 → 10678 tok/s (+6.5%).
 
-**Deferred: Qwen3.5** (both decode and prefill) — lower priority until Qwen3 is validated.
+#### Remaining: Qwen3.5 paged migration
+
+Qwen3 is fully paged. Qwen3.5 still uses contiguous KVCache for all 8 full-attention layers (both prefill and decode). Must migrate before Phase 2 (batch decode needs unified paged KV across both models).
+
+Current Qwen3.5 full-attention state:
+- **Prefill**: `prefill_attention_hd256_prep_cuda` (QK norm + partial RoPE + KV write to contiguous HND) → Triton FA2 HD256
+- **Decode**: `single_token_kernels` with contiguous KV — no FlashInfer paged attention, no `KvState`/`KvPool`
+- **State**: `Qwen35State` has `kv_cache: KVCache` (contiguous) + `recurrent_state: RecurrentState`. No `KvState`.
+
+Migration plan (mirrors Qwen3 Steps 1-2):
+1. **Decode**: wire FlashInfer paged attention for HD256 (8 full-attn layers). Need to verify FlashInfer `BatchDecodeWithPagedKVCache` supports HEAD_DIM=256. Add `KvPool`/`KvState` to `Qwen35State`. Keep contiguous prefill + scatter bridge initially.
+2. **Prefill**: eliminate contiguous KVCache — same pattern as Qwen3 Step 2 but with HD256 kernels. Replace Triton FA2 HD256 with FlashInfer `BatchPrefillWithPagedKVCache` (HD256). Remove scatter.
+
+Complexity: HD256 (Qwen3 is HD128). FlashInfer templates support HEAD_DIM=256 but need to confirm sm_120 kernel instantiation compiles and runs correctly. Partial RoPE (`rotary_dim=64` out of `head_dim=256`) adds a wrinkle — external RoPE applies to first 64 dims only, rest pass-through.
 
 #### Step 2: Contiguous KV → Paged KV (prefill writes directly to paged)
 
