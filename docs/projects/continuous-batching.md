@@ -124,11 +124,11 @@ QKV projections → prefill_attention_prep_cuda (QK norm + RoPE + KV write to co
                → [after all layers] scatter_kv_to_paged (contiguous → paged, per-layer copy)
 ```
 
-Target flow (fully paged):
+Target flow (Step 2 — fully paged, external RoPE retained):
 ```
-QKV projections → QK norm (+ RoPE, external or fused TBD)
-               → AppendPagedKVCache (write K/V to paged layout per layer)
-               → FlashInfer BatchPrefillWithPagedKVCache (reads paged KV directly)
+QKV projections → prefill_attention_prep_cuda (QK norm + RoPE, in-place on q/k)
+               → AppendPagedKVCache (write normed+RoPE'd K and raw V to paged NHD per layer)
+               → BatchPrefillWithPagedKVCache (reads paged KV, kNone)
 ```
 
 **FlashInfer prefill API** (`prefill.cuh`): `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, Variant, Params>`. Uses same `paged_kv_t` as decode. Supports causal mask, GQA, bf16, HEAD_DIM=128. Confirmed working on sm_120.
@@ -156,9 +156,9 @@ QKV projections → QK norm (+ RoPE, external or fused TBD)
 | Step | Change | Status | Result |
 |------|--------|--------|--------|
 | 1 | Prefill: Triton FA2 → FlashInfer (still contiguous KV, external RoPE, kNone) | **Done** | 5/6 exact match, 1/6 precision diff. Prefill 3-6% faster. |
-| 2 | Prefill: contiguous KV write → paged KV write + scatter removed | Next | |
-| 3 | Decode: kNone → kRoPELlama + norm-only kernel | | |
-| 4 | Prefill: external RoPE → kRoPELlama + norm-only kernel | | |
+| 2 | Prefill: contiguous KV write → paged KV write + scatter removed | **Next** | |
+| ~3~ | ~Decode: kNone → kRoPELlama + norm-only kernel~ | Deferred | kNone + external RoPE works; fused RoPE is optional perf tweak |
+| ~4~ | ~Prefill: external RoPE → kRoPELlama + norm-only kernel~ | Deferred | Same rationale as Step 3 |
 
 #### Step 1: Triton FA2 → FlashInfer SinglePrefill
 
