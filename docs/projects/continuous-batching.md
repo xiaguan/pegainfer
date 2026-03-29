@@ -245,8 +245,7 @@ Qwen3 only (Qwen3.5 deferred). Target: vLLM-equivalent continuous batching.
 | 1 | **Batched forward** — `Qwen3Model::batch_decode()` handles bs>1. `HiddenStates [dim, bs]`, batched GEMM/RMSNorm/RoPE/embedding, FlashInfer BatchDecode with real bs>1. MLP decomposed into GEMM + SiLU-mul + GEMM. | **Done** |
 | 2 | **Correctness test** — 2 requests in batch == 2 sequential single-request (greedy 10-token parity). | **Done** |
 | 3 | **Bucket CUDA Graphs** — per-bucket capture/replay, batched `DecodeBuffers`. | **Done** |
-| 4 | **Scheduler loop** — request queue (FCFS), prefill-priority step loop, `submit()` + retire, admission control. | — |
-| 5 | **Server integration** — `GenericServerEngine` wired to scheduler, `submit()` + await, streaming output per request. | — |
+| 4 | **Scheduler + server integration** — replace `GenericServerEngine`, scheduler thread, channel-based streaming. | — |
 
 #### Step 1-2: Batched forward + correctness (Done)
 
@@ -284,12 +283,104 @@ Per-bucket graph capture/replay for batch decode, matching vLLM's approach.
 
 **Correctness:** `batch_decode_graph_matches_sequential` test: 2 prompts × 10 decode steps with CUDA Graph = identical greedy output to sequential single-request decode.
 
-### Phase 3: Multi-Request Server Engine
+#### Step 4: Scheduler + server integration
 
-- Replace single `Mutex<State>` with scheduler-driven request pipeline
-- Async prefill interleaving with ongoing decode batches
+Replace `GenericServerEngine` (single-request, `Mutex`-guarded) with a scheduler that batches concurrent requests.
+
+**Threading model — separate by compute type:**
+
+```
+HTTP handler (tokio async task)        Scheduler (std::thread, 1 fixed thread)
+───────────────────────────           ─────────────────────────────────────────
+1. tokenizer.encode()  ← CPU, ~μs
+2. submit_tx.send(req) ──────────────→ 3. submit_rx.recv()
+                                       4. prefill(tokens, kv_state)    ← GPU
+                                       5. add to active set
+   ┌──────────────────────────────────← loop start
+   │                                   6. batch_decode(active)         ← GPU
+   │                                   7. sample → token_id per req
+8. token_rx.recv()     ←─────────────── 8. req.token_tx.send(token_id)
+9. tokenizer.decode()  ← CPU, ~μs
+10. SSE send to client
+   └──────────────────────────────────→ back to 6 (or check new prefill)
+```
+
+- **Tokenizer encode/decode stays in async tasks.** Pure CPU, microsecond-level. Each HTTP handler tokenizes its own prompt and detokenizes incoming tokens. No reason to involve the GPU thread.
+- **One `std::thread::spawn` for the scheduler.** Not `spawn_blocking` (thread pool, no affinity guarantee). This thread exclusively owns model weights, `BatchDecodeBuffers`, `KvPool`. No `Mutex` needed — it's the only thing touching the GPU.
+- **tokio `mpsc` channels for both directions.** `mpsc::UnboundedSender` is `Send` — works from sync scheduler thread to async tasks and vice versa.
+
+**Channel design:**
+
+```rust
+// HTTP handler → scheduler
+submit_tx: tokio::sync::mpsc::UnboundedSender<SchedulerRequest>
+
+struct SchedulerRequest {
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    max_tokens: usize,
+    stop_token_ids: Vec<u32>,
+    token_tx: tokio::sync::mpsc::UnboundedSender<TokenEvent>,
+}
+
+enum TokenEvent {
+    Token(u32),
+    Finished(FinishReason),
+}
+```
+
+Each HTTP handler creates its own `(token_tx, token_rx)` pair, sends `token_tx` inside the request, and `await`s on `token_rx` for streaming tokens back.
+
+**Scheduler main loop:**
+
+```rust
+loop {
+    // 1. Prefill-priority: drain all pending requests
+    while let Ok(req) = submit_rx.try_recv() {
+        let kv = kv_pool.alloc();
+        prefill(&model, &req.prompt_tokens, &mut kv);
+        active.push(ActiveRequest { req, kv, token_count: 0 });
+    }
+
+    // 2. Nothing active → block for next request (thread sleeps, no spin)
+    if active.is_empty() {
+        let req = submit_rx.blocking_recv();  // OK, dedicated thread
+        let kv = kv_pool.alloc();
+        prefill(&model, &req.prompt_tokens, &mut kv);
+        active.push(ActiveRequest { req, kv, token_count: 0 });
+    }
+
+    // 3. One batch decode step
+    let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
+    let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
+    model.batch_decode(&token_ids, &mut kv_refs, &mut bufs);
+
+    // 4. Sample + dispatch + retire
+    let tokens = model.select_tokens_batch(&mut bufs, active.len(), ...);
+    active.retain_mut(|r, token| {
+        r.token_count += 1;
+        if is_stop(token) || r.token_count >= r.req.max_tokens {
+            let _ = r.req.token_tx.send(TokenEvent::Finished(...));
+            false  // remove from active set, KvState dropped → pages returned
+        } else {
+            let _ = r.req.token_tx.send(TokenEvent::Token(token));
+            true
+        }
+    });
+}
+```
+
+`try_recv` after each decode step is the "decode interruption" mechanism — finish current step, then drain pending prefills before the next decode step.
+
+**Admission control:** Reject when `kv_pool.available_pages()` is insufficient for the new request's initial page allocation. Return HTTP 503. No queuing behind memory pressure.
+
+**Prefill:** Uses the existing single-request `model.forward(tokens, state)` path. One request at a time (serial prefill). After prefill, the first token is sampled and sent, then the `KvState` moves to the active decode set.
+
+### Phase 3: Advanced scheduling (deferred)
+
+- Chunked prefill interleaving with ongoing decode batches
 - Preemption (pause low-priority requests, free their pages)
-- Streaming output per request
+- Priority queuing beyond FCFS
 
 ## Architecture Reference
 
