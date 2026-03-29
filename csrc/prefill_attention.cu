@@ -157,4 +157,36 @@ void prefill_attention_prep_cuda(
     );
 }
 
+// ============================================================================
+// C API: QK norm + RoPE only (no cache write) for decode with paged attention.
+//
+// Reuses prefill_qk_norm_rope_kernel with seq_len=1.
+// Modifies q and k in-place.
+// ============================================================================
+void qk_norm_rope_cuda(
+    __nv_bfloat16* q,                    // [num_q_heads * head_dim] in-place
+    __nv_bfloat16* k,                    // [num_kv_heads * head_dim] in-place
+    const __nv_bfloat16* q_norm_weight,  // [head_dim]
+    const __nv_bfloat16* k_norm_weight,  // [head_dim]
+    const __nv_bfloat16* cos_cache,      // [max_pos * head_dim]
+    const __nv_bfloat16* sin_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int position,                        // current token position
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    dim3 grid(num_q_heads + num_kv_heads, 1);  // seq_len=1
+    prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim,
+        /*seq_len=*/1, q_dim, kv_dim, /*start_pos=*/position, rms_eps
+    );
+}
+
 } // extern "C"

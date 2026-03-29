@@ -414,4 +414,87 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ========================================================================
+    // Paged attention (FlashInfer)
+    // ========================================================================
+
+    // QK RMSNorm + RoPE for decode (seq_len=1). Modifies q and k in-place.
+    pub(crate) fn qk_norm_rope_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        position: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Append one K/V token per request to paged KV cache (FlashInfer).
+    pub(crate) fn paged_kv_append_cuda(
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        key: *const Half,
+        value: *const Half,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
+    pub(crate) fn paged_kv_scatter_cuda(
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        src_k: *const Half,
+        src_v: *const Half,
+        batch_indices: *const i32,
+        positions: *const i32,
+        nnz: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        stride_page: i64,
+        src_stride_n: i64,
+        src_stride_h: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
+    pub(crate) fn paged_attention_decode_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
 }

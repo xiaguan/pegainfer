@@ -734,6 +734,15 @@ fn main() {
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
+        // paged_attention.cu includes FlashInfer headers (C++17, header-only)
+        if stem == "paged_attention" {
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "-I".to_string(),
+                "third_party/flashinfer/include".to_string(),
+            ]);
+        }
+
         let status = Command::new(&nvcc)
             .args(&nvcc_args)
             .status()

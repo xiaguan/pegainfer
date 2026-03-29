@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
 use cudarc::driver::CudaSlice;
 use half::bf16;
@@ -5,15 +7,6 @@ use half::bf16;
 use crate::page_pool::{OwnedPagePermit, PageId, PagePool};
 use crate::tensor::DeviceContext;
 
-/// Shared KV backing storage with page-based allocation.
-///
-/// Owns a single GPU buffer in page-first layout: each page is a contiguous
-/// chunk holding all layers' K and V for `page_size` tokens.
-///
-/// ```text
-/// page_i: [L0_K | L0_V | L1_K | L1_V | ... | Ln_K | Ln_V]
-///          └─ page_size × num_kv_heads × head_dim each ─┘
-/// ```
 /// Page-first geometry: dimensions and derived strides for one page.
 ///
 /// Pure value type — no GPU, no allocation. Shared by `KvPool`, `KvState`, `KvDesc`.
@@ -53,10 +46,26 @@ impl KvLayout {
     }
 }
 
-pub(crate) struct KvPool {
+struct KvPoolInner {
     pool: PagePool,
     buffer: CudaSlice<bf16>,
     layout: KvLayout,
+}
+
+/// Shared KV backing storage with page-based allocation.
+///
+/// Owns a single GPU buffer in page-first layout: each page is a contiguous
+/// chunk holding all layers' K and V for `page_size` tokens.
+///
+/// ```text
+/// page_i: [L0_K | L0_V | L1_K | L1_V | ... | Ln_K | Ln_V]
+///          └─ page_size × num_kv_heads × head_dim each ─┘
+/// ```
+///
+/// Cheaply clonable (Arc). Multiple `KvState`s share the same pool.
+#[derive(Clone)]
+pub(crate) struct KvPool {
+    inner: Arc<KvPoolInner>,
 }
 
 impl KvPool {
@@ -77,41 +86,43 @@ impl KvPool {
             .map_err(|e| anyhow::anyhow!("KvPool alloc failed: {e}"))?;
 
         Ok(Self {
-            pool: PagePool::new(num_pages),
-            buffer,
-            layout,
+            inner: Arc::new(KvPoolInner {
+                pool: PagePool::new(num_pages),
+                buffer,
+                layout,
+            }),
         })
     }
 
     /// Create an empty per-request KV state.
-    pub(crate) fn alloc(&self) -> KvState<'_> {
+    pub(crate) fn alloc(&self) -> KvState {
         KvState {
-            permit: self.pool.try_acquire_many(0).expect("zero acquire"),
+            permit: self.inner.pool.try_acquire_many(0).expect("zero acquire"),
             seq_len: 0,
-            pool: self,
+            pool: self.clone(),
         }
     }
 
     pub(crate) fn layout(&self) -> &KvLayout {
-        &self.layout
+        &self.inner.layout
     }
 
     pub(crate) fn capacity_pages(&self) -> usize {
-        self.pool.capacity_pages()
+        self.inner.pool.capacity_pages()
     }
 
     pub(crate) fn available_pages(&self) -> usize {
-        self.pool.available_pages()
+        self.inner.pool.available_pages()
     }
 }
 
 /// Per-request KV state. Parallels `RecurrentState` for linear attention.
 ///
 /// Holds an RAII page permit that auto-returns pages on drop.
-pub(crate) struct KvState<'a> {
+pub(crate) struct KvState {
     permit: OwnedPagePermit,
     seq_len: usize,
-    pool: &'a KvPool,
+    pool: KvPool,
 }
 
 /// Pages needed to hold `token_count` tokens with the given `page_size`.
@@ -119,14 +130,14 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
-impl<'a> KvState<'a> {
+impl KvState {
     pub(crate) fn seq_len(&self) -> usize {
         self.seq_len
     }
 
     /// Ensure capacity for at least `token_count` tokens total.
     pub(crate) fn ensure_capacity(&mut self, token_count: usize) -> Result<()> {
-        let needed = pages_needed(token_count, self.pool.layout.page_size);
+        let needed = pages_needed(token_count, self.pool.inner.layout.page_size);
         let held = self.permit.len();
         if needed <= held {
             return Ok(());
@@ -152,16 +163,16 @@ impl<'a> KvState<'a> {
         let last_page_len = if self.seq_len == 0 {
             0
         } else {
-            let rem = self.seq_len % self.pool.layout.page_size;
+            let rem = self.seq_len % self.pool.inner.layout.page_size;
             if rem == 0 {
-                self.pool.layout.page_size
+                self.pool.inner.layout.page_size
             } else {
                 rem
             }
         };
         KvDesc {
-            layout: self.pool.layout,
-            buffer: &self.pool.buffer,
+            layout: self.pool.inner.layout,
+            buffer: &self.pool.inner.buffer,
             pages,
             seq_len: self.seq_len,
             last_page_len,
@@ -170,8 +181,12 @@ impl<'a> KvState<'a> {
 
     /// Reset for a new request: return all pages, zero seq_len.
     pub(crate) fn reset(&mut self) {
-        // Drop the old permit (returns pages) and acquire a fresh empty one.
-        self.permit = self.pool.pool.try_acquire_many(0).expect("zero acquire");
+        self.permit = self
+            .pool
+            .inner
+            .pool
+            .try_acquire_many(0)
+            .expect("zero acquire");
         self.seq_len = 0;
     }
 }

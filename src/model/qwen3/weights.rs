@@ -59,12 +59,13 @@ pub struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    pub(super) kv_pool: crate::kv_pool::KvPool,
 }
 
 impl Qwen3Model {
     pub fn from_safetensors_with_runtime(
         model_path: &str,
-        runtime: ModelRuntimeConfig,
+        _runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
         info!("Loading model from: {}", model_path);
         debug!("Initializing GPU");
@@ -195,6 +196,18 @@ impl Qwen3Model {
         );
         info!("GPU model loaded successfully");
 
+        let page_size = 16;
+        // Enough pages for ~2048 tokens at page_size=16 = 128 pages
+        let num_pages = 128;
+        let kv_pool = crate::kv_pool::KvPool::new(
+            &ctx,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            page_size,
+            num_pages,
+        )?;
+
         let model = Self {
             ctx,
             config,
@@ -204,7 +217,9 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph: runtime.enable_cuda_graph,
+            // CUDA Graph disabled: paged attention metadata allocs per-call
+            enable_cuda_graph: false,
+            kv_pool,
         };
 
         if model.enable_cuda_graph {

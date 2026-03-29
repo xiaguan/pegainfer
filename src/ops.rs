@@ -29,6 +29,7 @@ pub use sampling::{argmax, gpu_sample, gpu_sample_into};
 // pub(crate) re-exports
 #[cfg(test)]
 pub(crate) use attention::flash_attention_prefill_hd256_into;
+pub(crate) use attention::{paged_attention_decode_into, qk_norm_rope_into, scatter_kv_to_paged};
 pub(crate) use elementwise::{add_batch_into, extract_vec, silu_mul_batch_into};
 pub(crate) use linear::{gemm_into, linear};
 pub(crate) use norm::{rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into};

@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 in progress: `PagePool` + `try_grow` landed; building `KvPool` + `KvState`.
+> **Status:** Active. Phase 1: FlashInfer paged attention landed for Qwen3 decode (bs=1). Exact greedy parity with baseline, TPOT ~11.26ms. Next: CUDA Graph re-enable, batch decode (Phase 2).
 
 ## Motivation
 
@@ -83,9 +83,30 @@ Internal pointer arithmetic (`base + page_id × page_stride + layer × layer_kv_
 
 Done:
 - `PagePool`: generic fixed-page allocator, RAII `OwnedPagePermit`, `try_acquire_many(n)`, `try_grow(n)`.
+- `KvPool` + `KvState` + `KvDesc` in `src/kv_pool.rs`. Data structures + unit tests (geometry, lifecycle, OOM, drop). Page-first layout with `KvLayout` stride geometry. `KvPool` is `Clone` via `Arc` for trait-compatible state ownership.
+- FlashInfer submodule at `third_party/flashinfer` (header-only C++, `include/flashinfer/`).
+- `csrc/paged_attention.cu`: thin C wrapper around FlashInfer's `BatchDecodeWithPagedKVCacheDispatched` (decode) and `AppendPagedKVCacheDecode` (KV write). bf16, HEAD_DIM=128, NHD layout, no RoPE (applied externally). Non-partition path (no split-KV) for Phase 1.
+- `qk_norm_rope_cuda`: standalone QK RMSNorm + RoPE kernel for decode, reuses `prefill_qk_norm_rope_kernel` with seq_len=1.
+- Rust FFI bindings (`ffi.rs`) and ops wrappers (`ops/attention.rs`) for all three kernels.
+
+#### Decision: page-first ↔ FlashInfer stride bridge
+
+FlashInfer's `paged_kv_t` uses separate `k_data`/`v_data` pointers with custom strides. Our page-first layout stores all layers interleaved in one buffer. The bridge: for layer L, `k_data = base + L × layer_stride`, `v_data = base + L × layer_stride + kv_block_len`, `stride_page = page_stride`. NHD within each K/V block matches FlashInfer's NHD mode. No transpose or copy needed.
+
+#### Decision: BatchDecode for bs=1 (not SingleDecode)
+
+FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged layout. For paged KV at bs=1, we use `BatchDecodeWithPagedKVCacheDispatched` with `batch_size=1`, `partition_kv=false`. The kernel template always accesses `request_indices`/`kv_tile_indices` (even when not partitioning), so we provide trivial GPU arrays `[0]`.
+
+- Paged attention wired into Qwen3 decode path as the **only** decode attention. `KvPool` always created, `KvState` per-request, CUDA Graph disabled (Phase 1: metadata arrays allocated per-call).
+- FlashInfer decode kernel validated end-to-end: 10-token single-prompt generation passes, determinism verified. 50-token multi-token prompt generation produces coherent output (confirms kernel correctness), but differs from baseline (prefill→paged gap, see below).
+
+- Prefill→paged scatter: after prefill writes to contiguous KV cache, `scatter_kv_to_paged` copies all layers into paged layout via FlashInfer's `AppendPagedKVCache` kernel. Bridges HND (contiguous) → NHD (paged) per-layer.
+
+**Result:** Full e2e greedy parity with baseline on Qwen3-4B. All 45 tests pass. TPOT ~11.26ms (88.8 tok/s).
 
 Next:
-- `KvPool` + `KvState` + `KvDesc` in `src/kv_pool.rs`. Data structures + unit tests, no kernel integration yet.
+- Re-enable CUDA Graph with pre-allocated metadata buffers.
+- Phase 2: batch decode (multiple requests sharing KvPool).
 
 ### Phase 2: Scheduler + Batch Decode
 
