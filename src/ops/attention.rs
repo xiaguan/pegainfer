@@ -6,14 +6,13 @@ use crate::ffi;
 use crate::kv_pool::KvDesc;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
-/// Batched prefill attention with FlashAttention-2.
+/// Batched prefill attention with FlashInfer.
 ///
 /// Pipeline:
-///   1. QK norm + RoPE (CUDA kernel, in-place on q_batch/k_batch)
-///   2. KV cache write (CUDA kernel)
-///   3. FlashAttention-2 (Triton kernel — fused QK + causal softmax + V)
+///   1. QK norm + RoPE + KV cache write (CUDA kernel, in-place on q_batch/k_batch)
+///   2. FlashInfer SinglePrefill (causal, kNone — RoPE already applied)
 ///
-/// No O(n²) scratch buffers needed — FlashAttention uses online softmax.
+/// K/V cache is contiguous HND; FlashInfer reads it via custom strides.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_batch(
     ctx: &DeviceContext,
@@ -34,9 +33,11 @@ pub fn prefill_attention_batch(
     rms_eps: f32,
 ) -> Result<()> {
     let seq_len = q_batch.seq_len;
-    let q_dim = num_q_heads * head_dim;
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-    let gqa_ratio = num_q_heads / num_kv_heads;
+
+    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
+    let kv_len = start_pos + seq_len;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
@@ -51,7 +52,7 @@ pub fn prefill_attention_batch(
         let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            // Steps 1-2: QK norm + RoPE, KV cache write
+            // Step 1: QK norm + RoPE, KV cache write (contiguous HND)
             ffi::prefill_attention_prep_cuda(
                 q_ptr as *mut ffi::Half,
                 k_ptr as *mut ffi::Half,
@@ -71,20 +72,24 @@ pub fn prefill_attention_batch(
                 ctx.stream.cu_stream(),
             );
 
-            // Step 3: FlashAttention-2 (Triton) — reads normed Q and KV cache
-            ffi::flash_attention_prefill_cuda(
+            // Step 2: FlashInfer SinglePrefill (reads contiguous HND via strides)
+            let result = ffi::single_prefill_cuda(
                 q_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
                 kc_ptr as *const ffi::Half,
                 vc_ptr as *const ffi::Half,
-                o_ptr as *mut ffi::Half,
                 num_q_heads as i32,
                 num_kv_heads as i32,
-                gqa_ratio as i32,
+                head_dim as i32,
                 seq_len as i32,
-                start_pos as i32,
-                q_dim as i32,
+                kv_len as i32,
+                max_seq_len as i32,
+                sm_scale,
                 ctx.stream.cu_stream(),
             );
+            if result != 0 {
+                anyhow::bail!("single_prefill_cuda failed with error {result}");
+            }
         }
     }
 

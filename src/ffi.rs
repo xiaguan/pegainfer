@@ -125,8 +125,7 @@ unsafe extern "C" {
 
     pub(crate) fn cublas_init();
 
-    // Prefill attention preparation: QK norm + RoPE + KV cache write (steps 1-2).
-    // Step 3 (attention) is handled by flash_attention_prefill_cuda (Triton).
+    // Prefill attention preparation: QK norm + RoPE + KV cache write.
     pub(crate) fn prefill_attention_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
@@ -145,22 +144,6 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     );
-
-    // FlashAttention-2 prefill (Triton AOT): fused QK + softmax + V for all query tokens.
-    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
-    pub(crate) fn flash_attention_prefill_cuda(
-        Q: *const Half,
-        K_cache: *const Half,
-        V_cache: *const Half,
-        Output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        gqa_ratio: i32,
-        seq_len: i32,
-        start_pos: i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
     // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
@@ -439,6 +422,22 @@ unsafe extern "C" {
         stride_page: i64,
         src_stride_n: i64,
         src_stride_h: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Single-request prefill (FlashInfer SinglePrefill, contiguous HND KV, no RoPE).
+    pub(crate) fn single_prefill_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
         stream: CUstream,
     ) -> i32;
 

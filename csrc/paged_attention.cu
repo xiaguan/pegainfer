@@ -1,18 +1,19 @@
-// Thin C wrappers around FlashInfer's paged KV attention decode and append.
+// Thin C wrappers around FlashInfer's attention kernels.
 //
 // We include FlashInfer headers (header-only C++) and instantiate only the
 // template variants needed: bf16 Q/KV/O, HEAD_DIM=128, NHD layout, no RoPE.
 //
-// FlashInfer's BatchDecode dispatcher internally instantiates multiple GQA
-// group sizes (1,2,3,4,8) — this covers both Qwen3-4B (GQA=4) and
-// Qwen3.5-4B (GQA=8).
+// FlashInfer's dispatchers internally instantiate multiple GQA group sizes
+// (1,2,3,4,8) — this covers both Qwen3-4B (GQA=4) and Qwen3.5-4B (GQA=8).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 
 #include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/default_decode_params.cuh>
+#include <flashinfer/attention/default_prefill_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/page.cuh>
 
@@ -222,6 +223,79 @@ int paged_kv_scatter_cuda(
         static_cast<size_t>(src_stride_n),   // V has same layout as K
         static_cast<size_t>(src_stride_h),
         reinterpret_cast<cudaStream_t>(stream)));
+}
+
+// ---------------------------------------------------------------------------
+// Single-request prefill — wraps FlashInfer SinglePrefillWithKVCache.
+//
+// Reads Q from col-major [q_dim, seq_len] layout (= HiddenStates).
+// Reads K/V from contiguous HND cache: k[head, pos, dim].
+// No RoPE inside (caller does RoPE beforehand via prefill_attention_prep_cuda).
+// Causal mask, no split-KV (tmp=nullptr).
+// ---------------------------------------------------------------------------
+using PrefillParamsT = SinglePrefillParams<DType, DType, DType>;
+
+int single_prefill_cuda(
+    // Q and output (HiddenStates col-major: [q_dim, seq_len])
+    void*    q,
+    void*    output,
+    // Contiguous KV cache (HND per-layer: k[head, pos, dim])
+    void*    k_cache,
+    void*    v_cache,
+    // Dimensions
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  seq_len,          // number of Q tokens (qo_len)
+    int32_t  kv_len,           // total KV length (start_pos + seq_len)
+    int32_t  max_seq_len,      // allocated cache rows (for HND stride)
+    float    sm_scale,
+    // Stream
+    void*    stream)
+{
+    // Q/O strides: col-major [q_dim, seq_len]
+    uint32_t q_stride_n  = num_qo_heads * head_dim;   // stride between tokens
+    uint32_t q_stride_h  = head_dim;                   // stride between heads
+
+    // K/V strides: HND layout k[head, pos, dim]
+    uint32_t kv_stride_n = head_dim;                   // stride between positions
+    uint32_t kv_stride_h = max_seq_len * head_dim;     // stride between heads
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        /*maybe_custom_mask=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        static_cast<uint32_t>(head_dim),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kCausal,
+            Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
 }
 
 } // extern "C"

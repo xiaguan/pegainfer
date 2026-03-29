@@ -2,7 +2,7 @@
 
 > **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
 >
-> **Status:** Active. Phase 1 complete: FlashInfer paged attention + CUDA Graph for Qwen3 decode. TPOT 10.56ms (p50), 10.6% faster than pre-paged baseline. Next: Phase 2 (batch decode).
+> **Status:** Active. Phase 1 in progress. Qwen3 decode done (FlashInfer paged + CUDA Graph, TPOT 10.56ms). Prefill Step 1 done: Triton FA2 → FlashInfer SinglePrefill (contiguous KV, kNone). Next: Step 2, paged KV write.
 
 ## Motivation
 
@@ -36,7 +36,7 @@ Key components:
 - **Page table**: per-request logical→physical page mapping (CSR format)
 - **KV append**: write new K/V to paged layout
 - **Paged attention decode**: FlashInfer `decode.cuh` header (zero external deps, supports SM120, partial RoPE confirmed with `rope_dim=64`)
-- **Paged prefill**: gather pages → contiguous buffer → existing Triton FA kernel
+- **Paged prefill**: FlashInfer `prefill.cuh` reads paged KV directly (replacing Triton FA2, in progress)
 
 Applies to full attention layers only (8 in Qwen3.5, 36 in Qwen3). Linear attention layers use `RecurrentState` (unchanged).
 
@@ -85,7 +85,7 @@ Done:
 - `PagePool`: generic fixed-page allocator, RAII `OwnedPagePermit`, `try_acquire_many(n)`, `try_grow(n)`.
 - `KvPool` + `KvState` + `KvDesc` in `src/kv_pool.rs`. Data structures + unit tests (geometry, lifecycle, OOM, drop). Page-first layout with `KvLayout` stride geometry. `KvPool` is `Clone` via `Arc` for trait-compatible state ownership.
 - FlashInfer submodule at `third_party/flashinfer` (header-only C++, `include/flashinfer/`).
-- `csrc/paged_attention.cu`: thin C wrapper around FlashInfer's `BatchDecodeWithPagedKVCacheDispatched` (decode) and `AppendPagedKVCacheDecode` (KV write). bf16, HEAD_DIM=128, NHD layout, no RoPE (applied externally). Non-partition path (no split-KV) for Phase 1.
+- `csrc/paged_attention.cu`: thin C wrappers around FlashInfer's `BatchDecodeWithPagedKVCacheDispatched` (decode), `AppendPagedKVCacheDecode` (KV write), and `SinglePrefillWithKVCacheDispatched` (prefill). bf16, HEAD_DIM=128, no RoPE (applied externally). Non-partition path for Phase 1.
 - `qk_norm_rope_cuda`: standalone QK RMSNorm + RoPE kernel for decode, reuses `prefill_qk_norm_rope_kernel` with seq_len=1.
 - Rust FFI bindings (`ffi.rs`) and ops wrappers (`ops/attention.rs`) for all three kernels.
 
@@ -113,7 +113,73 @@ FlashInfer's `SingleDecodeWithKVCache` only supports contiguous KV — no paged 
 | FlashInfer paged, no CUDA Graph | 11.30ms | −4.3% |
 | FlashInfer paged + CUDA Graph | **10.56ms** | **−10.6%** |
 
-Phase 1 complete. Next: Phase 2 (batch decode).
+#### Remaining: fully paged KV for Qwen3
+
+Goal: **eliminate contiguous KVCache entirely**. Prefill writes directly to paged layout, attention reads from paged. No scatter step.
+
+Current Qwen3 prefill flow (Step 1 done — FlashInfer attention, still contiguous KV):
+```
+QKV projections → prefill_attention_prep_cuda (QK norm + RoPE + KV write to contiguous HND)
+               → single_prefill_cuda (FlashInfer, reads contiguous HND via strides)
+               → [after all layers] scatter_kv_to_paged (contiguous → paged, per-layer copy)
+```
+
+Target flow (fully paged):
+```
+QKV projections → QK norm (+ RoPE, external or fused TBD)
+               → AppendPagedKVCache (write K/V to paged layout per layer)
+               → FlashInfer BatchPrefillWithPagedKVCache (reads paged KV directly)
+```
+
+**FlashInfer prefill API** (`prefill.cuh`): `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, Variant, Params>`. Uses same `paged_kv_t` as decode. Supports causal mask, GQA, bf16, HEAD_DIM=128. Confirmed working on sm_120.
+
+**First attempt** (`git stash: "WIP: paged prefill + fused RoPE"`): changed 8 things at once, hit quality regression. Stashed. Lessons:
+
+1. **`kv_chunk_size_ptr` must be non-null** — FlashInfer prefill kernel always dereferences `*(params.kv_chunk_size_ptr)` even when `partition_kv=false`. Setting it to `nullptr` causes illegal memory access (same pattern as decode's `request_indices`/`kv_tile_indices`).
+
+2. **Too many simultaneous changes prevent root-cause analysis.** The stashed diff changes:
+   - Prefill QK norm: fused norm+RoPE → norm-only kernel
+   - Prefill RoPE: external bf16 precomputed → FlashInfer fused f32 (kRoPELlama)
+   - Prefill KV write: contiguous HND → paged NHD (AppendPagedKVCache)
+   - Prefill attention: Triton FA2 → FlashInfer BatchPrefill
+   - Prefill→decode bridge: scatter_kv_to_paged removed
+   - Decode QK norm: norm+RoPE → norm-only
+   - Decode RoPE: external bf16 → FlashInfer fused f32
+   - Decode attention: FlashInfer kNone → kRoPELlama
+
+   Output was coherent but diverged from baseline on all 6 test prompts ("What is 2+2?" produced "5..." — clearly wrong, not just precision drift). Cannot determine which change caused the regression without bisection.
+
+3. **FlashInfer's f32 fused RoPE ≠ our bf16 precomputed RoPE.** Our precomputed cos/sin cache (f32→bf16→f32 round-trip) was validated against HF Transformers. FlashInfer computes cos/sin from `rope_theta` in f32 — higher precision but different rounding path. Greedy decoding amplifies the divergence across 36 layers.
+
+**Incremental approach** — change one variable at a time, verify greedy parity after each:
+
+| Step | Change | Status | Result |
+|------|--------|--------|--------|
+| 1 | Prefill: Triton FA2 → FlashInfer (still contiguous KV, external RoPE, kNone) | **Done** | 5/6 exact match, 1/6 precision diff. Prefill 3-6% faster. |
+| 2 | Prefill: contiguous KV write → paged KV write + scatter removed | Next | |
+| 3 | Decode: kNone → kRoPELlama + norm-only kernel | | |
+| 4 | Prefill: external RoPE → kRoPELlama + norm-only kernel | | |
+
+#### Step 1: Triton FA2 → FlashInfer SinglePrefill
+
+Used `SinglePrefillWithKVCacheDispatched` (not the batch API) — handles tiling internally, no metadata arrays to compute. K/V read from contiguous HND cache via custom strides (`kv_stride_n = head_dim`, `kv_stride_h = max_seq_len × head_dim`). `PosEncodingMode::kNone` since RoPE is applied externally by `prefill_attention_prep_cuda`.
+
+Implementation: `single_prefill_cuda` C wrapper in `csrc/paged_attention.cu` + Rust FFI/ops. Triton `flash_attention_prefill_cuda` FFI removed (HD256 variant for Qwen3.5 retained).
+
+**Precision:** 5/6 test prompts produce identical greedy output. 1/6 ("My name is") diverges at 2nd token: "Li Hua" (FlashInfer) vs "Xiaoyu" (Triton). Both coherent and valid — top-2 probabilities were near-equal, different FP accumulation order tips the selection. Not a correctness bug. Baselines re-generated.
+
+**Performance:**
+
+| seq_len | Triton FA2 | FlashInfer | Delta |
+|---------|-----------|------------|-------|
+| 64 | 13.91ms | 13.46ms | −3.2% |
+| 256 | 27.66ms | 26.86ms | −2.9% |
+| 512 | 51.05ms | 49.55ms | −2.9% |
+| 1024 | 102.11ms | 95.90ms | **−6.1%** |
+
+Peak throughput at seq_len=1024: 10028 → 10678 tok/s (+6.5%).
+
+**Deferred: Qwen3.5** (both decode and prefill) — lower priority until Qwen3 is validated.
 
 ### Phase 2: Scheduler + Batch Decode
 
