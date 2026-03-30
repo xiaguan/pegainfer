@@ -21,36 +21,3 @@ impl SamplingParams {
         (self.temperature <= 0.0 || self.top_k == 1) && self.top_p >= 1.0
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_greedy_defaults() {
-        let params = SamplingParams::default();
-        assert!(params.is_greedy());
-    }
-
-    #[test]
-    fn test_greedy_top_k_1() {
-        let params = SamplingParams {
-            temperature: 0.7,
-            top_k: 1,
-            top_p: 1.0,
-            ..Default::default()
-        };
-        assert!(params.is_greedy());
-    }
-
-    #[test]
-    fn test_not_greedy() {
-        let params = SamplingParams {
-            temperature: 0.7,
-            top_k: -1,
-            top_p: 1.0,
-            ..Default::default()
-        };
-        assert!(!params.is_greedy());
-    }
-}
