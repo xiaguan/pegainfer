@@ -9,6 +9,9 @@ use crate::ops;
 
 impl Qwen3Model {
     /// Sample one token per request, each with its own sampling params.
+    ///
+    /// Fast path: when all requests use greedy sampling, launches a single batched
+    /// argmax kernel + one sync + one D2H. Falls back to serial for mixed params.
     pub(crate) fn select_tokens_batch_varied(
         &self,
         bufs: &mut BatchDecodeBuffers,
@@ -16,6 +19,13 @@ impl Qwen3Model {
         rng: &mut rand::rngs::StdRng,
     ) -> Result<Vec<u32>> {
         let batch_size = params.len();
+
+        // Fast path: all greedy → one batched argmax kernel
+        if params.iter().all(|p| p.is_greedy()) {
+            return ops::argmax_batched(&self.ctx, &bufs.logits, &mut bufs.sample_out, batch_size);
+        }
+
+        // Fallback: serial sampling for mixed params
         let mut tokens = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;

@@ -300,9 +300,61 @@ __global__ void gpu_sample_kernel(
   }
 }
 
+// ============================================================================
+// Batched argmax: one block per row, find argmax of each row independently.
+// Input: x [batch_size, vocab_size] row-major, out [batch_size].
+// ============================================================================
+__global__ void argmax_batched_kernel(const __nv_bfloat16 *__restrict__ x,
+                                      int *__restrict__ out, int vocab_size) {
+  int row = blockIdx.x;
+  const __nv_bfloat16 *row_data = x + (size_t)row * vocab_size;
+
+  extern __shared__ char shared_mem[];
+  float *shared_vals = (float *)shared_mem;
+  int *shared_idxs = (int *)(shared_mem + blockDim.x * sizeof(float));
+
+  int tid = threadIdx.x;
+  int stride = blockDim.x;
+
+  float local_max = -INFINITY;
+  int local_idx = 0;
+  for (int i = tid; i < vocab_size; i += stride) {
+    float val = __bfloat162float(row_data[i]);
+    if (val > local_max || (val == local_max && i < local_idx)) {
+      local_max = val;
+      local_idx = i;
+    }
+  }
+  shared_vals[tid] = local_max;
+  shared_idxs[tid] = local_idx;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (shared_vals[tid + s] > shared_vals[tid] ||
+          (shared_vals[tid + s] == shared_vals[tid] &&
+           shared_idxs[tid + s] < shared_idxs[tid])) {
+        shared_vals[tid] = shared_vals[tid + s];
+        shared_idxs[tid] = shared_idxs[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    out[row] = shared_idxs[0];
+  }
+}
+
 extern "C" {
 void argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
   argmax_kernel<<<1, SAMPLE_BLOCK, SAMPLE_BLOCK * (sizeof(float) + sizeof(int)), stream>>>(x, out, n);
+}
+
+void argmax_batched_cuda(const __nv_bfloat16 *x, int *out, int vocab_size,
+                         int batch_size, cudaStream_t stream) {
+  int smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
+  argmax_batched_kernel<<<batch_size, SAMPLE_BLOCK, smem, stream>>>(x, out, vocab_size);
 }
 
 void gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, int *output,

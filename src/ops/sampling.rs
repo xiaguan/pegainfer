@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Argmax — returns the index of the maximum element.
 ///
@@ -116,4 +116,41 @@ fn gpu_sample_core(
         .map_err(|e| anyhow!("D2H sample read failed: {}", e))?;
 
     Ok(result[0] as u32)
+}
+
+/// Batched greedy sampling: one argmax kernel launch for all rows, one sync, one D2H.
+///
+/// `logits` must be [batch_size, vocab_size] contiguous (HiddenStates with
+/// hidden_dim=vocab_size, seq_len=batch_size). `out` must have capacity >= batch_size.
+pub fn argmax_batched(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    out: &mut CudaSlice<i32>,
+    batch_size: usize,
+) -> Result<Vec<u32>> {
+    let vocab_size = logits.hidden_dim;
+
+    {
+        let (x_ptr, _gx) = logits.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::argmax_batched_cuda(
+                x_ptr as *const ffi::Half,
+                o_ptr as *mut i32,
+                vocab_size as i32,
+                batch_size as i32,
+                ctx.stream.cu_stream(),
+            );
+        }
+    }
+
+    ctx.sync()?;
+
+    let result = ctx
+        .stream
+        .clone_dtoh(out)
+        .map_err(|e| anyhow!("D2H batched argmax failed: {}", e))?;
+
+    Ok(result[..batch_size].iter().map(|&x| x as u32).collect())
 }

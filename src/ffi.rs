@@ -72,6 +72,14 @@ unsafe extern "C" {
 
     pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
 
+    pub(crate) fn argmax_batched_cuda(
+        x: *const Half,
+        out: *mut i32,
+        vocab_size: i32,
+        batch_size: i32,
+        stream: CUstream,
+    );
+
     pub(crate) fn gpu_sample_cuda(
         logits: *const Half,
         probs_scratch: *mut f32,

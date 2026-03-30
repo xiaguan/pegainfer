@@ -1,8 +1,8 @@
 # Batch Optimization
 
-> **TL;DR:** Unified forward pass implemented — prefill and decode tokens in one forward pass, decode GEMMs ride free on prefill compute. With varied-length workloads (n=500, c=8), throughput gap vs warmed vLLM is **2%** (previously 28% with fixed-length). Remaining gap is per-token decode efficiency: TPOT 18.28ms vs 17.38ms (+5%), partly from serial sampling overhead (~0.2ms/step recoverable). ITL p99 improved 17% (97→81ms).
+> **TL;DR:** Batch sampling landed — batched argmax replaces 8 serial extract+argmax+sync calls with one kernel launch + one sync. TPOT 12.09→11.75ms (−2.8%), closing gap vs vLLM from 5.9% to **3.0%**. ITL p99 at parity (12.38 vs 12.36ms). Remaining 3% is kernel fusion (torch.compile fuses residual+RMSNorm).
 >
-> **Status:** Active. Unified forward landed. Next: batch sampling to close remaining TPOT gap.
+> **Status:** Active. Batch sampling landed. Next: kernel fusion or accept remaining 3% gap.
 
 ## Baseline (2026-03-30, n=50)
 
@@ -137,7 +137,7 @@ Decode-heavy barely affected (prefill is trivial at in=1). Slight improvement fr
 
 1. **Prefill at parity with vLLM.** 4–9% faster across all concurrencies at in=1024. Both scale linearly (compute-bound). Previous n=20 data showing vLLM at 65ms/c=4 was a cold-start artifact — corrected with n=50.
 
-2. **Decode at parity.** TPOT within ±6% at all concurrencies. pegainfer has lower fixed overhead (no torch.compile) giving a 32% TTFT advantage at c=1 for decode-heavy loads.
+2. **Decode at near-parity.** TPOT within +3% at c=8 after batch sampling (11.75ms vs 11.41ms). pegainfer has lower fixed overhead (no torch.compile) giving a 32% TTFT advantage at c=1 for decode-heavy loads.
 
 3. **Batch prefill fixed ITL stalls.** ITL p99 dropped from 83→14ms at c=8. Decode steps no longer blocked by incoming prefills. pegainfer ITL p99 is now tighter than vLLM's (13.76ms vs 17.45ms at c=8).
 
@@ -181,12 +181,39 @@ in~256–768, out~32–96, c=8, n=500, `request-rate inf`. vLLM warmed (torch.co
 
 Throughput gap collapsed from 28% (fixed-length) to **2%** (varied-length). TTFT 27% faster than vLLM (no torch.compile overhead).
 
-### Remaining gap: TPOT +5%
+### Remaining gap: TPOT +3%
 
-nsys profile of pure decode (in=1, out=128, c=8) shows `argmax_kernel` at 8.3% of GPU time — 8 serial sampling calls per step (extract logits → argmax → sync, one per request). Batching into one call would save ~0.2ms/step (1.9%), closing TPOT gap from 5.9% to ~4%.
+After batch sampling, TPOT gap is 11.75ms vs 11.41ms (+3.0%). The remaining gap is kernel-level efficiency: vLLM's torch.compile fuses elementwise ops (residual add + RMSNorm → one memory pass), reducing bandwidth pressure. CUDA Graph eliminates launch overhead but not redundant memory traffic from unfused kernels.
 
-The remaining ~4% is kernel-level efficiency: vLLM's torch.compile fuses elementwise ops (residual add + RMSNorm → one memory pass), reducing bandwidth pressure. CUDA Graph eliminates launch overhead but not redundant memory traffic from unfused kernels.
+## Batch Sampling (2026-03-30)
 
-## Next Target: Batch Sampling
+### Problem
 
-Current `select_tokens_batch_varied` does 8 serial `extract_vec → gpu_sample_into → sync` calls. Replace with a single batched argmax/sampling kernel + one sync. Estimated TPOT improvement: ~0.2ms (1.9%).
+`select_tokens_batch_varied` did 8 serial `extract_vec → argmax → sync → D2H` calls per decode step. nsys showed 1,401 `cuStreamSynchronize` calls (8 per step × ~175 steps) and 1,401 D2D copies for logits extraction.
+
+### Implementation
+
+New `argmax_batched_kernel`: one CUDA block per row, grid=batch_size. Reads directly from contiguous logits buffer `[batch_size, vocab_size]` — no extract_vec needed. One kernel launch → one sync → one D2H for all tokens.
+
+`select_tokens_batch_varied` fast path: when all requests are greedy, calls batched kernel. Falls back to serial for mixed sampling params.
+
+### Results (in=1, out=128, c=8, n=50)
+
+| Metric | before | after | vLLM (warmed) | before→after | after vs vLLM |
+|--------|--------|-------|---------------|-------------|---------------|
+| TPOT median (ms) | 12.09 | **11.75** | 11.41 | **−2.8%** | +3.0% |
+| TPOT p99 (ms) | 12.17 | **11.82** | 11.42 | −2.9% | +3.5% |
+| ITL p99 (ms) | 12.65 | **12.38** | 12.36 | −2.1% | **+0.2% (parity)** |
+| Output tok/s | 572.78 | **591.69** | 612.86 | +3.3% | −3.5% |
+
+### nsys before → after
+
+| | before | after |
+|---|--------|-------|
+| argmax kernel instances | 1,401 (serial) | 157 (batched) + 18 (prefill) |
+| argmax GPU time | 41.5ms (2.0%) | 10.5ms (0.5%) |
+| cuStreamSynchronize calls | 1,401 | 175 |
+| cuMemcpyDtoHAsync calls | 1,401 | 175 |
+| cuMemcpyDtoDAsync calls | 1,402 | 18 |
+
+Sync calls dropped 87% (8/step → 1/step). D2D copies eliminated (batched kernel reads contiguous buffer directly).

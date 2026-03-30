@@ -106,7 +106,7 @@ impl BatchDecodeBuffers {
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
             sample_probs: ctx.stream.alloc_zeros(config.vocab_size)?,
-            sample_out: ctx.stream.alloc_zeros(1)?,
+            sample_out: ctx.stream.alloc_zeros(bs)?,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()
