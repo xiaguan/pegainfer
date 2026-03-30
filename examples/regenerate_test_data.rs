@@ -1,12 +1,14 @@
 //! Regenerate test_data/Qwen3-4B.json using pegainfer's greedy output.
+//!
+//! Uses the scheduler path (with CUDA Graph) to match the e2e test execution.
 //! Run: cargo run -r --example regenerate_test_data
 
-use pegainfer::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model};
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
+use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
 use pegainfer::tokenizer::Tokenizer;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const OUTPUT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/Qwen3-4B.json");
@@ -48,42 +50,40 @@ fn main() {
     let input: InputData = serde_json::from_str(&content).expect("Failed to parse JSON");
 
     let tokenizer = Tokenizer::from_file(MODEL_PATH).expect("Failed to load tokenizer");
-    let model =
-        Qwen3Model::from_safetensors_with_runtime(MODEL_PATH, ModelRuntimeConfig::default())
-            .expect("Failed to load model");
-    let mut state = model.create_state().expect("Failed to create state");
-    let greedy = SamplingParams::default();
-    let mut rng = StdRng::seed_from_u64(42);
+    let model = Qwen3Model::from_safetensors_with_runtime(
+        MODEL_PATH,
+        ModelRuntimeConfig {
+            enable_cuda_graph: true,
+        },
+    )
+    .expect("Failed to load model");
+
+    let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
 
     let mut cases = Vec::new();
     for case in &input.cases {
         let prompt_tokens = tokenizer.encode(&case.prompt).expect("encode failed");
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
-        // Generate using ModelForward
-        state.reset().expect("reset failed");
-        model
-            .forward(&prompt_tokens, &mut state)
-            .expect("prefill failed");
-        let mut output_tokens = prompt_tokens.clone();
-        let first = model
-            .select_token(&mut state, &greedy, &mut rng)
-            .expect("select failed");
-        output_tokens.push(first);
-        for _ in 1..case.max_new_tokens {
-            model
-                .forward(&[*output_tokens.last().unwrap()], &mut state)
-                .expect("decode failed");
-            let tok = model
-                .select_token(&mut state, &greedy, &mut rng)
-                .expect("select failed");
-            if model.is_stop_token(tok) {
-                break;
+        handle
+            .submit(SchedulerRequest {
+                prompt_tokens,
+                params: SamplingParams::default(),
+                max_tokens: case.max_new_tokens,
+                token_tx,
+            })
+            .expect("submit failed");
+
+        let mut tokens = Vec::new();
+        loop {
+            match token_rx.blocking_recv() {
+                Some(TokenEvent::Token(id)) => tokens.push(id),
+                Some(TokenEvent::Finished { .. }) => break,
+                None => panic!("scheduler channel closed without Finished"),
             }
-            output_tokens.push(tok);
         }
 
-        let new_tokens = &output_tokens[prompt_tokens.len()..];
-        let output_text = tokenizer.decode(new_tokens).expect("decode failed");
+        let output_text = tokenizer.decode(&tokens).expect("decode failed");
 
         eprintln!("[{}] prompt={:?}", case.name, case.prompt);
         eprintln!("  output={:?}", output_text);
@@ -95,6 +95,9 @@ fn main() {
             output: output_text,
         });
     }
+
+    // Drop handle to stop scheduler before writing
+    drop(handle);
 
     let output = OutputData {
         model_name: input.model_name,

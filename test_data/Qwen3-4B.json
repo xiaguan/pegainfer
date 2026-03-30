@@ -1,18 +1,18 @@
 {
-  "engine": "pegainfer",
   "model_name": "Qwen3-4B",
+  "engine": "pegainfer",
   "cases": [
     {
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young girl named Lila who is a talented painter, and her journey to become a successful artist. Include the following elements: a mentor, a challenge, and a turning point. Also, include a scene where she paints a self-port"
+      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and wants to"
     },
     {
       "name": "my_name",
       "prompt": "My name is",
       "max_new_tokens": 50,
-      "output": " Xiaoyu, and I am a student in the School of Economics and Management at Tsinghua University. I am currently studying a major in International Business. I have a strong interest in the field of international trade and have been involved in various"
+      "output": " Li Hua. I am a student in the School of Economics and Management at Tsinghua University. I am currently studying a master's degree in International Business. I have a strong interest in the field of international business, and I have been"
     },
     {
       "name": "math",

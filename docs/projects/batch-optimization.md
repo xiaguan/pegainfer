@@ -2,7 +2,7 @@
 
 > **TL;DR:** Realistic varied-length benchmark (in~1024–3072, out~64–192, Poisson QPS=2, n=500) shows pegainfer within 2% of vLLM throughput while beating it on TTFT (−16%), TPOT (−1.6%), and latency stability (std lower across the board). Fixed-length decode: TPOT 11.05ms vs vLLM 11.41ms (−3.2%). KV cache now dynamically sized (85% of free VRAM).
 >
-> **Status:** Active. Fused projections + dynamic KV cache landed. Decode TPOT surpasses vLLM at all concurrencies. Remaining: ITL p99 tail (prefill stalls → chunked prefill), kernel fusion (residual+RMSNorm).
+> **Status:** Active. Fused projections + dynamic KV cache landed. RMSNorm migrated to FlashInfer (zero perf delta). Decode TPOT surpasses vLLM at all concurrencies. Remaining: ITL p99 tail (prefill stalls → chunked prefill).
 
 ## Baseline (2026-03-30, n=50)
 
@@ -218,7 +218,7 @@ Input: ~1024–3072 tokens (uniform). Output: ~64–192 tokens (uniform). Poisso
 | QPS | OK | Failed | Req/s | TTFT med (ms) | TPOT med (ms) | ITL p99 (ms) | Peak c |
 |-----|-----|--------|-------|---------------|---------------|-------------|--------|
 | 1 | 500 | 0 | 1.00 | 256 | 17.75 | 209 | 11 |
-| 2 | 491 | 9 | 1.95 | 302 | 25.71 | 293 | 20 |
+| 2 | 491 | 9 | 1.95 | 301 | 25.23 | 291 | 20 |
 | 4 | 365 | 135 | 2.87 | 351 | 40.51 | 410 | 23 |
 
 Stable at QPS=1 (0 failures). QPS=2 is near capacity (9 failures). QPS=4 overloaded (27% failures).
@@ -229,27 +229,27 @@ Stable at QPS=1 (0 failures). QPS=2 is near capacity (9 failures). QPS=4 overloa
 |--------|-----------|------|-------|
 | completed | 491 | **500** | −1.8% |
 | failed | 9 | **0** | |
-| request_throughput | 1.95 | 1.99 | −1.9% |
-| output tok/s | 250.52 | 255.94 | **−2.1%** |
-| total tok/s | 4,226.74 | 4,319.32 | −2.1% |
-| max output tok/s | 716 | 764 | −6.3% |
+| request_throughput | 1.95 | 1.99 | −2.0% |
+| output tok/s | 251.14 | 255.94 | **−1.9%** |
+| total tok/s | 4,227.07 | 4,319.32 | −2.1% |
+| max output tok/s | 748 | 764 | −2.1% |
 | peak concurrent | 20 | 24 | −16.7% |
-| **TTFT mean** | **345.82** | 411.15 | **−15.9%** |
-| **TTFT median** | **302.05** | 358.57 | **−15.8%** |
-| **TTFT std** | **183.60** | 227.84 | **−19.4%** |
-| **TTFT p99** | **969.03** | 1244.92 | **−22.2%** |
-| **TPOT mean** | **26.85** | 28.12 | **−4.5%** |
-| **TPOT median** | **25.71** | 26.12 | **−1.6%** |
-| **TPOT std** | **8.22** | 10.38 | **−20.8%** |
-| **TPOT p99** | **50.52** | 56.22 | **−10.1%** |
-| **ITL mean** | **26.95** | 27.92 | **−3.5%** |
-| **ITL median** | **15.75** | 16.12 | **−2.3%** |
-| ITL std | 52.44 | **40.99** | +27.9% |
-| ITL p99 | 293.49 | **210.58** | +39.4% |
+| **TTFT mean** | **345.11** | 411.15 | **−16.1%** |
+| **TTFT median** | **301.27** | 358.57 | **−16.0%** |
+| **TTFT std** | **182.88** | 227.84 | **−19.7%** |
+| **TTFT p99** | **950.96** | 1244.92 | **−23.6%** |
+| **TPOT mean** | **26.56** | 28.12 | **−5.5%** |
+| **TPOT median** | **25.23** | 26.12 | **−3.4%** |
+| **TPOT std** | **8.13** | 10.38 | **−21.7%** |
+| **TPOT p99** | **50.04** | 56.22 | **−11.0%** |
+| **ITL mean** | **26.60** | 27.92 | **−4.7%** |
+| **ITL median** | **15.57** | 16.12 | **−3.4%** |
+| ITL std | 51.92 | **40.99** | +26.7% |
+| ITL p99 | 291.21 | **210.58** | +38.3% |
 
-pegainfer wins 17 of 20 metrics. Throughput within 2%. TTFT 16% faster, TPOT 1.6% faster with lower variance across the board.
+pegainfer wins 17 of 20 metrics. Throughput within 2%. TTFT 16% faster, TPOT 3.4% faster with lower variance across the board.
 
-vLLM wins: zero failed requests, ITL tail (std/p99). The ITL p99 gap (293 vs 211ms) is from prefill stalls — large prefills block all decode. Chunked prefill would fix this.
+vLLM wins: zero failed requests, ITL tail (std/p99). The ITL p99 gap (291 vs 211ms) is from prefill stalls — large prefills block all decode. Chunked prefill would fix this.
 
 ## Key Observations
 
@@ -257,15 +257,17 @@ vLLM wins: zero failed requests, ITL tail (std/p99). The ITL p99 gap (293 vs 211
 
 2. **Prefill at parity.** 4–9% faster across all concurrencies at in=1024. Both scale linearly (compute-bound).
 
-3. **Realistic throughput within 2% of vLLM.** Varied-length Poisson QPS=2: 250 vs 256 tok/s (−2.1%). The fixed-length 24% gap was a scheduling artifact from synchronized request waves.
+3. **Realistic throughput within 2% of vLLM.** Varied-length Poisson QPS=2: 251 vs 256 tok/s (−1.9%). The fixed-length 24% gap was a scheduling artifact from synchronized request waves.
 
 4. **TTFT consistently faster.** 16% faster median in realistic benchmark, 33% faster at c=1 decode-heavy. Lower fixed overhead (no torch.compile).
 
-5. **Latency more stable.** Lower std on TTFT (−19%), TPOT (−21%) in realistic benchmark. pegainfer is more predictable under load.
+5. **Latency more stable.** Lower std on TTFT (−20%), TPOT (−22%) in realistic benchmark. pegainfer is more predictable under load.
 
-6. **ITL p99 is the remaining gap.** 293ms vs 211ms in realistic benchmark. Large prefills block decode — chunked prefill is the fix. In fixed-length decode-heavy benchmarks, ITL p99 is already tighter than vLLM (11.68 vs 12.41ms at c=8).
+6. **ITL p99 is the remaining gap.** 291ms vs 211ms in realistic benchmark. Large prefills block decode — chunked prefill is the fix. In fixed-length decode-heavy benchmarks, ITL p99 is already tighter than vLLM (11.68 vs 12.41ms at c=8).
 
 7. **9 failed requests at QPS=2.** Needs investigation — possibly KV cache pressure or empty-prompt rejection from random dataset.
+
+8. **FlashInfer norm migration: zero perf delta.** Replaced ~774 lines of custom RMSNorm CUDA with FlashInfer's `RMSNorm`, `GemmaRMSNorm`, and `FusedAddRMSNorm`. Realistic QPS=2 benchmark unchanged within noise (TPOT 25.23 vs 25.71ms prior, −1.9%).
 
 ## Unified Forward Pass (2026-03-30)
 
