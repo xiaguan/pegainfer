@@ -387,145 +387,117 @@ mod tests {
         all_tokens
     }
 
-    /// Verify batch prefill produces the same first token as sequential prefill for each request.
-    ///
-    /// Uses multi-token prompts (≥2 tokens) to ensure both sequential and batch
-    /// paths go through the GEMM-based prefill code path. Single-token prompts
-    /// route through GEMV in `forward()`, which has slightly different bf16
-    /// rounding — that's a pre-existing difference, not a batch prefill bug.
+    /// Verify batch prefill, batch decode, and batch decode with CUDA Graph all match
+    /// sequential single-request results. Runs as one test to avoid parallel model loads
+    /// OOM-ing on a single GPU.
     #[test]
-    fn batch_prefill_matches_sequential() {
+    fn batch_matches_sequential() {
         let model_path = get_model_path();
-        let model = Qwen3Model::from_safetensors_with_runtime(
-            &model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: false,
-            },
-        )
-        .unwrap();
-
-        let prompt_a: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
-        let prompt_b: Vec<u32> = (1..65).collect(); // 64-token synthetic
-        let prompt_c: Vec<u32> = (1..129).collect(); // 128-token synthetic
-
+        let prompt_a: Vec<u32> = vec![9707]; // "Hello"
+        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
+        let num_steps = 10;
         let seed = 42;
-        let params = SamplingParams::default();
 
-        // Sequential reference: single-request prefill each prompt
-        let mut seq_first_tokens = Vec::new();
-        for prompt in [&prompt_a, &prompt_b, &prompt_c] {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let mut state = model.create_state().unwrap();
-            model.forward(prompt.as_slice(), &mut state).unwrap();
-            let token = model.select_token(&mut state, &params, &mut rng).unwrap();
-            seq_first_tokens.push(token);
-        }
-
-        // Batch prefill: all three prompts in one forward pass
-        let prompts: Vec<&[u32]> = vec![&prompt_a, &prompt_b, &prompt_c];
-        let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-        let logits_vec = model.batch_prefill(&prompts, &mut kv_states).unwrap();
-
-        let mut batch_first_tokens = Vec::new();
-        for logits in &logits_vec {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let mut probs: cudarc::driver::CudaSlice<f32> = model
-                .ctx
-                .stream
-                .alloc_zeros(model.config.vocab_size)
-                .unwrap();
-            let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
-            let random_val: f32 = rand::RngExt::random(&mut rng);
-            let token = crate::ops::gpu_sample_into(
-                &model.ctx, logits, &mut probs, &mut out, &params, random_val,
+        // --- Phase 1: batch prefill + batch decode (no CUDA Graph) ---
+        {
+            let model = Qwen3Model::from_safetensors_with_runtime(
+                &model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph: false,
+                },
             )
             .unwrap();
-            batch_first_tokens.push(token);
-        }
 
-        for (i, (seq_tok, batch_tok)) in seq_first_tokens
-            .iter()
-            .zip(batch_first_tokens.iter())
-            .enumerate()
-        {
+            // Batch prefill: multi-token prompts so both paths use GEMM prefill
+            let prefill_a: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
+            let prefill_b: Vec<u32> = (1..65).collect();
+            let prefill_c: Vec<u32> = (1..129).collect();
+            let params = SamplingParams::default();
+
+            let mut seq_first_tokens = Vec::new();
+            for prompt in [&prefill_a, &prefill_b, &prefill_c] {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut state = model.create_state().unwrap();
+                model.forward(prompt.as_slice(), &mut state).unwrap();
+                let token = model.select_token(&mut state, &params, &mut rng).unwrap();
+                seq_first_tokens.push(token);
+            }
+
+            let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
+            let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
+            let logits_vec = model.batch_prefill(&prompts, &mut kv_states).unwrap();
+
+            let mut batch_first_tokens = Vec::new();
+            for logits in &logits_vec {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut probs: cudarc::driver::CudaSlice<f32> = model
+                    .ctx
+                    .stream
+                    .alloc_zeros(model.config.vocab_size)
+                    .unwrap();
+                let mut out: cudarc::driver::CudaSlice<i32> =
+                    model.ctx.stream.alloc_zeros(1).unwrap();
+                let random_val: f32 = rand::RngExt::random(&mut rng);
+                let token = crate::ops::gpu_sample_into(
+                    &model.ctx, logits, &mut probs, &mut out, &params, random_val,
+                )
+                .unwrap();
+                batch_first_tokens.push(token);
+            }
+
+            for (i, (seq_tok, batch_tok)) in seq_first_tokens
+                .iter()
+                .zip(batch_first_tokens.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    seq_tok, batch_tok,
+                    "Prefill first token mismatch for prompt {i}: seq={seq_tok}, batch={batch_tok}"
+                );
+            }
+
+            // Batch decode (no graph)
+            let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
+            let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
+            let batch = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
+
             assert_eq!(
-                seq_tok, batch_tok,
-                "First token mismatch for prompt {i}: seq={seq_tok}, batch={batch_tok}"
+                batch[0], seq_a,
+                "Decode request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
+                batch[0], seq_a
+            );
+            assert_eq!(
+                batch[1], seq_b,
+                "Decode request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
+                batch[1], seq_b
             );
         }
-    }
+        // model dropped, GPU memory freed
 
-    #[test]
-    fn batch_decode_matches_sequential() {
-        let model_path = get_model_path();
-        let model = Qwen3Model::from_safetensors_with_runtime(
-            &model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: false,
-            },
-        )
-        .unwrap();
+        // --- Phase 2: batch decode with CUDA Graph ---
+        {
+            let model = Qwen3Model::from_safetensors_with_runtime(
+                &model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph: true,
+                },
+            )
+            .unwrap();
 
-        // Two different prompts at different lengths to test varied contexts
-        let prompt_a: Vec<u32> = vec![9707]; // "Hello"
-        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
+            let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
+            let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
+            let batch = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
 
-        let num_steps = 10;
-        let seed = 42;
-
-        // Sequential reference
-        let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
-        let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
-
-        // Batch
-        let batch_results = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
-
-        // Compare
-        assert_eq!(
-            batch_results[0], seq_a,
-            "Request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_results[0], seq_a
-        );
-        assert_eq!(
-            batch_results[1], seq_b,
-            "Request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_results[1], seq_b
-        );
-    }
-
-    #[test]
-    fn batch_decode_graph_matches_sequential() {
-        let model_path = get_model_path();
-        let model = Qwen3Model::from_safetensors_with_runtime(
-            &model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: true,
-            },
-        )
-        .unwrap();
-
-        let prompt_a: Vec<u32> = vec![9707]; // "Hello"
-        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
-
-        let num_steps = 10;
-        let seed = 42;
-
-        // Sequential reference (uses single-request CUDA Graph)
-        let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
-        let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
-
-        // Batch with bucket CUDA Graph
-        let batch_results = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
-
-        assert_eq!(
-            batch_results[0], seq_a,
-            "Graph request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_results[0], seq_a
-        );
-        assert_eq!(
-            batch_results[1], seq_b,
-            "Graph request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_results[1], seq_b
-        );
+            assert_eq!(
+                batch[0], seq_a,
+                "Graph request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
+                batch[0], seq_a
+            );
+            assert_eq!(
+                batch[1], seq_b,
+                "Graph request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
+                batch[1], seq_b
+            );
+        }
     }
 }

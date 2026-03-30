@@ -65,11 +65,3 @@ fn bench_prefill(seq_len: usize, warmup: usize, iters: usize) {
 fn bench_prefill_1024() {
     bench_prefill(1024, 2, 5);
 }
-
-#[test]
-#[ignore = "manual benchmark sweep"]
-fn bench_prefill_sweep() {
-    for &seq_len in &[1, 4, 16, 64, 256, 512, 1024] {
-        bench_prefill(seq_len, 2, 5);
-    }
-}
