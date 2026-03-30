@@ -29,8 +29,11 @@ pub(crate) use attention::{
     PrefillPagedPlan, paged_attention_batch_decode_into, paged_attention_decode_into,
     prefill_attention_paged_into, qk_norm_rope_batch_decode_into, qk_norm_rope_into,
 };
-pub(crate) use elementwise::{add_batch_into, extract_vec, silu_mul_batch_into};
-pub(crate) use linear::{gemm_into, linear};
+pub(crate) use elementwise::{
+    add_batch_into, extract_vec, silu_mul_batch_into, silu_mul_fused_batch_into,
+};
+pub(crate) use linear::deinterleave_qkv_into;
+pub(crate) use linear::{fused_mlp_gate_up_into, gemm_into, gemm_rows_into, gemv_rows, linear};
 pub(crate) use norm::{
     fused_add_rms_norm_batch_into, rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into,
 };

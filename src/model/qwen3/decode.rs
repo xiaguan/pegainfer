@@ -114,22 +114,30 @@ impl Qwen3Model {
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
 
-        // Q/K/V projections
-        ops::gemv(
+        // Q/K/V projections from fused qkv_proj
+        let q_dim = layer.attention.q_dim;
+        let kv_dim = layer.attention.kv_dim;
+        ops::gemv_rows(
             &self.ctx,
-            &layer.attention.q_proj,
+            &layer.attention.qkv_proj,
+            0,
+            q_dim,
             &bufs.normed,
             &mut bufs.q,
         )?;
-        ops::gemv(
+        ops::gemv_rows(
             &self.ctx,
-            &layer.attention.k_proj,
+            &layer.attention.qkv_proj,
+            q_dim,
+            kv_dim,
             &bufs.normed,
             &mut bufs.k,
         )?;
-        ops::gemv(
+        ops::gemv_rows(
             &self.ctx,
-            &layer.attention.v_proj,
+            &layer.attention.qkv_proj,
+            q_dim + kv_dim,
+            kv_dim,
             &bufs.normed,
             &mut bufs.v,
         )?;
@@ -187,12 +195,12 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // MLP
-        ops::fused_mlp_into(
+        // MLP (gate+up from fused weight matrix)
+        ops::fused_mlp_gate_up_into(
             &self.ctx,
             &bufs.normed,
-            &layer.mlp.gate_proj,
-            &layer.mlp.up_proj,
+            &layer.mlp.gate_up_proj,
+            layer.mlp.intermediate_size,
             &layer.mlp.down_proj,
             &mut bufs.mlp_act,
             &mut bufs.mlp_out,

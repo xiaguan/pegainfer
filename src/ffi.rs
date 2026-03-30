@@ -142,6 +142,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn deinterleave_qkv_cuda(
+        qkv: *const Half,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        q_dim: i32,
+        kv_dim: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
+    pub(crate) fn silu_mul_fused_cuda(
+        gate_up: *const Half,
+        out: *mut Half,
+        intermediate_size: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
     pub(crate) fn cublas_init();
 
     // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.

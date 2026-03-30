@@ -178,23 +178,18 @@ impl Qwen3Model {
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
 
-        // Q/K/V projections via GEMM (batched)
+        // QKV fused projection: one GEMM [q_dim+2*kv_dim, hidden] @ normed → deinterleave
         ops::gemm_into(
             &self.ctx,
-            &layer.attention.q_proj,
+            &layer.attention.qkv_proj,
             &bufs.normed,
+            &mut bufs.qkv_out,
+        );
+        ops::deinterleave_qkv_into(
+            &self.ctx,
+            &bufs.qkv_out,
             &mut bufs.q,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
             &mut bufs.k,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
             &mut bufs.v,
         );
 
@@ -252,23 +247,14 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // MLP: decomposed into GEMM + SiLU-mul + GEMM
-        // gate_out, up_out: [intermediate, bs]
-        // mlp_act: [intermediate, bs] (silu_mul output)
-        // mlp_out: [hidden, bs] (down_proj output)
+        // MLP: fused gate+up GEMM → silu_mul_fused → down GEMM
         ops::gemm_into(
             &self.ctx,
-            &layer.mlp.gate_proj,
+            &layer.mlp.gate_up_proj,
             &bufs.normed,
-            &mut bufs.gate_out,
+            &mut bufs.gate_up_out,
         );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.mlp_act)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

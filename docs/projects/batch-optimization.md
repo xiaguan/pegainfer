@@ -1,8 +1,8 @@
 # Batch Optimization
 
-> **TL;DR:** Batch sampling landed — batched argmax replaces 8 serial extract+argmax+sync calls with one kernel launch + one sync. TPOT 12.09→11.75ms (−2.8%), closing gap vs vLLM from 5.9% to **3.0%**. ITL p99 at parity (12.38 vs 12.36ms). Remaining 3% is kernel fusion (torch.compile fuses residual+RMSNorm).
+> **TL;DR:** Fused projections landed — QKV weights concatenated into one GEMM (3→1 launch, better SM utilization for small K/V projections), gate+up into one GEMM + fused silu_mul (3→2 kernels). TPOT 11.75→11.05ms (−6.0%), now **3.2% faster** than vLLM (11.05 vs 11.41ms). Zero extra VRAM.
 >
-> **Status:** Active. Batch sampling landed. Next: kernel fusion or accept remaining 3% gap.
+> **Status:** Active. Fused projections landed. Decode TPOT surpasses vLLM. Remaining opportunity: kernel fusion (residual+RMSNorm).
 
 ## Baseline (2026-03-30, n=50)
 
@@ -183,7 +183,7 @@ Throughput gap collapsed from 28% (fixed-length) to **2%** (varied-length). TTFT
 
 ### Remaining gap: TPOT +3%
 
-After batch sampling, TPOT gap is 11.75ms vs 11.41ms (+3.0%). The remaining gap is kernel-level efficiency: vLLM's torch.compile fuses elementwise ops (residual add + RMSNorm → one memory pass), reducing bandwidth pressure. CUDA Graph eliminates launch overhead but not redundant memory traffic from unfused kernels.
+After batch sampling, TPOT gap was 11.75ms vs 11.41ms (+3.0%). This was addressed by fused projections (see below).
 
 ## Batch Sampling (2026-03-30)
 
@@ -217,3 +217,29 @@ New `argmax_batched_kernel`: one CUDA block per row, grid=batch_size. Reads dire
 | cuMemcpyDtoDAsync calls | 1,402 | 18 |
 
 Sync calls dropped 87% (8/step → 1/step). D2D copies eliminated (batched kernel reads contiguous buffer directly).
+
+## Fused Projections (2026-03-30)
+
+### Problem
+
+Batch decode (`batch_decode_layer`) ran 7 cuBLAS GEMMs per layer: Q, K, V, O, gate, up, down. The K/V GEMMs (M=512, N=8, K=3584) had poor SM utilization — only ~16 CTAs on 80 SMs (~20%). Gate and up projections read `normed` twice.
+
+### Implementation
+
+**Weight concatenation at load time** — zero extra VRAM:
+- `qkv_proj = [q_proj; k_proj; v_proj]` → `[4608, 3584]` row-major. Individual weights dropped after vstack.
+- `gate_up_proj = [gate_proj; up_proj]` → `[28672, 3584]`. Individual weights dropped.
+
+**Batch decode path** (7 GEMMs → 4 GEMMs + 2 light kernels):
+- **QKV**: one GEMM `[4608, N, 3584]` → `deinterleave_qkv` kernel splits output to q/k/v buffers. K/V SM utilization jumps from ~20% to full (merged into one large GEMM).
+- **Gate+Up**: one GEMM `[28672, N, 3584]` → `silu_mul_fused` kernel reads gate/up from interleaved column-major layout, no deinterleave needed.
+
+**All paths updated** — single decode (GEMV), prefill (GEMM), unified forward all use fused weights via `gemv_rows` / `gemm_rows_into` with pointer offsets.
+
+### Results (in~1, out=128, c=8, n=50, greedy)
+
+| Metric | before | after | vLLM (warmed) | before→after | after vs vLLM |
+|--------|--------|-------|---------------|-------------|---------------|
+| TPOT median (ms) | 11.75 | **11.05** | 11.41 | **−6.0%** | **−3.2%** ✓ |
+| ITL p99 (ms) | 12.38 | **11.73** | 12.36 | **−5.2%** | **−5.1%** ✓ |
+| Output tok/s | 591.69 | **626.01** | 612.86 | **+5.8%** | **+2.1%** ✓ |

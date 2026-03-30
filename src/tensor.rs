@@ -123,6 +123,35 @@ pub struct DeviceMatrix {
 }
 
 impl DeviceMatrix {
+    /// Vertically stack matrices (same cols, concatenate rows). GPU D2D copy.
+    pub fn vstack(ctx: &DeviceContext, matrices: &[&DeviceMatrix]) -> Result<Self> {
+        assert!(!matrices.is_empty());
+        let cols = matrices[0].cols;
+        for m in matrices {
+            assert_eq!(m.cols, cols, "vstack: all matrices must have same cols");
+        }
+        let total_rows: usize = matrices.iter().map(|m| m.rows).sum();
+        let mut data: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros(total_rows * cols)
+            .map_err(|e| anyhow!("vstack alloc failed: {}", e))?;
+        let mut offset = 0;
+        for m in matrices {
+            let n = m.rows * m.cols;
+            let src = m.data.slice(..n);
+            let mut dst = data.slice_mut(offset..offset + n);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("vstack D2D copy failed: {}", e))?;
+            offset += n;
+        }
+        Ok(Self {
+            data,
+            rows: total_rows,
+            cols,
+        })
+    }
+
     /// Create from host data (row-major, bf16)
     pub fn from_host(ctx: &DeviceContext, data: &[bf16], rows: usize, cols: usize) -> Result<Self> {
         assert_eq!(data.len(), rows * cols);

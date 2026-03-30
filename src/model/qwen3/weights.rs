@@ -21,22 +21,27 @@ impl Default for ModelRuntimeConfig {
     }
 }
 
-/// Attention layer weights
+/// Attention layer weights.
+/// QKV stored as a single concatenated matrix [q_dim + 2*kv_dim, hidden_size].
+/// Individual projections accessed via row offsets (zero extra memory).
 pub(super) struct Attention {
-    pub(super) q_proj: DeviceMatrix,
-    pub(super) k_proj: DeviceMatrix,
-    pub(super) v_proj: DeviceMatrix,
+    /// Fused [q_proj; k_proj; v_proj] row-major
+    pub(super) qkv_proj: DeviceMatrix,
     pub(super) o_proj: DeviceMatrix,
     pub(super) q_norm: DeviceVec,
     pub(super) k_norm: DeviceVec,
+    pub(super) q_dim: usize,
+    pub(super) kv_dim: usize,
 }
 
-/// MLP layer weights
+/// MLP layer weights.
+/// Gate+Up stored as a single concatenated matrix [2*intermediate_size, hidden_size].
 #[allow(clippy::upper_case_acronyms, clippy::struct_field_names)]
 pub(super) struct MLP {
-    pub(super) gate_proj: DeviceMatrix,
-    pub(super) up_proj: DeviceMatrix,
+    /// Fused [gate_proj; up_proj] row-major
+    pub(super) gate_up_proj: DeviceMatrix,
     pub(super) down_proj: DeviceMatrix,
+    pub(super) intermediate_size: usize,
 }
 
 /// Transformer block
@@ -107,6 +112,48 @@ impl Qwen3Model {
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
 
+            let q_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.self_attn.q_proj.weight", prefix),
+            )?;
+            let k_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.self_attn.k_proj.weight", prefix),
+            )?;
+            let v_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.self_attn.v_proj.weight", prefix),
+            )?;
+            let q_dim = q_proj.rows;
+            let kv_dim = k_proj.rows;
+            let qkv_proj = DeviceMatrix::vstack(&ctx, &[&q_proj, &k_proj, &v_proj])?;
+            drop(q_proj);
+            drop(k_proj);
+            drop(v_proj);
+
+            let gate_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.mlp.gate_proj.weight", prefix),
+            )?;
+            let up_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.mlp.up_proj.weight", prefix),
+            )?;
+            let intermediate_size = gate_proj.rows;
+            let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
+            drop(gate_proj);
+            drop(up_proj);
+
             let block = TransformerBlock {
                 input_layernorm: load_tensor_1d(
                     &ctx,
@@ -115,24 +162,7 @@ impl Qwen3Model {
                     &format!("{}.input_layernorm.weight", prefix),
                 )?,
                 attention: Attention {
-                    q_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.q_proj.weight", prefix),
-                    )?,
-                    k_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.k_proj.weight", prefix),
-                    )?,
-                    v_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.v_proj.weight", prefix),
-                    )?,
+                    qkv_proj,
                     o_proj: load_tensor_2d(
                         &ctx,
                         &shards,
@@ -151,6 +181,8 @@ impl Qwen3Model {
                         &weight_map,
                         &format!("{}.self_attn.k_norm.weight", prefix),
                     )?,
+                    q_dim,
+                    kv_dim,
                 },
                 post_attention_layernorm: load_tensor_1d(
                     &ctx,
@@ -159,24 +191,14 @@ impl Qwen3Model {
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
                 mlp: MLP {
-                    gate_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.gate_proj.weight", prefix),
-                    )?,
-                    up_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.up_proj.weight", prefix),
-                    )?,
+                    gate_up_proj,
                     down_proj: load_tensor_2d(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
                     )?,
+                    intermediate_size,
                 },
             };
             layers.push(block);

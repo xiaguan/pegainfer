@@ -271,22 +271,30 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // ── 2. QKV projections [all tokens] ──────────────────────────
-        ops::gemm_into(
+        // ── 2. QKV projections from fused qkv_proj [all tokens] ─────
+        let q_dim_l = layer.attention.q_dim;
+        let kv_dim_l = layer.attention.kv_dim;
+        ops::gemm_rows_into(
             &self.ctx,
-            &layer.attention.q_proj,
+            &layer.attention.qkv_proj,
+            0,
+            q_dim_l,
             &bufs.normed,
             &mut bufs.q_batch,
         );
-        ops::gemm_into(
+        ops::gemm_rows_into(
             &self.ctx,
-            &layer.attention.k_proj,
+            &layer.attention.qkv_proj,
+            q_dim_l,
+            kv_dim_l,
             &bufs.normed,
             &mut bufs.k_batch,
         );
-        ops::gemm_into(
+        ops::gemm_rows_into(
             &self.ctx,
-            &layer.attention.v_proj,
+            &layer.attention.qkv_proj,
+            q_dim_l + kv_dim_l,
+            kv_dim_l,
             &bufs.normed,
             &mut bufs.v_batch,
         );
@@ -526,17 +534,11 @@ impl Qwen3Model {
 
         ops::gemm_into(
             &self.ctx,
-            &layer.mlp.gate_proj,
+            &layer.mlp.gate_up_proj,
             &bufs.normed,
-            &mut bufs.gate_out,
+            &mut bufs.gate_up_out,
         );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
