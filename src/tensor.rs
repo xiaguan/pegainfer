@@ -185,15 +185,7 @@ impl DeviceMatrix {
         // involve byte-swapping.
         let slice =
             unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), rows * cols) };
-        let gpu_data = ctx
-            .stream
-            .clone_htod(slice)
-            .map_err(|e| anyhow!("H2D copy failed: {}", e))?;
-        Ok(Self {
-            data: gpu_data,
-            rows,
-            cols,
-        })
+        Self::from_host(ctx, slice, rows, cols)
     }
 }
 
