@@ -121,18 +121,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub(crate) fn fused_mlp_cuda(
-        x: *const Half,
-        gate_proj: *const Half,
-        up_proj: *const Half,
-        down_proj: *const Half,
-        act: *mut Half,
-        out: *mut Half,
-        hidden_size: i32,
-        intermediate_size: i32,
-        stream: CUstream,
-    );
-
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub(crate) fn embedding_decode_cuda(
         embed: *const Half,
@@ -391,23 +379,6 @@ unsafe extern "C" {
     // ========================================================================
     // Paged attention (FlashInfer)
     // ========================================================================
-
-    // QK RMSNorm + RoPE for decode (seq_len=1, CUDA Graph safe).
-    // Reads position from decode_meta[1] on device.
-    pub(crate) fn qk_norm_rope_cuda(
-        q: *mut Half,
-        k: *mut Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        decode_meta: *const i32,
-        rms_eps: f32,
-        stream: CUstream,
-    );
 
     // Batched QK RMSNorm + RoPE for decode with per-request positions.
     pub(crate) fn qk_norm_rope_batched_decode_cuda(

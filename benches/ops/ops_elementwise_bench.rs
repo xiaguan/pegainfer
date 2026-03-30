@@ -3,8 +3,8 @@ use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
-    EPS, INTERMEDIATE_DIM, OUT_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_INTERMEDIATE, QWEN35_4B_VOCAB,
-    VECTOR_DIM, configure_group, device_matrix, device_vec, iter_sync, positive_device_vec,
+    EPS, OUT_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_VOCAB, VECTOR_DIM, configure_group, device_matrix,
+    device_vec, iter_sync, positive_device_vec,
 };
 
 pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
@@ -49,65 +49,6 @@ pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
                 .expect("rms_norm_into failed");
         });
     });
-
-    group.throughput(Throughput::Elements((INTERMEDIATE_DIM * VECTOR_DIM) as u64));
-    group.bench_function(BenchmarkId::new("fused_mlp_into", VECTOR_DIM), |b| {
-        let ctx = DeviceContext::new().expect("failed to create CUDA context");
-        let x = device_vec(&ctx, VECTOR_DIM).expect("failed to allocate x");
-        let gate_proj = device_matrix(&ctx, INTERMEDIATE_DIM, VECTOR_DIM)
-            .expect("failed to allocate gate proj");
-        let up_proj =
-            device_matrix(&ctx, INTERMEDIATE_DIM, VECTOR_DIM).expect("failed to allocate up proj");
-        let down_proj = device_matrix(&ctx, VECTOR_DIM, INTERMEDIATE_DIM)
-            .expect("failed to allocate down proj");
-        let mut act = DeviceVec::zeros(&ctx, INTERMEDIATE_DIM).expect("failed to allocate act");
-        let mut mlp_out = DeviceVec::zeros(&ctx, VECTOR_DIM).expect("failed to allocate mlp out");
-        iter_sync(b, &ctx, || {
-            ops::fused_mlp_into(
-                &ctx,
-                &x,
-                &gate_proj,
-                &up_proj,
-                &down_proj,
-                &mut act,
-                &mut mlp_out,
-            )
-            .expect("fused_mlp_into failed");
-        });
-    });
-
-    group.throughput(Throughput::Elements(
-        (QWEN35_4B_HIDDEN * QWEN35_4B_INTERMEDIATE) as u64,
-    ));
-    group.bench_function(
-        BenchmarkId::new("fused_mlp_into", "qwen35_4b_2560x9216"),
-        |b| {
-            let ctx = DeviceContext::new().expect("failed to create CUDA context");
-            let x = device_vec(&ctx, QWEN35_4B_HIDDEN).expect("failed to allocate x");
-            let gate_proj = device_matrix(&ctx, QWEN35_4B_INTERMEDIATE, QWEN35_4B_HIDDEN)
-                .expect("failed to allocate gate proj");
-            let up_proj = device_matrix(&ctx, QWEN35_4B_INTERMEDIATE, QWEN35_4B_HIDDEN)
-                .expect("failed to allocate up proj");
-            let down_proj = device_matrix(&ctx, QWEN35_4B_HIDDEN, QWEN35_4B_INTERMEDIATE)
-                .expect("failed to allocate down proj");
-            let mut act =
-                DeviceVec::zeros(&ctx, QWEN35_4B_INTERMEDIATE).expect("failed to allocate act");
-            let mut mlp_out =
-                DeviceVec::zeros(&ctx, QWEN35_4B_HIDDEN).expect("failed to allocate mlp out");
-            iter_sync(b, &ctx, || {
-                ops::fused_mlp_into(
-                    &ctx,
-                    &x,
-                    &gate_proj,
-                    &up_proj,
-                    &down_proj,
-                    &mut act,
-                    &mut mlp_out,
-                )
-                .expect("fused_mlp_into failed");
-            });
-        },
-    );
 
     group.throughput(Throughput::Elements(VECTOR_DIM as u64));
     group.bench_function(
