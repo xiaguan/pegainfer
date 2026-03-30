@@ -517,18 +517,15 @@ impl Qwen3Model {
             &mut bufs.o_buf,
         );
 
-        // ── 7. Residual add → hidden_out ─────────────────────────────
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
-        std::mem::swap(hidden, &mut bufs.hidden_out);
-
-        // ── 8. MLP ───────────────────────────────────────────────────
-        ops::rms_norm_batch_into(
+        // ── 7+8. Residual add + MLP RMSNorm (fused) ─────────────────
+        ops::fused_add_rms_norm_batch_into(
             &self.ctx,
             hidden,
+            &bufs.o_buf,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
+        )?;
 
         ops::gemm_into(
             &self.ctx,

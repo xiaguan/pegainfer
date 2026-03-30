@@ -48,7 +48,7 @@ pub(crate) fn gemm_rows_into(
     }
 }
 
-/// Matrix-vector multiplication: y = A @ x
+/// Matrix-vector multiplication: y = A @ x (via cuBLAS GEMM with N=1)
 /// A: (M, K) row-major, x: (K,), y: (M,)
 pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut DeviceVec) -> Result<()> {
     assert_eq!(a.cols, x.len, "A cols {} != x len {}", a.cols, x.len);
@@ -59,11 +59,12 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
     let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
 
     unsafe {
-        ffi::gemv_cuda(
+        ffi::gemm_graphsafe_cuda(
             a_ptr as *const ffi::Half,
             x_ptr as *const ffi::Half,
             y_ptr as *mut ffi::Half,
             a.rows as i32,
+            1,
             a.cols as i32,
             ctx.stream.cu_stream(),
         );

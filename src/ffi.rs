@@ -92,15 +92,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub(crate) fn gemv_cuda(
-        A: *const Half,
-        x: *const Half,
-        y: *mut Half,
-        M: i32,
-        K: i32,
-        stream: CUstream,
-    );
-
     pub(crate) fn gemm_cuda(
         W: *const Half,
         X: *const Half,
