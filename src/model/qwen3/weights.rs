@@ -218,8 +218,23 @@ impl Qwen3Model {
         info!("GPU model loaded successfully");
 
         let page_size = 16;
-        // Enough pages for max_position_embeddings (32768) at page_size=16
-        let num_pages = 2048;
+        let layout = crate::kv_pool::KvLayout::new(
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            page_size,
+        );
+        let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
+        let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
+        let kv_budget = (free_bytes as f64 * 0.85) as usize;
+        let num_pages = (kv_budget / bytes_per_page).max(64);
+        let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
+        info!(
+            "KV cache: {num_pages} pages ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            kv_budget as f64 / free_bytes as f64 * 100.0,
+            free_bytes as f64 / 1024.0 / 1024.0
+        );
         let kv_pool = crate::kv_pool::KvPool::new(
             &ctx,
             config.num_hidden_layers,
