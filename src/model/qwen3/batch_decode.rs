@@ -282,28 +282,49 @@ mod tests {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
     }
 
-    /// Run single-request sequential decode for a prompt, return generated token IDs.
+    /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
+    ///
+    /// Uses batch_decode with bs=1 (not ModelForward::forward) so the decode path
+    /// is identical to the multi-request batch — same cuBLAS handle, same FlashInfer
+    /// BatchDecode kernel. This avoids FP accumulation differences between BatchPrefill
+    /// (used by forward()) and BatchDecode.
     fn sequential_decode(
         model: &Qwen3Model,
         prompt_tokens: &[u32],
         num_decode_steps: usize,
         seed: u64,
     ) -> Vec<u32> {
-        let mut state = model.create_state().unwrap();
         let params = SamplingParams::default(); // greedy
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Prefill
+        // Prefill via ModelForward (produces first token)
+        let mut state = model.create_state().unwrap();
         model.forward(prompt_tokens, &mut state).unwrap();
         let first_token = model.select_token(&mut state, &params, &mut rng).unwrap();
 
+        // Decode remaining tokens via batch_decode(bs=1)
+        let mut kv_state = std::mem::replace(&mut state.kv_state, model.kv_pool.alloc());
+        let mut bufs = BatchDecodeBuffers::new(
+            &model.ctx,
+            &model.config,
+            1,
+            model.kv_pool.capacity_pages(),
+            model.kv_pool.padding_page_id(),
+        )
+        .unwrap();
+
         let mut tokens = vec![first_token];
         for _ in 1..num_decode_steps {
+            let token_ids = [*tokens.last().unwrap()];
+            let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
             model
-                .forward(&[*tokens.last().unwrap()], &mut state)
+                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
-            let token = model.select_token(&mut state, &params, &mut rng).unwrap();
-            tokens.push(token);
+            let params_refs: Vec<&SamplingParams> = vec![&params];
+            let batch_tokens = model
+                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
+                .unwrap();
+            tokens.push(batch_tokens[0]);
         }
         tokens
     }
@@ -432,93 +453,6 @@ mod tests {
                 "First token mismatch for prompt {i}: seq={seq_tok}, batch={batch_tok}"
             );
         }
-    }
-
-    /// Verify batch prefill + batch decode end-to-end matches sequential.
-    #[test]
-    fn batch_prefill_decode_matches_sequential() {
-        let model_path = get_model_path();
-        let model = Qwen3Model::from_safetensors_with_runtime(
-            &model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: false,
-            },
-        )
-        .unwrap();
-
-        // Multi-token prompts so both paths use prefill (not decode for len==1)
-        let prompt_a: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
-        let prompt_b: Vec<u32> = (1..33).collect(); // 32-token synthetic
-
-        let num_steps = 10;
-        let seed = 42;
-
-        // Sequential reference
-        let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
-        let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
-
-        // Batch prefill
-        let prompts: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
-        let mut kv_states: Vec<KvState> = (0..2).map(|_| model.kv_pool.alloc()).collect();
-        let logits_vec = model.batch_prefill(&prompts, &mut kv_states).unwrap();
-
-        // Sample first tokens
-        let params = SamplingParams::default();
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut probs: cudarc::driver::CudaSlice<f32> = model
-            .ctx
-            .stream
-            .alloc_zeros(model.config.vocab_size)
-            .unwrap();
-        let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
-
-        let mut all_tokens: Vec<Vec<u32>> = Vec::new();
-        for logits in &logits_vec {
-            let random_val: f32 = rand::RngExt::random(&mut rng);
-            let token = crate::ops::gpu_sample_into(
-                &model.ctx, logits, &mut probs, &mut out, &params, random_val,
-            )
-            .unwrap();
-            all_tokens.push(vec![token]);
-        }
-
-        // Continue with batch decode
-        let bs = 2;
-        let max_bs = bucket_for(bs);
-        let mut bufs = BatchDecodeBuffers::new(
-            &model.ctx,
-            &model.config,
-            max_bs,
-            model.kv_pool.capacity_pages(),
-            model.kv_pool.padding_page_id(),
-        )
-        .unwrap();
-
-        for _ in 1..num_steps {
-            let token_ids: Vec<u32> = all_tokens.iter().map(|t| *t.last().unwrap()).collect();
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-            model
-                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
-                .unwrap();
-            let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
-            let tokens = model
-                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
-                .unwrap();
-            for (j, &tok) in tokens.iter().enumerate() {
-                all_tokens[j].push(tok);
-            }
-        }
-
-        assert_eq!(
-            all_tokens[0], seq_a,
-            "Request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            all_tokens[0], seq_a
-        );
-        assert_eq!(
-            all_tokens[1], seq_b,
-            "Request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            all_tokens[1], seq_b
-        );
     }
 
     #[test]

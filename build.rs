@@ -261,148 +261,6 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     let mut generated_sources = Vec::new();
     let chunkwise_kernel_path = Path::new("tools/triton/gated_delta_rule_chunkwise_kernels.py");
 
-    let silu_spec = TritonKernelSpec {
-        artifact_dir: "silu_mul",
-        kernel_path: "tools/triton/silu_mul_kernel.py",
-        kernel_name: "silu_mul_kernel",
-        signature: "*bf16,*bf16,*bf16,i32,256",
-        grid: "(n_elements + 255) / 256,1,1",
-        out_name: "triton_silu_mul",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (silu_func, silu_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &silu_spec);
-    let silu_wrapper = write_wrapper(
-        &silu_c,
-        "triton_silu_mul_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nCUresult silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n}}\n",
-            func = silu_func
-        ),
-    );
-    generated_sources.push(silu_c);
-    generated_sources.push(silu_wrapper);
-
-    let add_spec = TritonKernelSpec {
-        artifact_dir: "add",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "add_kernel",
-        signature: "*bf16,*bf16,*bf16,i32,256",
-        grid: "(n_elements + 255) / 256,1,1",
-        out_name: "triton_add",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (add_func, add_c) = generate_triton_artifacts(&python, out_dir, &triton_target, &add_spec);
-    let add_wrapper = write_wrapper(
-        &add_c,
-        "triton_add_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, int32_t n_elements);\n\nCUresult add_cuda(const uint16_t* a, const uint16_t* b, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)a, (CUdeviceptr)b, (CUdeviceptr)out, (int32_t)n);\n}}\n",
-            func = add_func
-        ),
-    );
-    generated_sources.push(add_c);
-    generated_sources.push(add_wrapper);
-
-    let embedding_spec = TritonKernelSpec {
-        artifact_dir: "embedding",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "embedding_kernel",
-        signature: "*bf16,i32,*bf16,i32,256",
-        grid: "(hidden_size + 255) / 256,1,1",
-        out_name: "triton_embedding",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (embedding_func, embedding_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_spec);
-    let embedding_wrapper = write_wrapper(
-        &embedding_c,
-        "triton_embedding_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, int32_t token_id, CUdeviceptr out, int32_t hidden_size);\n\nCUresult embedding_cuda(const uint16_t* embed, int token_id, uint16_t* out, int hidden_size, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (int32_t)token_id, (CUdeviceptr)out, (int32_t)hidden_size);\n}}\n",
-            func = embedding_func
-        ),
-    );
-    generated_sources.push(embedding_c);
-    generated_sources.push(embedding_wrapper);
-
-    let embedding_decode_spec = TritonKernelSpec {
-        artifact_dir: "embedding_decode",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "embedding_decode_kernel",
-        signature: "*bf16,*i32,*bf16,i32,256",
-        grid: "(hidden_size + 255) / 256,1,1",
-        out_name: "triton_embedding_decode",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (embedding_decode_func, embedding_decode_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_decode_spec);
-    let embedding_decode_wrapper = write_wrapper(
-        &embedding_decode_c,
-        "triton_embedding_decode_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr decode_meta, CUdeviceptr out, int32_t hidden_size);\n\nCUresult embedding_decode_cuda(const uint16_t* embed, const int* decode_meta, uint16_t* out, int hidden_size, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)decode_meta, (CUdeviceptr)out, (int32_t)hidden_size);\n}}\n",
-            func = embedding_decode_func
-        ),
-    );
-    generated_sources.push(embedding_decode_c);
-    generated_sources.push(embedding_decode_wrapper);
-
-    let embedding_batched_spec = TritonKernelSpec {
-        artifact_dir: "embedding_batched",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "embedding_batched_kernel",
-        signature: "*bf16,*i32,*bf16,i32,i32,256",
-        grid: "(hidden_size * seq_len + 255) / 256,1,1",
-        out_name: "triton_embedding_batched",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (embedding_batched_func, embedding_batched_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_batched_spec);
-    let embedding_batched_wrapper = write_wrapper(
-        &embedding_batched_c,
-        "triton_embedding_batched_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr token_ids, CUdeviceptr out, int32_t hidden_size, int32_t seq_len);\n\nCUresult embedding_batched_cuda(const uint16_t* embed, const int* token_ids, uint16_t* out, int hidden_size, int seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)token_ids, (CUdeviceptr)out, (int32_t)hidden_size, (int32_t)seq_len);\n}}\n",
-            func = embedding_batched_func
-        ),
-    );
-    generated_sources.push(embedding_batched_c);
-    generated_sources.push(embedding_batched_wrapper);
-
-    // FlashAttention-2 prefill kernel: fused QK + softmax + V for all query tokens
-    // Grid: (cdiv(seq_len, BLOCK_M=128), num_q_heads, 1)
-    // Signature: Q(*bf16), K_cache(*bf16), V_cache(*bf16), Output(*bf16),
-    //   num_q_heads(i32), num_kv_heads(i32), gqa_ratio(i32), seq_len(i32), start_pos(i32), q_dim(i32),
-    //   constexprs: BLOCK_M=128, BLOCK_N=64, HEAD_DIM=128
-    let flash_attn_prefill_spec = TritonKernelSpec {
-        artifact_dir: "flash_attention_prefill",
-        kernel_path: "tools/triton/flash_attention_prefill_kernel.py",
-        kernel_name: "flash_attention_prefill_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,i32,i32,128,64,128",
-        grid: "(seq_len + 127) / 128,num_q_heads,1",
-        out_name: "triton_flash_attention_prefill",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (flash_attn_func, flash_attn_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &flash_attn_prefill_spec);
-    let flash_attn_wrapper = write_wrapper(
-        &flash_attn_c,
-        "triton_flash_attention_prefill_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim);\n\nCUresult flash_attention_prefill_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, start_pos, q_dim);\n}}\n",
-            func = flash_attn_func
-        ),
-    );
-    generated_sources.push(flash_attn_c);
-    generated_sources.push(flash_attn_wrapper);
-
     let flash_attn_prefill_hd256_spec = TritonKernelSpec {
         artifact_dir: "flash_attention_prefill_hd256",
         kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
@@ -611,14 +469,11 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT for silu_mul, add, embedding, FlashAttention prefill, and Qwen3.5 GDR; decode attention uses FlashInfer (nvcc)"
+        "cargo:warning=Using Triton AOT for Qwen3.5 HD256 FlashAttention prefill and GDR chunkwise; basic ops (add, silu_mul, embedding) use native CUDA"
     );
-    println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_hd256_kernel.py");
     println!("cargo:rerun-if-changed=tools/triton/gated_delta_rule_chunkwise_kernels.py");
-    println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
     println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
-    println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
 
@@ -640,7 +495,7 @@ fn main() {
             .join(",")
     );
 
-    let replaced_cuda_files = BTreeSet::from(["activation.cu", "elementwise.cu", "embedding.cu"]);
+    let replaced_cuda_files = BTreeSet::from(["activation.cu", "embedding.cu"]);
 
     let csrc_dir = Path::new("csrc");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)

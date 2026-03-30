@@ -41,7 +41,6 @@ pub(super) struct MLP {
     /// Fused [gate_proj; up_proj] row-major
     pub(super) gate_up_proj: DeviceMatrix,
     pub(super) down_proj: DeviceMatrix,
-    pub(super) intermediate_size: usize,
 }
 
 /// Transformer block
@@ -149,7 +148,6 @@ impl Qwen3Model {
                 &weight_map,
                 &format!("{}.mlp.up_proj.weight", prefix),
             )?;
-            let intermediate_size = gate_proj.rows;
             let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
             drop(gate_proj);
             drop(up_proj);
@@ -198,7 +196,6 @@ impl Qwen3Model {
                         &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
                     )?,
-                    intermediate_size,
                 },
             };
             layers.push(block);

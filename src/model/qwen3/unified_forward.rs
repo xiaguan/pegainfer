@@ -24,7 +24,6 @@ struct DecodeAttentionMeta {
     request_indices_d: CudaSlice<i32>,
     kv_tile_indices_d: CudaSlice<i32>,
     kv_chunk_size_d: CudaSlice<i32>,
-    num_decode: usize,
 }
 
 impl DecodeAttentionMeta {
@@ -54,7 +53,6 @@ impl DecodeAttentionMeta {
             request_indices_d: ctx.stream.clone_htod(&request_indices)?,
             kv_tile_indices_d: ctx.stream.clone_htod(&kv_tile_indices)?,
             kv_chunk_size_d: ctx.stream.clone_htod(&chunk_sizes)?,
-            num_decode,
         })
     }
 }
