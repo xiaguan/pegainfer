@@ -1,13 +1,14 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::server_engine::{
-    EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, detect_model_type,
-};
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::server_engine::{ModelType, detect_model_type};
+use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -62,30 +63,33 @@ async fn main() {
         args.cuda_graph
     );
 
-    let options = EngineOptions {
-        enable_cuda_graph: args.cuda_graph,
-    };
-
-    let (app, vocab_size) = match model_type {
-        ModelType::Qwen35 => {
-            let engine = Qwen35ServerEngine::load_with_options(model_path, 42, options)
-                .expect("Failed to load Qwen3.5 engine");
-            let vs = engine.vocab_size();
-            (build_app(Box::new(engine)), vs)
-        }
+    let app = match model_type {
         ModelType::Qwen3 => {
-            let engine = RealServerEngine::load_with_options(model_path, 42, options)
-                .expect("Failed to load Qwen3 engine");
-            let vs = engine.vocab_size();
-            (build_app(Box::new(engine)), vs)
+            let model = Qwen3Model::from_safetensors_with_runtime(
+                model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph: args.cuda_graph,
+                },
+            )
+            .expect("Failed to load Qwen3 model");
+
+            let tokenizer =
+                Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
+            let model_id = pegainfer::server_engine::model_id_from_path(model_path);
+
+            let handle = pegainfer::scheduler::start(model, 42).expect("Failed to start scheduler");
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis(),);
+
+            build_app(handle, tokenizer, model_id)
+        }
+        ModelType::Qwen35 => {
+            panic!(
+                "Qwen3.5 is not yet supported with the batch scheduler. \
+                 Paged migration required before Phase 2."
+            );
         }
     };
-
-    info!(
-        "Engine loaded: elapsed_ms={}, vocab_size={}",
-        start.elapsed().as_millis(),
-        vocab_size
-    );
 
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);

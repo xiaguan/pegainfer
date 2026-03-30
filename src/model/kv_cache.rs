@@ -63,10 +63,6 @@ impl KVCache {
         Ok(())
     }
 
-    pub(crate) fn increment_seq_len(&mut self) {
-        self.seq_len += 1;
-    }
-
     pub(crate) fn advance_seq_len(&mut self, count: usize) {
         self.seq_len += count;
     }

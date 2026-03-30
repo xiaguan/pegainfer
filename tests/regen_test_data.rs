@@ -1,8 +1,11 @@
 /// Regenerate model-specific golden data in test_data/<model_name>.json using greedy decoding.
 use std::path::{Path, PathBuf};
 
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
-use pegainfer::server_engine::{CompleteRequest, RealServerEngine, ServerEngine};
+use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
+use pegainfer::tokenizer::Tokenizer;
+use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -86,6 +89,36 @@ fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
     }
 }
 
+fn generate_text(
+    handle: &scheduler::SchedulerHandle,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+) -> String {
+    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+
+    handle
+        .submit(SchedulerRequest {
+            prompt_tokens,
+            params: SamplingParams::default(),
+            max_tokens,
+            token_tx,
+        })
+        .expect("submit failed");
+
+    let mut tokens = Vec::new();
+    loop {
+        match token_rx.blocking_recv() {
+            Some(TokenEvent::Token(id)) => tokens.push(id),
+            Some(TokenEvent::Finished { .. }) => break,
+            None => panic!("scheduler closed"),
+        }
+    }
+
+    tokenizer.decode(&tokens).expect("decode failed")
+}
+
 #[test]
 fn regen_test_data() {
     pegainfer::logging::init_stderr("info");
@@ -103,24 +136,20 @@ fn regen_test_data() {
         test_data_path.display()
     );
 
-    let mut engine = RealServerEngine::load(&model_path, 42).expect("Failed to load model");
+    let model = Qwen3Model::from_safetensors_with_runtime(
+        &model_path,
+        ModelRuntimeConfig {
+            enable_cuda_graph: true,
+        },
+    )
+    .expect("Failed to load model");
+    let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
+    let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
 
     let mut cases_json = Vec::new();
     for case in CASES {
         let prompt = wrap_prompt(case.prompt, prompt_style);
-        let req = CompleteRequest {
-            prompt: prompt.clone(),
-            max_tokens: case.max_new_tokens,
-            sampling: SamplingParams {
-                temperature: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                ..Default::default()
-            },
-            stop: None,
-        };
-        let resp = engine.complete(req).expect("complete failed");
-        let output = resp.text;
+        let output = generate_text(&handle, &tokenizer, &prompt, case.max_new_tokens);
         eprintln!(
             "[{}] raw_prompt={:?} prompt={:?} output={:?}",
             case.name, case.prompt, prompt, output

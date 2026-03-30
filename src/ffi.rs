@@ -42,6 +42,17 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub(crate) fn fused_add_rms_norm_batched_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        batch_size: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
     pub(crate) fn silu_mul_triton_aot_cuda(
         gate: *const Half,
         up: *const Half,
@@ -60,6 +71,14 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
+
+    pub(crate) fn argmax_batched_cuda(
+        x: *const Half,
+        out: *mut i32,
+        vocab_size: i32,
+        batch_size: i32,
+        stream: CUstream,
+    );
 
     pub(crate) fn gpu_sample_cuda(
         logits: *const Half,
@@ -123,20 +142,35 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn deinterleave_qkv_cuda(
+        qkv: *const Half,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        q_dim: i32,
+        kv_dim: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
+    pub(crate) fn silu_mul_fused_cuda(
+        gate_up: *const Half,
+        out: *mut Half,
+        intermediate_size: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
     pub(crate) fn cublas_init();
 
-    // Prefill attention preparation: QK norm + RoPE + KV cache write (steps 1-2).
-    // Step 3 (attention) is handled by flash_attention_prefill_cuda (Triton).
-    pub(crate) fn prefill_attention_prep_cuda(
+    // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
+    pub(crate) fn prefill_qk_norm_rope_only_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
-        v_batch: *const Half,
         q_norm_weight: *const Half,
         k_norm_weight: *const Half,
         cos_cache: *const Half,
         sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -145,22 +179,6 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     );
-
-    // FlashAttention-2 prefill (Triton AOT): fused QK + softmax + V for all query tokens.
-    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
-    pub(crate) fn flash_attention_prefill_cuda(
-        Q: *const Half,
-        K_cache: *const Half,
-        V_cache: *const Half,
-        Output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        gqa_ratio: i32,
-        seq_len: i32,
-        start_pos: i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
     // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
@@ -208,39 +226,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA Attention — decode variant (Triton AOT, split-KV, HEAD_DIM=128)
-    // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
-    // Writes partial results to partial_out/m/l (FP32). Call attention_decode_reduce after.
-    pub(crate) fn fused_gqa_attention_decode(
-        q_full: *const Half,
-        k_full: *const Half,
-        v_full: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache_base: *const Half,
-        sin_cache_base: *const Half,
-        decode_meta: *const i32,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // Attention reduce: merge split-KV partials into final bf16 output.
-    pub(crate) fn attention_decode_reduce(
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        output: *mut Half,
-        num_qheads: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // ========================================================================
     // Qwen3.5 kernels
     // ========================================================================
@@ -259,17 +244,6 @@ unsafe extern "C" {
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub(crate) fn rms_norm_offset_cuda(
         x: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
-
-    // Fused add + (1+weight) RMSNorm
-    pub(crate) fn fused_add_rms_norm_offset_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
         weight: *const Half,
         out: *mut Half,
         n: i32,
@@ -413,5 +387,150 @@ unsafe extern "C" {
         scale: f32,
         stream: CUstream,
     ) -> CUresult;
+
+    // ========================================================================
+    // Paged attention (FlashInfer)
+    // ========================================================================
+
+    // QK RMSNorm + RoPE for decode (seq_len=1, CUDA Graph safe).
+    // Reads position from decode_meta[1] on device.
+    pub(crate) fn qk_norm_rope_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        decode_meta: *const i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Batched QK RMSNorm + RoPE for decode with per-request positions.
+    pub(crate) fn qk_norm_rope_batched_decode_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Append one K/V token per request to paged KV cache (FlashInfer).
+    pub(crate) fn paged_kv_append_cuda(
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        key: *const Half,
+        value: *const Half,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
+    pub(crate) fn paged_kv_scatter_cuda(
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        src_k: *const Half,
+        src_v: *const Half,
+        batch_indices: *const i32,
+        positions: *const i32,
+        nnz: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        stride_page: i64,
+        src_stride_n: i64,
+        src_stride_h: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Return the number of Q tiles for batch prefill (needed to size plan arrays).
+    pub(crate) fn batch_prefill_paged_num_tiles(
+        seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+
+    // Return the CTA tile size for batch prefill planning.
+    pub(crate) fn batch_prefill_cta_tile_q(
+        total_seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+
+    // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
+    pub(crate) fn batch_prefill_paged_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
+    pub(crate) fn paged_attention_decode_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
 
 }

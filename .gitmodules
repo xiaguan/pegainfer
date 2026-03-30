@@ -1,0 +1,3 @@
+[submodule "third_party/flashinfer"]
+	path = third_party/flashinfer
+	url = https://github.com/flashinfer-ai/flashinfer

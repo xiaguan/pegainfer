@@ -84,6 +84,40 @@ pub(crate) fn silu_mul_batch_into(
     Ok(())
 }
 
+/// Fused SiLU-mul from combined [2*I, bs] gate+up buffer → [I, bs] output.
+/// Reads gate and up from interleaved column-major layout, no deinterleave needed.
+pub(crate) fn silu_mul_fused_batch_into(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let intermediate_size = out.hidden_dim;
+    let bs = gate_up.seq_len;
+    assert_eq!(
+        gate_up.hidden_dim,
+        2 * intermediate_size,
+        "gate_up dim {} != 2 * out dim {}",
+        gate_up.hidden_dim,
+        intermediate_size
+    );
+    assert_eq!(out.seq_len, bs);
+
+    let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::silu_mul_fused_cuda(
+            gu_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            intermediate_size as i32,
+            bs as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub(crate) fn extract_vec(
     ctx: &DeviceContext,

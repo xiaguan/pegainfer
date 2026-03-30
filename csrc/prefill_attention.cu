@@ -17,7 +17,9 @@ __global__ void prefill_qk_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ cos_cache,      // [max_pos * head_dim]
     const __nv_bfloat16* __restrict__ sin_cache,
     int num_q_heads, int num_kv_heads, int head_dim,
-    int seq_len, int q_dim, int kv_dim, int start_pos, float eps
+    int seq_len, int q_dim, int kv_dim, int start_pos,
+    const int* start_pos_d,  // if non-null, *start_pos_d overrides start_pos (CUDA Graph safe)
+    float eps
 ) {
     int head_global = blockIdx.x;
     int token = blockIdx.y;
@@ -60,7 +62,11 @@ __global__ void prefill_qk_norm_rope_kernel(
     __syncthreads();
 
     int half = head_dim / 2;
-    int pos = start_pos + token;
+    // When start_pos_d is non-null, each token reads its own position from the array.
+    // Single decode: start_pos_d = &decode_meta[1], token=0 → start_pos_d[0].
+    // Batched decode: start_pos_d = positions, token=batch_idx → positions[batch_idx].
+    // Prefill: start_pos_d = nullptr → start_pos + token (sequential within sequence).
+    int pos = start_pos_d ? __ldg(start_pos_d + token) : (start_pos + token);
 
     __nv_bfloat16 result;
     if (d < half) {
@@ -146,7 +152,7 @@ void prefill_attention_prep_cuda(
         q_batch, k_batch, q_norm_weight, k_norm_weight,
         cos_cache, sin_cache,
         num_q_heads, num_kv_heads, head_dim,
-        seq_len, q_dim, kv_dim, start_pos, rms_eps
+        seq_len, q_dim, kv_dim, start_pos, /*start_pos_d=*/nullptr, rms_eps
     );
 
     // Step 2: Write K, V to cache
@@ -154,6 +160,109 @@ void prefill_attention_prep_cuda(
     prefill_kv_cache_write_kernel<<<cache_grid, head_dim, 0, stream>>>(
         k_batch, v_batch, k_cache, v_cache,
         head_dim, kv_dim, max_seq_len, start_pos
+    );
+}
+
+// ============================================================================
+// C API: QK norm + RoPE only (no cache write) for decode with paged attention.
+//
+// CUDA Graph safe: reads position from decode_meta[1] on device.
+// decode_meta layout: [token_id, position, seq_len] as int32 on GPU.
+// ============================================================================
+void qk_norm_rope_cuda(
+    __nv_bfloat16* q,                    // [num_q_heads * head_dim] in-place
+    __nv_bfloat16* k,                    // [num_kv_heads * head_dim] in-place
+    const __nv_bfloat16* q_norm_weight,  // [head_dim]
+    const __nv_bfloat16* k_norm_weight,  // [head_dim]
+    const __nv_bfloat16* cos_cache,      // [max_pos * head_dim]
+    const __nv_bfloat16* sin_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* decode_meta,              // GPU: [token_id, position, seq_len]
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    dim3 grid(num_q_heads + num_kv_heads, 1);  // seq_len=1
+    prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim,
+        /*seq_len=*/1, q_dim, kv_dim, /*start_pos=*/0,
+        /*start_pos_d=*/decode_meta + 1,  // points to position field
+        rms_eps
+    );
+}
+
+// ============================================================================
+// C API: QK norm + RoPE only (no cache write).
+//
+// Same as prefill_attention_prep_cuda but skips the KV cache write kernel.
+// Used when KV is written to paged layout separately (via AppendPagedKVCache).
+// ============================================================================
+void prefill_qk_norm_rope_only_cuda(
+    __nv_bfloat16* q_batch,          // [q_dim, seq_len] modified in-place (normed+RoPE'd)
+    __nv_bfloat16* k_batch,          // [kv_dim, seq_len] modified in-place (normed+RoPE'd)
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int start_pos,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    dim3 norm_grid(num_q_heads + num_kv_heads, seq_len);
+    prefill_qk_norm_rope_kernel<<<norm_grid, head_dim, 0, stream>>>(
+        q_batch, k_batch, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim,
+        seq_len, q_dim, kv_dim, start_pos, /*start_pos_d=*/nullptr, rms_eps
+    );
+}
+
+// ============================================================================
+// Batched QK norm + RoPE for decode: per-request positions from GPU array.
+//
+// Q layout: [q_dim, batch_size], K layout: [kv_dim, batch_size]
+// Grid: (num_q_heads + num_kv_heads, batch_size), Block: head_dim
+// ============================================================================
+void qk_norm_rope_batched_decode_cuda(
+    __nv_bfloat16* q,                    // [q_dim * batch_size] in-place
+    __nv_bfloat16* k,                    // [kv_dim * batch_size] in-place
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,                // [batch_size] per-request positions on GPU
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int batch_size,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Single launch: blockIdx.y = batch index, positions[batch_idx] via start_pos_d array.
+    dim3 grid(num_q_heads + num_kv_heads, batch_size);
+    prefill_qk_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim,
+        /*seq_len=*/batch_size, q_dim, kv_dim,
+        /*start_pos=*/0, /*start_pos_d=*/positions,
+        rms_eps
     );
 }
 
