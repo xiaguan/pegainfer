@@ -47,7 +47,13 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
     Ok((shard_files, weight_map))
 }
 
-/// Memory-map shard files. Returns the mmaps; caller deserializes SafeTensors from them.
+/// Memory-map shard files and return the mmaps.
+///
+/// Typically chained with [`deserialize_shards`] to get `SafeTensors` views:
+/// ```ignore
+/// let mmaps = mmap_shards(&paths)?;
+/// let shards = deserialize_shards(&mmaps)?;
+/// ```
 pub(crate) fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
     let t0 = Instant::now();
     let mmaps: Vec<Mmap> = shard_paths
@@ -68,6 +74,16 @@ pub(crate) fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
         t0.elapsed().as_secs_f64() * 1e3
     );
     Ok(mmaps)
+}
+
+/// Deserialize memory-mapped shard data into `SafeTensors` views.
+pub(crate) fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>> {
+    mmaps
+        .iter()
+        .map(|m| {
+            SafeTensors::deserialize(m).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+        })
+        .collect()
 }
 
 fn find_tensor<'a>(

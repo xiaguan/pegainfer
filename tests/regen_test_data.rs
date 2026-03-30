@@ -1,13 +1,18 @@
 /// Regenerate model-specific golden data in test_data/<model_name>.json using greedy decoding.
 use std::path::{Path, PathBuf};
 
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::model::{
+    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
+};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
 use pegainfer::tokenizer::Tokenizer;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DEFAULT_QWEN35_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PromptStyle {
@@ -52,11 +57,27 @@ const CASES: &[Case] = &[
         prompt: "Write a Python function to reverse a string",
         max_new_tokens: 50,
     },
+    Case {
+        name: "kanye_album",
+        prompt: "我最喜欢的 Kanye West 的专辑是",
+        max_new_tokens: 50,
+    },
+    Case {
+        name: "coldplay_ghost",
+        prompt: "Coldplay 的《Ghost story》专辑真是",
+        max_new_tokens: 50,
+    },
+    Case {
+        name: "oyster_riddle",
+        prompt: "生蚝煮熟了是熟蚝",
+        max_new_tokens: 50,
+    },
+    Case {
+        name: "monkey_king_lake",
+        prompt: "孙悟空跳到一个湖里，跳出来变成了六耳猕猴，这个湖的名字是",
+        max_new_tokens: 50,
+    },
 ];
-
-fn model_path() -> String {
-    std::env::var("PEGAINFER_E2E_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
-}
 
 fn model_name(model_path: &str) -> String {
     Path::new(model_path)
@@ -89,7 +110,8 @@ fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
     }
 }
 
-fn generate_text(
+/// Generate text via the scheduler (Qwen3 path).
+fn generate_text_scheduler(
     handle: &scheduler::SchedulerHandle,
     tokenizer: &Tokenizer,
     prompt: &str,
@@ -119,21 +141,73 @@ fn generate_text(
     tokenizer.decode(&tokens).expect("decode failed")
 }
 
+/// Generate text directly via ModelForward trait (works for any model).
+fn generate_text_direct<M: ModelForward>(
+    model: &M,
+    state: &mut M::State,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    rng: &mut StdRng,
+) -> String {
+    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    state.reset().expect("reset failed");
+
+    model
+        .forward(&prompt_tokens, state)
+        .expect("prefill failed");
+    let sampling = SamplingParams::default();
+
+    let mut tokens = Vec::new();
+    let mut last = model
+        .select_token(state, &sampling, rng)
+        .expect("select_token failed");
+    tokens.push(last);
+
+    for _ in 1..max_tokens {
+        if model.is_stop_token(last) {
+            break;
+        }
+        model.forward(&[last], state).expect("decode failed");
+        last = model
+            .select_token(state, &sampling, rng)
+            .expect("select_token failed");
+        tokens.push(last);
+    }
+
+    tokenizer.decode(&tokens).expect("decode failed")
+}
+
+fn write_golden_json(output_path: &Path, model_name: &str, cases_json: Vec<serde_json::Value>) {
+    let data = serde_json::json!({
+        "model_name": model_name,
+        "engine": "pegainfer",
+        "cases": cases_json,
+    });
+    let json = serde_json::to_string_pretty(&data).unwrap();
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create test data directory");
+    }
+    std::fs::write(output_path, &json).expect("Failed to write test data");
+    eprintln!("Wrote {}", output_path.display());
+}
+
 #[test]
 fn regen_test_data() {
     pegainfer::logging::init_stderr("info");
 
-    let model_path = model_path();
+    let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
+        .unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
     let model_name = model_name(&model_path);
     let prompt_style = prompt_style(&model_name);
-    let test_data_path = test_data_path(&model_name);
+    let output_path = test_data_path(&model_name);
 
     eprintln!(
         "Regenerating golden data: model={}, path={}, prompt_style={:?}, output={}",
         model_name,
         model_path,
         prompt_style,
-        test_data_path.display()
+        output_path.display()
     );
 
     let model = Qwen3Model::from_safetensors_with_runtime(
@@ -149,7 +223,7 @@ fn regen_test_data() {
     let mut cases_json = Vec::new();
     for case in CASES {
         let prompt = wrap_prompt(case.prompt, prompt_style);
-        let output = generate_text(&handle, &tokenizer, &prompt, case.max_new_tokens);
+        let output = generate_text_scheduler(&handle, &tokenizer, &prompt, case.max_new_tokens);
         eprintln!(
             "[{}] raw_prompt={:?} prompt={:?} output={:?}",
             case.name, case.prompt, prompt, output
@@ -162,15 +236,55 @@ fn regen_test_data() {
         }));
     }
 
-    let data = serde_json::json!({
-        "model_name": model_name,
-        "engine": "pegainfer",
-        "cases": cases_json,
-    });
-    let json = serde_json::to_string_pretty(&data).unwrap();
-    if let Some(parent) = test_data_path.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create test data directory");
+    write_golden_json(&output_path, &model_name, cases_json);
+}
+
+#[test]
+fn regen_test_data_qwen35() {
+    pegainfer::logging::init_stderr("info");
+
+    let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
+        .unwrap_or_else(|_| DEFAULT_QWEN35_MODEL_PATH.to_string());
+    let model_name = model_name(&model_path);
+    let prompt_style = prompt_style(&model_name);
+    let output_path = test_data_path(&model_name);
+
+    eprintln!(
+        "Regenerating golden data: model={}, path={}, prompt_style={:?}, output={}",
+        model_name,
+        model_path,
+        prompt_style,
+        output_path.display()
+    );
+
+    let model = Qwen35Model::from_safetensors_with_options(&model_path, true)
+        .expect("Failed to load model");
+    let mut state = model.create_state().expect("Failed to create state");
+    let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let mut cases_json = Vec::new();
+    for case in CASES {
+        let prompt = wrap_prompt(case.prompt, prompt_style);
+        let output = generate_text_direct(
+            &model,
+            &mut state,
+            &tokenizer,
+            &prompt,
+            case.max_new_tokens,
+            &mut rng,
+        );
+        eprintln!(
+            "[{}] raw_prompt={:?} prompt={:?} output={:?}",
+            case.name, case.prompt, prompt, output
+        );
+        cases_json.push(serde_json::json!({
+            "name": case.name,
+            "prompt": prompt,
+            "max_new_tokens": case.max_new_tokens,
+            "output": output,
+        }));
     }
-    std::fs::write(&test_data_path, json).expect("Failed to write test data");
-    eprintln!("Wrote {}", test_data_path.display());
+
+    write_golden_json(&output_path, &model_name, cases_json);
 }
