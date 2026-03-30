@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::kv_pool::KvState;
+use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -255,5 +255,110 @@ impl Qwen3Model {
         std::mem::swap(hidden, &mut bufs.hidden_out);
 
         Ok(())
+    }
+
+    // ── Batch prefill ──────────────────────────────────────────────────
+
+    /// Batch prefill: process multiple prompts in a single forward pass.
+    ///
+    /// Concatenates all prompts' tokens, runs one GEMM per layer for the
+    /// entire batch, and uses FlashInfer's multi-request causal attention.
+    /// Returns per-request logits (last token of each prompt).
+    pub(crate) fn batch_prefill(
+        &self,
+        prompts: &[&[u32]],
+        kv_states: &mut [KvState],
+    ) -> Result<Vec<DeviceVec>> {
+        let batch_size = prompts.len();
+        assert_eq!(batch_size, kv_states.len());
+
+        let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+        let start_positions: Vec<usize> = kv_states.iter().map(|kv| kv.seq_len()).collect();
+
+        // Concatenate all tokens
+        let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
+        let hidden = self.get_embeddings_batch(&all_tokens)?;
+
+        // Allocate pages and advance for each request
+        for (i, kv) in kv_states.iter_mut().enumerate() {
+            kv.ensure_capacity(start_positions[i] + seq_lens[i])?;
+            kv.advance(seq_lens[i]);
+        }
+
+        // Build batch plan (all descs must reflect post-advance state)
+        let descs: Vec<_> = kv_states.iter().map(|kv| kv.desc()).collect();
+        let plan = PrefillPagedPlan::new_batch(
+            &self.ctx,
+            &descs,
+            &start_positions,
+            &seq_lens,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        )?;
+
+        // Forward through all layers
+        let kv_buffer = kv_states[0].buffer();
+        let layout = *kv_states[0].layout();
+        let hidden = self.process_all_layers_batch_multi(hidden, &layout, kv_buffer, &plan)?;
+
+        // Extract per-request last-token logits
+        let mut logits_vec = Vec::with_capacity(batch_size);
+        let mut offset = 0;
+        for &seq_len in &seq_lens {
+            let last_idx = offset + seq_len - 1;
+            let last_hidden = ops::extract_vec(&self.ctx, &hidden, last_idx)?;
+            let normed = ops::rms_norm(
+                &self.ctx,
+                &last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+            )?;
+            let logits = ops::linear(&self.ctx, &normed, self.output_projection())?;
+            logits_vec.push(logits);
+            offset += seq_len;
+        }
+
+        Ok(logits_vec)
+    }
+
+    fn process_all_layers_batch_multi(
+        &self,
+        mut hidden: HiddenStates,
+        layout: &KvLayout,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        plan: &PrefillPagedPlan,
+    ) -> Result<HiddenStates> {
+        let total_tokens = hidden.seq_len;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let inter_dim = self.config.intermediate_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let mut bufs = PrefillBuffers::new(
+            &self.ctx,
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            inter_dim,
+            total_tokens,
+        )?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.forward_layer_batch_paged(
+                layer_idx,
+                layer,
+                &mut hidden,
+                0, // start_pos unused for multi-request (plan has per-token positions)
+                kv_buffer,
+                layout,
+                plan,
+                &mut bufs,
+            )?;
+        }
+
+        Ok(hidden)
     }
 }

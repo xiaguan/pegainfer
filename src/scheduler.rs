@@ -1,9 +1,9 @@
 //! Scheduler: dedicated GPU thread that batches concurrent requests.
 //!
 //! HTTP handlers tokenize prompts and submit `SchedulerRequest` via channel.
-//! The scheduler prefills serially (one request at a time) then batch-decodes
-//! all active requests in a single forward pass. Per-request tokens flow back
-//! through individual channels.
+//! The scheduler batch-prefills all pending requests in one forward pass, then
+//! batch-decodes all active requests. Per-request tokens flow back through
+//! individual channels.
 
 use std::thread;
 
@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 
 use crate::kv_pool::KvState;
 use crate::model::qwen3::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::model::{ModelForward, Qwen3Model, Qwen3State};
+use crate::model::{ModelForward, Qwen3Model};
 use crate::sampler::SamplingParams;
 use crate::server_engine::FinishReason;
+use crate::tensor::DeviceVec;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -79,18 +80,37 @@ struct ActiveRequest {
 pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
     let max_bucket = *BATCH_BUCKETS.last().unwrap();
     let bufs = model.create_batch_decode_bufs(max_bucket)?;
-    let prefill_state = model.create_state()?;
+
+    // Sampling scratch — reused across prefill and decode sampling
+    let sample_scratch = SampleScratch::new(&model)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(model, submit_rx, bufs, prefill_state, seed);
+            scheduler_loop(model, submit_rx, bufs, sample_scratch, seed);
         })
         .expect("failed to spawn scheduler thread");
 
     Ok(SchedulerHandle { submit_tx })
+}
+
+/// Scratch buffers for GPU sampling (reused across all prefill sampling).
+struct SampleScratch {
+    probs: cudarc::driver::CudaSlice<f32>,
+    out: cudarc::driver::CudaSlice<i32>,
+}
+
+impl SampleScratch {
+    fn new(model: &Qwen3Model) -> Result<Self> {
+        let vocab_size = model.config().vocab_size;
+        let ctx = model.device_ctx();
+        Ok(Self {
+            probs: ctx.stream.alloc_zeros(vocab_size)?,
+            out: ctx.stream.alloc_zeros(1)?,
+        })
+    }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────
@@ -99,7 +119,7 @@ fn scheduler_loop(
     model: Qwen3Model,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     mut bufs: BatchDecodeBuffers,
-    mut prefill_state: Qwen3State,
+    mut sample_scratch: SampleScratch,
     seed: u64,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -108,36 +128,42 @@ fn scheduler_loop(
     info!("Scheduler ready (max_batch={})", bufs.max_batch_size);
 
     loop {
-        // 1. Prefill-priority: drain all pending requests before next decode step
+        // 1. Drain all pending requests
+        let mut pending: Vec<SchedulerRequest> = Vec::new();
         while let Ok(req) = submit_rx.try_recv() {
-            prefill_one(&model, &mut prefill_state, &mut active, req, &mut rng);
+            pending.push(req);
         }
 
-        // 2. Nothing active → block until a request arrives (thread sleeps, no spin)
-        if active.is_empty() {
+        // 2. Nothing active and nothing pending → block until a request arrives
+        if active.is_empty() && pending.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => {
-                    prefill_one(&model, &mut prefill_state, &mut active, req, &mut rng);
-                }
+                Some(req) => pending.push(req),
                 None => {
-                    // All senders dropped — server shutting down
                     info!("Scheduler: all handles dropped, exiting");
                     return;
                 }
             }
+            // Drain any others that arrived while we were blocked
+            while let Ok(req) = submit_rx.try_recv() {
+                pending.push(req);
+            }
         }
 
-        // 3. After prefill, active may still be empty (e.g. receiver already dropped)
+        // 3. Batch prefill all pending requests in one forward pass
+        if !pending.is_empty() {
+            prefill_batch(&model, &mut active, pending, &mut sample_scratch, &mut rng);
+        }
+
+        // 4. After prefill, active may still be empty
         if active.is_empty() {
             continue;
         }
 
-        // 4. One batch decode step
+        // 5. One batch decode step
         let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
         let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
 
         if let Err(e) = model.batch_decode(&token_ids, &mut kv_refs, &mut bufs) {
-            // Fatal for this batch — retire all active requests
             warn!("batch_decode error: {e}");
             for req in active.drain(..) {
                 let _ = req.token_tx.send(TokenEvent::Finished {
@@ -149,7 +175,7 @@ fn scheduler_loop(
             continue;
         }
 
-        // 5. Sample per-request + dispatch + retire finished
+        // 6. Sample per-request + dispatch + retire finished
         let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
         let tokens = match model.select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng) {
             Ok(t) => t,
@@ -188,7 +214,6 @@ fn scheduler_loop(
                 });
                 active.swap_remove(i);
             } else if req.token_tx.send(TokenEvent::Token(token)).is_err() {
-                // Receiver dropped — client disconnected or stop sequence detected
                 active.swap_remove(i);
             } else {
                 req.last_token = token;
@@ -198,71 +223,89 @@ fn scheduler_loop(
     }
 }
 
-// ── Prefill helper ──────────────────────────────────────────────────────
+// ── Batch prefill ───────────────────────────────────────────────────────
 
-fn prefill_one(
+fn prefill_batch(
     model: &Qwen3Model,
-    state: &mut Qwen3State,
     active: &mut Vec<ActiveRequest>,
-    req: SchedulerRequest,
+    pending: Vec<SchedulerRequest>,
+    scratch: &mut SampleScratch,
     rng: &mut StdRng,
 ) {
-    let prompt_len = req.prompt_tokens.len();
+    let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
+    let mut kv_states: Vec<KvState> = (0..pending.len()).map(|_| model.alloc_kv()).collect();
 
-    // Prefill (writes into state.kv_state which was swapped to empty after previous call)
-    if let Err(e) = model.forward(&req.prompt_tokens, state) {
-        warn!("Prefill failed for {prompt_len}-token prompt: {e}");
-        return;
-    }
-
-    // Sample first token
-    let first_token = match model.select_token(state, &req.params, rng) {
-        Ok(t) => t,
+    let logits_vec = match model.batch_prefill(&prompts, &mut kv_states) {
+        Ok(v) => v,
         Err(e) => {
-            warn!("First token sampling failed: {e}");
+            warn!("Batch prefill failed: {e}");
             return;
         }
     };
 
-    // Immediate EOS — no decode needed
-    if !req.params.ignore_eos && model.is_stop_token(first_token) {
-        let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
-            prompt_tokens: prompt_len,
-            completion_tokens: 0,
+    // Process each request: sample first token, handle EOS/limits, add to active
+    for (i, req) in pending.into_iter().enumerate() {
+        let prompt_len = req.prompt_tokens.len();
+
+        let first_token = match sample_from_logits(model, &logits_vec[i], scratch, &req.params, rng)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("First token sampling failed for request {i}: {e}");
+                continue;
+            }
+        };
+
+        if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+            });
+            continue;
+        }
+
+        if req.token_tx.send(TokenEvent::Token(first_token)).is_err() {
+            continue;
+        }
+
+        if req.max_tokens <= 1 {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+            });
+            continue;
+        }
+
+        // Take ownership of this request's KV state
+        let kv = std::mem::replace(&mut kv_states[i], model.alloc_kv());
+        active.push(ActiveRequest {
+            token_tx: req.token_tx,
+            kv,
+            last_token: first_token,
+            generated_count: 1,
+            max_tokens: req.max_tokens,
+            prompt_len,
+            params: req.params,
         });
-        // state.kv_state still holds prefilled pages — swap with fresh
-        let _ = state.take_kv_state(model.alloc_kv());
-        return;
     }
+}
 
-    // Send first token
-    if req.token_tx.send(TokenEvent::Token(first_token)).is_err() {
-        let _ = state.take_kv_state(model.alloc_kv());
-        return;
-    }
-
-    // max_tokens == 1 → done after first token
-    if req.max_tokens <= 1 {
-        let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            prompt_tokens: prompt_len,
-            completion_tokens: 1,
-        });
-        let _ = state.take_kv_state(model.alloc_kv());
-        return;
-    }
-
-    // Move prefilled KV into active set, leave state with a fresh allocation
-    let kv = state.take_kv_state(model.alloc_kv());
-
-    active.push(ActiveRequest {
-        token_tx: req.token_tx,
-        kv,
-        last_token: first_token,
-        generated_count: 1,
-        max_tokens: req.max_tokens,
-        prompt_len,
-        params: req.params,
-    });
+fn sample_from_logits(
+    model: &Qwen3Model,
+    logits: &DeviceVec,
+    scratch: &mut SampleScratch,
+    params: &SamplingParams,
+    rng: &mut StdRng,
+) -> Result<u32> {
+    let random_val: f32 = rand::RngExt::random(rng);
+    crate::ops::gpu_sample_into(
+        model.device_ctx(),
+        logits,
+        &mut scratch.probs,
+        &mut scratch.out,
+        params,
+        random_val,
+    )
 }

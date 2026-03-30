@@ -447,6 +447,14 @@ unsafe extern "C" {
         head_dim: i32,
     ) -> i32;
 
+    // Return the CTA tile size for batch prefill planning.
+    pub(crate) fn batch_prefill_cta_tile_q(
+        total_seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
     pub(crate) fn batch_prefill_paged_cuda(
         q: *const Half,
@@ -468,7 +476,7 @@ unsafe extern "C" {
         head_dim: i32,
         page_size: i32,
         seq_len: i32,
-        kv_len: i32,
+        batch_size: i32,
         padded_batch_size: i32,
         stride_page: i64,
         sm_scale: f32,

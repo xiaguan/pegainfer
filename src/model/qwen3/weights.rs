@@ -233,6 +233,14 @@ impl Qwen3Model {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn device_ctx(&self) -> &crate::tensor::DeviceContext {
+        &self.ctx
+    }
+
     /// Allocate a fresh (empty) per-request KV state from the shared pool.
     pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
         self.kv_pool.alloc()

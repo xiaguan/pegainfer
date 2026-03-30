@@ -203,7 +203,8 @@ pub fn prefill_attention_hd256_batch_with_scratch(
 
 /// Pre-computed GPU metadata for paged prefill attention.
 ///
-/// Built once per prefill call via `PrefillPagedPlan::new()`, shared across all layers.
+/// Built once per prefill call, shared across all layers.
+/// Supports both single-request (`new`) and multi-request (`new_batch`) prefill.
 pub(crate) struct PrefillPagedPlan {
     page_indices_d: CudaSlice<i32>,
     page_indptr_d: CudaSlice<i32>,
@@ -217,6 +218,8 @@ pub(crate) struct PrefillPagedPlan {
     kv_chunk_size_d: CudaSlice<i32>,
     total_num_rows_d: CudaSlice<u32>,
     num_tiles: i32,
+    batch_size: i32,
+    total_tokens: usize,
 }
 
 impl PrefillPagedPlan {
@@ -274,11 +277,112 @@ impl PrefillPagedPlan {
             kv_chunk_size_d,
             total_num_rows_d,
             num_tiles,
+            batch_size: 1,
+            total_tokens: seq_len,
+        })
+    }
+
+    /// Build plan for multiple requests (batch prefill).
+    ///
+    /// `descs[i]` must already reflect the post-advance state (pages allocated,
+    /// seq_len advanced) for each request.
+    pub(crate) fn new_batch(
+        ctx: &DeviceContext,
+        descs: &[KvDesc<'_>],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let batch_size = descs.len();
+        assert_eq!(batch_size, start_positions.len());
+        assert_eq!(batch_size, seq_lens.len());
+        let total_tokens: usize = seq_lens.iter().sum();
+        let group_size = num_q_heads / num_kv_heads;
+
+        // Page metadata (concatenated across requests, CSR format)
+        let mut all_page_indices = Vec::new();
+        let mut page_indptr = vec![0i32];
+        let mut last_page_lens = Vec::with_capacity(batch_size);
+        let mut kv_chunk_sizes = Vec::with_capacity(batch_size);
+
+        for (i, desc) in descs.iter().enumerate() {
+            let pages: Vec<i32> = desc
+                .page_indices()
+                .iter()
+                .map(|p| p.index() as i32)
+                .collect();
+            all_page_indices.extend_from_slice(&pages);
+            page_indptr.push(all_page_indices.len() as i32);
+            last_page_lens.push(desc.last_page_len() as i32);
+            kv_chunk_sizes.push((start_positions[i] + seq_lens[i]) as i32);
+        }
+
+        // Per-token metadata
+        let mut batch_indices = Vec::with_capacity(total_tokens);
+        let mut positions = Vec::with_capacity(total_tokens);
+        for (i, &seq_len) in seq_lens.iter().enumerate() {
+            let start = start_positions[i];
+            batch_indices.extend(std::iter::repeat_n(i as i32, seq_len));
+            positions.extend((start..start + seq_len).map(|p| p as i32));
+        }
+
+        // Q token boundaries (CSR)
+        let mut q_indptr = vec![0i32];
+        for &seq_len in seq_lens {
+            let prev = *q_indptr.last().unwrap();
+            q_indptr.push(prev + seq_len as i32);
+        }
+
+        // Tile plan: use global cta_tile_q for consistent tiling
+        let cta_tile_q = unsafe {
+            ffi::batch_prefill_cta_tile_q(
+                total_tokens as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            )
+        } as usize;
+
+        let mut request_indices_v = Vec::new();
+        let mut qo_tile_indices_v = Vec::new();
+        let mut kv_tile_indices_v = Vec::new();
+        for (req_idx, &seq_len) in seq_lens.iter().enumerate() {
+            let packed_qo_len = seq_len * group_size;
+            let num_tiles_req = packed_qo_len.div_ceil(cta_tile_q);
+            for tile in 0..num_tiles_req {
+                request_indices_v.push(req_idx as i32);
+                qo_tile_indices_v.push(tile as i32);
+                kv_tile_indices_v.push(0i32);
+            }
+        }
+        let num_tiles = request_indices_v.len() as i32;
+
+        // Upload all to GPU
+        Ok(Self {
+            page_indices_d: ctx.stream.clone_htod(&all_page_indices)?,
+            page_indptr_d: ctx.stream.clone_htod(&page_indptr)?,
+            last_page_len_d: ctx.stream.clone_htod(&last_page_lens)?,
+            batch_indices_d: ctx.stream.clone_htod(&batch_indices)?,
+            positions_d: ctx.stream.clone_htod(&positions)?,
+            q_indptr_d: ctx.stream.clone_htod(&q_indptr)?,
+            request_indices_d: ctx.stream.clone_htod(&request_indices_v)?,
+            qo_tile_indices_d: ctx.stream.clone_htod(&qo_tile_indices_v)?,
+            kv_tile_indices_d: ctx.stream.clone_htod(&kv_tile_indices_v)?,
+            kv_chunk_size_d: ctx.stream.clone_htod(&kv_chunk_sizes)?,
+            total_num_rows_d: ctx.stream.clone_htod(&[total_tokens as u32])?,
+            num_tiles,
+            batch_size: batch_size as i32,
+            total_tokens,
         })
     }
 }
 
 /// Per-layer paged prefill: QK norm + RoPE, append K/V to paged, batch prefill attention.
+///
+/// Supports both single-request and multi-request plans. For single-request,
+/// uses scalar start_pos for RoPE. For multi-request, uses per-token positions.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_attention_paged_into(
     ctx: &DeviceContext,
@@ -300,8 +404,7 @@ pub(crate) fn prefill_attention_paged_into(
     start_pos: usize,
     rms_eps: f32,
 ) -> Result<()> {
-    let seq_len = q_batch.seq_len;
-    let kv_len = start_pos + seq_len;
+    let total_tokens = plan.total_tokens;
     let kv_dim = num_kv_heads * head_dim;
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -333,21 +436,41 @@ pub(crate) fn prefill_attention_paged_into(
     let stream = ctx.stream.cu_stream();
 
     unsafe {
-        ffi::prefill_qk_norm_rope_only_cuda(
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            seq_len as i32,
-            start_pos as i32,
-            rms_eps,
-            stream,
-        );
+        if plan.batch_size == 1 {
+            // Single-request: scalar start_pos (no GPU positions array needed)
+            ffi::prefill_qk_norm_rope_only_cuda(
+                q_ptr as *mut ffi::Half,
+                k_ptr as *mut ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                total_tokens as i32,
+                start_pos as i32,
+                rms_eps,
+                stream,
+            );
+        } else {
+            // Multi-request: per-token positions from plan
+            ffi::qk_norm_rope_batched_decode_cuda(
+                q_ptr as *mut ffi::Half,
+                k_ptr as *mut ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                pos_ptr as *const i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                total_tokens as i32,
+                rms_eps,
+                stream,
+            );
+        }
 
         let src_stride_n = kv_dim as i64;
         let src_stride_h = head_dim as i64;
@@ -363,7 +486,7 @@ pub(crate) fn prefill_attention_paged_into(
             v_ptr as *const ffi::Half,
             bi_ptr as *const i32,
             pos_ptr as *const i32,
-            seq_len as i32,
+            total_tokens as i32,
             num_kv_heads as i32,
             head_dim as i32,
             layout.page_size as i32,
@@ -395,8 +518,8 @@ pub(crate) fn prefill_attention_paged_into(
             num_kv_heads as i32,
             head_dim as i32,
             layout.page_size as i32,
-            seq_len as i32,
-            kv_len as i32,
+            total_tokens as i32,
+            plan.batch_size,
             plan.num_tiles,
             stride_page,
             sm_scale,

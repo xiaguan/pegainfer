@@ -251,33 +251,47 @@ int32_t batch_prefill_paged_num_tiles(
     return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
 }
 
+// Return the CTA tile size for batch prefill planning.
+// Rust needs this to compute per-request tile counts that are consistent
+// with the kernel dispatch.
+int32_t batch_prefill_cta_tile_q(
+    int32_t  total_seq_len,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim)
+{
+    uint32_t group_size = num_qo_heads / num_kv_heads;
+    int64_t packed_qo_len = static_cast<int64_t>(total_seq_len) * group_size;
+    return static_cast<int32_t>(FA2DetermineCtaTileQ(packed_qo_len, head_dim));
+}
+
 int batch_prefill_paged_cuda(
-    // Q and output (HiddenStates col-major: [q_dim, seq_len])
+    // Q and output (HiddenStates col-major: [q_dim, total_seq_len])
     void*    q,
     void*    output,
     // KV pool buffer (entire pool)
     void*    kv_data,
     int64_t  k_offset_elems,
     int64_t  v_offset_elems,
-    // Paged KV metadata (GPU arrays)
+    // Paged KV metadata (GPU arrays, concatenated across requests)
     int32_t* page_indices,
     int32_t* page_indptr,
     int32_t* last_page_len_d,
     // Batch prefill plan metadata (GPU arrays, pre-allocated by Rust)
-    int32_t* q_indptr,             // [2]: [0, seq_len]
-    int32_t* request_indices,      // [num_tiles]: all zeros
-    int32_t* qo_tile_indices,      // [num_tiles]: [0, 1, ..., num_tiles-1]
-    int32_t* kv_tile_indices,      // [num_tiles]: all zeros
-    int32_t* kv_chunk_size_ptr,    // [1]: kv_len
-    uint32_t* total_num_rows,      // [1]: seq_len
+    int32_t* q_indptr,             // [batch_size+1]: CSR token boundaries
+    int32_t* request_indices,      // [num_tiles]: tile → request mapping
+    int32_t* qo_tile_indices,      // [num_tiles]: tile → local Q offset
+    int32_t* kv_tile_indices,      // [num_tiles]: all zeros (no KV partition)
+    int32_t* kv_chunk_size_ptr,    // [batch_size]: per-request kv_len
+    uint32_t* total_num_rows,      // [1]: total Q tokens
     // Dimensions
     int32_t  num_qo_heads,
     int32_t  num_kv_heads,
     int32_t  head_dim,
     int32_t  page_size,
-    int32_t  seq_len,
-    int32_t  kv_len,
-    int32_t  padded_batch_size,    // = num_tiles
+    int32_t  seq_len,              // total Q tokens across all requests
+    int32_t  batch_size,           // number of requests
+    int32_t  padded_batch_size,    // = total num_tiles
     int64_t  stride_page,
     float    sm_scale,
     // Stream
@@ -286,7 +300,7 @@ int batch_prefill_paged_cuda(
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
-        num_kv_heads, head_dim, page_size, /*batch_size=*/1, stride_page);
+        num_kv_heads, head_dim, page_size, batch_size, stride_page);
 
     uint32_t q_stride_n = num_qo_heads * head_dim;
     uint32_t q_stride_h = head_dim;
