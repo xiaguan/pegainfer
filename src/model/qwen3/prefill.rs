@@ -13,22 +13,22 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 /// Buffer reuse across steps (all kernels serialized on a single stream):
 ///   `normed`  reused for `normed2`  (steps 1-4 done before step 8)
 ///   `o_buf`   reused for `mlp_out`  (step 7 done before step 12)
-struct PrefillBuffers {
+pub(super) struct PrefillBuffers {
     /// Output ping-pong: layer writes result here; caller swaps with the incoming hidden.
-    hidden_out: HiddenStates, // hidden_dim × seq_len
-    normed: HiddenStates,      // hidden_dim × seq_len (reused for normed2)
-    q_batch: HiddenStates,     // q_dim × seq_len
-    k_batch: HiddenStates,     // kv_dim × seq_len
-    v_batch: HiddenStates,     // kv_dim × seq_len
-    o_buf: HiddenStates,       // hidden_dim × seq_len (reused for mlp_out)
-    gate_out: HiddenStates,    // inter_dim × seq_len
-    up_out: HiddenStates,      // inter_dim × seq_len
-    act_out: HiddenStates,     // inter_dim × seq_len
-    attn_output: HiddenStates, // q_dim × seq_len
+    pub(super) hidden_out: HiddenStates, // hidden_dim × seq_len
+    pub(super) normed: HiddenStates, // hidden_dim × seq_len (reused for normed2)
+    pub(super) q_batch: HiddenStates, // q_dim × seq_len
+    pub(super) k_batch: HiddenStates, // kv_dim × seq_len
+    pub(super) v_batch: HiddenStates, // kv_dim × seq_len
+    pub(super) o_buf: HiddenStates,  // hidden_dim × seq_len (reused for mlp_out)
+    pub(super) gate_out: HiddenStates, // inter_dim × seq_len
+    pub(super) up_out: HiddenStates, // inter_dim × seq_len
+    pub(super) act_out: HiddenStates, // inter_dim × seq_len
+    pub(super) attn_output: HiddenStates, // q_dim × seq_len
 }
 
 impl PrefillBuffers {
-    fn new(
+    pub(super) fn new(
         ctx: &DeviceContext,
         hidden_dim: usize,
         q_dim: usize,

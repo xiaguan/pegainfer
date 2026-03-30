@@ -7,6 +7,7 @@ mod decode;
 mod decode_buffers;
 mod forward;
 mod prefill;
+mod unified_forward;
 mod weights;
 
 pub use config::Config;

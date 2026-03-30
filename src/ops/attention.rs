@@ -223,6 +223,46 @@ pub(crate) struct PrefillPagedPlan {
 }
 
 impl PrefillPagedPlan {
+    pub(crate) fn page_indices_d(&self) -> &CudaSlice<i32> {
+        &self.page_indices_d
+    }
+    pub(crate) fn page_indptr_d(&self) -> &CudaSlice<i32> {
+        &self.page_indptr_d
+    }
+    pub(crate) fn last_page_len_d(&self) -> &CudaSlice<i32> {
+        &self.last_page_len_d
+    }
+    pub(crate) fn batch_indices_d(&self) -> &CudaSlice<i32> {
+        &self.batch_indices_d
+    }
+    pub(crate) fn positions_d(&self) -> &CudaSlice<i32> {
+        &self.positions_d
+    }
+    pub(crate) fn q_indptr_d(&self) -> &CudaSlice<i32> {
+        &self.q_indptr_d
+    }
+    pub(crate) fn request_indices_d(&self) -> &CudaSlice<i32> {
+        &self.request_indices_d
+    }
+    pub(crate) fn qo_tile_indices_d(&self) -> &CudaSlice<i32> {
+        &self.qo_tile_indices_d
+    }
+    pub(crate) fn kv_tile_indices_d(&self) -> &CudaSlice<i32> {
+        &self.kv_tile_indices_d
+    }
+    pub(crate) fn kv_chunk_size_d(&self) -> &CudaSlice<i32> {
+        &self.kv_chunk_size_d
+    }
+    pub(crate) fn total_num_rows_d(&self) -> &CudaSlice<u32> {
+        &self.total_num_rows_d
+    }
+    pub(crate) fn batch_size(&self) -> i32 {
+        self.batch_size
+    }
+    pub(crate) fn num_tiles(&self) -> i32 {
+        self.num_tiles
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         desc: &KvDesc<'_>,

@@ -1,8 +1,8 @@
 # Batch Optimization
 
-> **TL;DR:** Batch prefill implemented. ITL p99 dropped from 83→14ms at c=8 (−83%). Prefill throughput at parity with vLLM across all concurrencies (previous data showing vLLM 7× faster was a cold-start artifact). TTFT still scales linearly under concurrency; vLLM's chunked prefill holds it flat. Next: chunked prefill.
+> **TL;DR:** Unified forward pass implemented — prefill and decode tokens in one forward pass, decode GEMMs ride free on prefill compute. With varied-length workloads (n=500, c=8), throughput gap vs warmed vLLM is **2%** (previously 28% with fixed-length). Remaining gap is per-token decode efficiency: TPOT 18.28ms vs 17.38ms (+5%), partly from serial sampling overhead (~0.2ms/step recoverable). ITL p99 improved 17% (97→81ms).
 >
-> **Status:** Active. Batch prefill landed. Next: chunked prefill for TTFT.
+> **Status:** Active. Unified forward landed. Next: batch sampling to close remaining TPOT gap.
 
 ## Baseline (2026-03-30, n=50)
 
@@ -147,6 +147,46 @@ Decode-heavy barely affected (prefill is trivial at in=1). Slight improvement fr
 
 6. **Decode throughput scales well.** Output tok/s: 91→582 at c=1→c=8 (6.4×). TPOT increases only 11% (10.94→12.12ms) — GPU not saturated at c=8.
 
-## Next Target: Chunked Prefill
+## Unified Forward Pass (2026-03-30)
 
-To match vLLM's flat TTFT under load, need to break each request's prefill into chunks (e.g., 512 tokens per chunk) and interleave with decode steps. The batch prefill infrastructure (multi-request `PrefillPagedPlan`, paged KV scatter) is already in place — the scheduler needs a token-budget policy: each iteration processes up to N tokens of prefill (one or more chunks) plus one decode step for all active requests.
+### Why not chunked prefill
+
+The fixed-length benchmark (in=512, out=64, c=8, `request-rate inf`) creates an artificial worst case: all 8 requests finish simultaneously → perfect waves → prefill and decode never overlap. The 28% throughput gap was a scheduling artifact, not a fundamental deficiency. With varied-length requests, waves break up naturally.
+
+The real optimization is what vLLM does at the **kernel level**: mixing prefill and decode tokens in a single forward pass. Decode tokens (batch=8) are memory-bandwidth-bound; when folded into a compute-bound prefill GEMM (512 tokens), the 8 decode rows add <2% FLOPs and ride free.
+
+### Implementation
+
+New `unified_step` on `Qwen3Model`: when the scheduler has both pending prefill and active decode requests, it runs one forward pass for all tokens:
+
+- **GEMM ops** (QKV, O proj, MLP): all tokens in one batch — decode rides free
+- **QK norm + RoPE**: unified per-token positions array, same kernel for prefill and decode
+- **KV cache write**: scatter for prefill tokens, append for decode tokens (two kernel calls)
+- **Attention**: split — FlashInfer BatchPrefill for prefill portion, BatchDecode for decode portion, outputs concatenated
+- **Logits**: extract last token per prefill sequence + all decode tokens
+
+Scheduler policy: `pending && active → unified_step`, `pending only → prefill_batch`, `active only → decode_step (CUDA Graph)`. Pure decode (the common case) still uses CUDA Graph.
+
+### Results: varied-length workload
+
+in~256–768, out~32–96, c=8, n=500, `request-rate inf`. vLLM warmed (torch.compile cached), same seed.
+
+| Metric | pega baseline | pega unified | vLLM (warmed) | unified vs vLLM |
+|--------|--------------|-------------|---------------|----------------|
+| req/s | 6.27 | 6.41 | 6.54 | **−2.0%** |
+| output tok/s | 404.68 | 412.79 | 421.66 | **−2.1%** |
+| TTFT median (ms) | 71.21 | 78.60 | 108.09 | **−27.3%** ✓ |
+| TPOT median (ms) | 18.75 | 18.28 | 17.38 | +5.2% |
+| ITL p99 (ms) | 97.70 | 81.04 | 67.59 | +19.9% |
+
+Throughput gap collapsed from 28% (fixed-length) to **2%** (varied-length). TTFT 27% faster than vLLM (no torch.compile overhead).
+
+### Remaining gap: TPOT +5%
+
+nsys profile of pure decode (in=1, out=128, c=8) shows `argmax_kernel` at 8.3% of GPU time — 8 serial sampling calls per step (extract logits → argmax → sync, one per request). Batching into one call would save ~0.2ms/step (1.9%), closing TPOT gap from 5.9% to ~4%.
+
+The remaining ~4% is kernel-level efficiency: vLLM's torch.compile fuses elementwise ops (residual add + RMSNorm → one memory pass), reducing bandwidth pressure. CUDA Graph eliminates launch overhead but not redundant memory traffic from unfused kernels.
+
+## Next Target: Batch Sampling
+
+Current `select_tokens_batch_varied` does 8 serial `extract_vec → gpu_sample_into → sync` calls. Replace with a single batched argmax/sampling kernel + one sync. Estimated TPOT improvement: ~0.2ms (1.9%).
