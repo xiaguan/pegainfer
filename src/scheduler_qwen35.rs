@@ -183,6 +183,13 @@ fn prefill_batch(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 batch prefill failed: {e}");
+            for req in pending {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+            }
             return;
         }
     };
@@ -278,6 +285,22 @@ fn unified_step_sched(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 unified step failed: {e}");
+            // Notify all pending requests
+            for req in pending {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+            }
+            // Notify all active decode requests
+            for req in active.drain(..) {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                });
+            }
             return;
         }
     };
