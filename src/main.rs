@@ -84,11 +84,8 @@ async fn main() {
             build_app(handle, tokenizer, model_id)
         }
         ModelType::Qwen35 => {
-            let model = Qwen35Model::from_safetensors_with_options(
-                model_path,
-                args.cuda_graph,
-            )
-            .expect("Failed to load Qwen3.5 model");
+            let model = Qwen35Model::from_safetensors_with_options(model_path, args.cuda_graph)
+                .expect("Failed to load Qwen3.5 model");
 
             let tokenizer =
                 Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));

@@ -159,22 +159,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
-    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
-    pub(crate) fn flash_attention_prefill_hd256_cuda(
-        Q: *const Half,
-        K_cache: *const Half,
-        V_cache: *const Half,
-        Output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        gqa_ratio: i32,
-        seq_len: i32,
-        start_pos_ptr: *const i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
     pub(crate) fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,
@@ -202,17 +186,6 @@ unsafe extern "C" {
         attn_out: *mut Half,
         num_q_heads: i32,
         seq_len: i32,
-        stream: CUstream,
-    );
-
-    // Extract one K (or V) token from HND cache at GPU-resident position to compact NHD.
-    // Used by decode path: bridges prep_cuda (HND output) → paged_kv_append_cuda (compact NHD).
-    pub(crate) fn decode_kv_compact_hd256_cuda(
-        hnd: *const Half,
-        out: *mut Half,
-        start_pos_ptr: *const i32,
-        num_kv_heads: i32,
-        max_seq_len: i32,
         stream: CUstream,
     );
 
@@ -499,25 +472,6 @@ unsafe extern "C" {
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
-
-    // Single-request prefill for HEAD_DIM=256 (FlashInfer SinglePrefill, causal, kNone).
-    // Reads Q from col-major [q_dim, seq_len]; K/V from contiguous HND cache.
-    // Used for Qwen3.5 multi-token prefill. Single-token decode still uses
-    // flash_attention_prefill_hd256_cuda until Phase 2d.
-    pub(crate) fn single_prefill_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
     // Paged attention decode for HEAD_DIM=256 (Qwen3.5-4B full-attention layers).
     pub(crate) fn paged_attention_decode_cuda_hd256(
         q: *const Half,

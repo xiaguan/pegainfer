@@ -1,19 +1,15 @@
 # Triton AOT Integration
 
-`pegainfer` now builds `silu_mul`, `add`, and the embedding lookup kernels through Triton AOT by default.
+`pegainfer` currently uses Triton AOT for the Qwen3.5 HD256 prefill kernel and the
+Qwen3.5 GDR chunkwise prefill kernels.
 
 ## What this covers
 
 - Build-time generation of Triton AOT cubins for:
-  - `silu_mul`
-  - `add`
-  - `embedding`
-  - `embedding_decode`
-  - `embedding_batched`
+  - `flash_attention_prefill_hd256_kernel.py`
+  - `gated_delta_rule_chunkwise_kernels.py`
 - Generated C wrappers linked into the normal Rust build
-- Default runtime routing of the corresponding ops onto Triton-generated launchers
-- `extract_vec` / `write_vec` now using `cudarc` device-to-device memcpy instead of a custom CUDA copy kernel
-- A focused `triton_silu_smoke` binary that compares the Triton path against a CPU reference
+- Native CUDA now covers basic ops (`add`, `silu_mul`, `embedding`) and decode-critical paths
 
 `build.rs` now skips compiling the replaced legacy CUDA translation units `csrc/activation.cu`, `csrc/elementwise.cu`, and `csrc/embedding.cu`.
 
@@ -74,18 +70,11 @@ target/release/build/pegainfer-*/out/triton_aot/
 
 ## Validation
 
-Sanity-check the default `silu_mul` path against a host-side reference:
+Run the focused GPU tests for the active Triton-backed paths:
 
 ```bash
-cargo run --release --bin triton_silu_smoke -- --seq-len 32 --hidden-dim 4096 --iters 20
-```
-
-Run the focused GPU tests for the newly replaced paths:
-
-```bash
-cargo test --release embedding_variants -- --nocapture
-cargo test --release extract_write_vec_roundtrip -- --nocapture
-cargo test --release add_and_add_inplace -- --nocapture
+cargo test --release test_conv1d_prefill_handoff_matches_single_prefill -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release --test e2e_qwen35_scheduler -- --nocapture
 ```
 
 ## Common failures

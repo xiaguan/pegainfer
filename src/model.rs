@@ -13,10 +13,10 @@ pub mod qwen3;
 pub mod qwen35;
 
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
-pub use qwen35::{Qwen35Model, Qwen35State};
+pub use qwen35::Qwen35Model;
 
 // ============================================================================
-// ModelForward trait — shared by Qwen3 and Qwen3.5
+// ModelForward trait — used by the Qwen3 direct-request path
 // ============================================================================
 
 /// Per-request mutable state. Separate from model weights for bs > 1 future.

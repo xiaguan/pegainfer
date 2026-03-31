@@ -5,12 +5,12 @@
 use std::path::{Path, PathBuf};
 
 use log::info;
-use pegainfer::model::{GenerationState, ModelForward, Qwen35Model};
-use pegainfer::sampler::SamplingParams;
+use pegainfer::model::Qwen35Model;
+use pegainfer::scheduler::{SchedulerRequest, TokenEvent};
+use pegainfer::scheduler_qwen35;
 use pegainfer::tokenizer::Tokenizer;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
@@ -53,30 +53,31 @@ fn load_test_cases(path: &Path) -> Vec<TestCase> {
     data.cases
 }
 
-fn generate_text<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
+fn generate_text(
+    handle: &pegainfer::scheduler::SchedulerHandle,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
-    rng: &mut StdRng,
 ) -> String {
-    let tokens = tokenizer.encode(prompt).expect("encode failed");
-    state.reset().expect("reset failed");
-    model.forward(&tokens, state).expect("prefill failed");
-    let sampling = SamplingParams::default();
+    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+
+    handle
+        .submit(SchedulerRequest {
+            prompt_tokens,
+            params: pegainfer::sampler::SamplingParams::default(),
+            max_tokens,
+            token_tx,
+        })
+        .expect("submit failed");
 
     let mut out = Vec::new();
-    let mut last = model.select_token(state, &sampling, rng).expect("select_token");
-    out.push(last);
-
-    for _ in 1..max_tokens {
-        if model.is_stop_token(last) {
-            break;
+    loop {
+        match token_rx.blocking_recv() {
+            Some(TokenEvent::Token(id)) => out.push(id),
+            Some(TokenEvent::Finished { .. }) => break,
+            None => panic!("scheduler channel closed"),
         }
-        model.forward(&[last], state).expect("decode failed");
-        last = model.select_token(state, &sampling, rng).expect("select_token");
-        out.push(last);
     }
 
     tokenizer.decode(&out).expect("decode failed")
@@ -94,16 +95,15 @@ fn test_e2e_qwen35_generation() {
     let model =
         Qwen35Model::from_safetensors_with_options(&model_path, /*enable_cuda_graph=*/ true)
             .expect("Failed to load model");
-    let mut state = model.create_state().expect("Failed to create state");
     let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
-    let mut rng = StdRng::seed_from_u64(42);
+    let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
     info!("Model loaded");
 
     info!("=== Qwen3.5-4B greedy correctness ===");
     let mut pass = 0;
     let mut fail = 0;
     for case in &cases {
-        let output = generate_text(&model, &mut state, &tokenizer, &case.prompt, case.max_new_tokens, &mut rng);
+        let output = generate_text(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
         if output == case.output {
             info!("  PASS: {:?}", case.name);
             pass += 1;
@@ -115,6 +115,11 @@ fn test_e2e_qwen35_generation() {
         }
     }
 
-    assert_eq!(fail, 0, "{fail} / {} cases failed (see output above)", pass + fail);
+    assert_eq!(
+        fail,
+        0,
+        "{fail} / {} cases failed (see output above)",
+        pass + fail
+    );
     info!("All {} cases passed", pass);
 }

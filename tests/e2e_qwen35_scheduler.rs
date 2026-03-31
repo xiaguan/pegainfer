@@ -143,8 +143,7 @@ fn test_e2e_qwen35_scheduler() {
     // ── 2. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 2: Multi-request ===");
     for case in &cases {
-        let (tokens, _) =
-            generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
+        let (tokens, _) = generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens).expect("decode failed");
         assert!(
             !text.is_empty(),
