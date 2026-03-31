@@ -124,14 +124,42 @@ pub(crate) fn extract_vec(
     batch: &HiddenStates,
     token_idx: usize,
 ) -> Result<DeviceVec> {
-    let offset = token_idx * batch.hidden_dim;
     let len = batch.hidden_dim;
     let mut out = DeviceVec::zeros(ctx, len)?;
+    extract_vec_into(ctx, batch, token_idx, &mut out)?;
+    Ok(out)
+}
 
+/// Copy one column from `batch` into a pre-allocated `out`.
+pub(crate) fn extract_vec_into(
+    ctx: &DeviceContext,
+    batch: &HiddenStates,
+    token_idx: usize,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let offset = token_idx * batch.hidden_dim;
+    let len = batch.hidden_dim;
+    anyhow::ensure!(out.len == len, "extract_vec_into len mismatch");
     let src_view = batch.data.slice(offset..offset + len);
     ctx.stream
         .memcpy_dtod(&src_view, &mut out.data)
         .map_err(|e| anyhow!("Device copy failed: {}", e))?;
+    Ok(())
+}
 
-    Ok(out)
+#[allow(dead_code)]
+/// Copy `src` into one column of `batch`.
+pub(crate) fn write_vec_into(
+    ctx: &DeviceContext,
+    src: &DeviceVec,
+    batch: &mut HiddenStates,
+    token_idx: usize,
+) -> Result<()> {
+    anyhow::ensure!(src.len == batch.hidden_dim, "write_vec_into len mismatch");
+    let offset = token_idx * batch.hidden_dim;
+    let mut dst_view = batch.data.slice_mut(offset..offset + src.len);
+    ctx.stream
+        .memcpy_dtod(&src.data, &mut dst_view)
+        .map_err(|e| anyhow!("Device copy failed: {}", e))?;
+    Ok(())
 }

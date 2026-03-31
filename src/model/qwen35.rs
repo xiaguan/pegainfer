@@ -1,5 +1,6 @@
 //! Qwen3.5 model: mixed full attention + linear attention transformer.
 
+mod batch_decode;
 pub(crate) mod config;
 mod decode_buffers;
 mod forward;

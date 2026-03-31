@@ -350,4 +350,17 @@ impl Qwen35Model {
     pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
         &self.kv_pool
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_batch_decode_bufs(
+        &self,
+        max_batch_size: usize,
+    ) -> anyhow::Result<super::decode_buffers::BatchDecodeBuffers35> {
+        super::decode_buffers::BatchDecodeBuffers35::new(
+            &self.ctx,
+            &self.config,
+            max_batch_size,
+            self.kv_pool.capacity_pages(),
+        )
+    }
 }
