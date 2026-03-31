@@ -80,6 +80,8 @@ pub struct Qwen35Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    /// Shared paged KV pool for full-attention layers.
+    pub(super) kv_pool: crate::kv_pool::KvPool,
 }
 
 impl Qwen35Model {
@@ -299,6 +301,35 @@ impl Qwen35Model {
             debug!("Decode path CUDA Graph is disabled");
         }
 
+        // Paged KV pool for the 8 full-attention layers.
+        let page_size = 16usize;
+        let num_full_layers = config.num_full_attention_layers();
+        let layout = crate::kv_pool::KvLayout::new(
+            num_full_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            page_size,
+        );
+        let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
+        let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
+        let kv_budget = (free_bytes as f64 * 0.85) as usize;
+        let num_pages = (kv_budget / bytes_per_page).max(64);
+        let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
+        info!(
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            kv_budget as f64 / free_bytes as f64 * 100.0,
+            free_bytes as f64 / 1024.0 / 1024.0
+        );
+        let kv_pool = crate::kv_pool::KvPool::new(
+            &ctx,
+            num_full_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            page_size,
+            num_pages,
+        )?;
+
         Ok(Self {
             ctx,
             config,
@@ -308,6 +339,15 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph,
+            kv_pool,
         })
+    }
+
+    pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
+        self.kv_pool.alloc()
+    }
+
+    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
+        &self.kv_pool
     }
 }

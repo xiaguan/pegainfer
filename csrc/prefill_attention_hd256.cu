@@ -154,7 +154,31 @@ __global__ void attention_gate_batch_hd256_kernel(
     attn_out[idx] = __float2bfloat16(out * sig_gate);
 }
 
+// Extract one K (or V) token from HND cache at GPU-resident position to compact NHD.
+// Grid: (num_kv_heads,), Block: (HD256,)
+__global__ void decode_kv_compact_hd256_kernel(
+    const __nv_bfloat16* __restrict__ hnd,  // [num_heads * 4096 * HD256]
+    __nv_bfloat16* __restrict__ out,        // [num_heads * HD256] compact NHD
+    const int* __restrict__ start_pos_ptr
+) {
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    int pos = *start_pos_ptr;
+    out[h * HD256 + d] = hnd[h * 4096 * HD256 + pos * HD256 + d];
+}
+
 extern "C" {
+
+void decode_kv_compact_hd256_cuda(
+    const __nv_bfloat16* hnd,
+    __nv_bfloat16* out,
+    const int* start_pos_ptr,
+    int num_kv_heads,
+    cudaStream_t stream
+) {
+    decode_kv_compact_hd256_kernel<<<num_kv_heads, HD256, 0, stream>>>(
+        hnd, out, start_pos_ptr);
+}
 
 void prefill_attention_hd256_prep_cuda(
     const __nv_bfloat16* q_full_batch,

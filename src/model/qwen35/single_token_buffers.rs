@@ -46,6 +46,12 @@ pub(super) struct SingleTokenBuffers {
     /// Linear: gated norm output [z_dim, 1]
     pub normed_gated: HiddenStates,
 
+    // ── Compact K/V for paged_kv_append (one token, NHD) ───────────
+    /// Compact K scratch: [kv_dim] = num_kv_heads * head_dim.
+    pub kv_k_compact: DeviceVec,
+    /// Compact V scratch: [kv_dim] = num_kv_heads * head_dim.
+    pub kv_v_compact: DeviceVec,
+
     // ── Attention results (after O/out projection) [hidden_size, 1] ─
     pub attn_results: HiddenStates,
 
@@ -66,12 +72,31 @@ pub(super) struct SingleTokenBuffers {
     // ── CUDA Graph support ──────────────────────────────────────────
     /// Pre-allocated token_id buffer for embedding lookup (avoids clone_htod)
     pub token_id_gpu: CudaSlice<i32>,
-    /// GPU-resident start_pos for CUDA Graph-safe attention
+    /// GPU-resident start_pos for CUDA Graph-safe attention and scatter
     pub start_pos_buf: CudaSlice<i32>,
+
+    // ── Paged KV decode metadata (stable GPU addresses for CUDA Graph) ───
+    /// Page index list for the single request (capacity_pages+1 slots).
+    pub page_indices_d: CudaSlice<i32>,
+    /// CSR indptr for the single request: [0, num_pages] (2 elements).
+    pub page_indptr_d: CudaSlice<i32>,
+    /// Number of occupied slots in the last page (1 element).
+    pub last_page_len_d: CudaSlice<i32>,
+    /// Request index for BatchDecode: always [0] (1 element, constant).
+    pub request_indices_d: CudaSlice<i32>,
+    /// KV tile index for BatchDecode: always [0] (1 element, constant).
+    pub kv_tile_indices_d: CudaSlice<i32>,
+    /// Sequence length for BatchDecode: seq_len after advance (1 element).
+    pub kv_chunk_size_d: CudaSlice<i32>,
 }
 
 impl SingleTokenBuffers {
-    pub(super) fn new(ctx: &DeviceContext, c: &Config35) -> Result<Self> {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        c: &Config35,
+        pool_capacity: usize,
+        _padding_page_id: i32,
+    ) -> Result<Self> {
         let h = c.hidden_size;
         let q_proj_dim = c.full_attn_q_proj_dim();
         let q_dim = c.full_attn_q_dim();
@@ -102,6 +127,9 @@ impl SingleTokenBuffers {
             gdr_out: HiddenStates::zeros(ctx, z_dim, 1)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, 1)?,
 
+            kv_k_compact: DeviceVec::zeros(ctx, kv_dim)?,
+            kv_v_compact: DeviceVec::zeros(ctx, kv_dim)?,
+
             attn_results: HiddenStates::zeros(ctx, h, 1)?,
 
             gate_out: HiddenStates::zeros(ctx, inter, 1)?,
@@ -122,6 +150,60 @@ impl SingleTokenBuffers {
                 .stream
                 .alloc_zeros(1)
                 .map_err(|e| anyhow::anyhow!("Alloc start_pos failed: {}", e))?,
+
+            // Paged decode metadata (stable GPU addresses, values updated each step)
+            page_indices_d: ctx
+                .stream
+                .alloc_zeros(pool_capacity + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc page_indices_d failed: {}", e))?,
+            page_indptr_d: ctx
+                .stream
+                .alloc_zeros(2)
+                .map_err(|e| anyhow::anyhow!("Alloc page_indptr_d failed: {}", e))?,
+            last_page_len_d: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc last_page_len_d failed: {}", e))?,
+            request_indices_d: ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("Alloc request_indices_d failed: {}", e))?,
+            kv_tile_indices_d: ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("Alloc kv_tile_indices_d failed: {}", e))?,
+            kv_chunk_size_d: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc kv_chunk_size_d failed: {}", e))?,
         })
+    }
+
+    /// Sync paged decode metadata from `kv_state` to GPU arrays.
+    /// Must be called OUTSIDE the CUDA Graph, before each decode step.
+    pub(super) fn sync_paged_decode_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_state: &crate::kv_pool::KvState,
+        padding_page_id: i32,
+    ) -> Result<()> {
+        let pages = kv_state.page_indices_i32();
+        let mut page_indices = pages.clone();
+        // Pad remaining slots with the padding page so GPU sees valid page IDs.
+        page_indices.push(padding_page_id);
+
+        let indptr = [0i32, pages.len() as i32];
+        let last_page_len = [kv_state.last_page_len() as i32];
+        let chunk_size = [kv_state.seq_len() as i32];
+
+        ctx.stream
+            .memcpy_htod(&page_indices, &mut self.page_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&indptr, &mut self.page_indptr_d)?;
+        ctx.stream
+            .memcpy_htod(&last_page_len, &mut self.last_page_len_d)?;
+        ctx.stream
+            .memcpy_htod(&chunk_size, &mut self.kv_chunk_size_d)?;
+        Ok(())
     }
 }
