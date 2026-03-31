@@ -398,7 +398,11 @@ for (uint32_t iter = 0; iter < num_iters; ++iter) {
 }
 ```
 
-FlashInfer also provides GDN (Gated Delta Network) support (`flashinfer/gdn_prefill.py`), generating 32 kernel variants across dtypes and boolean combinations. The GDN recurrence formula may be compatible with Qwen3.5's Gated Delta Rule -- worth investigating.
+FlashInfer also provides GDN (Gated Delta Network) support in the submodule (`flashinfer/gdn_prefill.py`, `flashinfer/gdn_decode.py`), but the current pegainfer integration boundary is still not ready to consume it directly:
+
+- The GDN code exists in the submodule, but pegainfer does not yet expose a matching C++/FFI entrypoint. The currently usable FlashInfer path is the header-only paged-attention integration via thin C wrappers.
+- FlashInfer GDN's expected state layout is not directly compatible with pegainfer's current `RecurrentState` / `LayerRecurrentState` representation, so plugging it in would require a separate state-pool / layout adaptation layer.
+- Short-term strategy: keep Qwen3.5 linear attention on the existing GDR path, and evaluate FlashInfer GDN as a separate workstream instead of mixing it into the critical-path batch/scheduler PRs.
 
 **What to learn:**
 - Prefill and decode as separate optimization problems
