@@ -216,7 +216,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    #[allow(dead_code)]
     pub(crate) fn qk_norm_partial_rope_batched_decode_hd256_cuda(
         q_full_batch: *const Half,
         k_batch: *mut Half,
