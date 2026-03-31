@@ -5,6 +5,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
+use crate::kv_pool::KvState;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated GPU buffers for token sampling (softmax + multinomial).
@@ -14,6 +15,7 @@ pub(crate) struct DecodeBuffers35 {
     /// Pre-allocated sampling output (1 element, token id)
     pub(crate) sample_out: CudaSlice<i32>,
 }
+
 
 impl DecodeBuffers35 {
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
@@ -81,6 +83,10 @@ pub(crate) struct BatchDecodeBuffers35 {
     // Sampling scratch
     pub(crate) sample_probs: CudaSlice<f32>,
     pub(crate) sample_out: CudaSlice<i32>,
+
+    /// Page index reserved for CUDA Graph padding slots. Padding entries point
+    /// here with seq_len=1 so FlashInfer accesses valid (but discarded) memory.
+    padding_page_id: i32,
 }
 
 #[allow(dead_code)]
@@ -90,6 +96,7 @@ impl BatchDecodeBuffers35 {
         config: &Config35,
         max_batch_size: usize,
         max_total_pages: usize,
+        padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
@@ -134,7 +141,8 @@ impl BatchDecodeBuffers35 {
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages)?,
+            // Extra capacity for padding slots (at most max_batch_size padding entries).
+            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
@@ -143,6 +151,8 @@ impl BatchDecodeBuffers35 {
 
             sample_probs: ctx.stream.alloc_zeros(config.vocab_size)?,
             sample_out: ctx.stream.alloc_zeros(bs)?,
+
+            padding_page_id,
         })
     }
 
@@ -172,16 +182,23 @@ impl BatchDecodeBuffers35 {
         self.normed_gated.seq_len = bs;
     }
 
+    /// Sync paged attention metadata to GPU.
+    ///
+    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
     pub(crate) fn sync_paged_meta(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&crate::kv_pool::KvState],
+        kv_states: &[&KvState],
+        padded_bs: usize,
     ) -> Result<()> {
-        let bs = kv_states.len();
+        let real_bs = kv_states.len();
+        debug_assert!(padded_bs >= real_bs);
+
         let mut all_page_indices = Vec::new();
         let mut indptr = vec![0i32];
-        let mut last_page_lens = Vec::with_capacity(bs);
-        let mut chunk_sizes = Vec::with_capacity(bs);
+        let mut last_page_lens = Vec::with_capacity(padded_bs);
+        let mut chunk_sizes = Vec::with_capacity(padded_bs);
 
         for kv in kv_states {
             let pages = kv.page_indices_i32();
@@ -191,8 +208,16 @@ impl BatchDecodeBuffers35 {
             chunk_sizes.push(kv.seq_len() as i32);
         }
 
-        let request_indices: Vec<i32> = (0..bs as i32).collect();
-        let kv_tile_indices = vec![0i32; bs];
+        // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1.
+        for _ in real_bs..padded_bs {
+            all_page_indices.push(self.padding_page_id);
+            indptr.push(all_page_indices.len() as i32);
+            last_page_lens.push(1);
+            chunk_sizes.push(1);
+        }
+
+        let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
+        let kv_tile_indices = vec![0i32; padded_bs];
 
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
