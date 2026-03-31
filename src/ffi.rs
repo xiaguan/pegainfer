@@ -472,6 +472,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Single-request prefill for HEAD_DIM=256 (FlashInfer SinglePrefill, causal, kNone).
+    // Reads Q from col-major [q_dim, seq_len]; K/V from contiguous HND cache.
+    // Used for Qwen3.5 multi-token prefill. Single-token decode still uses
+    // flash_attention_prefill_hd256_cuda until Phase 2d.
+    pub(crate) fn single_prefill_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub(crate) fn paged_attention_decode_cuda(
         q: *const Half,
