@@ -35,7 +35,8 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
     int seq_len,
     const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
     int rotary_dim,
-    float rms_eps
+    float rms_eps,
+    int max_seq_len
 ) {
     int start_pos = *start_pos_ptr;
     int head_global = blockIdx.x;
@@ -95,7 +96,7 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int dst = head_local * 4096 * HD256 + pos * HD256;
+            int dst = head_local * max_seq_len * HD256 + pos * HD256;
             k_cache[dst + d] = lo;
             k_cache[dst + d + half_rotary] = hi;
         }
@@ -106,7 +107,7 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
             int dst = token * q_dim + head_local * HD256;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int dst = head_local * 4096 * HD256 + pos * HD256;
+            int dst = head_local * max_seq_len * HD256 + pos * HD256;
             k_cache[dst + d] = smem[d];
         }
     }
@@ -117,7 +118,8 @@ __global__ void prefill_v_cache_write_hd256_kernel(
     __nv_bfloat16* __restrict__ v_cache,        // [num_kvheads * max_seq * HD256]
     int num_kv_heads,
     int seq_len,
-    const int* __restrict__ start_pos_ptr       // GPU-resident
+    const int* __restrict__ start_pos_ptr,      // GPU-resident
+    int max_seq_len
 ) {
     int start_pos = *start_pos_ptr;
     int kv_head = blockIdx.x;
@@ -126,7 +128,7 @@ __global__ void prefill_v_cache_write_hd256_kernel(
 
     int kv_dim = num_kv_heads * HD256;
     int src = token * kv_dim + kv_head * HD256 + d;
-    int dst = kv_head * 4096 * HD256 + (start_pos + token) * HD256 + d;
+    int dst = kv_head * max_seq_len * HD256 + (start_pos + token) * HD256 + d;
     v_cache[dst] = v_batch[src];
 }
 
@@ -330,6 +332,7 @@ void prefill_attention_hd256_prep_cuda(
     const int* start_pos_ptr,
     int rotary_dim,
     float rms_eps,
+    int max_seq_len,
     cudaStream_t stream
 ) {
     dim3 prep_grid(num_q_heads + num_kv_heads, seq_len);
@@ -347,7 +350,8 @@ void prefill_attention_hd256_prep_cuda(
         seq_len,
         start_pos_ptr,
         rotary_dim,
-        rms_eps
+        rms_eps,
+        max_seq_len
     );
 
     dim3 v_grid(num_kv_heads, seq_len);
@@ -356,7 +360,8 @@ void prefill_attention_hd256_prep_cuda(
         v_cache,
         num_kv_heads,
         seq_len,
-        start_pos_ptr
+        start_pos_ptr,
+        max_seq_len
     );
 }
 

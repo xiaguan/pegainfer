@@ -40,13 +40,8 @@ const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
 const SNAPSHOT_DECODE_OUTPUT_LEN: usize = 256;
 
-/// Qwen3.5 HD256 needs ~4x the attention working memory of Qwen3 HD128,
-/// so a 10k prefill OOMs on 16 GB GPUs. Use 4000 tokens for Qwen3.5.
-fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
-    match model_type {
-        ModelType::Qwen3 => 10_000,
-        ModelType::Qwen35 => 4_000,
-    }
+fn snapshot_prefill_prompt_len(_model_type: ModelType) -> usize {
+    10_000
 }
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
@@ -1624,7 +1619,10 @@ fn main() -> Result<()> {
                 &cli.model_path,
                 runtime.enable_cuda_graph,
             )?;
-            let handle = scheduler_qwen35::start(model, command_seed(&cli))?;
+            // Bench runs one request at a time — use minimal batch capacity
+            // to leave GPU memory for large prefill scratch buffers.
+            let handle =
+                scheduler_qwen35::start_with_capacity(model, command_seed(&cli), 4)?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };

@@ -155,21 +155,25 @@ mod tests {
             let mut rec_a = RecurrentState::new(&model.ctx, &model.config).unwrap();
             let mut rec_b = RecurrentState::new(&model.ctx, &model.config).unwrap();
 
-            // Prefill both prompts
-            let mut kv_cache_a = KVCache::new(
-                model.config.num_full_attention_layers(),
-                model.config.num_key_value_heads,
-            );
-            let first_logits_a = model
-                .prefill_forward(&prompt_a, &mut kv_cache_a, &mut kv_a, &mut rec_a)
-                .unwrap();
-            let mut kv_cache_b = KVCache::new(
-                model.config.num_full_attention_layers(),
-                model.config.num_key_value_heads,
-            );
-            let first_logits_b = model
-                .prefill_forward(&prompt_b, &mut kv_cache_b, &mut kv_b, &mut rec_b)
-                .unwrap();
+            // Prefill both prompts (drop HND staging buffers between prefills to save memory)
+            let first_logits_a = {
+                let mut kv_cache = KVCache::new(
+                    model.config.num_full_attention_layers(),
+                    model.config.num_key_value_heads,
+                );
+                model
+                    .prefill_forward(&prompt_a, &mut kv_cache, &mut kv_a, &mut rec_a)
+                    .unwrap()
+            };
+            let first_logits_b = {
+                let mut kv_cache = KVCache::new(
+                    model.config.num_full_attention_layers(),
+                    model.config.num_key_value_heads,
+                );
+                model
+                    .prefill_forward(&prompt_b, &mut kv_cache, &mut kv_b, &mut rec_b)
+                    .unwrap()
+            };
 
             let mut rng = StdRng::seed_from_u64(seed);
             let first_a = greedy_sample(&model, &first_logits_a, &mut rng);

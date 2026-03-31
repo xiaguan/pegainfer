@@ -25,7 +25,7 @@ impl KVCache {
             head_dim: 0,
             num_layers,
             num_kv_heads,
-            max_seq_len: 4096,
+            max_seq_len: 20_000,
         }
     }
 
