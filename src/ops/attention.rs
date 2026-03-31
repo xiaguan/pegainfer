@@ -54,7 +54,16 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     Ok(())
 }
 
-/// Qwen3.5 full-attention prefill: prep Q/K/cache, run HD256 FlashAttention-2, then apply gate.
+/// Qwen3.5 full-attention prefill (multi-token): prep Q/K/cache via CUDA kernel,
+/// run FlashInfer SinglePrefill HD256, then apply gate.
+///
+/// Requires `start_pos` as a CPU value; `kv_len = start_pos + seq_len` is computed
+/// here and passed to FlashInfer.  This path is never CUDA-Graph captured (multi-token
+/// prefill always allocates new buffers), so a CPU-side `kv_len` is safe.
+///
+/// Single-token decode still routes through `prefill_attention_hd256_batch_with_scratch`
+/// which uses the Triton AOT path (CUDA-Graph safe via GPU-resident start_pos_ptr).
+/// That path will be replaced in Phase 2d when paged decode lands.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_hd256_batch(
     ctx: &DeviceContext,
@@ -74,32 +83,97 @@ pub fn prefill_attention_hd256_batch(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let seq_len = q_full_batch.seq_len;
     let q_dim = num_q_heads * 256;
-    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, q_full_batch.seq_len)?;
-    // Allocate temporary GPU scalar for start_pos
+    let kv_dim = num_kv_heads * 256;
+    let kv_len = start_pos + seq_len;
+    // KVCache allocates num_kv_heads * max_seq_len * head_dim elements; max_seq_len=4096.
+    const MAX_SEQ_LEN: usize = 4096;
+
+    assert_eq!(q_full_batch.hidden_dim, q_dim * 2);
+    assert_eq!(k_batch.hidden_dim, kv_dim);
+    assert_eq!(v_batch.hidden_dim, kv_dim);
+    assert_eq!(output.hidden_dim, q_dim);
+
+    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, seq_len)?;
     let start_pos_buf: CudaSlice<i32> = ctx
         .stream
         .clone_htod(&[start_pos as i32])
         .map_err(|e| anyhow::anyhow!("start_pos H2D failed: {e}"))?;
-    prefill_attention_hd256_batch_with_scratch(
-        ctx,
-        q_full_batch,
-        k_batch,
-        v_batch,
-        q_norm,
-        k_norm,
-        cos_cache,
-        sin_cache,
-        k_cache,
-        v_cache,
-        output,
-        &mut q_prepped,
-        num_q_heads,
-        num_kv_heads,
-        &start_pos_buf,
-        rotary_dim,
-        rms_eps,
-    )
+
+    // Step 1: QK norm + partial RoPE + write K/V to contiguous cache.
+    unsafe {
+        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
+        let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
+        let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
+        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
+        let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
+        let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
+        let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
+        let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+        let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+        let (sp_ptr, _gsp) = start_pos_buf.device_ptr(&ctx.stream);
+
+        ffi::prefill_attention_hd256_prep_cuda(
+            qf_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qp_ptr as *mut ffi::Half,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            seq_len as i32,
+            sp_ptr as *const i32,
+            rotary_dim as i32,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    // Step 2: FlashInfer SinglePrefill HD256 on the contiguous KV cache.
+    let sm_scale = 1.0f32 / f32::sqrt(256.0f32);
+    unsafe {
+        let (qp_ptr, _gqp) = q_prepped.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+        let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
+        let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
+
+        let ret = ffi::single_prefill_cuda_hd256(
+            qp_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            kc_ptr as *const ffi::Half,
+            vc_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            seq_len as i32,
+            kv_len as i32,
+            MAX_SEQ_LEN as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        );
+        anyhow::ensure!(ret == 0, "single_prefill_cuda_hd256 failed: {ret}");
+    }
+
+    // Step 3: Apply gate from q_full_batch to output.
+    unsafe {
+        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+        ffi::attention_gate_batch_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            seq_len as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Same as `prefill_attention_hd256_batch` but uses pre-allocated scratch buffers.

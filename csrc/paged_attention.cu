@@ -436,4 +436,72 @@ int single_prefill_cuda(
             reinterpret_cast<cudaStream_t>(stream)));
 }
 
+// ---------------------------------------------------------------------------
+// Single-request prefill for HEAD_DIM=256 — wraps FlashInfer SinglePrefillWithKVCache.
+//
+// Identical to single_prefill_cuda but instantiated with HEAD_DIM_QK/VO=256.
+// Reads Q from col-major [q_dim, seq_len] (HiddenStates layout).
+// Reads K/V from contiguous HND cache: k[head, pos, dim].
+// No RoPE inside (caller does QK norm + partial RoPE beforehand).
+// Causal mask, no split-KV.
+//
+// Used by Qwen3.5-4B multi-token prefill.  Single-token decode still routes to
+// the Triton AOT path (CUDA-Graph safe) until Phase 2d introduces paged decode.
+// ---------------------------------------------------------------------------
+int single_prefill_cuda_hd256(
+    void*    q,
+    void*    output,
+    void*    k_cache,
+    void*    v_cache,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  seq_len,          // number of Q tokens (qo_len)
+    int32_t  kv_len,           // total KV length (start_pos + seq_len)
+    int32_t  max_seq_len,      // allocated cache rows (for HND stride)
+    float    sm_scale,
+    void*    stream)
+{
+    uint32_t q_stride_n  = num_qo_heads * 256;
+    uint32_t q_stride_h  = 256;
+
+    uint32_t kv_stride_n = 256;
+    uint32_t kv_stride_h = static_cast<uint32_t>(max_seq_len) * 256;
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        /*maybe_custom_mask=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        /*head_dim=*/256U,
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/256,
+            /*HEAD_DIM_VO=*/256,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kCausal,
+            Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+}
+
 } // extern "C"
