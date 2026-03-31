@@ -467,9 +467,7 @@ int single_prefill_cuda_hd256(
     uint32_t kv_stride_n = 256;
     uint32_t kv_stride_h = static_cast<uint32_t>(max_seq_len) * 256;
 
-    using PrefillParamsHD256T = SinglePrefillParams<DType, DType, DType>;
-
-    PrefillParamsHD256T params(
+    PrefillParamsT params(
         reinterpret_cast<DType*>(q),
         reinterpret_cast<DType*>(k_cache),
         reinterpret_cast<DType*>(v_cache),
@@ -500,7 +498,7 @@ int single_prefill_cuda_hd256(
             /*USE_FP16_QK_REDUCTION=*/false,
             MaskMode::kCausal,
             Variant,
-            PrefillParamsHD256T>(
+            PrefillParamsT>(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));

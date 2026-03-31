@@ -15,7 +15,7 @@ use serde::Deserialize;
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
 fn get_model_path() -> String {
-    let path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
+    let path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
     info!("Using model path: {}", path);
     path
