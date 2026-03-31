@@ -207,7 +207,7 @@ fn regen_test_data() {
     let _guard = lock_gpu_regen_test();
     pegainfer::logging::init_stderr("info");
 
-    let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
     let model_name = model_name(&model_path);
     let prompt_style = prompt_style(&model_name);
@@ -256,7 +256,7 @@ fn regen_test_data_qwen35() {
     let _guard = lock_gpu_regen_test();
     pegainfer::logging::init_stderr("info");
 
-    let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| DEFAULT_QWEN35_MODEL_PATH.to_string());
     let model_name = model_name(&model_path);
     let prompt_style = prompt_style(&model_name);
