@@ -9,6 +9,7 @@ mod prefill;
 pub mod prefill_buffers;
 mod recurrent_state;
 mod single_token_buffers;
+mod unified_forward;
 mod weights;
 
 pub use forward::Qwen35State;
