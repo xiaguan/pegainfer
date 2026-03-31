@@ -212,6 +212,7 @@ unsafe extern "C" {
         out: *mut Half,
         start_pos_ptr: *const i32,
         num_kv_heads: i32,
+        max_seq_len: i32,
         stream: CUstream,
     );
 
