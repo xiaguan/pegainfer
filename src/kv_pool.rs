@@ -282,14 +282,14 @@ mod tests {
 
     #[test]
     fn stride_geometry_qwen35() {
-        // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=128, page_size=16
-        let l = KvLayout::new(8, 4, 128, 16);
+        // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=256, page_size=16
+        let l = KvLayout::new(8, 4, 256, 16);
 
-        assert_eq!(l.kv_block_len, 16 * 4 * 128); // 8192 elements
-        assert_eq!(l.layer_stride, 2 * 8192); // 16384 (K + V)
-        assert_eq!(l.page_stride, 8 * 16384); // 131072 per page
-        // bytes: 131072 * 2 = 262144 = 256 KB per page
-        assert_eq!(l.page_stride * 2, 256 * 1024);
+        assert_eq!(l.kv_block_len, 16 * 4 * 256); // 16384 elements
+        assert_eq!(l.layer_stride, 2 * 16384); // 32768 (K + V)
+        assert_eq!(l.page_stride, 8 * 32768); // 262144 per page
+        // bytes: 262144 * 2 = 524288 = 512 KB per page
+        assert_eq!(l.page_stride * 2, 512 * 1024);
     }
 
     #[test]
