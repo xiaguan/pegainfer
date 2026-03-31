@@ -52,7 +52,7 @@ pegainfer: commit 280e457 (main)
 ### HF Baselines
 
 ```bash
-cd /data/marcus/pegainfer
+# From the repo root (where .venv and models/ are)
 
 # Qwen3-4B
 .venv/bin/lm_eval run --model hf \
@@ -71,12 +71,10 @@ cd /data/marcus/pegainfer
 
 ```bash
 # Start server (one model at a time, single GPU)
-cd /data/workspace-rex
-PEGAINFER_TRITON_PYTHON=/data/workspace-rex/.venv/bin/python \
+PEGAINFER_TRITON_PYTHON=.venv/bin/python \
   cargo run --release -- --model-path models/Qwen3-4B --port 8000 --cuda-graph=false
 
-# Run eval (separate terminal)
-cd /data/marcus/pegainfer
+# Run eval (separate terminal, from repo root)
 .venv/bin/lm_eval run --model local-completions \
   --model_args "model=Qwen3-4B,base_url=http://localhost:8000/v1/completions,tokenizer_backend=huggingface,tokenizer=models/Qwen3-4B,tokenized_requests=False" \
   --tasks gsm8k --num_fewshot 8 --batch_size 1 \

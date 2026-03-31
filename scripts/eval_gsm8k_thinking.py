@@ -123,8 +123,9 @@ def main():
         }
         resp = requests.post(args.base_url, json=payload)
         resp.raise_for_status()
-        raw_text = resp.json()["choices"][0]["text"]
-        finish = resp.json()["choices"][0]["finish_reason"]
+        result = resp.json()
+        raw_text = result["choices"][0]["text"]
+        finish = result["choices"][0]["finish_reason"]
 
         cleaned = strip_think(raw_text)
         gold = extract_gold(ex["answer"])
