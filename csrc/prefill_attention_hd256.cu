@@ -167,6 +167,103 @@ __global__ void decode_kv_compact_hd256_kernel(
     out[h * HD256 + d] = hnd[h * 4096 * HD256 + pos * HD256 + d];
 }
 
+// Batched decode prep for Qwen3.5 full attention:
+// - read Q from interleaved q_full [q, gate]
+// - RMSNorm with (1+w) offset
+// - apply partial RoPE using per-request positions
+// - write prepared Q to compact NHD batch
+// - normalize/apply partial RoPE to K in-place
+__global__ void qk_norm_partial_rope_batched_decode_hd256_kernel(
+    const __nv_bfloat16* __restrict__ q_full_batch,  // [q_full_dim, batch]
+    __nv_bfloat16* __restrict__ k_batch,             // [kv_dim, batch] in-place
+    const __nv_bfloat16* __restrict__ q_norm_weight, // [HD256]
+    const __nv_bfloat16* __restrict__ k_norm_weight, // [HD256]
+    const __nv_bfloat16* __restrict__ cos_cache,     // [max_seq * rotary_dim]
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const int* __restrict__ positions,               // [batch]
+    __nv_bfloat16* __restrict__ q_batch_out,         // [q_dim, batch]
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    int rotary_dim,
+    float rms_eps
+) {
+    int head_global = blockIdx.x;
+    int token = blockIdx.y;
+    int d = threadIdx.x;
+    if (token >= batch_size) return;
+
+    bool is_q = head_global < num_q_heads;
+    int head_local = is_q ? head_global : (head_global - num_q_heads);
+    int q_dim = num_q_heads * HD256;
+    int q_full_dim = q_dim * 2;
+    int kv_dim = num_kv_heads * HD256;
+
+    int src_offset = is_q
+        ? token * q_full_dim + head_local * 2 * HD256 + d
+        : token * kv_dim + head_local * HD256 + d;
+
+    __nv_bfloat16 x = is_q ? q_full_batch[src_offset] : k_batch[src_offset];
+    const __nv_bfloat16* norm_w = is_q ? q_norm_weight : k_norm_weight;
+
+    float sq = __bfloat162float(x);
+    sq *= sq;
+    float sq_sum = warp_reduce_sum(sq);
+
+    int warp_id = d / WARP_SIZE;
+    int lane_id = d % WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS_HD256];
+    __shared__ float inv_rms;
+    __shared__ __nv_bfloat16 smem[HD256];
+
+    if (lane_id == 0) warp_sums[warp_id] = sq_sum;
+    __syncthreads();
+
+    if (d == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS_HD256; i++) total += warp_sums[i];
+        inv_rms = 1.0f / sqrtf(total / HD256 + rms_eps);
+    }
+    __syncthreads();
+
+    smem[d] = rms_norm_elem_offset_hd256(x, inv_rms, norm_w[d]);
+    __syncthreads();
+
+    int pos = positions[token];
+    int half_rotary = rotary_dim / 2;
+
+    if (d < half_rotary) {
+        __nv_bfloat16 lo = smem[d];
+        __nv_bfloat16 hi = smem[d + half_rotary];
+        apply_rope_pair_hd256(
+            lo,
+            hi,
+            cos_cache[pos * rotary_dim + d],
+            sin_cache[pos * rotary_dim + d]
+        );
+
+        if (is_q) {
+            int dst = token * q_dim + head_local * HD256;
+            q_batch_out[dst + d] = lo;
+            q_batch_out[dst + d + half_rotary] = hi;
+        } else {
+            int dst = token * kv_dim + head_local * HD256;
+            k_batch[dst + d] = lo;
+            k_batch[dst + d + half_rotary] = hi;
+        }
+    }
+
+    if (d >= rotary_dim) {
+        if (is_q) {
+            int dst = token * q_dim + head_local * HD256;
+            q_batch_out[dst + d] = smem[d];
+        } else {
+            int dst = token * kv_dim + head_local * HD256;
+            k_batch[dst + d] = smem[d];
+        }
+    }
+}
+
 extern "C" {
 
 void decode_kv_compact_hd256_cuda(
@@ -178,6 +275,40 @@ void decode_kv_compact_hd256_cuda(
 ) {
     decode_kv_compact_hd256_kernel<<<num_kv_heads, HD256, 0, stream>>>(
         hnd, out, start_pos_ptr);
+}
+
+void qk_norm_partial_rope_batched_decode_hd256_cuda(
+    const __nv_bfloat16* q_full_batch,
+    __nv_bfloat16* k_batch,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,
+    __nv_bfloat16* q_batch_out,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    int rotary_dim,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    dim3 grid(num_q_heads + num_kv_heads, batch_size);
+    qk_norm_partial_rope_batched_decode_hd256_kernel<<<grid, THREADS_HD256, 0, stream>>>(
+        q_full_batch,
+        k_batch,
+        q_norm_weight,
+        k_norm_weight,
+        cos_cache,
+        sin_cache,
+        positions,
+        q_batch_out,
+        num_q_heads,
+        num_kv_heads,
+        batch_size,
+        rotary_dim,
+        rms_eps
+    );
 }
 
 void prefill_attention_hd256_prep_cuda(
