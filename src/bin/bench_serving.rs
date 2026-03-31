@@ -1619,7 +1619,10 @@ fn main() -> Result<()> {
                 &cli.model_path,
                 runtime.enable_cuda_graph,
             )?;
-            let handle = scheduler_qwen35::start(model, command_seed(&cli))?;
+            // Bench runs one request at a time — use minimal batch capacity
+            // to leave GPU memory for large prefill scratch buffers.
+            let handle =
+                scheduler_qwen35::start_with_capacity(model, command_seed(&cli), 4)?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };

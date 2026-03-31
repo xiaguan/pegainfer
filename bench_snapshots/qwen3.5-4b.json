@@ -1,5 +1,5 @@
 {
-  "commit": "2cf526c",
+  "commit": "6d34bee",
   "date": "2026-03-31",
   "model": "Qwen3.5-4B",
   "gpu": "NVIDIA GeForce RTX 5070 Ti",
@@ -8,53 +8,21 @@
     "output_len": 1,
     "metrics": {
       "ttft_ms": {
-        "avg_ms": 0.904811,
-        "p50_ms": 0.5385369999999999,
-        "p95_ms": 1.771999,
-        "p99_ms": 1.778648,
-        "max_ms": 1.778648,
+        "avg_ms": 1011.627088,
+        "p50_ms": 1012.5828459999999,
+        "p95_ms": 1012.8710809999999,
+        "p99_ms": 1012.920093,
+        "max_ms": 1012.920093,
         "samples": 20
       },
       "first_decode_step_ms": null,
       "steady_tpot_ms": null,
       "e2e_ms": {
-        "avg_ms": 0.904811,
-        "p50_ms": 0.5385369999999999,
-        "p95_ms": 1.771999,
-        "p99_ms": 1.778648,
-        "max_ms": 1.778648,
-        "samples": 20
-      },
-      "generated_tokens": {
-        "min": 0,
-        "max": 0,
-        "avg": 0.0,
-        "samples": 20
-      },
-      "request_tok_s": null,
-      "decode_tok_s": null
-    }
-  },
-  "decode_heavy": {
-    "prompt_len": 1024,
-    "output_len": 256,
-    "metrics": {
-      "ttft_ms": {
-        "avg_ms": 107.807394,
-        "p50_ms": 107.791958,
-        "p95_ms": 108.117465,
-        "p99_ms": 108.305332,
-        "max_ms": 108.305332,
-        "samples": 20
-      },
-      "first_decode_step_ms": null,
-      "steady_tpot_ms": null,
-      "e2e_ms": {
-        "avg_ms": 111.45589799999999,
-        "p50_ms": 111.435492,
-        "p95_ms": 111.79768,
-        "p99_ms": 111.912727,
-        "max_ms": 111.912727,
+        "avg_ms": 1011.6312670000001,
+        "p50_ms": 1012.586547,
+        "p95_ms": 1012.8766709999999,
+        "p99_ms": 1012.925533,
+        "max_ms": 1012.925533,
         "samples": 20
       },
       "generated_tokens": {
@@ -63,8 +31,54 @@
         "avg": 1.0,
         "samples": 20
       },
-      "request_tok_s": 8.972158587548819,
+      "request_tok_s": 0.9885024632280848,
       "decode_tok_s": null
+    }
+  },
+  "decode_heavy": {
+    "prompt_len": 1024,
+    "output_len": 256,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 110.473684,
+        "p50_ms": 110.487488,
+        "p95_ms": 110.64405500000001,
+        "p99_ms": 110.796247,
+        "max_ms": 110.796247,
+        "samples": 20
+      },
+      "first_decode_step_ms": {
+        "avg_ms": 13.008763,
+        "p50_ms": 13.010073,
+        "p95_ms": 13.028641,
+        "p99_ms": 13.035319,
+        "max_ms": 13.035319,
+        "samples": 20
+      },
+      "steady_tpot_ms": {
+        "avg_ms": 12.392932,
+        "p50_ms": 12.392771,
+        "p95_ms": 12.477768000000001,
+        "p99_ms": 12.498064,
+        "max_ms": 12.732708,
+        "samples": 5080
+      },
+      "e2e_ms": {
+        "avg_ms": 3271.293209,
+        "p50_ms": 3271.3586490000002,
+        "p95_ms": 3271.655483,
+        "p99_ms": 3272.164321,
+        "max_ms": 3272.164321,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 256,
+        "max": 256,
+        "avg": 256.0,
+        "samples": 20
+      },
+      "request_tok_s": 78.25651312361698,
+      "decode_tok_s": 80.67543199065948
     }
   }
 }
