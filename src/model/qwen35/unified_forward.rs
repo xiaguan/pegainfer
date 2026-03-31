@@ -320,7 +320,7 @@ mod tests {
             // Use kv_prefill as the decode kv_states
             let _ = (kv_a, kv_b, rec_a, rec_b); // unused, use kv_prefill
             let mut kv_refs: Vec<&mut KvState> =
-                vec![&mut kv_prefill[0], &mut kv_prefill[1]];
+                kv_prefill.iter_mut().collect();
 
             let mut tokens_a = vec![first_a];
             let mut tokens_b = vec![first_b];
@@ -391,8 +391,7 @@ mod tests {
 
             let mut tokens_a = vec![first_a];
             let mut tokens_b = vec![first_b];
-            let mut kv_refs: Vec<&mut KvState> =
-                vec![&mut kv_states[0], &mut kv_states[1]];
+            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
 
             for _ in 1..num_steps {
                 let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];

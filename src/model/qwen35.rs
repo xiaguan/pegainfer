@@ -7,7 +7,7 @@ mod decode_buffers;
 mod forward;
 mod prefill;
 pub mod prefill_buffers;
-mod recurrent_state;
+pub(crate) mod recurrent_state;
 mod single_token_buffers;
 mod unified_forward;
 mod weights;

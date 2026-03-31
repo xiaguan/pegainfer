@@ -9,6 +9,7 @@ pub mod ops;
 pub(crate) mod page_pool;
 pub mod sampler;
 pub mod scheduler;
+pub mod scheduler_qwen35;
 pub mod server_engine;
 pub mod tensor;
 pub mod tokenizer;

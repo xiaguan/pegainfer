@@ -6,7 +6,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
@@ -84,10 +84,22 @@ async fn main() {
             build_app(handle, tokenizer, model_id)
         }
         ModelType::Qwen35 => {
-            panic!(
-                "Qwen3.5 is not yet supported with the batch scheduler. \
-                 Paged migration required before Phase 2."
-            );
+            let model = Qwen35Model::from_safetensors_with_options(
+                model_path,
+                args.cuda_graph,
+            )
+            .expect("Failed to load Qwen3.5 model");
+
+            let tokenizer =
+                Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
+            let model_id = pegainfer::server_engine::model_id_from_path(model_path);
+
+            let handle = pegainfer::scheduler_qwen35::start(model, 42)
+                .expect("Failed to start Qwen3.5 scheduler");
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+
+            build_app(handle, tokenizer, model_id)
         }
     };
 
