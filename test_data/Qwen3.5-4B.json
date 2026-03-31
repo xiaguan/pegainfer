@@ -9,7 +9,7 @@
     {
       "max_new_tokens": 50,
       "name": "my_name",
-      "output": " John. I am 12 years old. I am a student. I am in Class 3, Grade 6. I am a boy. I am tall and thin. I have black hair and black eyes. I like playing football.",
+      "output": " John. I am 12 years old. I am a student. I am in Class 5, Grade 6. I am a boy. I am from China. I am a good student. I like to play football. I like",
       "prompt": "My name is"
     },
     {
@@ -21,7 +21,7 @@
     {
       "max_new_tokens": 50,
       "name": "chinese_weather",
-      "output": "，适合去公园散步。\nA. 今天天气真好，适合去公园散步。\nB. 今天天气真好，适合去公园散步。\nC. 今天天气真好，适合去公园散步。\nD. 选项",
+      "output": "，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。\n今天天气真好，适合出去走走。",
       "prompt": "今天天气真好"
     },
     {
@@ -45,7 +45,7 @@
     {
       "max_new_tokens": 50,
       "name": "coldplay_ghost",
-      "output": "让人印象深刻，尤其是其中的《A Sky Full of Stars》。这首歌的歌词充满了诗意，例如“我站在高处，看着你，看着你，看着你，看着你，看着你，看着你，看着你，看着你，看着",
+      "output": "让人印象深刻，尤其是其中的《A Sky Full of Stars》。这首歌的歌词充满了诗意，例如“我站在悬崖边，看着你坠落，我站在悬崖边，看着你坠落”。这首歌的旋律优美，情感真挚，让人难以忘怀。",
       "prompt": "Coldplay 的《Ghost story》专辑真是"
     },
     {

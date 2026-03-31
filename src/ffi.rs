@@ -205,6 +205,16 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Extract one K (or V) token from HND cache at GPU-resident position to compact NHD.
+    // Used by decode path: bridges prep_cuda (HND output) → paged_kv_append_cuda (compact NHD).
+    pub(crate) fn decode_kv_compact_hd256_cuda(
+        hnd: *const Half,
+        out: *mut Half,
+        start_pos_ptr: *const i32,
+        num_kv_heads: i32,
+        stream: CUstream,
+    );
+
     // ========================================================================
     // Qwen3.5 kernels
     // ========================================================================
@@ -486,6 +496,57 @@ unsafe extern "C" {
         seq_len: i32,
         kv_len: i32,
         max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode for HEAD_DIM=256 (Qwen3.5-4B full-attention layers).
+    pub(crate) fn paged_attention_decode_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Batch prefill with paged KV for HEAD_DIM=256 (Qwen3.5-4B multi-token prefill).
+    pub(crate) fn batch_prefill_paged_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
