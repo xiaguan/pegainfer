@@ -51,7 +51,6 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 /// copy_state_to_slot(ctx, last_slot_src, vacated_slot_idx)
 /// ```
 /// and update the caller's slot-to-request mapping accordingly.
-#[allow(dead_code)]
 pub(crate) struct BatchDecodeGraphState {
     /// Shared decode buffers sized to MAX_BATCH.
     pub(crate) buffers: BatchDecodeBuffers35,
@@ -62,12 +61,7 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) graphs: Vec<CudaGraphState>,
 }
 
-#[allow(dead_code)]
 impl BatchDecodeGraphState {
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, kv_pool: &KvPool) -> Result<Self> {
-        Self::with_capacity(ctx, config, kv_pool, MAX_BATCH)
-    }
-
     /// Create a graph state with a custom maximum batch size.
     ///
     /// `max_batch` is clamped to `MAX_BATCH` (64). Use this when GPU memory is
@@ -90,7 +84,10 @@ impl BatchDecodeGraphState {
             slot_states.push(RecurrentState::new(ctx, config)?);
         }
 
-        let graphs = BATCH_BUCKETS.iter().map(|_| CudaGraphState::new()).collect();
+        let graphs = BATCH_BUCKETS
+            .iter()
+            .map(|_| CudaGraphState::new())
+            .collect();
 
         Ok(Self {
             buffers,
@@ -121,25 +118,6 @@ impl BatchDecodeGraphState {
                 .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
         }
         dst.seq_len = src.seq_len;
-        Ok(())
-    }
-
-    /// Zero slot `slot_idx`'s recurrent state and reset seq_len to 0.
-    ///
-    /// Use for requests that have no prior prefill state (e.g., first-token
-    /// prompts that were decoded directly without a separate prefill step).
-    pub(crate) fn zero_slot_state(&mut self, ctx: &DeviceContext, slot_idx: usize) -> Result<()> {
-        debug_assert!(slot_idx < MAX_BATCH, "slot_idx {slot_idx} out of range");
-        let dst = &mut self.slot_states[slot_idx];
-        dst.seq_len = 0;
-        for layer in &mut dst.layers {
-            ctx.stream
-                .memset_zeros(&mut layer.state)
-                .map_err(|e| anyhow::anyhow!("zero recurrent state slot {slot_idx}: {e}"))?;
-            ctx.stream
-                .memset_zeros(&mut layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("zero conv state slot {slot_idx}: {e}"))?;
-        }
         Ok(())
     }
 }

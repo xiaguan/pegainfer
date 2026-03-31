@@ -55,10 +55,10 @@ trait ModelForward {
 
 ```
 Qwen3State:   DecodeBuffers + KVCache + CudaGraphState + Option<DeviceVec> (prefill logits)
-Qwen35State:  DecodeBuffers35 + KVCache + RecurrentState + CudaGraphState35 + Option<DeviceVec>
+Qwen3.5:      direct `ModelForward` state retired; production and tests go through the scheduler / batch APIs
 ```
 
-`reset()` clears KV cache and recurrent state; retains decode buffer allocations and captured CUDA Graph.
+`reset()` semantics now matter only for the Qwen3 direct path.
 
 ### Model-internal differences (hidden behind the trait)
 

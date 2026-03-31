@@ -1,13 +1,12 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use pegainfer::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use pegainfer::ops;
-use pegainfer::tensor::{DeviceContext, DeviceVec};
+use pegainfer::tensor::DeviceContext;
 
 use super::common::{
-    EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS, QWEN35_4B_LINEAR_K_DIM,
-    QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM, QWEN35_4B_LINEAR_V_HEADS, QWEN35_4B_Q_HEADS,
-    QWEN35_4B_ROPE_THETA, QWEN35_4B_ROTARY_DIM, configure_group, f32_slice, hidden_states,
-    iter_sync, positive_device_vec, rope_cache, zero_f32_slice,
+    QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
+    QWEN35_4B_LINEAR_V_HEADS, configure_group, f32_slice, hidden_states, iter_sync,
+    positive_device_vec, zero_f32_slice,
 };
 
 pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
@@ -78,64 +77,4 @@ pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
     }
 
     group.finish();
-}
-
-/// Qwen3.5 full-attention prefill microbench on the Triton path.
-///
-/// This includes Q/K prep, KV cache write, Triton attention, and output gating.
-pub(crate) fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
-    let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
-    let q_full_dim = q_dim * 2;
-    let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
-    let cache_len = QWEN35_4B_KV_HEADS * MAX_SEQ_LEN * QWEN35_4B_HEAD_DIM;
-
-    for &seq_len in &[128usize, 512, 2048] {
-        let mut group = c.benchmark_group(format!("qwen35_prefill_attn/seq{seq_len}"));
-        configure_group(&mut group);
-        group.throughput(Throughput::Elements((q_dim * seq_len) as u64));
-
-        group.bench_function("prefill_attention_hd256_batch", |b| {
-            let ctx = DeviceContext::new().expect("ctx");
-            let q_full_batch = hidden_states(&ctx, q_full_dim, seq_len).expect("q_full_batch");
-            let k_batch = hidden_states(&ctx, kv_dim, seq_len).expect("k_batch");
-            let v_batch = hidden_states(&ctx, kv_dim, seq_len).expect("v_batch");
-            let q_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("q_norm");
-            let k_norm = positive_device_vec(&ctx, QWEN35_4B_HEAD_DIM).expect("k_norm");
-            let (cos_cache, sin_cache) = rope_cache(
-                &ctx,
-                MAX_SEQ_LEN,
-                QWEN35_4B_ROTARY_DIM,
-                QWEN35_4B_ROPE_THETA,
-            )
-            .expect("rope");
-            let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("k_cache");
-            let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("v_cache");
-            let mut attn_out =
-                pegainfer::tensor::HiddenStates::zeros(&ctx, q_dim, seq_len).expect("attn_out");
-
-            iter_sync(b, &ctx, || {
-                ops::prefill_attention_hd256_batch(
-                    &ctx,
-                    &q_full_batch,
-                    &k_batch,
-                    &v_batch,
-                    &q_norm,
-                    &k_norm,
-                    &cos_cache,
-                    &sin_cache,
-                    &mut k_cache,
-                    &mut v_cache,
-                    &mut attn_out,
-                    QWEN35_4B_Q_HEADS,
-                    QWEN35_4B_KV_HEADS,
-                    0,
-                    QWEN35_4B_ROTARY_DIM,
-                    EPS,
-                )
-                .expect("prefill_attention_hd256_batch failed");
-            });
-        });
-
-        group.finish();
-    }
 }

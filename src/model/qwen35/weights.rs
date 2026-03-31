@@ -79,7 +79,6 @@ pub struct Qwen35Model {
     // Partial RoPE cache: [max_seq_len * rotary_dim]
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
-    pub(super) enable_cuda_graph: bool,
     /// Shared paged KV pool for full-attention layers.
     pub(super) kv_pool: crate::kv_pool::KvPool,
 }
@@ -338,7 +337,6 @@ impl Qwen35Model {
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph,
             kv_pool,
         })
     }
@@ -354,33 +352,6 @@ impl Qwen35Model {
     pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
         self.kv_pool.alloc()
     }
-
-    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
-        &self.kv_pool
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn create_batch_decode_bufs(
-        &self,
-        max_batch_size: usize,
-    ) -> anyhow::Result<super::decode_buffers::BatchDecodeBuffers35> {
-        super::decode_buffers::BatchDecodeBuffers35::new(
-            &self.ctx,
-            &self.config,
-            max_batch_size,
-            self.kv_pool.capacity_pages(),
-            self.kv_pool.padding_page_id(),
-        )
-    }
-
-    /// Create a CUDA Graph batch decode state sized for MAX_BATCH=64 slots.
-    #[allow(dead_code)]
-    pub(crate) fn create_batch_decode_graph_state(
-        &self,
-    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
-        super::batch_decode_graph::BatchDecodeGraphState::new(&self.ctx, &self.config, &self.kv_pool)
-    }
-
     /// Create a CUDA Graph batch decode state with a custom slot capacity.
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
@@ -392,5 +363,9 @@ impl Qwen35Model {
             &self.kv_pool,
             max_batch,
         )
+    }
+
+    pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
+        token_id == self.config.eos_token_id
     }
 }

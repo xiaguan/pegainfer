@@ -52,18 +52,4 @@ impl RecurrentState {
 
         Ok(Self { layers, seq_len: 0 })
     }
-
-    /// Reset all state to zeros for a new generation.
-    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
-        self.seq_len = 0;
-        for layer in &mut self.layers {
-            ctx.stream
-                .memset_zeros(&mut layer.state)
-                .map_err(|e| anyhow::anyhow!("memset recurrent state failed: {}", e))?;
-            ctx.stream
-                .memset_zeros(&mut layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("memset conv state failed: {}", e))?;
-        }
-        Ok(())
-    }
 }

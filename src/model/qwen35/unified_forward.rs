@@ -94,8 +94,7 @@ impl Qwen35Model {
             let num_decode = decode_tokens.len();
             let mut dlogits = Vec::with_capacity(num_decode);
             for i in 0..num_decode {
-                let logit =
-                    ops::extract_vec(&self.ctx, &graph_state.buffers.logits, i)?;
+                let logit = ops::extract_vec(&self.ctx, &graph_state.buffers.logits, i)?;
                 dlogits.push(logit);
             }
             dlogits
@@ -114,7 +113,6 @@ mod tests {
 
     use super::*;
     use crate::kv_pool::KvState;
-    use crate::model::ModelForward;
     use crate::sampler::SamplingParams;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -131,97 +129,19 @@ mod tests {
             .stream
             .alloc_zeros(model.config.vocab_size)
             .unwrap();
-        let mut out: cudarc::driver::CudaSlice<i32> =
-            model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
         let random_val: f32 = rand::RngExt::random(rng);
-        crate::ops::gpu_sample_into(&model.ctx, logits, &mut probs, &mut out, &params, random_val)
-            .unwrap()
-    }
-
-    /// Run a full decode sequence using ModelForward::forward (reference path).
-    fn sequential_forward(
-        model: &crate::model::qwen35::weights::Qwen35Model,
-        prompt: &[u32],
-        num_decode_steps: usize,
-        seed: u64,
-    ) -> Vec<u32> {
-        let params = SamplingParams::default();
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut state = model.create_state().unwrap();
-        model.forward(prompt, &mut state).unwrap();
-        let first = model.select_token(&mut state, &params, &mut rng).unwrap();
-        let mut tokens = vec![first];
-        for _ in 1..num_decode_steps {
-            let last = *tokens.last().unwrap();
-            if model.is_stop_token(last) {
-                break;
-            }
-            model.forward(&[last], &mut state).unwrap();
-            tokens.push(model.select_token(&mut state, &params, &mut rng).unwrap());
-        }
-        tokens
-    }
-
-    /// Verify batch_prefill produces the same first token as ModelForward::forward.
-    #[test]
-    fn batch_prefill_matches_sequential() {
-        let model_path = get_model_path();
-        let model =
-            Qwen35Model::from_safetensors_with_options(&model_path, false).unwrap();
-
-        let prompt_a: Vec<u32> = vec![9707];
-        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
-        let prompts: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
-        let seed = 42;
-
-        // Reference: sequential forward for each prompt
-        let mut rng = StdRng::seed_from_u64(seed);
-        let params = SamplingParams::default();
-        let mut ref_tokens = Vec::new();
-        for prompt in &prompts {
-            let mut state = model.create_state().unwrap();
-            model.forward(prompt, &mut state).unwrap();
-            ref_tokens.push(model.select_token(&mut state, &params, &mut rng).unwrap());
-        }
-
-        // batch_prefill
-        let mut kv_states: Vec<KvState> = (0..prompts.len())
-            .map(|_| model.alloc_kv())
-            .collect();
-        let mut rec_states: Vec<_> = (0..prompts.len())
-            .map(|_| {
-                crate::model::qwen35::recurrent_state::RecurrentState::new(
-                    &model.ctx,
-                    &model.config,
-                )
-                .unwrap()
-            })
-            .collect();
-        let mut rec_refs: Vec<&mut _> = rec_states.iter_mut().collect();
-
-        let logits = model
-            .batch_prefill(&prompts, &mut kv_states, &mut rec_refs)
-            .unwrap();
-
-        let mut rng2 = StdRng::seed_from_u64(seed);
-        let batch_tokens: Vec<u32> = logits
-            .iter()
-            .map(|l| greedy_sample(&model, l, &mut rng2))
-            .collect();
-
-        assert_eq!(
-            batch_tokens, ref_tokens,
-            "batch_prefill first-token mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_tokens, ref_tokens
-        );
+        crate::ops::gpu_sample_into(
+            &model.ctx, logits, &mut probs, &mut out, &params, random_val,
+        )
+        .unwrap()
     }
 
     /// Verify that unified_step decode output matches batch_decode_graph standalone.
     #[test]
     fn unified_step_decode_matches_graph_decode() {
         let model_path = get_model_path();
-        let model =
-            Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
+        let model = Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
@@ -232,30 +152,32 @@ mod tests {
         let ref_tokens = {
             let mut kv_a = model.alloc_kv();
             let mut kv_b = model.alloc_kv();
-            let mut rec_a =
-                RecurrentState::new(&model.ctx, &model.config).unwrap();
-            let mut rec_b =
-                RecurrentState::new(&model.ctx, &model.config).unwrap();
+            let mut rec_a = RecurrentState::new(&model.ctx, &model.config).unwrap();
+            let mut rec_b = RecurrentState::new(&model.ctx, &model.config).unwrap();
 
             // Prefill both prompts
             let mut kv_cache_a = KVCache::new(
                 model.config.num_full_attention_layers(),
                 model.config.num_key_value_heads,
             );
-            let first_logits_a =
-                model.prefill_forward(&prompt_a, &mut kv_cache_a, &mut kv_a, &mut rec_a).unwrap();
+            let first_logits_a = model
+                .prefill_forward(&prompt_a, &mut kv_cache_a, &mut kv_a, &mut rec_a)
+                .unwrap();
             let mut kv_cache_b = KVCache::new(
                 model.config.num_full_attention_layers(),
                 model.config.num_key_value_heads,
             );
-            let first_logits_b =
-                model.prefill_forward(&prompt_b, &mut kv_cache_b, &mut kv_b, &mut rec_b).unwrap();
+            let first_logits_b = model
+                .prefill_forward(&prompt_b, &mut kv_cache_b, &mut kv_b, &mut rec_b)
+                .unwrap();
 
             let mut rng = StdRng::seed_from_u64(seed);
             let first_a = greedy_sample(&model, &first_logits_a, &mut rng);
             let first_b = greedy_sample(&model, &first_logits_b, &mut rng);
 
-            let mut gs = model.create_batch_decode_graph_state().unwrap();
+            let mut gs = model
+                .create_batch_decode_graph_state_with_capacity(2)
+                .unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_a, 0).unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_b, 1).unwrap();
             model.ctx.sync().unwrap();
@@ -279,18 +201,8 @@ mod tests {
 
         // --- unified_step path ---
         let unified_tokens = {
-            let mut kv_a = model.alloc_kv();
-            let mut kv_b = model.alloc_kv();
-            let mut rec_a =
-                RecurrentState::new(&model.ctx, &model.config).unwrap();
-            let mut rec_b =
-                RecurrentState::new(&model.ctx, &model.config).unwrap();
-
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
-            let mut kv_prefill: Vec<KvState> = vec![
-                model.alloc_kv(),
-                model.alloc_kv(),
-            ];
+            let mut kv_prefill: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
             let mut rec_p: Vec<RecurrentState> = vec![
                 RecurrentState::new(&model.ctx, &model.config).unwrap(),
                 RecurrentState::new(&model.ctx, &model.config).unwrap(),
@@ -304,7 +216,9 @@ mod tests {
                     &mut rec_p_refs,
                     &[],
                     &mut [],
-                    &mut model.create_batch_decode_graph_state().unwrap(),
+                    &mut model
+                        .create_batch_decode_graph_state_with_capacity(2)
+                        .unwrap(),
                 )
                 .unwrap();
 
@@ -313,14 +227,13 @@ mod tests {
             let first_b = greedy_sample(&model, &prefill_logits[1], &mut rng);
 
             // Transfer prefill states to decode graph slots
-            let mut gs = model.create_batch_decode_graph_state().unwrap();
+            let mut gs = model
+                .create_batch_decode_graph_state_with_capacity(2)
+                .unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_p[0], 0).unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_p[1], 1).unwrap();
 
-            // Use kv_prefill as the decode kv_states
-            let _ = (kv_a, kv_b, rec_a, rec_b); // unused, use kv_prefill
-            let mut kv_refs: Vec<&mut KvState> =
-                kv_prefill.iter_mut().collect();
+            let mut kv_refs: Vec<&mut KvState> = kv_prefill.iter_mut().collect();
 
             let mut tokens_a = vec![first_a];
             let mut tokens_b = vec![first_b];
@@ -328,14 +241,7 @@ mod tests {
             for _ in 1..num_steps {
                 let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
                 let (_, dlogits) = model
-                    .unified_step(
-                        &[],
-                        &mut [],
-                        &mut [],
-                        &tids,
-                        &mut kv_refs,
-                        &mut gs,
-                    )
+                    .unified_step(&[], &mut [], &mut [], &tids, &mut kv_refs, &mut gs)
                     .unwrap();
                 tokens_a.push(greedy_sample(&model, &dlogits[0], &mut rng));
                 tokens_b.push(greedy_sample(&model, &dlogits[1], &mut rng));
@@ -347,74 +253,6 @@ mod tests {
             unified_tokens, ref_tokens,
             "unified_step decode mismatch:\n  unified: {:?}\n  ref:     {:?}",
             unified_tokens, ref_tokens
-        );
-    }
-
-    /// Full integration: batch_prefill followed by decode steps matches sequential.
-    #[test]
-    fn batch_prefill_then_decode_matches_sequential() {
-        let model_path = get_model_path();
-        let model =
-            Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
-
-        let prompt_a: Vec<u32> = vec![9707];
-        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
-        let num_steps = 6;
-        let seed = 42;
-
-        // Reference: sequential forward for each
-        let seq_a = sequential_forward(&model, &prompt_a, num_steps, seed);
-        let seq_b = sequential_forward(&model, &prompt_b, num_steps, seed);
-
-        // batch_prefill → batch_decode_graph
-        let batch_tokens = {
-            let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
-            let mut kv_states: Vec<KvState> =
-                (0..2).map(|_| model.alloc_kv()).collect();
-            let mut rec_vec: Vec<RecurrentState> = (0..2)
-                .map(|_| RecurrentState::new(&model.ctx, &model.config).unwrap())
-                .collect();
-            let mut rec_refs: Vec<&mut RecurrentState> = rec_vec.iter_mut().collect();
-
-            let prefill_logits = model
-                .batch_prefill(&prompts_ref, &mut kv_states, &mut rec_refs)
-                .unwrap();
-
-            let mut rng = StdRng::seed_from_u64(seed);
-            let first_a = greedy_sample(&model, &prefill_logits[0], &mut rng);
-            let first_b = greedy_sample(&model, &prefill_logits[1], &mut rng);
-
-            let mut gs = model.create_batch_decode_graph_state().unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_vec[0], 0).unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_vec[1], 1).unwrap();
-            model.ctx.sync().unwrap();
-
-            let mut tokens_a = vec![first_a];
-            let mut tokens_b = vec![first_b];
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-
-            for _ in 1..num_steps {
-                let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
-                model
-                    .batch_decode_graph(&tids, &mut kv_refs, &mut gs)
-                    .unwrap();
-                let la = ops::extract_vec(&model.ctx, &gs.buffers.logits, 0).unwrap();
-                let lb = ops::extract_vec(&model.ctx, &gs.buffers.logits, 1).unwrap();
-                tokens_a.push(greedy_sample(&model, &la, &mut rng));
-                tokens_b.push(greedy_sample(&model, &lb, &mut rng));
-            }
-            (tokens_a, tokens_b)
-        };
-
-        assert_eq!(
-            batch_tokens.0, seq_a,
-            "batch prompt_a mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_tokens.0, seq_a
-        );
-        assert_eq!(
-            batch_tokens.1, seq_b,
-            "batch prompt_b mismatch:\n  batch: {:?}\n  seq:   {:?}",
-            batch_tokens.1, seq_b
         );
     }
 }

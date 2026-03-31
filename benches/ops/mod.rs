@@ -4,4 +4,3 @@ pub(crate) mod ops_elementwise_bench;
 pub(crate) mod ops_embedding_sampling_bench;
 pub(crate) mod ops_qwen35_norm_bench;
 pub(crate) mod ops_qwen35_state_bench;
-pub(crate) mod ops_triton_bench;

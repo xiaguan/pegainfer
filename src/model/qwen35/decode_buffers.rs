@@ -8,32 +8,7 @@ use super::config::Config35;
 use crate::kv_pool::KvState;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
-/// Pre-allocated GPU buffers for token sampling (softmax + multinomial).
-pub(crate) struct DecodeBuffers35 {
-    /// FP32 scratch buffer for GPU sampling softmax (vocab_size)
-    pub(crate) sample_probs: CudaSlice<f32>,
-    /// Pre-allocated sampling output (1 element, token id)
-    pub(crate) sample_out: CudaSlice<i32>,
-}
-
-
-impl DecodeBuffers35 {
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
-        Ok(Self {
-            sample_probs: ctx
-                .stream
-                .alloc_zeros(config.vocab_size)
-                .map_err(|e| anyhow::anyhow!("Alloc sample_probs failed: {}", e))?,
-            sample_out: ctx
-                .stream
-                .alloc_zeros(1)
-                .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?,
-        })
-    }
-}
-
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
-#[allow(dead_code)]
 pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) max_batch_size: usize,
 
@@ -89,7 +64,6 @@ pub(crate) struct BatchDecodeBuffers35 {
     padding_page_id: i32,
 }
 
-#[allow(dead_code)]
 impl BatchDecodeBuffers35 {
     pub(crate) fn new(
         ctx: &DeviceContext,

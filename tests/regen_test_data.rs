@@ -2,14 +2,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use pegainfer::model::{
-    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
-};
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
+use pegainfer::scheduler_qwen35;
 use pegainfer::tokenizer::Tokenizer;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -143,43 +140,6 @@ fn generate_text_scheduler(
     tokenizer.decode(&tokens).expect("decode failed")
 }
 
-/// Generate text directly via ModelForward trait (works for any model).
-fn generate_text_direct<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
-    tokenizer: &Tokenizer,
-    prompt: &str,
-    max_tokens: usize,
-    rng: &mut StdRng,
-) -> String {
-    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
-    state.reset().expect("reset failed");
-
-    model
-        .forward(&prompt_tokens, state)
-        .expect("prefill failed");
-    let sampling = SamplingParams::default();
-
-    let mut tokens = Vec::new();
-    let mut last = model
-        .select_token(state, &sampling, rng)
-        .expect("select_token failed");
-    tokens.push(last);
-
-    for _ in 1..max_tokens {
-        if model.is_stop_token(last) {
-            break;
-        }
-        model.forward(&[last], state).expect("decode failed");
-        last = model
-            .select_token(state, &sampling, rng)
-            .expect("select_token failed");
-        tokens.push(last);
-    }
-
-    tokenizer.decode(&tokens).expect("decode failed")
-}
-
 fn write_golden_json(output_path: &Path, model_name: &str, cases_json: Vec<serde_json::Value>) {
     let data = serde_json::json!({
         "model_name": model_name,
@@ -272,21 +232,13 @@ fn regen_test_data_qwen35() {
 
     let model = Qwen35Model::from_safetensors_with_options(&model_path, true)
         .expect("Failed to load model");
-    let mut state = model.create_state().expect("Failed to create state");
     let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
-    let mut rng = StdRng::seed_from_u64(42);
+    let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
 
     let mut cases_json = Vec::new();
     for case in CASES {
         let prompt = wrap_prompt(case.prompt, prompt_style);
-        let output = generate_text_direct(
-            &model,
-            &mut state,
-            &tokenizer,
-            &prompt,
-            case.max_new_tokens,
-            &mut rng,
-        );
+        let output = generate_text_scheduler(&handle, &tokenizer, &prompt, case.max_new_tokens);
         eprintln!(
             "[{}] raw_prompt={:?} prompt={:?} output={:?}",
             case.name, case.prompt, prompt, output

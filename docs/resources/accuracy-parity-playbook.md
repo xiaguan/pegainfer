@@ -103,13 +103,11 @@
   --out target/accuracy/hf_cases_after_convfix.json
 ```
 
-如果怀疑是某个小 kernel 的 bf16 语义错了，先跑微型 smoke test：
+如果怀疑是某个小 kernel 的 bf16 语义错了，先跑聚焦的算子测试：
 
 ```bash
-cargo run --release --bin triton_silu_smoke -- --seq-len 8 --hidden-dim 1024 --iters 1
+cargo test --release test_conv1d_prefill_handoff_matches_single_prefill -- --nocapture
 ```
-
-这条命令现在已经验证过，当前输出里 `max_abs_diff=0.000000`。
 
 ## High-Signal Tricks
 

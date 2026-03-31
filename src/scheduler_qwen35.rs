@@ -16,9 +16,9 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::kv_pool::KvState;
+use crate::model::Qwen35Model;
 use crate::model::qwen35::batch_decode_graph::BatchDecodeGraphState;
 use crate::model::qwen35::recurrent_state::RecurrentState;
-use crate::model::{ModelForward, Qwen35Model};
 use crate::sampler::SamplingParams;
 use crate::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use crate::server_engine::FinishReason;
@@ -61,14 +61,22 @@ impl SampleScratch {
 
 /// Start the Qwen3.5 scheduler thread with default max batch size (64).
 pub fn start(model: Qwen35Model, seed: u64) -> Result<SchedulerHandle> {
-    start_with_capacity(model, seed, crate::model::qwen35::batch_decode_graph::MAX_BATCH)
+    start_with_capacity(
+        model,
+        seed,
+        crate::model::qwen35::batch_decode_graph::MAX_BATCH,
+    )
 }
 
 /// Start the Qwen3.5 scheduler thread with a custom max batch size.
 ///
 /// Lower `max_batch` reduces GPU memory usage (each slot holds a full
 /// RecurrentState for all linear attention layers).
-pub fn start_with_capacity(model: Qwen35Model, seed: u64, max_batch: usize) -> Result<SchedulerHandle> {
+pub fn start_with_capacity(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+) -> Result<SchedulerHandle> {
     let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
     let sample_scratch = SampleScratch::new(&model)?;
 
@@ -77,7 +85,14 @@ pub fn start_with_capacity(model: Qwen35Model, seed: u64, max_batch: usize) -> R
     thread::Builder::new()
         .name("scheduler-qwen35".into())
         .spawn(move || {
-            scheduler_loop(model, submit_rx, graph_state, sample_scratch, seed, max_batch);
+            scheduler_loop(
+                model,
+                submit_rx,
+                graph_state,
+                sample_scratch,
+                seed,
+                max_batch,
+            );
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
@@ -387,11 +402,8 @@ fn decode_step(
     }
 
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-    let tokens = match model.select_tokens_batch_varied(
-        &mut graph_state.buffers,
-        &params_refs,
-        rng,
-    ) {
+    let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
+    {
         Ok(t) => t,
         Err(e) => {
             warn!("Qwen3.5 sampling error: {e}");
@@ -511,7 +523,10 @@ fn compact_slot(
         for layer_idx in 0..src.layers.len() {
             let (src_part, dst_part) = if idx < last {
                 let (left, right) = graph_state.slot_states.split_at_mut(last);
-                (&right[0].layers[layer_idx], &mut left[idx].layers[layer_idx])
+                (
+                    &right[0].layers[layer_idx],
+                    &mut left[idx].layers[layer_idx],
+                )
             } else {
                 unreachable!("idx < active.len() <= last");
             };

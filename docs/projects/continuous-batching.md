@@ -201,16 +201,16 @@ Peak throughput at seq_len=1024: 10028 → 10678 tok/s (+6.5%).
 
 #### Remaining: Qwen3.5 paged migration
 
-Qwen3 is fully paged. Qwen3.5 still uses contiguous KVCache for all 8 full-attention layers (both prefill and decode). Must migrate before Phase 2 (batch decode needs unified paged KV across both models).
+Qwen3 is fully paged. Qwen3.5 has also removed the old standalone decode path: decode runs through the scheduler + paged KV graph path, while prefill still uses a contiguous staging `KVCache` internally before scattering into paged KV.
 
 Current Qwen3.5 full-attention state:
-- **Prefill**: `prefill_attention_hd256_prep_cuda` (QK norm + partial RoPE + KV write to contiguous HND) → Triton FA2 HD256
-- **Decode**: `single_token_kernels` with contiguous KV — no FlashInfer paged attention, no `KvState`/`KvPool`
-- **State**: `Qwen35State` has `kv_cache: KVCache` (contiguous) + `recurrent_state: RecurrentState`. No `KvState`.
+- **Prefill**: `prefill_attention_hd256_prep_cuda` writes staged contiguous HND buffers, then scatters into paged KV
+- **Decode**: scheduler-owned paged FlashInfer decode via `batch_decode_graph`
+- **State**: scheduler / batch path owns `KvState` + `RecurrentState`; old `Qwen35State` direct-request path is gone
 
 Migration plan (mirrors Qwen3 Steps 1-2):
-1. **Decode**: wire FlashInfer paged attention for HD256 (8 full-attn layers). Need to verify FlashInfer `BatchDecodeWithPagedKVCache` supports HEAD_DIM=256. Add `KvPool`/`KvState` to `Qwen35State`. Keep contiguous prefill + scatter bridge initially.
-2. **Prefill**: eliminate contiguous KVCache — same pattern as Qwen3 Step 2 but with HD256 kernels. Replace Triton FA2 HD256 with FlashInfer `BatchPrefillWithPagedKVCache` (HD256). Remove scatter.
+1. **Prefill**: eliminate contiguous KVCache staging — same pattern as Qwen3 Step 2 but with HD256 kernels.
+2. **Kernel simplification**: remove the remaining scatter/staging bridge once paged HD256 prefill fully covers the path.
 
 Complexity: HD256 (Qwen3 is HD128). FlashInfer templates support HEAD_DIM=256 but need to confirm sm_120 kernel instantiation compiles and runs correctly. Partial RoPE (`rotary_dim=64` out of `head_dim=256`) adds a wrinkle — external RoPE applies to first 64 dims only, rest pass-through.
 

@@ -26,11 +26,14 @@ use pegainfer::model::{
     GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
 };
 use pegainfer::sampler::SamplingParams;
+use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
+use pegainfer::scheduler_qwen35;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench_snapshots");
 const SNAPSHOT_PREFILL_PROMPT_LEN: usize = 10_000;
@@ -873,6 +876,61 @@ impl<M: ModelForward> BenchModel for ModelWithState<M> {
     }
 }
 
+struct SchedulerBenchModel {
+    handle: SchedulerHandle,
+}
+
+impl BenchModel for SchedulerBenchModel {
+    fn timed_generation(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        _rng: &mut StdRng,
+    ) -> GenTimings {
+        run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
+            let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+            self.handle
+                .submit(SchedulerRequest {
+                    prompt_tokens: toks.to_vec(),
+                    params: SamplingParams {
+                        temperature: sampling.temperature,
+                        top_k: sampling.top_k,
+                        top_p: sampling.top_p,
+                        ignore_eos: sampling.ignore_eos,
+                    },
+                    max_tokens: n,
+                    token_tx,
+                })
+                .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
+
+            loop {
+                match token_rx.blocking_recv() {
+                    Some(TokenEvent::Token(id)) => {
+                        if !cb(id) {
+                            break;
+                        }
+                    }
+                    Some(TokenEvent::Finished { .. }) => break,
+                    None => anyhow::bail!("scheduler channel closed"),
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+fn command_seed(cli: &Cli) -> u64 {
+    match &cli.command {
+        Command::Request(args) => args.run.seed,
+        Command::Matrix(args) => args.run.seed,
+        Command::Curve(args) => args.run.seed,
+        Command::Snapshot(args) => args.run.seed,
+        Command::Compare(_) => 42,
+    }
+}
+
 fn normalize_sizes(values: &[usize], flag: &str) -> Result<Vec<usize>> {
     ensure!(!values.is_empty(), "{flag} must not be empty");
     ensure!(values.iter().all(|v| *v > 0), "{flag} values must be > 0");
@@ -1551,10 +1609,10 @@ fn main() -> Result<()> {
                 &cli.model_path,
                 runtime.enable_cuda_graph,
             )?;
-            let state = model.create_state()?;
+            let handle = scheduler_qwen35::start(model, command_seed(&cli))?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = ModelWithState { model, state };
+            let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
         }
     }

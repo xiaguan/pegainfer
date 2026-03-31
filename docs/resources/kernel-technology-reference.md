@@ -37,12 +37,7 @@ The build pipeline (`build.rs`) compiles both handwritten CUDA and Triton AOT ar
 
 | Kernel | File | Purpose |
 |--------|------|---------|
-| `flash_attention_prefill_kernel.py` | Prefill attention | FlashAttention-2 algorithm, `BLOCK_M=128`, `BLOCK_N=64`, HD=128 |
 | `flash_attention_prefill_hd256_kernel.py` | HD=256 prefill | Adapted tile shapes for larger head dimension |
-| `attention_decode_kernel.py` | Split-KV decode | Fused QK-norm + RoPE + partial softmax per split |
-| `attention_reduce_kernel.py` | Decode reduce | Merges partial `(acc, m, l)` from split-KV |
-| `silu_mul_kernel.py` | SiLU\*gate | Elementwise `silu(gate) * up` |
-| `basic_kernels.py` | Add, Embedding | Vector add, embedding lookup (decode / batched / CUDA-graph variants) |
 | `gated_delta_rule_chunkwise_kernels.py` | GDR chunkwise | Linear attention state updates for Qwen3.5 prefill |
 
 ---

@@ -495,7 +495,8 @@ fn main() {
             .join(",")
     );
 
-    let replaced_cuda_files = BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
+    let replaced_cuda_files =
+        BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
 
     let csrc_dir = Path::new("csrc");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
