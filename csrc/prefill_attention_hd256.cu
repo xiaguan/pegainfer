@@ -157,14 +157,15 @@ __global__ void attention_gate_batch_hd256_kernel(
 // Extract one K (or V) token from HND cache at GPU-resident position to compact NHD.
 // Grid: (num_kv_heads,), Block: (HD256,)
 __global__ void decode_kv_compact_hd256_kernel(
-    const __nv_bfloat16* __restrict__ hnd,  // [num_heads * 4096 * HD256]
+    const __nv_bfloat16* __restrict__ hnd,  // [num_heads * max_seq_len * HD256]
     __nv_bfloat16* __restrict__ out,        // [num_heads * HD256] compact NHD
-    const int* __restrict__ start_pos_ptr
+    const int* __restrict__ start_pos_ptr,
+    int max_seq_len
 ) {
     int h = blockIdx.x;
     int d = threadIdx.x;
     int pos = *start_pos_ptr;
-    out[h * HD256 + d] = hnd[h * 4096 * HD256 + pos * HD256 + d];
+    out[h * HD256 + d] = hnd[h * max_seq_len * HD256 + pos * HD256 + d];
 }
 
 // Batched decode prep for Qwen3.5 full attention:
@@ -271,10 +272,11 @@ void decode_kv_compact_hd256_cuda(
     __nv_bfloat16* out,
     const int* start_pos_ptr,
     int num_kv_heads,
+    int max_seq_len,
     cudaStream_t stream
 ) {
     decode_kv_compact_hd256_kernel<<<num_kv_heads, HD256, 0, stream>>>(
-        hnd, out, start_pos_ptr);
+        hnd, out, start_pos_ptr, max_seq_len);
 }
 
 void qk_norm_partial_rope_batched_decode_hd256_cuda(

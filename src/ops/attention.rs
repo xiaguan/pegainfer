@@ -61,9 +61,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
 /// here and passed to FlashInfer.  This path is never CUDA-Graph captured (multi-token
 /// prefill always allocates new buffers), so a CPU-side `kv_len` is safe.
 ///
-/// Single-token decode still routes through `prefill_attention_hd256_batch_with_scratch`
-/// which uses the Triton AOT path (CUDA-Graph safe via GPU-resident start_pos_ptr).
-/// That path will be replaced in Phase 2d when paged decode lands.
+/// Single-token decode uses `paged_attention_decode_cuda_hd256` (paged FlashInfer path).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_hd256_batch(
     ctx: &DeviceContext,

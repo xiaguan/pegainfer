@@ -84,6 +84,7 @@ impl Qwen35Model {
         // All layers processed. Advance write-buffer seq_len for next prefill call.
         kv_cache.advance_seq_len(seq_len);
         recurrent.seq_len += seq_len;
+        debug_assert_eq!(kv_cache.len(), kv_state.seq_len(), "kv_cache and kv_state seq_len diverged");
 
         // Extract last token's hidden state
         let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, seq_len - 1)?;
@@ -484,6 +485,7 @@ impl Qwen35Model {
         // CPU state updates (after graph)
         kv_cache.advance_seq_len(1);
         recurrent.seq_len += 1;
+        debug_assert_eq!(kv_cache.len(), kv_state.seq_len(), "kv_cache and kv_state seq_len diverged");
 
         Ok(())
     }
@@ -789,12 +791,14 @@ fn paged_full_attention_decode_hd256(
         let (kc_cmp_ptr, _gkcc) = kv_k_compact.data.device_ptr_mut(&ctx.stream);
         let (vc_cmp_ptr, _gvcc) = kv_v_compact.data.device_ptr_mut(&ctx.stream);
         let (sp_ptr, _gsp) = start_pos_buf.device_ptr(&ctx.stream);
+        let max_seq_len = kc.len / (num_kv_heads * HEAD_DIM);
         unsafe {
             ffi::decode_kv_compact_hd256_cuda(
                 kc_ptr as *const ffi::Half,
                 kc_cmp_ptr as *mut ffi::Half,
                 sp_ptr as *const i32,
                 num_kv_heads as i32,
+                max_seq_len as i32,
                 stream,
             );
             ffi::decode_kv_compact_hd256_cuda(
@@ -802,6 +806,7 @@ fn paged_full_attention_decode_hd256(
                 vc_cmp_ptr as *mut ffi::Half,
                 sp_ptr as *const i32,
                 num_kv_heads as i32,
+                max_seq_len as i32,
                 stream,
             );
         }
