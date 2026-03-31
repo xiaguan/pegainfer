@@ -12,10 +12,10 @@ Each model has one snapshot file (`bench_snapshots/{model}.json`), always the la
 
 | Name | prompt_len | output_len | Key metric |
 |------|-----------|------------|------------|
-| prefill_heavy | 10000 | 1 | TTFT |
+| prefill_heavy | model-dependent | 1 | TTFT |
 | decode_heavy | 1024 | 256 | TPOT (steady, excluding first decode step) |
 
-Hardcoded in `snapshot`. `compare` checks shape consistency — if you change the constants, it will error until you re-baseline.
+Prefill prompt length is model-dependent: Qwen3 uses 10000 tokens, Qwen3.5 uses 4000 (HD256 attention needs ~4x working memory vs HD128, OOMs at 10k on 16 GB GPUs). `compare` checks shape consistency within the same model — if you change the constants, it will error until you re-baseline.
 
 `prefill_heavy` with `output_len=1` produces no steady decode steps: `steady_tpot_ms` is `null` in the JSON. This is expected.
 

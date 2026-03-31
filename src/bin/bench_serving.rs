@@ -33,10 +33,18 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench_snapshots");
-const SNAPSHOT_PREFILL_PROMPT_LEN: usize = 10_000;
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
 const SNAPSHOT_DECODE_OUTPUT_LEN: usize = 256;
+
+/// Qwen3.5 HD256 needs ~4x the attention working memory of Qwen3 HD128,
+/// so a 10k prefill OOMs on 16 GB GPUs. Use 4000 tokens for Qwen3.5.
+fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
+    match model_type {
+        ModelType::Qwen3 => 10_000,
+        ModelType::Qwen35 => 4_000,
+    }
+}
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
 
@@ -1250,9 +1258,16 @@ fn format_delta(pct: f64) -> String {
     }
 }
 
-fn run_snapshot(model: &mut dyn BenchModel, cli: &Cli, args: &SnapshotArgs) -> Result<()> {
-    info!("Running prefill-heavy ({SNAPSHOT_PREFILL_PROMPT_LEN},{SNAPSHOT_PREFILL_OUTPUT_LEN})");
-    let prefill_tokens = synthetic_prompt_tokens(SNAPSHOT_PREFILL_PROMPT_LEN);
+fn run_snapshot(
+    model: &mut dyn BenchModel,
+    cli: &Cli,
+    model_type: ModelType,
+    args: &SnapshotArgs,
+) -> Result<()> {
+    let prefill_prompt_len = snapshot_prefill_prompt_len(model_type);
+
+    info!("Running prefill-heavy ({prefill_prompt_len},{SNAPSHOT_PREFILL_OUTPUT_LEN})");
+    let prefill_tokens = synthetic_prompt_tokens(prefill_prompt_len);
     let prefill_timings = measure_timings(
         model,
         &prefill_tokens,
@@ -1274,7 +1289,7 @@ fn run_snapshot(model: &mut dyn BenchModel, cli: &Cli, args: &SnapshotArgs) -> R
         model: model_name.clone(),
         gpu: gpu_name(),
         prefill_heavy: SnapshotProfile {
-            prompt_len: SNAPSHOT_PREFILL_PROMPT_LEN,
+            prompt_len: prefill_prompt_len,
             output_len: SNAPSHOT_PREFILL_OUTPUT_LEN,
             metrics: prefill_metrics,
         },
@@ -1499,7 +1514,7 @@ fn dispatch(
     tokenizer: &Tokenizer,
 ) -> Result<()> {
     match &cli.command {
-        Command::Snapshot(args) => run_snapshot(model, cli, args),
+        Command::Snapshot(args) => run_snapshot(model, cli, model_type, args),
         _ => {
             let report = run_command(cli, model_type, load_ms, model, tokenizer)?;
             emit_report(cli, &report)
