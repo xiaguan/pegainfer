@@ -65,14 +65,28 @@ pub(crate) struct BatchDecodeGraphState {
 #[allow(dead_code)]
 impl BatchDecodeGraphState {
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35, kv_pool: &KvPool) -> Result<Self> {
+        Self::with_capacity(ctx, config, kv_pool, MAX_BATCH)
+    }
+
+    /// Create a graph state with a custom maximum batch size.
+    ///
+    /// `max_batch` is clamped to `MAX_BATCH` (64). Use this when GPU memory is
+    /// limited and fewer concurrent decode slots are acceptable.
+    pub(crate) fn with_capacity(
+        ctx: &DeviceContext,
+        config: &Config35,
+        kv_pool: &KvPool,
+        max_batch: usize,
+    ) -> Result<Self> {
+        let cap = max_batch.min(MAX_BATCH);
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
 
         let buffers =
-            BatchDecodeBuffers35::new(ctx, config, MAX_BATCH, max_total_pages, padding_page_id)?;
+            BatchDecodeBuffers35::new(ctx, config, cap, max_total_pages, padding_page_id)?;
 
-        let mut slot_states = Vec::with_capacity(MAX_BATCH);
-        for _ in 0..MAX_BATCH {
+        let mut slot_states = Vec::with_capacity(cap);
+        for _ in 0..cap {
             slot_states.push(RecurrentState::new(ctx, config)?);
         }
 
