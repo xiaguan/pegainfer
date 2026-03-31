@@ -109,4 +109,60 @@ impl GdrChunkwiseScratch35 {
     pub fn num_chunks(seq_len: usize) -> usize {
         seq_len.div_ceil(Self::CHUNK_SIZE)
     }
+
+    /// Estimate peak GPU memory (bytes) for prefill scratch at a given seq_len.
+    ///
+    /// Accounts for:
+    /// 1. GDR chunkwise scratch (persists across all linear attention layers)
+    /// 2. Per-layer transient peak — max of full-attention or MLP intermediates,
+    ///    plus shared hidden-state buffers (temporaries freed between layers)
+    pub(crate) fn estimate_bytes(config: &Config35, max_seq_len: usize) -> usize {
+        let num_vh = config.linear_num_value_heads;
+        let key_dim = config.linear_key_head_dim;
+        let val_dim = config.linear_value_head_dim;
+        let chunk_sz = Self::CHUNK_SIZE;
+        let num_chunks = max_seq_len.div_ceil(chunk_sz);
+        let seq = max_seq_len;
+
+        let kv_hidden = num_vh * key_dim;
+        let vv_hidden = num_vh * val_dim;
+
+        // 1. GDR scratch (bf16 = 2 bytes, f32 = 4 bytes)
+        let gdr_bytes = {
+            let f32_elems = seq * num_vh                            // g_cumsum
+                + seq * num_vh                                      // beta
+                + seq * num_vh * chunk_sz                           // a_tril
+                + num_chunks * num_vh * val_dim * key_dim; // chunk_state
+            let bf16_elems = seq * num_vh * chunk_sz                // a_inv
+                + kv_hidden * seq                                   // q_expanded
+                + kv_hidden * seq                                   // k_expanded
+                + vv_hidden * seq                                   // v_raw
+                + kv_hidden * seq                                   // w
+                + vv_hidden * seq                                   // u
+                + vv_hidden * seq; // v_new
+            f32_elems * 4 + bf16_elems * 2
+        };
+
+        // 2. Per-layer transient peak (all bf16 = 2 bytes).
+        //    Attention and MLP temps don't coexist — MLP runs after attention.
+        let hidden_dim = config.hidden_size;
+        let intermediate = config.intermediate_size;
+
+        // Shared: hidden_batch + normed + hidden_plus_attn + normed_for_mlp
+        let shared_layer = hidden_dim * seq * 4;
+
+        // Full attention: q_full(with gate) + k + v + attn_out + q_prepped
+        let full_qkv = config.num_attention_heads * config.head_dim * 2;
+        let full_kv = config.num_key_value_heads * config.head_dim;
+        let full_out = config.num_attention_heads * config.head_dim;
+        let full_attn_temps = (full_qkv + full_kv * 2 + full_out * 2) * seq;
+
+        // MLP: gate_out + up_out + act_out
+        let mlp_temps = intermediate * seq * 3;
+
+        let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);
+        let per_layer_bytes = peak_layer * 2; // bf16
+
+        gdr_bytes + per_layer_bytes
+    }
 }

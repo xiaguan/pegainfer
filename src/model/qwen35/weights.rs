@@ -312,11 +312,18 @@ impl Qwen35Model {
         let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
-        let kv_budget = (free_bytes as f64 * 0.85) as usize;
+        // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
+        // before allocating KV pool, so prefill doesn't OOM.
+        let max_prefill_len = super::prefill::MAX_SEQ;
+        let scratch_reserve =
+            super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
+        let available = free_bytes.saturating_sub(scratch_reserve);
+        let kv_budget = (available as f64 * 0.85) as usize;
         let num_pages = (kv_budget / bytes_per_page).max(64);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
+        let scratch_mb = scratch_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, {:.0}% of {:.0} MB free",
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
