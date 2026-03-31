@@ -177,6 +177,7 @@ unsafe extern "C" {
         start_pos_ptr: *const i32,
         rotary_dim: i32,
         rms_eps: f32,
+        max_seq_len: i32,
         stream: CUstream,
     );
 
