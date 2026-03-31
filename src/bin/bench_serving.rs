@@ -904,16 +904,19 @@ impl BenchModel for SchedulerBenchModel {
                     },
                     max_tokens: n,
                     token_tx,
+                    logprobs: 0,
+                    echo: false,
                 })
                 .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
 
             loop {
                 match token_rx.blocking_recv() {
-                    Some(TokenEvent::Token(id)) => {
+                    Some(TokenEvent::Token { id, .. }) => {
                         if !cb(id) {
                             break;
                         }
                     }
+                    Some(TokenEvent::PromptTokens { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     None => anyhow::bail!("scheduler channel closed"),
                 }

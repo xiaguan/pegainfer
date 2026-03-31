@@ -57,6 +57,16 @@ pub fn truncate_at_stop<'a>(
 
 // ── Shared types ────────────────────────────────────────────────────────
 
+/// Per-token log-probability data (token ID + logprob).
+/// Token strings are resolved in the HTTP layer via tokenizer.
+#[derive(Clone, Debug)]
+pub struct TokenLogprob {
+    /// Log-probability of the selected token.
+    pub logprob: f32,
+    /// Top-k alternative token IDs and their log-probabilities.
+    pub top_logprobs: Vec<(u32, f32)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinishReason {
     Length,
