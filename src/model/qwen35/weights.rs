@@ -361,6 +361,15 @@ impl Qwen35Model {
             &self.config,
             max_batch_size,
             self.kv_pool.capacity_pages(),
+            self.kv_pool.padding_page_id(),
         )
+    }
+
+    /// Create a CUDA Graph batch decode state sized for MAX_BATCH=64 slots.
+    #[allow(dead_code)]
+    pub(crate) fn create_batch_decode_graph_state(
+        &self,
+    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        super::batch_decode_graph::BatchDecodeGraphState::new(&self.ctx, &self.config, &self.kv_pool)
     }
 }
