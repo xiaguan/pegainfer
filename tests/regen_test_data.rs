@@ -1,5 +1,6 @@
 /// Regenerate model-specific golden data in test_data/<model_name>.json using greedy decoding.
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use pegainfer::model::{
     GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_QWEN35_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+static GPU_REGEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PromptStyle {
@@ -192,8 +194,17 @@ fn write_golden_json(output_path: &Path, model_name: &str, cases_json: Vec<serde
     eprintln!("Wrote {}", output_path.display());
 }
 
+fn lock_gpu_regen_test() -> MutexGuard<'static, ()> {
+    // These tests each load a full model onto the same GPU, so they must not run concurrently.
+    GPU_REGEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
+#[ignore = "regenerates checked-in golden data; run manually when fixtures need refresh"]
 fn regen_test_data() {
+    let _guard = lock_gpu_regen_test();
     pegainfer::logging::init_stderr("info");
 
     let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
@@ -240,7 +251,9 @@ fn regen_test_data() {
 }
 
 #[test]
+#[ignore = "regenerates checked-in golden data; run manually when fixtures need refresh"]
 fn regen_test_data_qwen35() {
+    let _guard = lock_gpu_regen_test();
     pegainfer::logging::init_stderr("info");
 
     let model_path = std::env::var("PEGAINFER_E2E_MODEL_PATH")
