@@ -10,6 +10,8 @@ Each model has one snapshot file per GPU (`bench_snapshots/{gpu-slug}/{model}.js
 
 Regressions are only meaningful when comparing the **same GPU** across commits. Cross-GPU differences are expected (e.g. RTX 4090 decode is 10–16% faster than RTX 5070 Ti).
 
+> **Migration note (PR #66):** Snapshots moved from `bench_snapshots/{model}.json` to `bench_snapshots/{gpu-slug}/{model}.json`. Since `compare` uses `git show {ref}:{path}`, baselines from before PR #66 are not reachable under the new path. After merging, run `snapshot` once to establish a fresh baseline for each GPU.
+
 ## Standard Profiles
 
 | Name | prompt_len | output_len | Key metric |
