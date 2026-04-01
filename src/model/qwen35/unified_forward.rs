@@ -259,4 +259,63 @@ mod tests {
             unified_tokens, ref_tokens
         );
     }
+
+    fn assert_prefill_split_matches_single(model: &Qwen35Model, prompt: &[u32], split: usize) {
+        assert!(split > 0 && split < prompt.len(), "invalid split {}", split);
+
+        let full_logits = {
+            let mut kv = model.alloc_kv();
+            let mut rec = RecurrentState::new(&model.ctx, &model.config).unwrap();
+            let mut kv_cache = KVCache::new(
+                model.config.num_full_attention_layers(),
+                model.config.num_key_value_heads,
+            );
+            model
+                .prefill_forward(prompt, &mut kv_cache, &mut kv, &mut rec)
+                .unwrap()
+                .to_host(&model.ctx)
+                .unwrap()
+        };
+
+        let split_logits = {
+            let mut kv = model.alloc_kv();
+            let mut rec = RecurrentState::new(&model.ctx, &model.config).unwrap();
+            let mut kv_cache = KVCache::new(
+                model.config.num_full_attention_layers(),
+                model.config.num_key_value_heads,
+            );
+            model
+                .prefill_forward(&prompt[..split], &mut kv_cache, &mut kv, &mut rec)
+                .unwrap();
+            model
+                .prefill_forward(&prompt[split..], &mut kv_cache, &mut kv, &mut rec)
+                .unwrap()
+                .to_host(&model.ctx)
+                .unwrap()
+        };
+
+        let max_diff = full_logits
+            .iter()
+            .zip(split_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_diff < 0.05,
+            "prefill split mismatch at split={split}: max logit diff {max_diff}"
+        );
+    }
+
+    #[test]
+    #[ignore = "debug repro for split-prefill divergence in Qwen3.5"]
+    fn debug_prefill_split_matches_single_across_chunk_boundaries() {
+        let model_path = get_model_path();
+        let model = Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
+
+        let prompt: Vec<u32> = (0..1536).map(|i| ((i % 1000) + 100) as u32).collect();
+        assert_prefill_split_matches_single(&model, &prompt[..128], 64);
+        assert_prefill_split_matches_single(&model, &prompt[..129], 64);
+        assert_prefill_split_matches_single(&model, &prompt[..1025], 64);
+        assert_prefill_split_matches_single(&model, &prompt[..1025], 1024);
+    }
 }
