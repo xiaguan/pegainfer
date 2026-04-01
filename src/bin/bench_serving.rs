@@ -1287,18 +1287,21 @@ fn gpu_name() -> String {
     .unwrap_or_else(|| "unknown".into())
 }
 
-/// Produce a filesystem-safe slug from the GPU name.
+/// Produce a filesystem-safe slug from a GPU name string.
 ///
 /// `"NVIDIA GeForce RTX 5070 Ti"` → `"rtx-5070-ti"`
-fn gpu_slug() -> String {
-    let name = gpu_name();
+fn gpu_slug_from(name: &str) -> String {
     let stripped = name
         .strip_prefix("NVIDIA GeForce ")
         .or_else(|| name.strip_prefix("NVIDIA "))
-        .unwrap_or(&name);
+        .unwrap_or(name);
     stripped
         .to_lowercase()
-        .split_whitespace()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-")
 }
@@ -1355,11 +1358,12 @@ fn run_snapshot(
     let decode_metrics = build_request_metrics(&decode_timings);
 
     let model_name = model_display_name(&cli.model_path);
+    let gpu = gpu_name();
     let report = SnapshotReport {
         commit: git_short_commit(),
         date: today_date(),
         model: model_name.clone(),
-        gpu: gpu_name(),
+        gpu: gpu.clone(),
         prefill_heavy: SnapshotProfile {
             prompt_len: prefill_prompt_len,
             output_len: SNAPSHOT_PREFILL_OUTPUT_LEN,
@@ -1372,7 +1376,7 @@ fn run_snapshot(
         },
     };
 
-    let dir = Path::new(SNAPSHOT_DIR).join(gpu_slug());
+    let dir = Path::new(SNAPSHOT_DIR).join(gpu_slug_from(&gpu));
     fs::create_dir_all(&dir)?;
     let filename = model_name.to_lowercase();
     let path = dir.join(format!("{filename}.json"));
