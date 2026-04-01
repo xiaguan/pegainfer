@@ -78,7 +78,6 @@ fn generate_text(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => out.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
             None => panic!("scheduler channel closed"),
         }

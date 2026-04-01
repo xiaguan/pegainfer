@@ -447,6 +447,24 @@ fn decode_step(
         return;
     }
 
+    // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
+    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
+    let cpu_logits: Vec<Option<Vec<f32>>> = if any_logprobs {
+        (0..active.len())
+            .map(|i| {
+                if active[i].logprobs > 0 {
+                    crate::ops::extract_vec(model.device_ctx(), &graph_state.buffers.logits, i)
+                        .ok()
+                        .and_then(|v| v.to_host(model.device_ctx()).ok())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        vec![None; active.len()]
+    };
+
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
     let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
     {
@@ -464,28 +482,17 @@ fn decode_step(
         }
     };
 
-    // Extract per-request logprobs from batched logits if needed
-    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
-    let logprobs_vec: Vec<Option<TokenLogprob>> = if any_logprobs {
-        let batch_size = active.len();
-        (0..batch_size)
-            .map(|i| {
-                if active[i].logprobs > 0 {
-                    crate::ops::extract_vec(model.device_ctx(), &graph_state.buffers.logits, i)
-                        .ok()
-                        .and_then(|logits_vec| {
-                            extract_logprobs(model, &logits_vec, tokens[i], active[i].logprobs).ok()
-                        })
-                } else {
-                    None
-                }
+    let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
+        .into_iter()
+        .enumerate()
+        .map(|(i, logits_opt)| {
+            logits_opt.and_then(|logits_f32| {
+                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
             })
-            .collect()
-    } else {
-        vec![None; active.len()]
-    };
+        })
+        .collect();
 
-    dispatch_decode_tokens(model, active, &tokens, logprobs_vec, graph_state);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
 }
 
 /// Process decode logits from unified step: sample, extract logprobs, dispatch.
@@ -524,26 +531,26 @@ fn process_decode_logits(
         }
     }
 
-    dispatch_decode_tokens(model, active, &tokens, logprobs_vec, graph_state);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
 ///
-/// When a request is retired (swap_remove), D2D-copy the last slot's recurrent
-/// state into the vacated slot to keep slots 0..active.len() dense.
+/// `tokens` and `logprobs` are indexed by original position in `active`.
+/// Retirements collected first, then compacted in reverse order.
 fn dispatch_decode_tokens(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
     tokens: &[u32],
-    logprobs: Vec<Option<TokenLogprob>>,
+    logprobs: &[Option<TokenLogprob>],
     graph_state: &mut BatchDecodeGraphState,
 ) {
-    let mut i = 0;
-    let mut lp_idx = 0;
-    while i < active.len() {
-        let token = tokens[lp_idx];
-        let logprob = logprobs[lp_idx].clone();
-        lp_idx += 1;
+    let n = active.len();
+    let mut to_retire = Vec::new();
+
+    for i in 0..n {
+        let token = tokens[i];
+        let logprob = logprobs[i].clone();
         let req = &mut active[i];
         req.generated_count += 1;
 
@@ -556,9 +563,8 @@ fn dispatch_decode_tokens(
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
-            compact_slot(model, active, graph_state, i);
+            to_retire.push(i);
         } else if at_limit {
-            // Send the final token, then Finished.
             let _ = req.token_tx.send(TokenEvent::Token {
                 id: token,
                 logprob,
@@ -568,7 +574,7 @@ fn dispatch_decode_tokens(
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
-            compact_slot(model, active, graph_state, i);
+            to_retire.push(i);
         } else if req
             .token_tx
             .send(TokenEvent::Token {
@@ -577,11 +583,15 @@ fn dispatch_decode_tokens(
             })
             .is_err()
         {
-            compact_slot(model, active, graph_state, i);
+            to_retire.push(i);
         } else {
             req.last_token = token;
-            i += 1;
         }
+    }
+
+    // Remove in reverse order so compact_slot indices stay valid
+    for &i in to_retire.iter().rev() {
+        compact_slot(model, active, graph_state, i);
     }
 }
 
@@ -659,6 +669,18 @@ fn extract_logprobs(
     top_k: usize,
 ) -> Result<TokenLogprob> {
     let logits_f32 = logits.to_host(model.device_ctx())?;
+    compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
+}
+
+fn compute_logprobs_from_cpu(
+    logits_f32: &[f32],
+    sampled_token: u32,
+    top_k: usize,
+) -> Option<TokenLogprob> {
+    if logits_f32.is_empty() {
+        return None;
+    }
 
     let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
@@ -669,19 +691,22 @@ fn extract_logprobs(
     let k = top_k.min(logits_f32.len());
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
     if k > 0 {
-        let mut indices: Vec<u32> = (0..logits_f32.len() as u32).collect();
-        indices.sort_unstable_by(|&a, &b| {
-            logits_f32[b as usize]
-                .partial_cmp(&logits_f32[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &idx in indices.iter().take(k) {
-            let lp = logits_f32[idx as usize] - log_sum_exp;
-            top.push((idx, lp));
+        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (idx, &val) in logits_f32.iter().enumerate() {
+            if best.len() < k || val > best.last().unwrap().1 {
+                let pos = best.partition_point(|&(_, v)| v > val);
+                best.insert(pos, (idx as u32, val));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+        }
+        for (idx, val) in best {
+            top.push((idx, val - log_sum_exp));
         }
     }
 
-    Ok(TokenLogprob {
+    Some(TokenLogprob {
         logprob: sampled_logprob,
         top_logprobs: top,
     })

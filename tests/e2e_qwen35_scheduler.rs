@@ -78,7 +78,6 @@ fn generate_tokens(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -186,7 +185,6 @@ fn test_e2e_qwen35_scheduler() {
                 match rx.blocking_recv() {
                     Some(TokenEvent::Token { id, .. }) => tokens.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::PromptTokens { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     None => panic!("channel closed for {:?}", name),
                 }

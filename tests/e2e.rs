@@ -91,7 +91,6 @@ fn generate_tokens(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }

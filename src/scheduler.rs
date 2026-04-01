@@ -197,15 +197,19 @@ fn prefill_batch(
     let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
     let mut kv_states: Vec<KvState> = (0..pending.len()).map(|_| model.alloc_kv()).collect();
 
-    let logits_vec = match model.batch_prefill(&prompts, &mut kv_states) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Batch prefill failed: {e}");
-            return;
-        }
-    };
+    let any_echo = pending.iter().any(|r| r.echo);
+    let (logits_vec, all_position_logits) =
+        match model.batch_prefill(&prompts, &mut kv_states, any_echo) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Batch prefill failed: {e}");
+                return;
+            }
+        };
 
     // Process each request: sample first token, handle EOS/limits, add to active
+    let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+    let mut token_offset = 0usize;
     for (i, req) in pending.into_iter().enumerate() {
         let prompt_len = req.prompt_tokens.len();
 
@@ -225,17 +229,36 @@ fn prefill_batch(
             None
         };
 
-        // Echo: send prompt tokens before generation (first token has no logprob in echo)
+        // Echo: send prompt tokens with logprobs computed from all-position logits.
+        // Token at position j has logprob from logits at position j-1.
+        // First token (j=0) has no conditioning context → logprob = None.
         if req.echo {
-            // The first prompt token has no logprob (no conditioning context).
-            // Subsequent prompt tokens would need all-position logits from prefill.
-            // For now, send prompt token IDs with None logprobs.
-            let echo_logprobs = vec![None; req.prompt_tokens.len()];
+            let prompt_len_local = req.prompt_tokens.len();
+            let mut echo_logprobs: Vec<Option<TokenLogprob>> = Vec::with_capacity(prompt_len_local);
+            echo_logprobs.push(None); // first token has no logprob
+            if let Some(ref all_logits) = all_position_logits {
+                for j in 1..prompt_len_local {
+                    let prev_pos = token_offset + j - 1; // position in concatenated sequence
+                    let target_token = req.prompt_tokens[j];
+                    let lp = crate::ops::extract_vec(model.device_ctx(), all_logits, prev_pos)
+                        .ok()
+                        .and_then(|logits_vec| {
+                            let logits_f32 = logits_vec.to_host(model.device_ctx()).ok()?;
+                            compute_logprobs_from_cpu(&logits_f32, target_token, req.logprobs)
+                        });
+                    echo_logprobs.push(lp);
+                }
+            } else {
+                for _ in 1..prompt_len_local {
+                    echo_logprobs.push(None);
+                }
+            }
             let _ = req.token_tx.send(TokenEvent::PromptTokens {
                 ids: req.prompt_tokens.clone(),
                 logprobs: echo_logprobs,
             });
         }
+        token_offset += seq_lens[i];
 
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
             let _ = req.token_tx.send(TokenEvent::Finished {
@@ -410,6 +433,24 @@ fn decode_step(
         return;
     }
 
+    // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits in-place)
+    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
+    let cpu_logits: Vec<Option<Vec<f32>>> = if any_logprobs {
+        (0..active.len())
+            .map(|i| {
+                if active[i].logprobs > 0 {
+                    crate::ops::extract_vec(model.device_ctx(), &bufs.logits, i)
+                        .ok()
+                        .and_then(|v| v.to_host(model.device_ctx()).ok())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        vec![None; active.len()]
+    };
+
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
     let tokens = match model.select_tokens_batch_varied(bufs, &params_refs, rng) {
         Ok(t) => t,
@@ -426,29 +467,18 @@ fn decode_step(
         }
     };
 
-    // Extract per-request logprobs from batched logits if any request needs them
-    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
-    let logprobs_vec: Vec<Option<TokenLogprob>> = if any_logprobs {
-        let batch_size = active.len();
-        (0..batch_size)
-            .map(|i| {
-                if active[i].logprobs > 0 {
-                    // Extract this request's logits column from the batched buffer
-                    crate::ops::extract_vec(model.device_ctx(), &bufs.logits, i)
-                        .ok()
-                        .and_then(|logits_vec| {
-                            extract_logprobs(model, &logits_vec, tokens[i], active[i].logprobs).ok()
-                        })
-                } else {
-                    None
-                }
+    // Compute logprobs from cached CPU logits
+    let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
+        .into_iter()
+        .enumerate()
+        .map(|(i, logits_opt)| {
+            logits_opt.and_then(|logits_f32| {
+                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
             })
-            .collect()
-    } else {
-        vec![None; active.len()]
-    };
+        })
+        .collect();
 
-    dispatch_decode_tokens(model, active, &tokens, logprobs_vec);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec);
 }
 
 /// Process decode logits from unified step: sample, extract logprobs, dispatch.
@@ -487,22 +517,25 @@ fn process_decode_logits(
         }
     }
 
-    dispatch_decode_tokens(model, active, &tokens, logprobs_vec);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec);
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
+///
+/// `tokens` and `logprobs` are indexed by original position in `active`.
+/// Retirements collected first, then applied in reverse to avoid index invalidation.
 fn dispatch_decode_tokens(
     model: &Qwen3Model,
     active: &mut Vec<ActiveRequest>,
     tokens: &[u32],
-    logprobs: Vec<Option<TokenLogprob>>,
+    logprobs: &[Option<TokenLogprob>],
 ) {
-    let mut i = 0;
-    let mut lp_idx = 0; // tracks into the original logprobs vec
-    while i < active.len() {
-        let token = tokens[lp_idx];
-        let logprob = logprobs[lp_idx].clone();
-        lp_idx += 1;
+    let n = active.len();
+    let mut to_retire = Vec::new();
+
+    for i in 0..n {
+        let token = tokens[i];
+        let logprob = logprobs[i].clone();
         let req = &mut active[i];
         req.generated_count += 1;
 
@@ -520,7 +553,7 @@ fn dispatch_decode_tokens(
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
-            active.swap_remove(i);
+            to_retire.push(i);
         } else if req
             .token_tx
             .send(TokenEvent::Token {
@@ -529,11 +562,15 @@ fn dispatch_decode_tokens(
             })
             .is_err()
         {
-            active.swap_remove(i);
+            to_retire.push(i);
         } else {
             req.last_token = token;
-            i += 1;
         }
+    }
+
+    // Remove in reverse order so swap_remove doesn't invalidate earlier indices
+    for &i in to_retire.iter().rev() {
+        active.swap_remove(i);
     }
 }
 
@@ -555,47 +592,54 @@ fn sample_from_logits(
     )
 }
 
-/// Extract log-probabilities from logits for a given sampled token.
-///
-/// Copies logits to CPU, computes log-softmax, returns the sampled token's
-/// logprob and the top-k alternatives.
+/// Extract log-probabilities from GPU logits for a given sampled token.
 fn extract_logprobs(
     model: &Qwen3Model,
     logits: &DeviceVec,
     sampled_token: u32,
     top_k: usize,
 ) -> Result<TokenLogprob> {
-    use crate::server_engine::TokenLogprob;
-
-    // GPU → CPU: bf16 logits → f32
     let logits_f32 = logits.to_host(model.device_ctx())?;
+    compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
+}
 
-    // log-softmax: log(softmax(x)) = x - log(sum(exp(x)))
-    // For numerical stability: x_i - max(x) - log(sum(exp(x_j - max(x))))
+/// Compute log-probabilities from CPU f32 logits.
+fn compute_logprobs_from_cpu(
+    logits_f32: &[f32],
+    sampled_token: u32,
+    top_k: usize,
+) -> Option<TokenLogprob> {
+    if logits_f32.is_empty() {
+        return None;
+    }
+
     let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
     let log_sum_exp = max_val + sum_exp.ln();
 
     let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
 
-    // Top-k: partial sort by logit value (descending)
+    // Top-k: O(V*k) scan keeping k largest logits
     let k = top_k.min(logits_f32.len());
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
     if k > 0 {
-        // Use a simple selection for small k
-        let mut indices: Vec<u32> = (0..logits_f32.len() as u32).collect();
-        indices.sort_unstable_by(|&a, &b| {
-            logits_f32[b as usize]
-                .partial_cmp(&logits_f32[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &idx in indices.iter().take(k) {
-            let lp = logits_f32[idx as usize] - log_sum_exp;
-            top.push((idx, lp));
+        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (idx, &val) in logits_f32.iter().enumerate() {
+            if best.len() < k || val > best.last().unwrap().1 {
+                let pos = best.partition_point(|&(_, v)| v > val);
+                best.insert(pos, (idx as u32, val));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+        }
+        for (idx, val) in best {
+            top.push((idx, val - log_sum_exp));
         }
     }
 
-    Ok(TokenLogprob {
+    Some(TokenLogprob {
         logprob: sampled_logprob,
         top_logprobs: top,
     })

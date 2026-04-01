@@ -81,7 +81,6 @@ fn main() {
             match token_rx.blocking_recv() {
                 Some(TokenEvent::Token { id, .. }) => tokens.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::PromptTokens { .. }) => {}
                 Some(TokenEvent::Finished { .. }) => break,
                 None => panic!("scheduler channel closed without Finished"),
             }
