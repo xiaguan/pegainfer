@@ -18,6 +18,167 @@ use crate::tensor::{DeviceVec, HiddenStates};
 
 impl Qwen35Model {
     #[allow(clippy::type_complexity)]
+    pub fn debug_prefill_linear_attention_internal_last_hidden(
+        &self,
+        token_ids: &[u32],
+        target_layer_idx: usize,
+    ) -> Result<(
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    )> {
+        let seq_len = token_ids.len();
+        anyhow::ensure!(
+            seq_len > 0,
+            "debug_prefill_linear_attention_internal_last_hidden requires non-empty input"
+        );
+        anyhow::ensure!(
+            target_layer_idx < self.layers.len(),
+            "target_layer_idx {} out of range {}",
+            target_layer_idx,
+            self.layers.len()
+        );
+        let c = &self.config;
+
+        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
+        let token_ids_gpu = self
+            .ctx
+            .stream
+            .clone_htod(&token_ids_i32)
+            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
+
+        let mut hidden_batch = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &token_ids_gpu,
+            &mut hidden_batch,
+        )?;
+
+        let mut kv_cache = KVCache::new(c.num_full_attention_layers(), c.num_key_value_heads);
+        let mut kv_state = self.alloc_kv();
+        let mut recurrent = RecurrentState::new(&self.ctx, &self.config)?;
+
+        kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
+        let base_pos = kv_state.seq_len();
+        kv_state.ensure_capacity(base_pos + seq_len)?;
+        kv_state.advance(seq_len);
+        let kv_desc = kv_state.desc();
+        let prefill_plan = PrefillPagedPlan::new(
+            &self.ctx,
+            &kv_desc,
+            base_pos,
+            seq_len,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            c.head_dim,
+        )?;
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if layer_idx != target_layer_idx {
+                hidden_batch = self.prefill_layer(
+                    layer_idx,
+                    layer,
+                    &hidden_batch,
+                    &mut gdr_chunkwise_scratch,
+                    &mut linear_idx,
+                    &mut full_idx,
+                    &mut kv_cache,
+                    &kv_state,
+                    &prefill_plan,
+                    &mut recurrent,
+                )?;
+                continue;
+            }
+
+            let attn = match &layer.attn {
+                LayerKind::LinearAttention(attn) => attn,
+                LayerKind::FullAttention(_) => {
+                    anyhow::bail!("target layer {} is not linear_attention", target_layer_idx)
+                }
+            };
+
+            let eps = c.rms_norm_eps;
+            let input_normed =
+                self.batched_rms_norm_offset(&hidden_batch, &layer.input_layernorm, eps)?;
+
+            let qkv_batch = ops::gemm(&self.ctx, &attn.in_proj_qkv, &input_normed)?;
+            let z_batch = ops::gemm(&self.ctx, &attn.in_proj_z, &input_normed)?;
+            let b_batch = ops::gemm(&self.ctx, &attn.in_proj_b, &input_normed)?;
+            let a_batch = ops::gemm(&self.ctx, &attn.in_proj_a, &input_normed)?;
+
+            let qkv_dim = c.linear_attn_qkv_dim();
+            let z_dim = c.linear_attn_z_dim();
+            let layer_state = &mut recurrent.layers[linear_idx];
+
+            let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
+            ops::conv1d_prefill_batch_into(
+                &self.ctx,
+                &qkv_batch,
+                &attn.conv1d_weight,
+                &mut layer_state.conv_state,
+                &mut qkv_conv_batch,
+                c.linear_conv_kernel_dim,
+            );
+
+            let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+            ops::gated_delta_rule_prefill_chunkwise_into(
+                &self.ctx,
+                &qkv_conv_batch,
+                &b_batch,
+                &a_batch,
+                &attn.dt_bias,
+                &attn.a_log,
+                &mut layer_state.state,
+                &mut gdr_chunkwise_scratch,
+                &mut gdr_out_batch,
+                c.linear_num_key_heads,
+                c.linear_num_value_heads,
+                c.linear_key_head_dim,
+                c.linear_value_head_dim,
+            )?;
+
+            let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+            ops::rms_norm_gated_batch_into(
+                &self.ctx,
+                &gdr_out_batch,
+                &attn.norm_weight,
+                &z_batch,
+                &mut normed_out_batch,
+                c.linear_num_value_heads,
+                c.linear_value_head_dim,
+                eps,
+            );
+
+            let out_proj_batch = ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?;
+
+            return Ok((
+                ops::extract_vec(&self.ctx, &input_normed, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &qkv_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &z_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &b_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &a_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &qkv_conv_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &gdr_out_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &normed_out_batch, seq_len - 1)?.to_host(&self.ctx)?,
+                ops::extract_vec(&self.ctx, &out_proj_batch, seq_len - 1)?.to_host(&self.ctx)?,
+            ));
+        }
+
+        unreachable!("target layer should have returned");
+    }
+
+    #[allow(clippy::type_complexity)]
     pub fn debug_prefill_full_attention_internal_last_hidden(
         &self,
         token_ids: &[u32],
