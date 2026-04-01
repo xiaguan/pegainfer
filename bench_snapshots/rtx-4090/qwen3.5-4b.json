@@ -1,0 +1,84 @@
+{
+  "commit": "fedaf78",
+  "date": "2026-04-01",
+  "model": "Qwen3.5-4B",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "prefill_heavy": {
+    "prompt_len": 10000,
+    "output_len": 1,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 715.115763,
+        "p50_ms": 714.763214,
+        "p95_ms": 716.9821010000001,
+        "p99_ms": 725.3476290000001,
+        "max_ms": 725.3476290000001,
+        "samples": 20
+      },
+      "first_decode_step_ms": null,
+      "steady_tpot_ms": null,
+      "e2e_ms": {
+        "avg_ms": 715.118549,
+        "p50_ms": 714.764004,
+        "p95_ms": 716.98503,
+        "p99_ms": 725.350739,
+        "max_ms": 725.350739,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 1,
+        "max": 1,
+        "avg": 1.0,
+        "samples": 20
+      },
+      "request_tok_s": 1.3983695446282238,
+      "decode_tok_s": null
+    }
+  },
+  "decode_heavy": {
+    "prompt_len": 1024,
+    "output_len": 256,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 81.57310600000001,
+        "p50_ms": 81.618007,
+        "p95_ms": 82.00363800000001,
+        "p99_ms": 82.234808,
+        "max_ms": 82.234808,
+        "samples": 20
+      },
+      "first_decode_step_ms": {
+        "avg_ms": 12.139427,
+        "p50_ms": 12.140839,
+        "p95_ms": 12.193282,
+        "p99_ms": 12.194059,
+        "max_ms": 12.194059,
+        "samples": 20
+      },
+      "steady_tpot_ms": {
+        "avg_ms": 11.036597,
+        "p50_ms": 11.036314,
+        "p95_ms": 11.114743,
+        "p99_ms": 11.123159000000001,
+        "max_ms": 11.329658,
+        "samples": 5080
+      },
+      "e2e_ms": {
+        "avg_ms": 2897.011717,
+        "p50_ms": 2897.0166600000002,
+        "p95_ms": 2897.728661,
+        "p99_ms": 2898.117547,
+        "max_ms": 2898.117547,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 256,
+        "max": 256,
+        "avg": 256.0,
+        "samples": 20
+      },
+      "request_tok_s": 88.36691907512107,
+      "decode_tok_s": 90.5721412615664
+    }
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "commit": "fedaf78",
+  "date": "2026-04-01",
+  "model": "Qwen3-4B",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "prefill_heavy": {
+    "prompt_len": 10000,
+    "output_len": 1,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 713.7508,
+        "p50_ms": 714.440971,
+        "p95_ms": 716.534288,
+        "p99_ms": 717.16038,
+        "max_ms": 717.16038,
+        "samples": 20
+      },
+      "first_decode_step_ms": null,
+      "steady_tpot_ms": null,
+      "e2e_ms": {
+        "avg_ms": 713.750842,
+        "p50_ms": 714.441011,
+        "p95_ms": 716.5343280000001,
+        "p99_ms": 717.16042,
+        "max_ms": 717.16042,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 1,
+        "max": 1,
+        "avg": 1.0,
+        "samples": 20
+      },
+      "request_tok_s": 1.4010491337243993,
+      "decode_tok_s": null
+    }
+  },
+  "decode_heavy": {
+    "prompt_len": 1024,
+    "output_len": 256,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 55.456686999999995,
+        "p50_ms": 55.489487,
+        "p95_ms": 55.66952,
+        "p99_ms": 55.669659,
+        "max_ms": 55.669659,
+        "samples": 20
+      },
+      "first_decode_step_ms": {
+        "avg_ms": 10.464103000000001,
+        "p50_ms": 10.462519,
+        "p95_ms": 10.5123,
+        "p99_ms": 10.544657,
+        "max_ms": 10.544657,
+        "samples": 20
+      },
+      "steady_tpot_ms": {
+        "avg_ms": 10.306977,
+        "p50_ms": 10.309364,
+        "p95_ms": 10.35396,
+        "p99_ms": 10.398598999999999,
+        "max_ms": 11.270107,
+        "samples": 5080
+      },
+      "e2e_ms": {
+        "avg_ms": 2683.893263,
+        "p50_ms": 2683.317073,
+        "p95_ms": 2687.099502,
+        "p99_ms": 2688.068651,
+        "max_ms": 2688.068651,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 256,
+        "max": 256,
+        "avg": 256.0,
+        "samples": 20
+      },
+      "request_tok_s": 95.38382299594471,
+      "decode_tok_s": 97.01585032997403
+    }
+  }
+}
