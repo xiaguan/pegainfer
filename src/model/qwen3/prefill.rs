@@ -257,14 +257,32 @@ impl Qwen3Model {
 
     /// Batch prefill: process multiple prompts in a single forward pass.
     ///
+    /// Compute logits for ALL positions in the hidden states.
+    ///
+    /// Used when `echo=true` to return prompt token log-probabilities.
+    /// Applies final RMS norm + lm_head projection in a single batched GEMM.
+    /// Returns `HiddenStates` with shape `[vocab_size, total_tokens]`.
+    pub(crate) fn compute_all_position_logits(
+        &self,
+        hidden: &HiddenStates,
+    ) -> Result<HiddenStates> {
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, hidden.seq_len)?;
+        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, self.config.rms_norm_eps, &mut normed);
+        ops::gemm(&self.ctx, self.output_projection(), &normed)
+    }
+
     /// Concatenates all prompts' tokens, runs one GEMM per layer for the
     /// entire batch, and uses FlashInfer's multi-request causal attention.
     /// Returns per-request logits (last token of each prompt).
+    ///
+    /// If `echo` is true, also returns all-position logits as a
+    /// `HiddenStates [vocab_size, total_tokens]` for prompt logprobs.
     pub(crate) fn batch_prefill(
         &self,
         prompts: &[&[u32]],
         kv_states: &mut [KvState],
-    ) -> Result<Vec<DeviceVec>> {
+        echo: bool,
+    ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
         assert_eq!(batch_size, kv_states.len());
 
@@ -298,6 +316,13 @@ impl Qwen3Model {
         let layout = *kv_states[0].layout();
         let hidden = self.process_all_layers_batch_multi(hidden, &layout, kv_buffer, &plan)?;
 
+        // All-position logits for echo (before we extract last-token logits)
+        let all_logits = if echo {
+            Some(self.compute_all_position_logits(&hidden)?)
+        } else {
+            None
+        };
+
         // Extract per-request last-token logits
         let mut logits_vec = Vec::with_capacity(batch_size);
         let mut offset = 0;
@@ -315,7 +340,7 @@ impl Qwen3Model {
             offset += seq_len;
         }
 
-        Ok(logits_vec)
+        Ok((logits_vec, all_logits))
     }
 
     fn process_all_layers_batch_multi(

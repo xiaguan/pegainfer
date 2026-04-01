@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::server_engine::StreamDelta;
@@ -17,6 +19,10 @@ pub(super) struct CompletionRequest {
     pub(super) stream_options: Option<StreamOptions>,
     pub(super) stop: Option<Vec<String>>,
     pub(super) ignore_eos: Option<bool>,
+    /// Number of top log-probabilities to return per token (0 or absent = disabled).
+    pub(super) logprobs: Option<usize>,
+    /// If true, echo prompt tokens before completion tokens.
+    pub(super) echo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,8 +61,17 @@ pub(super) struct CompletionResponse {
 struct Choice {
     text: String,
     index: usize,
-    logprobs: Option<()>,
+    logprobs: Option<LogprobsResponse>,
     finish_reason: String,
+}
+
+/// OpenAI-compatible logprobs response structure.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct LogprobsResponse {
+    pub(super) tokens: Vec<String>,
+    pub(super) token_logprobs: Vec<Option<f32>>,
+    pub(super) top_logprobs: Vec<Option<HashMap<String, f32>>>,
+    pub(super) text_offset: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +89,7 @@ impl CompletionResponse {
         text: String,
         finish_reason: crate::server_engine::FinishReason,
         usage: crate::server_engine::Usage,
+        logprobs: Option<LogprobsResponse>,
     ) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4()),
@@ -83,7 +99,7 @@ impl CompletionResponse {
             choices: vec![Choice {
                 text,
                 index: 0,
-                logprobs: None,
+                logprobs,
                 finish_reason: finish_reason.as_openai_str().to_string(),
             }],
             usage: Usage {

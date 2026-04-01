@@ -21,7 +21,7 @@ use crate::model::qwen35::batch_decode_graph::BatchDecodeGraphState;
 use crate::model::qwen35::recurrent_state::RecurrentState;
 use crate::sampler::SamplingParams;
 use crate::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
-use crate::server_engine::FinishReason;
+use crate::server_engine::{FinishReason, TokenLogprob};
 use crate::tensor::DeviceVec;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -38,6 +38,8 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
+    /// Number of top logprobs to return (0 = disabled).
+    logprobs: usize,
 }
 
 /// Scratch buffers for GPU sampling (reused across prefill sampling).
@@ -221,6 +223,20 @@ fn prefill_batch(
             }
         };
 
+        let logprob = if req.logprobs > 0 {
+            extract_logprobs(model, &logits_vec[i], first_token, req.logprobs).ok()
+        } else {
+            None
+        };
+
+        if req.echo {
+            let echo_logprobs = vec![None; req.prompt_tokens.len()];
+            let _ = req.token_tx.send(TokenEvent::PromptTokens {
+                ids: req.prompt_tokens.clone(),
+                logprobs: echo_logprobs,
+            });
+        }
+
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -230,7 +246,14 @@ fn prefill_batch(
             continue;
         }
 
-        if req.token_tx.send(TokenEvent::Token(first_token)).is_err() {
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: first_token,
+                logprob,
+            })
+            .is_err()
+        {
             continue;
         }
 
@@ -259,6 +282,7 @@ fn prefill_batch(
             max_tokens: req.max_tokens,
             prompt_len,
             params: req.params,
+            logprobs: req.logprobs,
         });
     }
 }
@@ -336,6 +360,20 @@ fn unified_step_sched(
                 }
             };
 
+        let logprob = if req.logprobs > 0 {
+            extract_logprobs(model, &prefill_logits[i], first_token, req.logprobs).ok()
+        } else {
+            None
+        };
+
+        if req.echo {
+            let echo_logprobs = vec![None; req.prompt_tokens.len()];
+            let _ = req.token_tx.send(TokenEvent::PromptTokens {
+                ids: req.prompt_tokens.clone(),
+                logprobs: echo_logprobs,
+            });
+        }
+
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -345,7 +383,14 @@ fn unified_step_sched(
             continue;
         }
 
-        if req.token_tx.send(TokenEvent::Token(first_token)).is_err() {
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: first_token,
+                logprob,
+            })
+            .is_err()
+        {
             continue;
         }
 
@@ -374,6 +419,7 @@ fn unified_step_sched(
             max_tokens: req.max_tokens,
             prompt_len,
             params: req.params,
+            logprobs: req.logprobs,
         });
     }
 }
@@ -401,6 +447,24 @@ fn decode_step(
         return;
     }
 
+    // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
+    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
+    let cpu_logits: Vec<Option<Vec<f32>>> = if any_logprobs {
+        (0..active.len())
+            .map(|i| {
+                if active[i].logprobs > 0 {
+                    crate::ops::extract_vec(model.device_ctx(), &graph_state.buffers.logits, i)
+                        .ok()
+                        .and_then(|v| v.to_host(model.device_ctx()).ok())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        vec![None; active.len()]
+    };
+
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
     let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
     {
@@ -418,10 +482,20 @@ fn decode_step(
         }
     };
 
-    dispatch_decode_tokens(model, active, &tokens, graph_state);
+    let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
+        .into_iter()
+        .enumerate()
+        .map(|(i, logits_opt)| {
+            logits_opt.and_then(|logits_f32| {
+                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
+            })
+        })
+        .collect();
+
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
 }
 
-/// Process decode logits from unified step: sample and dispatch.
+/// Process decode logits from unified step: sample, extract logprobs, dispatch.
 fn process_decode_logits(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
@@ -431,9 +505,18 @@ fn process_decode_logits(
     rng: &mut StdRng,
 ) {
     let mut tokens = Vec::with_capacity(active.len());
+    let mut logprobs_vec: Vec<Option<TokenLogprob>> = Vec::with_capacity(active.len());
     for (i, logits) in decode_logits.iter().enumerate() {
         match sample_from_logits(model, logits, scratch, &active[i].params, rng) {
-            Ok(t) => tokens.push(t),
+            Ok(t) => {
+                let lp = if active[i].logprobs > 0 {
+                    extract_logprobs(model, logits, t, active[i].logprobs).ok()
+                } else {
+                    None
+                };
+                tokens.push(t);
+                logprobs_vec.push(lp);
+            }
             Err(e) => {
                 warn!("decode sampling error: {e}");
                 for req in active.drain(..) {
@@ -448,22 +531,26 @@ fn process_decode_logits(
         }
     }
 
-    dispatch_decode_tokens(model, active, &tokens, graph_state);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
 ///
-/// When a request is retired (swap_remove), D2D-copy the last slot's recurrent
-/// state into the vacated slot to keep slots 0..active.len() dense.
+/// `tokens` and `logprobs` are indexed by original position in `active`.
+/// Retirements collected first, then compacted in reverse order.
 fn dispatch_decode_tokens(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
     tokens: &[u32],
+    logprobs: &[Option<TokenLogprob>],
     graph_state: &mut BatchDecodeGraphState,
 ) {
-    let mut i = 0;
-    while i < active.len() {
+    let n = active.len();
+    let mut to_retire = Vec::new();
+
+    for i in 0..n {
         let token = tokens[i];
+        let logprob = logprobs[i].clone();
         let req = &mut active[i];
         req.generated_count += 1;
 
@@ -476,22 +563,35 @@ fn dispatch_decode_tokens(
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
-            compact_slot(model, active, graph_state, i);
+            to_retire.push(i);
         } else if at_limit {
-            // Send the final token, then Finished.
-            let _ = req.token_tx.send(TokenEvent::Token(token));
+            let _ = req.token_tx.send(TokenEvent::Token {
+                id: token,
+                logprob,
+            });
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
-            compact_slot(model, active, graph_state, i);
-        } else if req.token_tx.send(TokenEvent::Token(token)).is_err() {
-            compact_slot(model, active, graph_state, i);
+            to_retire.push(i);
+        } else if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token,
+                logprob,
+            })
+            .is_err()
+        {
+            to_retire.push(i);
         } else {
             req.last_token = token;
-            i += 1;
         }
+    }
+
+    // Remove in reverse order so compact_slot indices stay valid
+    for &i in to_retire.iter().rev() {
+        compact_slot(model, active, graph_state, i);
     }
 }
 
@@ -560,4 +660,54 @@ fn sample_from_logits(
         params,
         random_val,
     )
+}
+
+fn extract_logprobs(
+    model: &Qwen35Model,
+    logits: &DeviceVec,
+    sampled_token: u32,
+    top_k: usize,
+) -> Result<TokenLogprob> {
+    let logits_f32 = logits.to_host(model.device_ctx())?;
+    compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
+}
+
+fn compute_logprobs_from_cpu(
+    logits_f32: &[f32],
+    sampled_token: u32,
+    top_k: usize,
+) -> Option<TokenLogprob> {
+    if logits_f32.is_empty() {
+        return None;
+    }
+
+    let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
+    let log_sum_exp = max_val + sum_exp.ln();
+
+    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
+
+    let k = top_k.min(logits_f32.len());
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+    if k > 0 {
+        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (idx, &val) in logits_f32.iter().enumerate() {
+            if best.len() < k || val > best.last().unwrap().1 {
+                let pos = best.partition_point(|&(_, v)| v > val);
+                best.insert(pos, (idx as u32, val));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+        }
+        for (idx, val) in best {
+            top.push((idx, val - log_sum_exp));
+        }
+    }
+
+    Some(TokenLogprob {
+        logprob: sampled_logprob,
+        top_logprobs: top,
+    })
 }

@@ -18,7 +18,9 @@ use crate::server_engine::{
     FinishReason, StreamDelta, Usage, truncate_at_first_stop, truncate_at_stop,
 };
 use crate::tokenizer::Tokenizer;
-use openai_v1::{CompletionRequest, CompletionResponse, StreamChunk, StreamUsageChunk};
+use openai_v1::{
+    CompletionRequest, CompletionResponse, LogprobsResponse, StreamChunk, StreamUsageChunk,
+};
 
 struct AppState {
     handle: SchedulerHandle,
@@ -43,6 +45,8 @@ async fn completions(
     let requested_model = req.model.clone();
     let loaded_model = state.model_id.clone();
     let prompt_len = req.prompt.len();
+    let logprobs_n = req.logprobs.unwrap_or(0);
+    let echo = req.echo.unwrap_or(false);
 
     if req.prompt.trim().is_empty() {
         warn!("Rejecting empty prompt request");
@@ -88,6 +92,8 @@ async fn completions(
             params: sampling,
             max_tokens,
             token_tx,
+            logprobs: logprobs_n,
+            echo,
         })
         .map_err(|_| {
             error!("Scheduler thread has exited");
@@ -105,7 +111,15 @@ async fn completions(
         )
         .into_response())
     } else {
-        handle_non_streaming(state, token_rx, req.stop, prompt_token_count, loaded_model).await
+        handle_non_streaming(
+            state,
+            token_rx,
+            req.stop,
+            prompt_token_count,
+            loaded_model,
+            logprobs_n,
+        )
+        .await
     }
 }
 
@@ -117,17 +131,28 @@ async fn handle_non_streaming(
     stop: Option<Vec<String>>,
     prompt_token_count: usize,
     loaded_model: String,
+    logprobs_requested: usize,
 ) -> Result<Response, StatusCode> {
     let request_start = Instant::now();
 
-    // Collect all tokens
-    let mut token_ids = Vec::new();
+    // Collect all tokens and logprobs
+    let mut all_token_ids: Vec<u32> = Vec::new();
+    let mut all_logprobs: Vec<Option<crate::server_engine::TokenLogprob>> = Vec::new();
+    let mut prompt_token_ids: Vec<u32> = Vec::new();
+    let mut prompt_logprobs: Vec<Option<crate::server_engine::TokenLogprob>> = Vec::new();
     let mut finish_reason = FinishReason::Stop;
     let mut completion_tokens = 0;
 
     while let Some(event) = token_rx.recv().await {
         match event {
-            TokenEvent::Token(id) => token_ids.push(id),
+            TokenEvent::Token { id, logprob } => {
+                all_token_ids.push(id);
+                all_logprobs.push(logprob);
+            }
+            TokenEvent::PromptTokens { ids, logprobs } => {
+                prompt_token_ids = ids;
+                prompt_logprobs = logprobs;
+            }
             TokenEvent::Finished {
                 finish_reason: fr,
                 completion_tokens: ct,
@@ -140,20 +165,24 @@ async fn handle_non_streaming(
         }
     }
 
-    // Channel closed without Finished → scheduler error
-    if completion_tokens == 0 && token_ids.is_empty() && finish_reason == FinishReason::Stop {
-        // Could be immediate EOS (0 tokens, Stop) or an error.
-        // If we got no tokens and no Finished event, it's an error.
-        // But if we got a Finished event with 0 tokens, it's valid (immediate EOS).
-        // The loop above breaks on Finished, so if we reach here without
-        // finish info and no tokens, it means the channel closed unexpectedly.
-    }
-
-    // Detokenize
-    let mut text = state.tokenizer.decode(&token_ids).map_err(|e| {
+    // Detokenize completion tokens
+    let mut text = state.tokenizer.decode(&all_token_ids).map_err(|e| {
         error!("Detokenization error: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // If echo, prepend prompt text
+    let echo_prefix = if !prompt_token_ids.is_empty() {
+        let prompt_text = state.tokenizer.decode(&prompt_token_ids).map_err(|e| {
+            error!("Prompt detokenization error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let prefix_len = prompt_text.len();
+        text = format!("{prompt_text}{text}");
+        Some(prefix_len)
+    } else {
+        None
+    };
 
     // Stop sequence truncation
     if let Some(ref stops) = stop
@@ -162,6 +191,69 @@ async fn handle_non_streaming(
         text = truncated;
         finish_reason = FinishReason::Stop;
     }
+
+    // Build logprobs response if requested
+    let logprobs_response = if logprobs_requested > 0 {
+        let tokenizer = &state.tokenizer;
+
+        // Combine prompt + completion tokens for the response
+        let mut tokens = Vec::new();
+        let mut token_logprobs = Vec::new();
+        let mut top_logprobs = Vec::new();
+        let mut text_offset = Vec::new();
+        let mut offset = 0usize;
+
+        // Echo prompt tokens
+        for (i, &tid) in prompt_token_ids.iter().enumerate() {
+            let tok_str = tokenizer.decode(&[tid]).unwrap_or_default();
+            text_offset.push(offset);
+            offset += tok_str.len();
+            tokens.push(tok_str);
+            // First prompt token has no logprob
+            let lp = prompt_logprobs.get(i).and_then(|l| l.as_ref());
+            token_logprobs.push(lp.map(|l| l.logprob));
+            top_logprobs.push(lp.map(|l| {
+                l.top_logprobs
+                    .iter()
+                    .map(|&(tid, lp)| {
+                        (tokenizer.decode(&[tid]).unwrap_or_default(), lp)
+                    })
+                    .collect()
+            }));
+        }
+
+        // Completion tokens
+        if let Some(prefix_len) = echo_prefix {
+            offset = prefix_len;
+        } else {
+            offset = 0;
+        }
+        for (i, &tid) in all_token_ids.iter().enumerate() {
+            let tok_str = tokenizer.decode(&[tid]).unwrap_or_default();
+            text_offset.push(offset);
+            offset += tok_str.len();
+            tokens.push(tok_str);
+            let lp = all_logprobs.get(i).and_then(|l| l.as_ref());
+            token_logprobs.push(lp.map(|l| l.logprob));
+            top_logprobs.push(lp.map(|l| {
+                l.top_logprobs
+                    .iter()
+                    .map(|&(tid, lp)| {
+                        (tokenizer.decode(&[tid]).unwrap_or_default(), lp)
+                    })
+                    .collect()
+            }));
+        }
+
+        Some(LogprobsResponse {
+            tokens,
+            token_logprobs,
+            top_logprobs,
+            text_offset,
+        })
+    } else {
+        None
+    };
 
     let total_time = request_start.elapsed();
     info!(
@@ -176,8 +268,14 @@ async fn handle_non_streaming(
         completion_tokens,
         total_tokens: prompt_token_count + completion_tokens,
     };
-    let response =
-        CompletionResponse::from_parts(loaded_model, now_secs(), text, finish_reason, usage);
+    let response = CompletionResponse::from_parts(
+        loaded_model,
+        now_secs(),
+        text,
+        finish_reason,
+        usage,
+        logprobs_response,
+    );
     Ok(Json(response).into_response())
 }
 
@@ -252,7 +350,10 @@ fn streaming_bridge(
 
     loop {
         match token_rx.blocking_recv() {
-            Some(TokenEvent::Token(id)) => {
+            Some(TokenEvent::PromptTokens { .. }) => {
+                // Echo tokens handled in non-streaming; skip in streaming for now
+            }
+            Some(TokenEvent::Token { id, .. }) => {
                 token_count += 1;
                 match decoder.step(id) {
                     Ok(Some(text_delta)) => {
@@ -407,7 +508,14 @@ mod tests {
         tokio::spawn(async move {
             while let Some(req) = submit_rx.recv().await {
                 for &t in &tokens {
-                    if req.token_tx.send(TokenEvent::Token(t)).is_err() {
+                    if req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: t,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }

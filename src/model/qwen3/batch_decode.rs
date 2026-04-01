@@ -425,7 +425,7 @@ mod tests {
 
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
             let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let logits_vec = model.batch_prefill(&prompts, &mut kv_states).unwrap();
+            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_states, false).unwrap();
 
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {

@@ -94,8 +94,7 @@ impl DeviceVec {
         })
     }
 
-    /// Copy to host as f32 (for testing)
-    #[cfg(test)]
+    /// Copy to host as f32.
     pub(crate) fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
         let host_f16 = ctx
             .stream
