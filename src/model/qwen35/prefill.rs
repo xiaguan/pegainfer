@@ -339,7 +339,7 @@ impl Qwen35Model {
                     layout.page_size as i32,
                     seq_len as i32,
                     prefill_plan.batch_size(),
-                    prefill_plan.batch_size(), // padded_batch_size = batch_size for single-req
+                    prefill_plan.num_tiles(),
                     stride_page,
                     sm_scale,
                     self.ctx.stream.cu_stream(),
