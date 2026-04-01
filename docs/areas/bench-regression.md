@@ -1,12 +1,14 @@
 # Benchmark Regression Tracking
 
-> **TL;DR:** One JSON snapshot per model in `bench_snapshots/`, git history is the timeline. `snapshot` generates, `compare` diffs against git. Thresholds: TPOT p50 >2%, TTFT p50 >3%.
+> **TL;DR:** One JSON snapshot per model **per GPU** in `bench_snapshots/{gpu-slug}/`, git history is the timeline. `snapshot` generates (auto-detects GPU), `compare` diffs against git. Thresholds: TPOT p50 >2%, TTFT p50 >3%.
 >
 > **Status:** Active.
 
 ## Concept
 
-Each model has one snapshot file (`bench_snapshots/{model}.json`), always the latest. Git is the history — `git log -p bench_snapshots/` is the timeline. Both `snapshot` and `compare` run inference in-process, no server needed.
+Each model has one snapshot file per GPU (`bench_snapshots/{gpu-slug}/{model}.json`), always the latest. The GPU slug is derived automatically from `nvidia-smi` (e.g. `NVIDIA GeForce RTX 5070 Ti` → `rtx-5070-ti`). Git is the history — `git log -p bench_snapshots/` is the timeline. Both `snapshot` and `compare` run inference in-process, no server needed.
+
+Regressions are only meaningful when comparing the **same GPU** across commits. Cross-GPU differences are expected (e.g. RTX 4090 decode is 10–16% faster than RTX 5070 Ti).
 
 ## Standard Profiles
 
@@ -25,33 +27,33 @@ Prefill prompt length is model-dependent: Qwen3 uses 10000 tokens, Qwen3.5 uses 
 
 ```bash
 cargo run -r --bin bench_serving -- --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
-git add bench_snapshots/qwen3-4b.json
+git add bench_snapshots/rtx-5070-ti/qwen3-4b.json  # path auto-detected from GPU
 git commit -m "chore: establish benchmark baseline for Qwen3-4B"
 ```
 
 ### Before merging a PR
 
 ```bash
-# 1. Generate snapshot
+# 1. Generate snapshot (writes to bench_snapshots/{gpu-slug}/qwen3-4b.json)
 cargo run -r --bin bench_serving -- --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
 
 # 2. Compare against last committed version (exits non-zero if no baseline)
-cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json --baseline HEAD
+cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD
 
 # 3. If clean, commit with the PR
-git add bench_snapshots/qwen3-4b.json
+git add bench_snapshots/rtx-5070-ti/qwen3-4b.json
 ```
 
 Qwen3.5-4B:
 ```bash
 cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B snapshot --warmup 5 --iters 20
-cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3.5-4b.json --baseline HEAD
+cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3.5-4b.json --baseline HEAD
 ```
 
 Compare against older ref:
 ```bash
-cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json --baseline HEAD~5
-cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json --baseline main
+cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD~5
+cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline main
 ```
 
 ## Regression Thresholds
@@ -72,9 +74,10 @@ Thresholds trigger on **p50 only**. The comparison table also shows p99 for manu
 
 ## Snapshot JSON Schema
 
-Filename: model directory name, lowercased (`models/Qwen3.5-4B` → `qwen3.5-4b.json`).
+Filename: `bench_snapshots/{gpu-slug}/{model}.json`. GPU slug is derived from `nvidia-smi` output (strip `NVIDIA GeForce ` prefix, lowercase, spaces to dashes). Model name is the directory basename, lowercased (`models/Qwen3.5-4B` → `qwen3.5-4b.json`).
 
 ```json
+// bench_snapshots/rtx-5070-ti/qwen3-4b.json
 {
   "commit": "117a963",
   "date": "2026-03-30",

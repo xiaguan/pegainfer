@@ -59,7 +59,7 @@ Examples:
   cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
   cargo run -r --bin bench_serving -- --format json --out bench.json request --prompt-len 512 --output-len 64
   cargo run -r --bin bench_serving -- snapshot
-  cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json";
+  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json";
 const REQUEST_EXAMPLES: &str = "\
 Examples:
   cargo run -r --bin bench_serving -- request
@@ -82,8 +82,8 @@ Examples:
   cargo run -r --bin bench_serving -- snapshot --warmup 3 --iters 10";
 const COMPARE_EXAMPLES: &str = "\
 Examples:
-  cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json
-  cargo run -r --bin bench_serving -- compare bench_snapshots/qwen3-4b.json --baseline HEAD~3";
+  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json
+  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD~3";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -1287,6 +1287,22 @@ fn gpu_name() -> String {
     .unwrap_or_else(|| "unknown".into())
 }
 
+/// Produce a filesystem-safe slug from the GPU name.
+///
+/// `"NVIDIA GeForce RTX 5070 Ti"` → `"rtx-5070-ti"`
+fn gpu_slug() -> String {
+    let name = gpu_name();
+    let stripped = name
+        .strip_prefix("NVIDIA GeForce ")
+        .or_else(|| name.strip_prefix("NVIDIA "))
+        .unwrap_or(&name);
+    stripped
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn today_date() -> String {
     shell_output("date", &["+%Y-%m-%d"]).unwrap_or_else(|| "unknown".into())
 }
@@ -1356,8 +1372,8 @@ fn run_snapshot(
         },
     };
 
-    let dir = Path::new(SNAPSHOT_DIR);
-    fs::create_dir_all(dir)?;
+    let dir = Path::new(SNAPSHOT_DIR).join(gpu_slug());
+    fs::create_dir_all(&dir)?;
     let filename = model_name.to_lowercase();
     let path = dir.join(format!("{filename}.json"));
     fs::write(&path, serde_json::to_string_pretty(&report)?)?;
