@@ -1,0 +1,84 @@
+{
+  "commit": "13b0285",
+  "date": "2026-04-02",
+  "model": "Qwen3-4B",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "prefill_heavy": {
+    "prompt_len": 10000,
+    "output_len": 1,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 520.2133960000001,
+        "p50_ms": 520.390173,
+        "p95_ms": 521.6565330000001,
+        "p99_ms": 521.70916,
+        "max_ms": 521.70916,
+        "samples": 20
+      },
+      "first_decode_step_ms": null,
+      "steady_tpot_ms": null,
+      "e2e_ms": {
+        "avg_ms": 520.2134550000001,
+        "p50_ms": 520.390233,
+        "p95_ms": 521.656593,
+        "p99_ms": 521.709209,
+        "max_ms": 521.709209,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 1,
+        "max": 1,
+        "avg": 1.0,
+        "samples": 20
+      },
+      "request_tok_s": 1.9222878392602423,
+      "decode_tok_s": null
+    }
+  },
+  "decode_heavy": {
+    "prompt_len": 1024,
+    "output_len": 256,
+    "metrics": {
+      "ttft_ms": {
+        "avg_ms": 43.455845,
+        "p50_ms": 43.463565,
+        "p95_ms": 43.493238,
+        "p99_ms": 43.516208,
+        "max_ms": 43.516208,
+        "samples": 20
+      },
+      "first_decode_step_ms": {
+        "avg_ms": 8.437764,
+        "p50_ms": 8.438614000000001,
+        "p95_ms": 8.462657,
+        "p99_ms": 8.472278999999999,
+        "max_ms": 8.472278999999999,
+        "samples": 20
+      },
+      "steady_tpot_ms": {
+        "avg_ms": 8.447372,
+        "p50_ms": 8.457042999999999,
+        "p95_ms": 8.497974000000001,
+        "p99_ms": 8.527998,
+        "max_ms": 8.977585,
+        "samples": 5080
+      },
+      "e2e_ms": {
+        "avg_ms": 2197.526324,
+        "p50_ms": 2197.429002,
+        "p95_ms": 2199.312509,
+        "p99_ms": 2204.9930679999998,
+        "max_ms": 2204.9930679999998,
+        "samples": 20
+      },
+      "generated_tokens": {
+        "min": 256,
+        "max": 256,
+        "avg": 256.0,
+        "samples": 20
+      },
+      "request_tok_s": 116.49462268704404,
+      "decode_tok_s": 118.38053468723295
+    }
+  }
+}
