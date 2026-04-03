@@ -215,9 +215,7 @@ async fn handle_non_streaming(
             top_logprobs.push(lp.map(|l| {
                 l.top_logprobs
                     .iter()
-                    .map(|&(tid, lp)| {
-                        (tokenizer.decode(&[tid]).unwrap_or_default(), lp)
-                    })
+                    .map(|&(tid, lp)| (tokenizer.decode(&[tid]).unwrap_or_default(), lp))
                     .collect()
             }));
         }
@@ -238,9 +236,7 @@ async fn handle_non_streaming(
             top_logprobs.push(lp.map(|l| {
                 l.top_logprobs
                     .iter()
-                    .map(|&(tid, lp)| {
-                        (tokenizer.decode(&[tid]).unwrap_or_default(), lp)
-                    })
+                    .map(|&(tid, lp)| (tokenizer.decode(&[tid]).unwrap_or_default(), lp))
                     .collect()
             }));
         }

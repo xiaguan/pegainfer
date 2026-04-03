@@ -46,7 +46,7 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) gdr_tmp: DeviceVec,
 
     // Metadata
-    pub(crate) token_ids_d: CudaSlice<i32>,
+    pub(crate) token_ids_d: CudaSlice<u32>,
     pub(crate) positions_d: CudaSlice<i32>,
     pub(crate) page_indices_d: CudaSlice<i32>,
     pub(crate) page_indptr_d: CudaSlice<i32>,

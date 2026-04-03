@@ -56,11 +56,10 @@ impl Qwen3Model {
         let hidden_dim = self.config.hidden_size;
 
         // Copy token IDs to GPU
-        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
         let token_ids_gpu = self
             .ctx
             .stream
-            .clone_htod(&token_ids_i32)
+            .clone_htod(token_ids)
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
@@ -267,7 +266,13 @@ impl Qwen3Model {
         hidden: &HiddenStates,
     ) -> Result<HiddenStates> {
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, hidden.seq_len)?;
-        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, self.config.rms_norm_eps, &mut normed);
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
         ops::gemm(&self.ctx, self.output_projection(), &normed)
     }
 

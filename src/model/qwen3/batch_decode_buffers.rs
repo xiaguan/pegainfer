@@ -49,7 +49,7 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) logits: HiddenStates,
 
     // GPU metadata
-    pub(crate) token_ids_d: CudaSlice<i32>,
+    pub(crate) token_ids_d: CudaSlice<u32>,
     pub(crate) positions_d: CudaSlice<i32>,
 
     // Paged attention metadata (concatenated across requests, CSR format)

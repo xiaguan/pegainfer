@@ -181,7 +181,7 @@ fn test_embedding_variants() -> Result<()> {
         4,
     )?;
 
-    let decode_meta = ctx.stream.clone_htod(&[1_i32])?;
+    let decode_meta = ctx.stream.clone_htod(&[1_u32])?;
     let mut decode_out = DeviceVec::zeros(&ctx, 4)?;
     embedding_decode_into(&ctx, &embed, &decode_meta, &mut decode_out)?;
     let decode_host = decode_out.to_host(&ctx)?;
@@ -196,7 +196,7 @@ fn test_embedding_variants() -> Result<()> {
         decode_host[3]
     );
 
-    let token_ids = ctx.stream.clone_htod(&[2_i32, 0_i32])?;
+    let token_ids = ctx.stream.clone_htod(&[2_u32, 0_u32])?;
     let mut batch_out = HiddenStates::zeros(&ctx, 4, 2)?;
     embedding_batch(&ctx, &embed, &token_ids, &mut batch_out)?;
     let batch_host = ctx.stream.clone_dtoh(&batch_out.data)?;

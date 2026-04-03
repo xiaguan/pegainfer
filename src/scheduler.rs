@@ -556,10 +556,7 @@ fn dispatch_decode_tokens(
             to_retire.push(i);
         } else if req
             .token_tx
-            .send(TokenEvent::Token {
-                id: token,
-                logprob,
-            })
+            .send(TokenEvent::Token { id: token, logprob })
             .is_err()
         {
             to_retire.push(i);
