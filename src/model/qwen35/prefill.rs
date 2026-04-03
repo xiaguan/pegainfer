@@ -31,11 +31,10 @@ impl Qwen35Model {
         kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
 
         // Get embeddings for all tokens
-        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
         let token_ids_gpu = self
             .ctx
             .stream
-            .clone_htod(&token_ids_i32)
+            .clone_htod(token_ids)
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
         let hidden_dim = c.hidden_size;

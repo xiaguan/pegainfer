@@ -68,8 +68,8 @@ fn generate_tokens(
             params: SamplingParams::default(),
             max_tokens,
             token_tx,
-                logprobs: 0,
-                echo: false,
+            logprobs: 0,
+            echo: false,
         })
         .expect("submit failed");
 
@@ -77,7 +77,7 @@ fn generate_tokens(
     loop {
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -171,8 +171,8 @@ fn test_e2e_qwen35_scheduler() {
                     params: SamplingParams::default(),
                     max_tokens: case.max_new_tokens,
                     token_tx,
-                        logprobs: 0,
-                        echo: false,
+                    logprobs: 0,
+                    echo: false,
                 })
                 .expect("submit failed");
             receivers.push((case.name.clone(), token_rx));
@@ -207,8 +207,8 @@ fn test_e2e_qwen35_scheduler() {
                 params: SamplingParams::default(),
                 max_tokens: 10,
                 token_tx,
-                    logprobs: 0,
-                    echo: false,
+                logprobs: 0,
+                echo: false,
             })
             .expect("submit failed");
         std::thread::sleep(std::time::Duration::from_millis(500));

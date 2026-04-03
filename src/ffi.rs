@@ -63,7 +63,7 @@ unsafe extern "C" {
 
     pub(crate) fn embedding_batched_cuda(
         embed: *const Half,
-        token_ids: *const i32,
+        token_ids: *const u32,
         out: *mut Half,
         hidden_size: i32,
         seq_len: i32,
@@ -115,7 +115,7 @@ unsafe extern "C" {
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub(crate) fn embedding_decode_cuda(
         embed: *const Half,
-        decode_meta: *const i32,
+        token_id: *const u32,
         out: *mut Half,
         hidden_size: i32,
         stream: CUstream,

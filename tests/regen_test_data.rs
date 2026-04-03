@@ -125,8 +125,8 @@ fn generate_text_scheduler(
             params: SamplingParams::default(),
             max_tokens,
             token_tx,
-                logprobs: 0,
-                echo: false,
+            logprobs: 0,
+            echo: false,
         })
         .expect("submit failed");
 
@@ -134,7 +134,7 @@ fn generate_text_scheduler(
     loop {
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
             None => panic!("scheduler closed"),
         }

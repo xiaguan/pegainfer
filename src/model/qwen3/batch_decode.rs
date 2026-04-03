@@ -77,13 +77,13 @@ impl Qwen3Model {
         bufs.set_batch_size(padded_bs);
 
         // Sync metadata to GPU (pad token_ids/positions with 0 for padding slots)
-        let mut token_ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-        token_ids_i32.resize(padded_bs, 0);
+        let mut token_ids_padded = token_ids.to_vec();
+        token_ids_padded.resize(padded_bs, 0);
         positions.resize(padded_bs, 0);
 
         self.ctx
             .stream
-            .memcpy_htod(&token_ids_i32, &mut bufs.token_ids_d)?;
+            .memcpy_htod(&token_ids_padded, &mut bufs.token_ids_d)?;
         self.ctx
             .stream
             .memcpy_htod(&positions, &mut bufs.positions_d)?;
@@ -425,7 +425,9 @@ mod tests {
 
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
             let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_states, false).unwrap();
+            let (logits_vec, _) = model
+                .batch_prefill(&prompts, &mut kv_states, false)
+                .unwrap();
 
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {

@@ -7,7 +7,7 @@ use pegainfer::sampler::SamplingParams;
 use pegainfer::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use super::common::{
-    BATCH_SEQ_LEN, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta, embedding_matrix,
+    BATCH_SEQ_LEN, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_token_id, embedding_matrix,
     iter_sync, token_ids,
 };
 
@@ -23,10 +23,9 @@ pub(crate) fn bench_embedding_sampling_ops(c: &mut Criterion) {
         let token_id = 17_u32;
         let mut embed_out =
             DeviceVec::zeros(&ctx, VECTOR_DIM).expect("failed to allocate embedding out");
-        let decode_meta =
-            decode_meta(&ctx, token_id as i32, 0, 1).expect("failed to allocate decode meta");
+        let decode_token = decode_token_id(&ctx, token_id).expect("failed to allocate token id");
         iter_sync(b, &ctx, || {
-            ops::embedding_decode_into(&ctx, &embed, &decode_meta, &mut embed_out)
+            ops::embedding_decode_into(&ctx, &embed, &decode_token, &mut embed_out)
                 .expect("embedding_decode_into failed");
         });
     });

@@ -158,23 +158,18 @@ pub(crate) fn token_ids(
     ctx: &DeviceContext,
     seq_len: usize,
     vocab_size: usize,
-) -> Result<CudaSlice<i32>> {
-    let host: Vec<i32> = (0..seq_len)
-        .map(|idx| (idx % vocab_size.max(1)) as i32)
+) -> Result<CudaSlice<u32>> {
+    let host: Vec<u32> = (0..seq_len)
+        .map(|idx| (idx % vocab_size.max(1)) as u32)
         .collect();
     ctx.stream
         .clone_htod(&host)
         .map_err(|e| anyhow!("H2D copy failed: {}", e))
 }
 
-pub(crate) fn decode_meta(
-    ctx: &DeviceContext,
-    token_id: i32,
-    current_pos: usize,
-    seq_len: usize,
-) -> Result<CudaSlice<i32>> {
+pub(crate) fn decode_token_id(ctx: &DeviceContext, token_id: u32) -> Result<CudaSlice<u32>> {
     ctx.stream
-        .clone_htod(&[token_id, current_pos as i32, seq_len as i32])
+        .clone_htod(&[token_id])
         .map_err(|e| anyhow!("H2D copy failed: {}", e))
 }
 

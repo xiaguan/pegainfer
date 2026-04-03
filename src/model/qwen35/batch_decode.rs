@@ -156,12 +156,12 @@ impl Qwen35Model {
         graph_state.buffers.set_batch_size(padded_bs);
 
         // H2D: token_ids and positions — zero-padded to bucket size.
-        let mut token_ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-        token_ids_i32.resize(padded_bs, 0);
+        let mut token_ids_padded = token_ids.to_vec();
+        token_ids_padded.resize(padded_bs, 0);
         positions.resize(padded_bs, 0);
         self.ctx
             .stream
-            .memcpy_htod(&token_ids_i32, &mut graph_state.buffers.token_ids_d)?;
+            .memcpy_htod(&token_ids_padded, &mut graph_state.buffers.token_ids_d)?;
         self.ctx
             .stream
             .memcpy_htod(&positions, &mut graph_state.buffers.positions_d)?;

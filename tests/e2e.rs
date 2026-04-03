@@ -80,8 +80,8 @@ fn generate_tokens(
             params: SamplingParams::default(), // greedy
             max_tokens,
             token_tx,
-                logprobs: 0,
-                echo: false,
+            logprobs: 0,
+            echo: false,
         })
         .expect("submit failed");
 
@@ -90,7 +90,7 @@ fn generate_tokens(
     loop {
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -198,8 +198,8 @@ fn test_e2e_generation() {
                 params: SamplingParams::default(),
                 max_tokens: 10,
                 token_tx,
-                    logprobs: 0,
-                    echo: false,
+                logprobs: 0,
+                echo: false,
             })
             .expect("submit failed");
         // Give scheduler time to process and retire

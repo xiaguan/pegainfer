@@ -43,19 +43,19 @@ __global__ void silu_mul_kernel(
 
 // ============================================================================
 // Embedding lookup: out = embed[token_id, :]
-// Reads token_id from decode_meta[0] (CUDA Graph safe).
+// Reads token_id from token_id[0] (CUDA Graph safe).
 // ============================================================================
 
 __global__ void embedding_decode_kernel(
     const __nv_bfloat16 *__restrict__ embed,
-    const int *__restrict__ decode_meta,
+    const uint32_t *__restrict__ token_id,
     __nv_bfloat16 *__restrict__ out,
     int hidden_size) {
-  int token_id = __ldg(&decode_meta[0]);
+  uint32_t token_idx = __ldg(&token_id[0]);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
        idx < hidden_size;
        idx += gridDim.x * blockDim.x) {
-    out[idx] = embed[(size_t)token_id * hidden_size + idx];
+    out[idx] = embed[(size_t)token_idx * hidden_size + idx];
   }
 }
 
@@ -66,7 +66,7 @@ __global__ void embedding_decode_kernel(
 
 __global__ void embedding_batched_kernel(
     const __nv_bfloat16 *__restrict__ embed,
-    const int *__restrict__ token_ids,
+    const uint32_t *__restrict__ token_ids,
     __nv_bfloat16 *__restrict__ out,
     int hidden_size, int seq_len) {
   int total = hidden_size * seq_len;
@@ -75,7 +75,7 @@ __global__ void embedding_batched_kernel(
        idx += gridDim.x * blockDim.x) {
     int token_offset = idx / hidden_size;
     int dim_offset = idx % hidden_size;
-    int token_id = token_ids[token_offset];
+    uint32_t token_id = token_ids[token_offset];
     out[idx] = embed[(size_t)token_id * hidden_size + dim_offset];
   }
 }
@@ -101,16 +101,16 @@ CUresult silu_mul_triton_aot_cuda(
 }
 
 CUresult embedding_decode_cuda(
-    const __nv_bfloat16 *embed, const int *decode_meta,
+    const __nv_bfloat16 *embed, const uint32_t *token_id,
     __nv_bfloat16 *out, int hidden_size, cudaStream_t stream) {
   int block = 256;
   int grid = (hidden_size + block - 1) / block;
-  embedding_decode_kernel<<<grid, block, 0, stream>>>(embed, decode_meta, out, hidden_size);
+  embedding_decode_kernel<<<grid, block, 0, stream>>>(embed, token_id, out, hidden_size);
   return (CUresult)cudaGetLastError();
 }
 
 CUresult embedding_batched_cuda(
-    const __nv_bfloat16 *embed, const int *token_ids,
+    const __nv_bfloat16 *embed, const uint32_t *token_ids,
     __nv_bfloat16 *out, int hidden_size, int seq_len, cudaStream_t stream) {
   int total = hidden_size * seq_len;
   int block = 256;
