@@ -72,23 +72,25 @@ unsafe extern "C" {
 
     pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
 
-    pub(crate) fn argmax_batched_cuda(
-        x: *const Half,
-        out: *mut i32,
+    pub(crate) fn flashinfer_top1_cuda(
+        logits: *const Half,
+        top1_value_scratch: *mut Half,
+        row_states_scratch: *mut u8,
+        output: *mut i32,
         vocab_size: i32,
-        batch_size: i32,
         stream: CUstream,
     );
 
-    pub(crate) fn gpu_sample_cuda(
+    pub(crate) fn gpu_sample_flashinfer_cuda(
         logits: *const Half,
         probs_scratch: *mut f32,
+        valid_scratch: *mut u8,
         output: *mut i32,
         vocab_size: i32,
         inv_temperature: f32,
         top_k: i32,
         top_p: f32,
-        random_val: f32,
+        seed: u64,
         stream: CUstream,
     );
 

@@ -540,7 +540,11 @@ fn main() {
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
         // Files that include FlashInfer headers (C++17, header-only)
-        if stem == "paged_attention" || stem == "flashinfer_norm" {
+        if stem == "paged_attention"
+            || stem == "flashinfer_norm"
+            || stem == "flashinfer_sampling"
+            || stem == "flashinfer_top1"
+        {
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "-I".to_string(),

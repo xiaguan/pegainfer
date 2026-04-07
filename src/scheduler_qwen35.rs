@@ -45,6 +45,9 @@ struct ActiveRequest35 {
 /// Scratch buffers for GPU sampling (reused across prefill sampling).
 struct SampleScratch {
     probs: cudarc::driver::CudaSlice<f32>,
+    top1_value: cudarc::driver::CudaSlice<half::bf16>,
+    row_states: cudarc::driver::CudaSlice<u8>,
+    valid: cudarc::driver::CudaSlice<u8>,
     out: cudarc::driver::CudaSlice<i32>,
 }
 
@@ -54,6 +57,11 @@ impl SampleScratch {
         let ctx = model.device_ctx();
         Ok(Self {
             probs: ctx.stream.alloc_zeros(vocab_size)?,
+            top1_value: ctx.stream.alloc_zeros(1)?,
+            row_states: ctx
+                .stream
+                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
+            valid: ctx.stream.alloc_zeros(1)?,
             out: ctx.stream.alloc_zeros(1)?,
         })
     }
@@ -650,6 +658,9 @@ fn sample_from_logits(
         model.device_ctx(),
         logits,
         &mut scratch.probs,
+        &mut scratch.top1_value,
+        &mut scratch.row_states,
+        &mut scratch.valid,
         &mut scratch.out,
         params,
         random_val,

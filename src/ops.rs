@@ -19,7 +19,7 @@ pub use norm::{
     fused_add_rms_norm_into, rms_norm_batch_offset_into, rms_norm_into, rms_norm_offset_into,
 };
 pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
-pub use sampling::{argmax, argmax_batched, gpu_sample, gpu_sample_into};
+pub use sampling::{argmax, flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into};
 
 // pub(crate) re-exports
 pub(crate) use attention::{
