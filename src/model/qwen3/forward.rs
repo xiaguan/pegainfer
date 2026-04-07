@@ -21,6 +21,12 @@ pub struct Qwen3State {
     logits: Option<DeviceVec>,
     /// FP32 scratch buffer for GPU sampling softmax (vocab_size).
     sample_probs: CudaSlice<f32>,
+    /// One-element scratch for FlashInfer top-1 selection.
+    sample_top1_value: CudaSlice<half::bf16>,
+    /// Row-state scratch for FlashInfer radix top-k helpers.
+    sample_row_states: CudaSlice<u8>,
+    /// Per-request validity scratch used by FlashInfer sampling.
+    sample_valid: CudaSlice<u8>,
     /// Pre-allocated sampling output (1 element).
     sample_out: CudaSlice<i32>,
 }
@@ -38,6 +44,18 @@ impl Qwen3State {
                 .stream
                 .alloc_zeros(vocab_size)
                 .map_err(|e| anyhow::anyhow!("Alloc sample_probs failed: {e}"))?,
+            sample_top1_value: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc sample_top1_value failed: {e}"))?,
+            sample_row_states: ctx
+                .stream
+                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+                .map_err(|e| anyhow::anyhow!("Alloc sample_row_states failed: {e}"))?,
+            sample_valid: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc sample_valid failed: {e}"))?,
             sample_out: ctx
                 .stream
                 .alloc_zeros(1)
@@ -86,6 +104,9 @@ impl ModelForward for Qwen3Model {
             &self.ctx,
             logits,
             &mut state.sample_probs,
+            &mut state.sample_top1_value,
+            &mut state.sample_row_states,
+            &mut state.sample_valid,
             &mut state.sample_out,
             params,
             random_val,

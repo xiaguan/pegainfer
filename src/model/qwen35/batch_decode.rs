@@ -20,10 +20,6 @@ impl Qwen35Model {
     ) -> Result<Vec<u32>> {
         let batch_size = params.len();
 
-        if params.iter().all(|p| p.is_greedy()) {
-            return ops::argmax_batched(&self.ctx, &bufs.logits, &mut bufs.sample_out, batch_size);
-        }
-
         let mut tokens = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
@@ -32,6 +28,9 @@ impl Qwen35Model {
                 &self.ctx,
                 &logits_i,
                 &mut bufs.sample_probs,
+                &mut bufs.sample_top1_value,
+                &mut bufs.sample_row_states,
+                &mut bufs.sample_valid,
                 &mut bufs.sample_out,
                 params[i],
                 random_val,

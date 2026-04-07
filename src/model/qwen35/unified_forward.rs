@@ -129,10 +129,26 @@ mod tests {
             .stream
             .alloc_zeros(model.config.vocab_size)
             .unwrap();
+        let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
+            model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut row_states: cudarc::driver::CudaSlice<u8> = model
+            .ctx
+            .stream
+            .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+            .unwrap();
+        let mut valid: cudarc::driver::CudaSlice<u8> = model.ctx.stream.alloc_zeros(1).unwrap();
         let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
         let random_val: f32 = rand::RngExt::random(rng);
         crate::ops::gpu_sample_into(
-            &model.ctx, logits, &mut probs, &mut out, &params, random_val,
+            &model.ctx,
+            logits,
+            &mut probs,
+            &mut top1_value,
+            &mut row_states,
+            &mut valid,
+            &mut out,
+            &params,
+            random_val,
         )
         .unwrap()
     }

@@ -237,6 +237,14 @@ fn test_gpu_sample() -> Result<()> {
         .stream
         .alloc_zeros(5)
         .map_err(|e| anyhow!("Alloc failed: {}", e))?;
+    let mut top1_value: CudaSlice<half::bf16> = ctx
+        .stream
+        .alloc_zeros(1)
+        .map_err(|e| anyhow!("Alloc failed: {}", e))?;
+    let mut row_states: CudaSlice<u8> = ctx
+        .stream
+        .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+        .map_err(|e| anyhow!("Alloc failed: {}", e))?;
 
     // Test 1: With very low temperature (near-greedy), should pick token 2
     let params = crate::sampler::SamplingParams {
@@ -245,19 +253,35 @@ fn test_gpu_sample() -> Result<()> {
         top_p: 1.0,
         ..Default::default()
     };
-    let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.5)?;
+    let token = gpu_sample(
+        &ctx,
+        &logits,
+        &mut probs,
+        &mut top1_value,
+        &mut row_states,
+        &params,
+        0.5,
+    )?;
     assert_eq!(token, 2, "near-greedy should pick index 2 (highest logit)");
 
-    // Test 2: With high temperature, random_val=0.0 should pick first nonzero token
+    // Test 2: Pure temperature sampling stays valid after switching to the
+    // FlashInfer backend. Exact RNG semantics differ from the legacy kernel.
     let params = crate::sampler::SamplingParams {
         temperature: 1.0,
         top_k: -1,
         top_p: 1.0,
         ..Default::default()
     };
-    let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.0)?;
-    // random_val=0.0 should pick the first token (index 0)
-    assert_eq!(token, 0, "random_val=0.0 should pick first token");
+    let token = gpu_sample(
+        &ctx,
+        &logits,
+        &mut probs,
+        &mut top1_value,
+        &mut row_states,
+        &params,
+        0.0,
+    )?;
+    assert!(token < 5, "sampled token should stay in bounds");
 
     // Test 3: top_k=1 should always pick the highest
     let params = crate::sampler::SamplingParams {
@@ -266,7 +290,15 @@ fn test_gpu_sample() -> Result<()> {
         top_p: 1.0,
         ..Default::default()
     };
-    let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.5)?;
+    let token = gpu_sample(
+        &ctx,
+        &logits,
+        &mut probs,
+        &mut top1_value,
+        &mut row_states,
+        &params,
+        0.5,
+    )?;
     assert_eq!(token, 2, "top_k=1 should pick highest probability token");
 
     Ok(())
