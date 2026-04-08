@@ -359,6 +359,10 @@ impl Qwen35Model {
     pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
         self.kv_pool.alloc()
     }
+
+    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
+        &self.kv_pool
+    }
     /// Create a CUDA Graph batch decode state with a custom slot capacity.
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
