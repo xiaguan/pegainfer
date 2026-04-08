@@ -275,6 +275,10 @@ impl Qwen3Model {
         self.kv_pool.alloc()
     }
 
+    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
+        &self.kv_pool
+    }
+
     /// Create pre-allocated batch decode buffers.
     pub(crate) fn create_batch_decode_bufs(
         &self,

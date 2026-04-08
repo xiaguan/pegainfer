@@ -146,30 +146,53 @@ fn scheduler_loop(
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest> = Vec::new();
+    // Requests that could not be admitted due to KV budget pressure.
+    // Held here so they aren't lost; re-evaluated every loop iteration.
+    let mut deferred: Vec<SchedulerRequest> = Vec::new();
 
     info!("Scheduler ready (max_batch={})", bufs.max_batch_size);
 
     loop {
-        // 1. Drain all pending requests
-        let mut pending: Vec<SchedulerRequest> = Vec::new();
+        // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
-            pending.push(req);
+            deferred.push(req);
         }
 
-        // 2. Nothing active and nothing pending → block until a request arrives
-        if active.is_empty() && pending.is_empty() {
+        // 2. Nothing active and nothing deferred → block until a request arrives.
+        if active.is_empty() && deferred.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => pending.push(req),
+                Some(req) => deferred.push(req),
                 None => {
                     info!("Scheduler: all handles dropped, exiting");
                     return;
                 }
             }
-            // Drain any others that arrived while we were blocked
             while let Ok(req) = submit_rx.try_recv() {
-                pending.push(req);
+                deferred.push(req);
             }
         }
+
+        // 3. Admission control: admit deferred requests only if the KV pool
+        //    has enough pages for their prefill, after reserving one page per
+        //    active request for its next decode step.
+        let page_size = model.kv_pool().layout().page_size;
+        let decode_reserve = active.len(); // one page per active request
+        let mut budget = model
+            .kv_pool()
+            .available_pages()
+            .saturating_sub(decode_reserve);
+        let mut pending: Vec<SchedulerRequest> = Vec::new();
+        let mut still_deferred: Vec<SchedulerRequest> = Vec::new();
+        for req in deferred.drain(..) {
+            let needed = req.prompt_tokens.len().div_ceil(page_size);
+            if needed <= budget {
+                budget -= needed;
+                pending.push(req);
+            } else {
+                still_deferred.push(req);
+            }
+        }
+        deferred = still_deferred;
 
         let have_pending = !pending.is_empty();
 

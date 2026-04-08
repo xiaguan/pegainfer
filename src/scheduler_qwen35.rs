@@ -146,10 +146,29 @@ fn scheduler_loop(
             }
         }
 
-        // Cap pending to available slot capacity; defer overflow to next iteration.
-        let available = max_batch.saturating_sub(active.len());
-        if pending.len() > available {
-            deferred = pending.split_off(available);
+        // Admission control: cap by slot capacity AND KV page budget.
+        // Reserve one page per active decode request for its next step.
+        let page_size = model.kv_pool().layout().page_size;
+        let decode_reserve = active.len();
+        let mut page_budget = model
+            .kv_pool()
+            .available_pages()
+            .saturating_sub(decode_reserve);
+        let slot_budget = max_batch.saturating_sub(active.len());
+        let mut admitted = 0;
+        for req in &pending {
+            if admitted >= slot_budget {
+                break;
+            }
+            let needed = req.prompt_tokens.len().div_ceil(page_size);
+            if needed > page_budget {
+                break;
+            }
+            page_budget -= needed;
+            admitted += 1;
+        }
+        if admitted < pending.len() {
+            deferred = pending.split_off(admitted);
         }
 
         let have_pending = !pending.is_empty();
