@@ -587,6 +587,8 @@ However, a few important engineering issues still remain open:
 The next practical steps should be:
 
 - keep the current TP path stable and avoid reopening the earlier decode append bug
+- further unify the `tp=1` and `tp>1` scheduler / executor flow now that both paths are real and runnable
+- defer TP-specific CUDA Graph work until after that runtime shape is cleaner and more stable
 - then revisit vocab-side replication only after the execution and correctness story is stable
 
 So the right reading of the current status is:
@@ -594,6 +596,7 @@ So the right reading of the current status is:
 - the architecture direction is validated
 - the TP path is real and runnable
 - the implementation is still a first-pass runtime bring-up, not the final production shape
+- TP-specific CUDA Graph support should still be treated as follow-up work rather than a solved part of the current baseline
 
 The core bar for this milestone is straightforward:
 

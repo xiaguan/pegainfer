@@ -6,7 +6,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
@@ -78,27 +78,18 @@ async fn main() {
             let tokenizer =
                 Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
             let model_id = pegainfer::server_engine::model_id_from_path(model_path);
-            let handle = if args.tp_size == 1 {
-                let model = Qwen3Model::from_safetensors_with_runtime(
-                    model_path,
-                    ModelRuntimeConfig {
-                        enable_cuda_graph: args.cuda_graph,
-                        tensor_parallel: None,
-                        device_ordinal: args.device_ordinal,
-                    },
-                )
-                .expect("Failed to load Qwen3 model");
-                pegainfer::scheduler::start(model, 42).expect("Failed to start scheduler")
+            let device_ordinals: Vec<usize> = if args.tp_size == 1 {
+                vec![args.device_ordinal]
             } else {
-                let device_ordinals: Vec<usize> = (0..args.tp_size).collect();
-                pegainfer::scheduler::start_tensor_parallel(
-                    model_path,
-                    args.cuda_graph,
-                    &device_ordinals,
-                    42,
-                )
-                .expect("Failed to start tensor-parallel scheduler")
+                (0..args.tp_size).collect()
             };
+            let handle = pegainfer::scheduler::start_qwen3(
+                model_path,
+                args.cuda_graph,
+                &device_ordinals,
+                42,
+            )
+            .expect("Failed to start Qwen3 scheduler");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis(),);
 

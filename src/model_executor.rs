@@ -162,9 +162,13 @@ impl<'a> SingleDecodeStep<'a> {
         (0..self.batch_size)
             .map(|i| {
                 if requested_topk[i] > 0 {
-                    ops::extract_vec(self.executor.device_ctx(), &self.executor.bufs.logits, i)
-                        .ok()
-                        .and_then(|v| v.to_host(self.executor.device_ctx()).ok())
+                    ops::extract_vec(
+                        self.executor.device_ctx(),
+                        &self.executor.lane.decode_bufs().logits,
+                        i,
+                    )
+                    .ok()
+                    .and_then(|v| v.to_host(self.executor.device_ctx()).ok())
                 } else {
                     None
                 }
@@ -173,9 +177,7 @@ impl<'a> SingleDecodeStep<'a> {
     }
 
     fn sample_tokens(self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
-        self.executor
-            .model
-            .select_tokens_batch_varied(&mut self.executor.bufs, params, rng)
+        self.executor.lane.select_tokens(params, rng)
     }
 }
 
@@ -191,7 +193,7 @@ impl<'a> TensorParallelDecodeStep<'a> {
                 if requested_topk[i] > 0 {
                     ops::extract_vec(
                         self.executor.primary_device_ctx(),
-                        &self.executor.primary_bufs().logits,
+                        &self.executor.primary_lane.decode_bufs().logits,
                         i,
                     )
                     .ok()
@@ -204,10 +206,7 @@ impl<'a> TensorParallelDecodeStep<'a> {
     }
 
     fn sample_tokens(self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
-        let executor = self.executor;
-        let model = &executor.primary_model;
-        let bufs = &mut executor.primary_bufs;
-        model.select_tokens_batch_varied(bufs, params, rng)
+        self.executor.primary_lane.select_tokens(params, rng)
     }
 }
 
@@ -234,16 +233,32 @@ impl Qwen3Executor {
         Ok(Self::Single(SingleGpuQwen3Executor::new(model)?))
     }
 
-    pub(crate) fn tensor_parallel(
+    pub(crate) fn from_runtime(
         model_path: &str,
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
     ) -> Result<Self> {
-        Ok(Self::TensorParallel(TensorParallelQwen3Executor::new(
-            model_path,
-            enable_cuda_graph,
-            device_ordinals,
-        )?))
+        anyhow::ensure!(
+            !device_ordinals.is_empty(),
+            "Qwen3 executor requires at least one device"
+        );
+        if device_ordinals.len() == 1 {
+            let model = Qwen3Model::from_safetensors_with_runtime(
+                model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph,
+                    tensor_parallel: None,
+                    device_ordinal: device_ordinals[0],
+                },
+            )?;
+            Self::single(model)
+        } else {
+            Ok(Self::TensorParallel(TensorParallelQwen3Executor::new(
+                model_path,
+                enable_cuda_graph,
+                device_ordinals,
+            )?))
+        }
     }
 }
 
@@ -312,42 +327,117 @@ impl ModelExecutor for Qwen3Executor {
     }
 }
 
-pub(crate) struct SingleGpuQwen3Executor {
+struct LocalQwen3Lane {
     model: Qwen3Model,
     bufs: BatchDecodeBuffers,
 }
 
-impl SingleGpuQwen3Executor {
+impl LocalQwen3Lane {
     fn new(model: Qwen3Model) -> Result<Self> {
         let max_bucket = *BATCH_BUCKETS.last().unwrap();
         let bufs = model.create_batch_decode_bufs(max_bucket)?;
         Ok(Self { model, bufs })
     }
 
-    fn page_size_inner(&self) -> usize {
-        self.model.kv_pool().layout().page_size
+    fn bind(&self) -> Result<CublasThreadGuard> {
+        bind_model_thread(&self.model)?;
+        Ok(CublasThreadGuard)
     }
 
-    fn available_pages_inner(&self) -> usize {
-        self.model.kv_pool().available_pages()
+    fn alloc_kv(&self) -> KvState {
+        self.model.alloc_kv()
     }
 
-    fn device_ctx_inner(&self) -> &DeviceContext {
+    fn kv_pool(&self) -> &KvPool {
+        self.model.kv_pool()
+    }
+
+    fn device_ctx(&self) -> &DeviceContext {
         self.model.device_ctx()
     }
 
-    fn vocab_size_inner(&self) -> usize {
+    fn vocab_size(&self) -> usize {
         self.model.config().vocab_size
     }
 
-    fn is_stop_token_inner(&self, token_id: u32) -> bool {
+    fn is_stop_token(&self, token_id: u32) -> bool {
         self.model.is_stop_token(token_id)
+    }
+
+    fn decode_bufs(&self) -> &BatchDecodeBuffers {
+        &self.bufs
+    }
+
+    fn select_tokens(&mut self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
+        self.model
+            .select_tokens_batch_varied(&mut self.bufs, params, rng)
+    }
+
+    fn execute_prefill(
+        &mut self,
+        prompts: &[&[u32]],
+        kv_states: &mut [&mut KvState],
+        echo: bool,
+    ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
+        self.model.batch_prefill(prompts, kv_states, echo)
+    }
+
+    fn execute_decode(&mut self, token_ids: &[u32], kv_states: &mut [&mut KvState]) -> Result<()> {
+        self.model
+            .batch_decode(token_ids, kv_states, &mut self.bufs)
+    }
+
+    fn execute_unified(
+        &mut self,
+        prefill_prompts: &[&[u32]],
+        prefill_kv_states: &mut [&mut KvState],
+        decode_tokens: &[u32],
+        decode_kv_states: &mut [&mut KvState],
+    ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+        self.model.unified_step(
+            prefill_prompts,
+            prefill_kv_states,
+            decode_tokens,
+            decode_kv_states,
+        )
+    }
+}
+
+pub(crate) struct SingleGpuQwen3Executor {
+    lane: LocalQwen3Lane,
+}
+
+impl SingleGpuQwen3Executor {
+    fn new(model: Qwen3Model) -> Result<Self> {
+        Ok(Self {
+            lane: LocalQwen3Lane::new(model)?,
+        })
+    }
+
+    fn page_size_inner(&self) -> usize {
+        self.lane.kv_pool().layout().page_size
+    }
+
+    fn available_pages_inner(&self) -> usize {
+        self.lane.kv_pool().available_pages()
+    }
+
+    fn device_ctx_inner(&self) -> &DeviceContext {
+        self.lane.device_ctx()
+    }
+
+    fn vocab_size_inner(&self) -> usize {
+        self.lane.vocab_size()
+    }
+
+    fn is_stop_token_inner(&self, token_id: u32) -> bool {
+        self.lane.is_stop_token(token_id)
     }
 }
 
 impl ModelExecutor for SingleGpuQwen3Executor {
     fn alloc_kv(&self) -> RequestKvState {
-        RequestKvState::new(vec![self.model.alloc_kv()])
+        RequestKvState::new(vec![self.lane.alloc_kv()])
     }
 
     fn page_size(&self) -> usize {
@@ -371,16 +461,15 @@ impl ModelExecutor for SingleGpuQwen3Executor {
     }
 
     fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        bind_model_thread(&self.model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.lane.bind()?;
         let mut local_kv_states: Vec<&mut KvState> = plan
             .kv_states
             .iter_mut()
             .map(|state| state.shard_mut(0))
             .collect();
         let (logits, all_position_logits) =
-            self.model
-                .batch_prefill(plan.prompts, &mut local_kv_states, plan.echo)?;
+            self.lane
+                .execute_prefill(plan.prompts, &mut local_kv_states, plan.echo)?;
         Ok(PrefillResult {
             logits,
             all_position_logits,
@@ -388,15 +477,14 @@ impl ModelExecutor for SingleGpuQwen3Executor {
     }
 
     fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        bind_model_thread(&self.model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.lane.bind()?;
         let mut local_kv_states: Vec<&mut KvState> = plan
             .kv_states
             .iter_mut()
             .map(|state| state.shard_mut(0))
             .collect();
-        self.model
-            .batch_decode(plan.token_ids, &mut local_kv_states, &mut self.bufs)?;
+        self.lane
+            .execute_decode(plan.token_ids, &mut local_kv_states)?;
         Ok(DecodeStep::Single(SingleDecodeStep {
             executor: self,
             batch_size: plan.token_ids.len(),
@@ -404,8 +492,7 @@ impl ModelExecutor for SingleGpuQwen3Executor {
     }
 
     fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        bind_model_thread(&self.model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.lane.bind()?;
         let mut prefill_kv_states: Vec<&mut KvState> = plan
             .prefill_kv_states
             .iter_mut()
@@ -416,7 +503,7 @@ impl ModelExecutor for SingleGpuQwen3Executor {
             .iter_mut()
             .map(|state| state.shard_mut(0))
             .collect();
-        let (prefill_logits, decode_logits) = self.model.unified_step(
+        let (prefill_logits, decode_logits) = self.lane.execute_unified(
             plan.prefill_prompts,
             &mut prefill_kv_states,
             plan.decode_tokens,
@@ -430,8 +517,7 @@ impl ModelExecutor for SingleGpuQwen3Executor {
 }
 
 pub(crate) struct TensorParallelQwen3Executor {
-    primary_model: Qwen3Model,
-    primary_bufs: BatchDecodeBuffers,
+    primary_lane: LocalQwen3Lane,
     kv_pools: Vec<KvPool>,
     workers: Vec<RankWorker>,
 }
@@ -465,36 +551,31 @@ impl TensorParallelQwen3Executor {
             model.attach_tp_comm(comm);
         }
 
-        let max_bucket = *BATCH_BUCKETS.last().unwrap();
-        let mut bufs = Vec::with_capacity(world_size);
-        for model in &models {
-            bufs.push(model.create_batch_decode_bufs(max_bucket)?);
-        }
-
         let kv_pools = models.iter().map(|model| model.kv_pool().clone()).collect();
-        let primary_model = models.remove(0);
-        let primary_bufs = bufs.remove(0);
-        let workers = models
+        let mut lanes = models
             .into_iter()
-            .zip(bufs)
+            .map(LocalQwen3Lane::new)
+            .collect::<Result<Vec<_>>>()?;
+        let primary_lane = lanes.remove(0);
+        let workers = lanes
+            .into_iter()
             .enumerate()
-            .map(|(index, (model, bufs))| RankWorker::spawn(index + 1, model, bufs))
+            .map(|(index, lane)| RankWorker::spawn(index + 1, lane))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            primary_model,
-            primary_bufs,
+            primary_lane,
             kv_pools,
             workers,
         })
     }
 
-    fn primary_model(&self) -> &Qwen3Model {
-        &self.primary_model
+    fn tp_size(&self) -> usize {
+        self.kv_pools.len()
     }
 
-    fn primary_bufs(&self) -> &BatchDecodeBuffers {
-        &self.primary_bufs
+    fn primary_model(&self) -> &Qwen3Model {
+        &self.primary_lane.model
     }
 
     fn primary_device_ctx(&self) -> &DeviceContext {
@@ -524,6 +605,98 @@ impl TensorParallelQwen3Executor {
     fn is_stop_token_inner(&self, token_id: u32) -> bool {
         self.primary_model().is_stop_token(token_id)
     }
+
+    fn shard_kv_ptrs(&self, kv_states: &mut [RequestKvState]) -> Vec<Vec<KvStatePtr>> {
+        let tp_size = self.tp_size();
+        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
+            .map(|_| Vec::with_capacity(kv_states.len()))
+            .collect();
+        for kv_state in kv_states.iter_mut() {
+            for (rank, rank_kvs) in kv_by_rank.iter_mut().enumerate() {
+                rank_kvs.push(kv_state.shard_ptr(rank));
+            }
+        }
+        kv_by_rank
+    }
+
+    fn shard_kv_ptr_refs(&self, kv_states: &mut [&mut RequestKvState]) -> Vec<Vec<KvStatePtr>> {
+        let tp_size = self.tp_size();
+        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
+            .map(|_| Vec::with_capacity(kv_states.len()))
+            .collect();
+        for kv_state in kv_states.iter_mut() {
+            for (rank, rank_kvs) in kv_by_rank.iter_mut().enumerate() {
+                rank_kvs.push(kv_state.shard_ptr(rank));
+            }
+        }
+        kv_by_rank
+    }
+
+    fn wait_for_workers(
+        pending: Vec<mpsc::Receiver<Result<()>>>,
+        op_name: &'static str,
+    ) -> Result<()> {
+        for recv in pending {
+            recv.recv()
+                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??;
+        }
+        Ok(())
+    }
+
+    fn bind_primary(&self) -> Result<CublasThreadGuard> {
+        self.primary_lane.bind()
+    }
+
+    fn dispatch_prefill_workers(
+        &self,
+        prompts: Vec<TokenSlicePtr>,
+        mut kv_by_rank: Vec<Vec<KvStatePtr>>,
+        echo: bool,
+    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(worker.execute_prefill(
+                prompts.clone(),
+                std::mem::take(&mut kv_by_rank[rank + 1]),
+                echo,
+            )?);
+        }
+        Ok(pending)
+    }
+
+    fn dispatch_decode_workers(
+        &self,
+        token_ids: Vec<u32>,
+        mut kv_by_rank: Vec<Vec<KvStatePtr>>,
+    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(
+                worker
+                    .execute_decode(token_ids.clone(), std::mem::take(&mut kv_by_rank[rank + 1]))?,
+            );
+        }
+        Ok(pending)
+    }
+
+    fn dispatch_unified_workers(
+        &self,
+        prefill_prompts: Vec<TokenSlicePtr>,
+        mut prefill_kv_by_rank: Vec<Vec<KvStatePtr>>,
+        decode_tokens: Vec<u32>,
+        mut decode_kv_by_rank: Vec<Vec<KvStatePtr>>,
+    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(worker.execute_unified(
+                prefill_prompts.clone(),
+                std::mem::take(&mut prefill_kv_by_rank[rank + 1]),
+                decode_tokens.clone(),
+                std::mem::take(&mut decode_kv_by_rank[rank + 1]),
+            )?);
+        }
+        Ok(pending)
+    }
 }
 
 impl ModelExecutor for TensorParallelQwen3Executor {
@@ -552,46 +725,26 @@ impl ModelExecutor for TensorParallelQwen3Executor {
     }
 
     fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        let tp_size = self.kv_pools.len();
-        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(plan.kv_states.len()))
-            .collect();
-        for kv_state in plan.kv_states.iter_mut() {
-            for rank in 0..tp_size {
-                kv_by_rank[rank].push(kv_state.shard_ptr(rank));
-            }
-        }
-
+        let mut kv_by_rank = self.shard_kv_ptrs(plan.kv_states);
         let prompts: Vec<TokenSlicePtr> = plan
             .prompts
             .iter()
             .map(|tokens| TokenSlicePtr::from_slice(tokens))
             .collect();
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(worker.execute_prefill(
-                prompts.clone(),
-                std::mem::take(&mut kv_by_rank[rank + 1]),
-                plan.echo,
-            )?);
-        }
+        let pending = self.dispatch_prefill_workers(prompts, kv_by_rank.clone(), plan.echo)?;
 
-        bind_model_thread(&self.primary_model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.bind_primary()?;
         let result = {
             let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
             let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
                 .into_iter()
                 .map(|ptr| unsafe { ptr.as_mut() })
                 .collect();
-            self.primary_model
-                .batch_prefill(plan.prompts, &mut local_kv_states, plan.echo)?
+            self.primary_lane
+                .execute_prefill(plan.prompts, &mut local_kv_states, plan.echo)?
         };
 
-        for recv in pending {
-            recv.recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel prefill worker dropped"))??;
-        }
+        Self::wait_for_workers(pending, "prefill")?;
 
         Ok(PrefillResult {
             logits: result.0,
@@ -600,43 +753,22 @@ impl ModelExecutor for TensorParallelQwen3Executor {
     }
 
     fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        let tp_size = self.kv_pools.len();
-        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(plan.kv_states.len()))
-            .collect();
-        for kv_state in plan.kv_states.iter_mut() {
-            for rank in 0..tp_size {
-                kv_by_rank[rank].push(kv_state.shard_ptr(rank));
-            }
-        }
+        let mut kv_by_rank = self.shard_kv_ptr_refs(plan.kv_states);
         let token_ids = plan.token_ids.to_vec();
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(
-                worker
-                    .execute_decode(token_ids.clone(), std::mem::take(&mut kv_by_rank[rank + 1]))?,
-            );
-        }
+        let pending = self.dispatch_decode_workers(token_ids, kv_by_rank.clone())?;
 
-        bind_model_thread(&self.primary_model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.bind_primary()?;
         {
             let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
             let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
                 .into_iter()
                 .map(|ptr| unsafe { ptr.as_mut() })
                 .collect();
-            self.primary_model.batch_decode(
-                plan.token_ids,
-                &mut local_kv_states,
-                &mut self.primary_bufs,
-            )?;
+            self.primary_lane
+                .execute_decode(plan.token_ids, &mut local_kv_states)?;
         }
 
-        for recv in pending {
-            recv.recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel decode worker dropped"))??;
-        }
+        Self::wait_for_workers(pending, "decode")?;
 
         Ok(DecodeStep::TensorParallel(TensorParallelDecodeStep {
             executor: self,
@@ -645,23 +777,8 @@ impl ModelExecutor for TensorParallelQwen3Executor {
     }
 
     fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        let tp_size = self.kv_pools.len();
-        let mut prefill_kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(plan.prefill_kv_states.len()))
-            .collect();
-        for kv_state in plan.prefill_kv_states.iter_mut() {
-            for rank in 0..tp_size {
-                prefill_kv_by_rank[rank].push(kv_state.shard_ptr(rank));
-            }
-        }
-        let mut decode_kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(plan.decode_kv_states.len()))
-            .collect();
-        for kv_state in plan.decode_kv_states.iter_mut() {
-            for rank in 0..tp_size {
-                decode_kv_by_rank[rank].push(kv_state.shard_ptr(rank));
-            }
-        }
+        let mut prefill_kv_by_rank = self.shard_kv_ptrs(plan.prefill_kv_states);
+        let mut decode_kv_by_rank = self.shard_kv_ptr_refs(plan.decode_kv_states);
 
         let prefill_prompts: Vec<TokenSlicePtr> = plan
             .prefill_prompts
@@ -669,18 +786,14 @@ impl ModelExecutor for TensorParallelQwen3Executor {
             .map(|tokens| TokenSlicePtr::from_slice(tokens))
             .collect();
         let decode_tokens = plan.decode_tokens.to_vec();
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(worker.execute_unified(
-                prefill_prompts.clone(),
-                std::mem::take(&mut prefill_kv_by_rank[rank + 1]),
-                decode_tokens.clone(),
-                std::mem::take(&mut decode_kv_by_rank[rank + 1]),
-            )?);
-        }
+        let pending = self.dispatch_unified_workers(
+            prefill_prompts,
+            prefill_kv_by_rank.clone(),
+            decode_tokens,
+            decode_kv_by_rank.clone(),
+        )?;
 
-        bind_model_thread(&self.primary_model)?;
-        let _cublas_guard = CublasThreadGuard;
+        let _cublas_guard = self.bind_primary()?;
         let result = {
             let prefill_kv_ptrs = std::mem::take(&mut prefill_kv_by_rank[0]);
             let decode_kv_ptrs = std::mem::take(&mut decode_kv_by_rank[0]);
@@ -692,7 +805,7 @@ impl ModelExecutor for TensorParallelQwen3Executor {
                 .into_iter()
                 .map(|ptr| unsafe { ptr.as_mut() })
                 .collect();
-            self.primary_model.unified_step(
+            self.primary_lane.execute_unified(
                 plan.prefill_prompts,
                 &mut prefill_kv_states,
                 plan.decode_tokens,
@@ -700,10 +813,7 @@ impl ModelExecutor for TensorParallelQwen3Executor {
             )?
         };
 
-        for recv in pending {
-            recv.recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel unified worker dropped"))??;
-        }
+        Self::wait_for_workers(pending, "unified")?;
 
         Ok(UnifiedResult {
             prefill_logits: result.0,
@@ -748,13 +858,13 @@ struct RankWorker {
 }
 
 impl RankWorker {
-    fn spawn(rank: usize, model: Qwen3Model, mut bufs: BatchDecodeBuffers) -> Result<Self> {
+    fn spawn(rank: usize, mut lane: LocalQwen3Lane) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
         let handle = thread::Builder::new()
             .name(format!("qwen3-tp-rank-{rank}"))
             .spawn(move || {
-                let startup = bind_model_thread(&model).map(|_| CublasThreadGuard);
+                let startup = lane.bind();
                 match startup {
                     Ok(_guard) => {
                         let _ = startup_tx.send(Ok(()));
@@ -774,8 +884,8 @@ impl RankWorker {
                                         .into_iter()
                                         .map(|ptr| unsafe { ptr.as_mut() })
                                         .collect();
-                                    let result = model
-                                        .batch_prefill(&prompts, &mut kv_states, echo)
+                                    let result = lane
+                                        .execute_prefill(&prompts, &mut kv_states, echo)
                                         .map(|_| ());
                                     let _ = resp.send(result);
                                 }
@@ -788,9 +898,8 @@ impl RankWorker {
                                         .into_iter()
                                         .map(|ptr| unsafe { ptr.as_mut() })
                                         .collect();
-                                    let result = model
-                                        .batch_decode(&token_ids, &mut kv_states, &mut bufs)
-                                        .map(|_| ());
+                                    let result =
+                                        lane.execute_decode(&token_ids, &mut kv_states).map(|_| ());
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::Unified {
@@ -812,8 +921,8 @@ impl RankWorker {
                                         .into_iter()
                                         .map(|ptr| unsafe { ptr.as_mut() })
                                         .collect();
-                                    let result = model
-                                        .unified_step(
+                                    let result = lane
+                                        .execute_unified(
                                             &prefill_prompts,
                                             &mut prefill_kv_states,
                                             &decode_tokens,

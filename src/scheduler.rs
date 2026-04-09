@@ -102,13 +102,13 @@ pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
     start_with_executor(executor, seed)
 }
 
-pub fn start_tensor_parallel(
+pub fn start_qwen3(
     model_path: &str,
     enable_cuda_graph: bool,
     device_ordinals: &[usize],
     seed: u64,
 ) -> Result<SchedulerHandle> {
-    let executor = Qwen3Executor::tensor_parallel(model_path, enable_cuda_graph, device_ordinals)?;
+    let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
     start_with_executor(executor, seed)
 }
 
