@@ -172,18 +172,34 @@ impl Qwen3Model {
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
 
-        // QKV fused projection: one GEMM [q_dim+2*kv_dim, hidden] @ normed → deinterleave
-        ops::gemm_into(
+        // Match prefill numerics: compute Q/K/V via row-sliced GEMMs instead of
+        // fused qkv GEMM + deinterleave. The fused path is mathematically
+        // equivalent but diverges enough under shard-local TP to flip greedy
+        // decode in parity tests.
+        let q_dim = layer.attention.q_dim;
+        let kv_dim = layer.attention.kv_dim;
+        ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
+            0,
+            q_dim,
             &bufs.normed,
-            &mut bufs.qkv_out,
-        );
-        ops::deinterleave_qkv_into(
-            &self.ctx,
-            &bufs.qkv_out,
             &mut bufs.q,
+        );
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.attention.qkv_proj,
+            q_dim,
+            kv_dim,
+            &bufs.normed,
             &mut bufs.k,
+        );
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.attention.qkv_proj,
+            q_dim + kv_dim,
+            kv_dim,
+            &bufs.normed,
             &mut bufs.v,
         );
 
@@ -215,6 +231,7 @@ impl Qwen3Model {
             &bufs.page_indices_d,
             &bufs.page_indptr_d,
             &bufs.last_page_len_d,
+            &bufs.positions_d,
             &bufs.request_indices_d,
             &bufs.kv_tile_indices_d,
             &bufs.kv_chunk_size_d,
@@ -302,7 +319,11 @@ mod tests {
         let mut kv_state = std::mem::replace(&mut state.kv_state, model.kv_pool.alloc());
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
-            &model.config,
+            model.config.hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config.vocab_size,
             1,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),

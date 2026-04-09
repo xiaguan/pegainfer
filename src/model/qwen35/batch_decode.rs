@@ -82,6 +82,7 @@ impl Qwen35Model {
             &bufs.page_indices_d,
             &bufs.page_indptr_d,
             &bufs.last_page_len_d,
+            &bufs.positions_d,
             &bufs.request_indices_d,
             &bufs.kv_tile_indices_d,
             &bufs.kv_chunk_size_d,

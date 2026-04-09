@@ -189,6 +189,14 @@ These issues have now been fixed in the current bring-up implementation:
 - TP worker threads needed explicit per-thread device binding before GPU work
 - request-scoped worker-thread cuBLAS resources needed explicit teardown so repeated TP requests did not accumulate unstable per-thread state
 
+The later TP correctness pass exposed a separate decode-path bug that should be recorded explicitly:
+
+- decode was using a specialized paged KV append path that did not stay aligned with the generic paged scatter semantics used by prefill
+- this caused decode-built KV state to drift from a fresh prefill-built KV state for the same logical prefix
+- the fix was to stop using the decode-only append path and route decode KV writes through the same explicit paged scatter path used elsewhere
+
+That decode-state corruption bug is now fixed. The remaining TP correctness work is narrower than the original bring-up failures.
+
 This means the first-pass TP executor is now correct enough to run end-to-end, but the runtime shape is still more fragile than the eventual target design.
 
 ### First-Pass Validity Constraints
@@ -572,14 +580,13 @@ That means the executor and sharding path are no longer merely `TP=2`-shaped, bu
 
 However, a few important engineering issues still remain open:
 
-- TP-vs-TP=1 correctness has only been smoke-tested so far; it still needs a deliberate comparison path
+- TP-vs-TP=1 exact parity is still not fully settled, but the old decode-state corruption bug is no longer the main blocker
 - embedding and `lm_head` are still replicated by design in this first pass
 - some of the runtime fixes are pragmatic bring-up fixes rather than final abstractions, especially around thread-scoped CUDA runtime / cuBLAS setup and teardown
 
 The next practical steps should be:
 
-- turn the recent long-lived rank-worker implementation into the new baseline and commit it once it is revalidated
-- add a small TP-vs-TP=1 comparison harness for fixed prompts and deterministic decoding
+- keep the current TP path stable and avoid reopening the earlier decode append bug
 - then revisit vocab-side replication only after the execution and correctness story is stable
 
 So the right reading of the current status is:
