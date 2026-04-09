@@ -1,17 +1,17 @@
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 
-// cuBLAS handle management (external linkage — shared with prefill_attention.cu)
-// g_cublas_handle: workspace-free, safe for CUDA Graph capture (decode path).
-// g_cublas_prefill_handle: has 32MB workspace, allows cuBLAS to pick faster algorithms
-// for the 252 GEMMs per prefill. Never used under CUDA Graphs.
-cublasHandle_t g_cublas_handle = nullptr;
-cublasHandle_t g_cublas_prefill_handle = nullptr;
-
-static void *g_cublas_workspace = nullptr;
+// cuBLAS handle management.
+// Make handles thread-local so each TP rank thread can bind a handle to its own
+// CUDA context/device without racing on a process-global singleton.
+thread_local cublasHandle_t g_cublas_handle = nullptr;
+thread_local cublasHandle_t g_cublas_prefill_handle = nullptr;
+thread_local void *g_cublas_workspace = nullptr;
 static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
 
 extern "C" {
+
+int cuda_set_device(int device_ordinal) { return static_cast<int>(cudaSetDevice(device_ordinal)); }
 
 void cublas_init() {
   if (g_cublas_handle == nullptr) {

@@ -69,7 +69,7 @@ impl Qwen3Model {
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
-        prefill_kv_states: &mut [KvState],
+        prefill_kv_states: &mut [&mut KvState],
         decode_tokens: &[u32],
         decode_kv_states: &mut [&mut KvState],
     ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
@@ -127,8 +127,8 @@ impl Qwen3Model {
             &prefill_descs,
             &prefill_start_positions,
             &prefill_seq_lens,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
             self.config.head_dim,
         )?;
 
@@ -198,12 +198,9 @@ impl Qwen3Model {
         layout: &KvLayout,
     ) -> Result<HiddenStates> {
         let total_tokens = total_prefill + num_decode;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
 
         let mut bufs = PrefillBuffers::new(
             &self.ctx,
@@ -249,11 +246,11 @@ impl Qwen3Model {
         layout: &KvLayout,
     ) -> Result<()> {
         let total_tokens = total_prefill + num_decode;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_heads = self.local_num_attention_heads();
+        let num_kv_heads = self.local_num_key_value_heads();
         let head_dim = self.config.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let q_dim = num_heads * head_dim;
+        let kv_dim = self.local_kv_dim();
+        let q_dim = self.local_q_dim();
         let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let k_offset = (layer_idx * layout.layer_stride) as i64;
@@ -516,6 +513,7 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // ── 7+8. Residual add + MLP RMSNorm (fused) ─────────────────
         ops::fused_add_rms_norm_batch_into(
@@ -540,6 +538,7 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // ── 9. Residual add → hidden_out ─────────────────────────────
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;

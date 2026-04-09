@@ -197,8 +197,8 @@ impl Qwen3Model {
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_d,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
             self.config.head_dim,
             eps,
         );
@@ -219,7 +219,7 @@ impl Qwen3Model {
             &bufs.kv_tile_indices_d,
             &bufs.kv_chunk_size_d,
             &mut bufs.attn_out,
-            self.config.num_attention_heads,
+            self.local_num_attention_heads(),
             bs,
         )?;
 
@@ -230,6 +230,7 @@ impl Qwen3Model {
             &bufs.attn_out,
             &mut bufs.attn_proj,
         );
+        self.all_reduce_hidden(&mut bufs.attn_proj)?;
 
         // Residual + LayerNorm
         ops::fused_add_rms_norm_batch_into(
@@ -255,6 +256,7 @@ impl Qwen3Model {
             &bufs.mlp_act,
             &mut bufs.mlp_out,
         );
+        self.all_reduce_hidden(&mut bufs.mlp_out)?;
 
         Ok(())
     }
@@ -356,7 +358,11 @@ mod tests {
         };
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
-            &model.config,
+            model.config.hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config.vocab_size,
             max_bs,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),
@@ -398,6 +404,8 @@ mod tests {
                 &model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph: false,
+                    tensor_parallel: None,
+                    device_ordinal: 0,
                 },
             )
             .unwrap();
@@ -419,9 +427,8 @@ mod tests {
 
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
             let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let (logits_vec, _) = model
-                .batch_prefill(&prompts, &mut kv_states, false)
-                .unwrap();
+            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
 
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {
@@ -493,6 +500,8 @@ mod tests {
                 &model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph: true,
+                    tensor_parallel: None,
+                    device_ordinal: 0,
                 },
             )
             .unwrap();

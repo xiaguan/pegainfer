@@ -143,6 +143,8 @@ unsafe extern "C" {
     );
 
     pub(crate) fn cublas_init();
+    pub(crate) fn cublas_destroy();
+    pub(crate) fn cuda_set_device(device_ordinal: i32) -> i32;
 
     // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
     pub(crate) fn prefill_qk_norm_rope_only_cuda(

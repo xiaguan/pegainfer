@@ -2,7 +2,7 @@
 
 > **TL;DR:** Add `TP=2` support for `Qwen3-4B` as the first model-parallel milestone. The goal is correctness and a clean architectural foundation for larger dense models and future MoE work, not a fully generalized distributed runtime on day one.
 >
-> **Status:** Active. Initial scope definition for the first tensor-parallel milestone.
+> **Status:** Active. `Qwen3-4B` has now been brought up end-to-end with `TP=2` on a single machine, but the implementation still carries first-pass runtime debt.
 
 ## Goal
 
@@ -168,6 +168,26 @@ Per transformer layer, the expected TP collectives are:
 - one `all-reduce` after MLP output projection
 
 No additional collective requirements are introduced by the first-pass embedding / `lm_head` choice.
+
+### Runtime Bring-Up Notes
+
+The first end-to-end `TP=2` bring-up exposed two concrete runtime hazards that are worth recording because they are not obvious from the high-level TP partitioning design alone.
+
+- `cuBLAS` handle and workspace state must not be process-global when TP ranks execute on different GPUs from different threads
+- TP worker threads must explicitly bind both the CUDA runtime device and the driver context before using cuBLAS, FlashInfer, or NCCL
+
+In practice, the initial TP implementation hit:
+
+- an illegal memory access reported later in `paged_kv_scatter_cuda`
+- intermittent hangs after some requests had already succeeded
+
+The root cause was not the scheduler boundary. It was runtime state management:
+
+- `cuBLAS` handles and workspaces needed to become thread-local
+- TP worker threads needed explicit per-thread device binding before GPU work
+- request-scoped worker-thread cuBLAS resources needed explicit teardown so repeated TP requests did not accumulate unstable per-thread state
+
+This means the first-pass TP executor is currently correct enough to run end-to-end, but the runtime shape is still more fragile than the eventual target design.
 
 ### First-Pass Validity Constraints
 
@@ -531,6 +551,27 @@ Primary acceptance criteria:
 - generated outputs under `TP=2` match the `TP=1` baseline for the covered `e2e` cases
 - `TP=1` continues to pass its existing `e2e` coverage
 - runtime stability is acceptable: no hangs, no cross-device state corruption, no obvious lifecycle failures during model load or generation
+
+## Current State And Remaining Issues
+
+At this point, the implementation meets the basic smoke-test bar for `Qwen3-4B TP=2`:
+
+- model load succeeds on two GPUs
+- requests complete end-to-end through the existing OpenAI-compatible HTTP path
+- generated outputs are sensible and clearly non-degenerate
+
+However, a few important engineering issues remain open:
+
+- the current `TensorParallelQwen3Executor` still creates worker threads per step instead of using long-lived rank workers
+- TP correctness has only been smoke-tested so far; it still needs a deliberate TP-vs-TP=1 comparison path
+- embedding and `lm_head` are still replicated by design in this first pass
+- some of the runtime fixes are pragmatic rather than final abstractions, especially around thread-scoped CUDA runtime / cuBLAS setup and teardown
+
+So the right reading of the current status is:
+
+- the architecture direction is validated
+- the TP path is real and runnable
+- the implementation is still a first-pass runtime bring-up, not the final production shape
 
 The core bar for this milestone is straightforward:
 

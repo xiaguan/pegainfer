@@ -18,7 +18,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::model::Qwen3Model;
-use crate::model_executor::SingleGpuQwen3Executor;
+use crate::model_executor::{ModelExecutor, Qwen3Executor, RequestKvState};
 use crate::sampler::SamplingParams;
 use crate::server_engine::{FinishReason, TokenLogprob};
 
@@ -81,7 +81,7 @@ impl SchedulerHandle {
 /// An in-flight request being decoded.
 pub(super) struct ActiveRequestState {
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
-    pub(super) kv: crate::kv_pool::KvState,
+    pub(super) kv: RequestKvState,
     pub(super) last_token: u32,
     pub(super) generated_count: usize,
     pub(super) max_tokens: usize,
@@ -98,8 +98,21 @@ pub(super) struct ActiveRequestState {
 /// The scheduler exclusively owns the request lifecycle and KV allocation state.
 /// No Mutex — only this thread touches the GPU.
 pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
-    let executor = SingleGpuQwen3Executor::new(model)?;
+    let executor = Qwen3Executor::single(model)?;
+    start_with_executor(executor, seed)
+}
 
+pub fn start_tensor_parallel(
+    model_path: &str,
+    enable_cuda_graph: bool,
+    device_ordinals: &[usize],
+    seed: u64,
+) -> Result<SchedulerHandle> {
+    let executor = Qwen3Executor::tensor_parallel(model_path, enable_cuda_graph, device_ordinals)?;
+    start_with_executor(executor, seed)
+}
+
+pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> Result<SchedulerHandle> {
     // Sampling scratch — reused across prefill and unified-step sampling
     let sample_scratch = SampleScratch::new(&executor)?;
 
@@ -118,7 +131,7 @@ pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
 // ── Main loop ───────────────────────────────────────────────────────────
 
 fn scheduler_loop(
-    mut executor: SingleGpuQwen3Executor,
+    mut executor: Qwen3Executor,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     mut sample_scratch: SampleScratch,
     seed: u64,
@@ -154,12 +167,9 @@ fn scheduler_loop(
         // 3. Admission control: admit deferred requests only if the KV pool
         //    has enough pages for their prefill, after reserving one page per
         //    active request for its next decode step.
-        let page_size = executor.kv_pool().layout().page_size;
+        let page_size = executor.page_size();
         let decode_reserve = active.len(); // one page per active request
-        let mut budget = executor
-            .kv_pool()
-            .available_pages()
-            .saturating_sub(decode_reserve);
+        let mut budget = executor.available_pages().saturating_sub(decode_reserve);
         let mut pending: Vec<SchedulerRequest> = Vec::new();
         let mut still_deferred: Vec<SchedulerRequest> = Vec::new();
         for req in deferred.drain(..) {

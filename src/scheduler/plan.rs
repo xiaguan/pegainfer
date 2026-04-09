@@ -1,10 +1,9 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::kv_pool::KvState;
 use crate::model_executor::{
-    DecodePlan, ModelExecutor, PrefillPlan, PrefillResult, SingleGpuQwen3Executor, UnifiedPlan,
-    UnifiedResult,
+    DecodePlan, ModelExecutor, PrefillPlan, PrefillResult, Qwen3Executor, RequestKvState,
+    UnifiedPlan, UnifiedResult,
 };
 use crate::sampler::SamplingParams;
 
@@ -19,7 +18,7 @@ pub(super) enum ExecutionPlan {
 pub(super) enum ExecutionArtifacts {
     Prefill {
         pending: Vec<SchedulerRequest>,
-        kv_states: Vec<KvState>,
+        kv_states: Vec<RequestKvState>,
         result: PrefillResult,
     },
     Decode {
@@ -28,7 +27,7 @@ pub(super) enum ExecutionArtifacts {
     },
     Unified {
         pending: Vec<SchedulerRequest>,
-        prefill_kv_states: Vec<KvState>,
+        prefill_kv_states: Vec<RequestKvState>,
         result: UnifiedResult,
     },
 }
@@ -49,7 +48,7 @@ pub(super) fn build_next_plan(
 }
 
 pub(super) fn execute_plan(
-    executor: &mut SingleGpuQwen3Executor,
+    executor: &mut Qwen3Executor,
     active: &mut [ActiveRequestState],
     plan: ExecutionPlan,
     rng: &mut StdRng,
@@ -57,7 +56,7 @@ pub(super) fn execute_plan(
     match plan {
         ExecutionPlan::Prefill { pending } => {
             let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
-            let mut kv_states: Vec<KvState> =
+            let mut kv_states: Vec<RequestKvState> =
                 (0..pending.len()).map(|_| executor.alloc_kv()).collect();
             let any_echo = pending.iter().any(|r| r.echo);
             let result = executor.execute_prefill(PrefillPlan {
@@ -80,7 +79,8 @@ pub(super) fn execute_plan(
             let params_refs: Vec<&SamplingParams> = params_owned.iter().collect();
 
             let (cpu_logits, tokens) = {
-                let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
+                let mut kv_refs: Vec<&mut RequestKvState> =
+                    active.iter_mut().map(|r| &mut r.kv).collect();
                 let decode_step = executor.begin_decode(DecodePlan {
                     token_ids: &token_ids,
                     kv_states: &mut kv_refs,
@@ -98,10 +98,10 @@ pub(super) fn execute_plan(
         }
         ExecutionPlan::Unified { pending } => {
             let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
-            let mut prefill_kv_states: Vec<KvState> =
+            let mut prefill_kv_states: Vec<RequestKvState> =
                 (0..pending.len()).map(|_| executor.alloc_kv()).collect();
             let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-            let mut decode_kv_refs: Vec<&mut KvState> =
+            let mut decode_kv_refs: Vec<&mut RequestKvState> =
                 active.iter_mut().map(|r| &mut r.kv).collect();
             let result = executor.execute_unified(UnifiedPlan {
                 prefill_prompts: &prompts,

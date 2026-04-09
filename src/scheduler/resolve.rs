@@ -2,7 +2,7 @@ use anyhow::Result;
 use log::warn;
 use rand::rngs::StdRng;
 
-use crate::model_executor::SingleGpuQwen3Executor;
+use crate::model_executor::{ModelExecutor, Qwen3Executor, RequestKvState};
 use crate::sampler::SamplingParams;
 use crate::server_engine::{FinishReason, TokenLogprob};
 use crate::tensor::{DeviceVec, HiddenStates};
@@ -20,7 +20,7 @@ pub(super) struct SampleScratch {
 }
 
 impl SampleScratch {
-    pub(super) fn new(executor: &SingleGpuQwen3Executor) -> Result<Self> {
+    pub(super) fn new(executor: &Qwen3Executor) -> Result<Self> {
         let vocab_size = executor.vocab_size();
         let ctx = executor.device_ctx();
         Ok(Self {
@@ -36,7 +36,7 @@ impl SampleScratch {
 }
 
 pub(super) fn resolve_step(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     active: &[ActiveRequestState],
     artifacts: ExecutionArtifacts,
     scratch: &mut SampleScratch,
@@ -85,9 +85,9 @@ pub(super) fn resolve_step(
 }
 
 fn resolve_prefill_outputs(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     pending: Vec<SchedulerRequest>,
-    kv_states: &mut [crate::kv_pool::KvState],
+    kv_states: &mut [RequestKvState],
     logits_vec: Vec<DeviceVec>,
     all_position_logits: Option<HiddenStates>,
     scratch: &mut SampleScratch,
@@ -200,7 +200,7 @@ fn resolve_prefill_outputs(
 }
 
 fn resolve_decode_outputs(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     active: &[ActiveRequestState],
     cpu_logits: &[Option<Vec<f32>>],
     tokens: &[u32],
@@ -240,7 +240,7 @@ fn resolve_decode_outputs(
 }
 
 fn resolve_decode_logits(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     active: &[ActiveRequestState],
     decode_logits: &[DeviceVec],
     scratch: &mut SampleScratch,
@@ -301,7 +301,7 @@ fn resolve_decode_logits(
 }
 
 fn sample_from_logits(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     logits: &DeviceVec,
     scratch: &mut SampleScratch,
     params: &SamplingParams,
@@ -322,7 +322,7 @@ fn sample_from_logits(
 }
 
 fn extract_logprobs(
-    executor: &SingleGpuQwen3Executor,
+    executor: &Qwen3Executor,
     logits: &DeviceVec,
     sampled_token: u32,
     top_k: usize,
