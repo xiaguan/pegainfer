@@ -69,6 +69,451 @@ Allowed simplifications:
 
 These are first-pass scope controls, not permanent architectural commitments.
 
+## Tensor-Parallel Partitioning Spec
+
+The first `Qwen3-4B` tensor-parallel milestone should follow the mainstream dense-model TP layout used by systems such as vLLM and SGLang:
+
+- attention projections are partitioned by head
+- MLP projections are partitioned by intermediate dimension
+- layer outputs that rejoin the residual stream are reduced across ranks
+- tied embedding / `lm_head` is replicated in the first pass
+
+This is the intended layout for `TP=2`.
+
+### Qwen3-4B Local Dimensions At TP=2
+
+`Qwen3-4B` runtime dimensions:
+
+- `hidden_size = 2560`
+- `num_attention_heads = 32`
+- `num_key_value_heads = 8`
+- `head_dim = 128`
+- `intermediate_size = 9728`
+
+Under `TP=2`, the local dimensions per rank are:
+
+- local query heads: `16`
+- local KV heads: `4`
+- local query projection dim: `16 * 128 = 2048`
+- local KV projection dim: `4 * 128 = 512`
+- local intermediate dim: `9728 / 2 = 4864`
+
+The first pass should explicitly require divisibility for these dimensions. If a model does not divide cleanly across TP ranks, it is out of scope for this milestone.
+
+### Attention Projection Layout
+
+For Qwen3 attention, the fused `qkv_proj` should be partitioned by head-aligned output slices.
+
+Global layout:
+
+- `qkv_proj`: `[q_dim + 2 * kv_dim, hidden_size]`
+- for Qwen3-4B: `[4096 + 1024 + 1024, 2560] = [6144, 2560]`
+
+Local layout at `TP=2`:
+
+- local `q_proj`: `[2048, 2560]`
+- local `k_proj`: `[512, 2560]`
+- local `v_proj`: `[512, 2560]`
+- local fused `qkv_proj`: `[3072, 2560]`
+
+This partitioning is semantic, not just row-chunking by index. Each rank owns a contiguous subset of query heads and KV heads.
+
+### Attention Output Projection Layout
+
+The output projection should follow the standard row-parallel pattern.
+
+- each rank consumes its local attention output
+- each rank produces a partial hidden-state contribution
+- the partial hidden states are combined with an `all-reduce`
+
+The residual stream after this reduction is logically full-width hidden state.
+
+### MLP Projection Layout
+
+The MLP should be partitioned by intermediate dimension.
+
+For Qwen3-4B:
+
+- global `intermediate_size = 9728`
+- local `intermediate_size = 4864` at `TP=2`
+
+Projection layout:
+
+- `gate_up_proj` is column-parallel over intermediate dimension
+- `down_proj` is row-parallel and its outputs are combined with an `all-reduce`
+
+With the current fused MLP layout, each rank owns its local fused gate/up rows:
+
+- global fused `gate_up_proj`: `[2 * 9728, 2560] = [19456, 2560]`
+- local fused `gate_up_proj`: `[2 * 4864, 2560] = [9728, 2560]`
+
+As with attention, the residual stream after the MLP output reduction is logically full-width hidden state.
+
+### Embedding And LM Head
+
+For the first pass:
+
+- token embedding is replicated
+- tied `lm_head` is replicated
+
+This is a deliberate simplification for the initial milestone. It is acceptable because the goal of the first pass is to validate model-parallel execution and establish the TP boundary, not to fully optimize vocab-side memory layout on day one.
+
+### Communication Points
+
+For the first dense TP pass, the communication pattern should stay minimal.
+
+Per transformer layer, the expected TP collectives are:
+
+- one `all-reduce` after attention output projection
+- one `all-reduce` after MLP output projection
+
+No additional collective requirements are introduced by the first-pass embedding / `lm_head` choice.
+
+### First-Pass Validity Constraints
+
+The `Qwen3-4B, TP=2` first pass assumes:
+
+- `num_attention_heads % tp_size == 0`
+- `num_key_value_heads % tp_size == 0`
+- `intermediate_size % tp_size == 0`
+
+These constraints are part of the milestone definition, not an implementation accident.
+
+## ModelExecutor Abstraction
+
+The next architectural step should be extracting a synchronous `ModelExecutor` boundary from the current scheduler-owned execution path.
+
+This is the key abstraction for future model-execution strategies:
+
+- single GPU execution
+- tensor parallel execution
+- later tensor-parallel plus expert-parallel execution
+
+It should be the execution abstraction for one logical model replica. It should not become the abstraction for request queueing, service-layer data parallelism, or cluster orchestration.
+
+### Why This Is The Next Step
+
+The current scheduler owns both:
+
+- control-plane logic such as active/deferred request management, admission control, and token streaming
+- execution-plane logic such as prefill, decode, and unified-step GPU execution
+
+Tensor parallelism changes the execution plane much more than it changes the control plane.
+
+So the right next step is not a new scheduler design. The right next step is to extract the execution plane behind a stable executor interface while keeping the scheduler responsible for request lifecycle, KV allocation, and batching policy.
+
+### Control Plane Versus Execution Plane
+
+The scheduler should remain the control plane.
+
+The scheduler should continue to own:
+
+- request queueing
+- active / deferred request lifecycle
+- admission control
+- `KvPool`
+- KV page allocation and recycling
+- deciding whether the next step is prefill, decode, or unified
+- sampling policy
+- token streaming
+- finish reasons
+- HTTP / API semantics
+
+The executor should become the execution plane.
+
+The executor should own:
+
+- model weights
+- shared execution resources such as decode buffers, graph state, and TP communication state
+- the implementation of batch-level prefill, decode, and unified-step execution
+
+This means the scheduler decides what batch should run next, while the executor decides how to execute that batch on the underlying device topology.
+
+### Request-Owned Versus Executor-Owned State
+
+The scheduler should continue to own request lifecycle state.
+
+Examples:
+
+- KV allocation state
+- page lists or page-table metadata
+- request-local sequence lengths
+- last-token bookkeeping and generation counters
+
+The executor should own shared execution resources.
+
+Examples:
+
+- model weights
+- shared decode buffers
+- CUDA graph state
+- TP communication state
+- rank-local scratch buffers
+
+This split keeps admission control and KV budgeting where they already belong, while still moving model execution out of the scheduler.
+
+### Interface Shape
+
+The interface should be batch-step oriented, not kernel oriented.
+
+The scheduler should build a batch specification for one of the existing runtime step types:
+
+- prefill batch
+- decode batch
+- unified step
+
+The executor should synchronously execute that batch specification and return the outputs needed for scheduler-side post-processing.
+
+The first version should stay synchronous.
+
+The current runtime already serializes GPU ownership through the scheduler thread, and the next architectural goal is to separate responsibilities, not to introduce a second concurrency model.
+
+### Batch Specification
+
+The batch specification should describe one execution step, not a whole request lifecycle.
+
+The important information is:
+
+- which requests participate in the step
+- whether the step is prefill, decode, or unified
+- the input tokens for each request
+- mutable references to request-owned execution state
+- KV page metadata or equivalent scheduler-owned KV views needed by the kernels
+
+This keeps the executor narrow: it consumes one scheduler-chosen batch plan and executes it.
+
+### Three Runtime Boundaries
+
+The point of the next refactor is not to make the scheduler look smaller on paper.
+
+The point is to isolate three different responsibilities that already change independently:
+
+- control-plane step selection
+- model execution
+- step-result resolution back into request lifecycle state
+
+Those responsibilities should be represented by three explicit boundary types.
+
+#### `ExecutionPlan`
+
+`ExecutionPlan` is the boundary between the scheduler and the executor.
+
+Its job is to describe what should run in this step.
+
+It should contain:
+
+- the step kind
+- the participating prefill and decode requests
+- the input tokens or prompt slices for those requests
+- mutable references or views into scheduler-owned request execution state such as `KvState`
+- any per-step ordering or indexing the executor needs
+
+It should not contain:
+
+- finish reasons
+- token streaming semantics
+- HTTP / API semantics
+- admission policy
+- executor-internal resource ownership
+
+Ownership model:
+
+- owned and constructed by the scheduler
+- consumed by the executor
+- valid only for one execution step
+
+#### `ExecutionArtifacts`
+
+`ExecutionArtifacts` is the boundary between the executor and the step-result resolver.
+
+Its job is to describe what the executor produced, before those results are interpreted as request lifecycle outcomes.
+
+Examples:
+
+- prefill logits
+- unified-step prefill and decode logits
+- an executor-owned decode-step view over batched decode buffers
+
+It should contain raw execution products and executor-owned views.
+
+It should not contain:
+
+- finish reasons
+- retirement decisions
+- request promotions
+- token events
+
+Ownership model:
+
+- produced by the executor
+- consumed by a scheduler-local result-resolution layer
+- short-lived, step-scoped
+
+#### `StepEffects`
+
+`StepEffects` is the boundary between the step-result resolver and the scheduler's long-lived request state.
+
+Its job is to describe how this step changes request lifecycle state.
+
+Examples:
+
+- which pending requests become active
+- which active requests retire
+- which token events should be emitted
+- prompt echo payloads
+- finish reasons
+- updates to `last_token` and generation counters
+
+It should contain scheduler-facing state transitions and event payloads.
+
+It should not contain:
+
+- raw executor buffer views
+- CUDA graph state
+- TP communication state
+- executor-owned staging resources
+
+Ownership model:
+
+- produced by the step-result resolver
+- applied by the scheduler
+- step-scoped, but expressed in scheduler terms rather than executor terms
+
+### Why These Boundaries Matter
+
+This is not abstraction for its own sake.
+
+These boundaries isolate three different change vectors:
+
+- batching and admission policy change the scheduler
+- TP and other model-parallel execution strategies change the executor
+- sampling, logprobs, echo, and finish handling change step-result resolution
+
+Without these boundaries, those changes accumulate in the same scheduler functions and the runtime becomes harder to extend in predictable ways.
+
+### Scheduler-Local Result Resolution
+
+Not all logic currently living in the scheduler should move into the executor.
+
+There is a third layer that should remain scheduler-local, but should not stay inline inside the scheduler loop.
+
+That layer is step-result resolution.
+
+It should be responsible for:
+
+- first-token handling after prefill or unified execution
+- decode-token handling after decode or unified execution
+- logprob assembly
+- prompt-echo assembly
+- EOS / max-length / consumer-drop retirement decisions
+- promotion of newly-prefilled requests into the active set
+
+This logic is scheduler policy, not model execution.
+
+So the right direction is:
+
+- keep execution in `ModelExecutor`
+- keep request lifecycle ownership in the scheduler
+- move step-result interpretation into a scheduler-local resolver layer
+
+### Next Refactor Shape
+
+The next step after introducing `ModelExecutor` should be to restructure the scheduler around these boundaries:
+
+1. build an `ExecutionPlan`
+2. execute it to produce `ExecutionArtifacts`
+3. resolve those artifacts into `StepEffects`
+4. apply those effects to scheduler-owned state
+
+Conceptually:
+
+```rust
+loop {
+    let plan = build_next_plan(...);
+    let artifacts = executor.execute(plan)?;
+    let effects = resolve_step(plan, artifacts, ...);
+    apply_effects(effects, ...);
+}
+```
+
+The primary value of this refactor is responsibility isolation, not reducing the line count of `scheduler.rs` by itself.
+
+### Rust Sketch
+
+The following sketch is intentionally narrow. It is meant to capture the boundary, not to freeze the final implementation.
+
+```rust
+use anyhow::Result;
+
+use crate::kv_pool::KvState;
+use crate::tensor::DeviceVec;
+
+pub struct Qwen3RequestState {
+    pub kv: KvState,
+}
+
+pub enum BatchKind {
+    Prefill,
+    Decode,
+    Unified,
+}
+
+pub struct PrefillItem<'a> {
+    pub prompt_tokens: &'a [u32],
+    pub state: &'a mut Qwen3RequestState,
+}
+
+pub struct DecodeItem<'a> {
+    pub token: u32,
+    pub state: &'a mut Qwen3RequestState,
+}
+
+pub struct BatchSpec<'a> {
+    pub kind: BatchKind,
+    pub prefills: &'a mut [PrefillItem<'a>],
+    pub decodes: &'a mut [DecodeItem<'a>],
+}
+
+pub struct BatchResult {
+    pub prefill_logits: Vec<DeviceVec>,
+    pub decode_logits: Vec<DeviceVec>,
+}
+
+pub trait ModelExecutor: Send {
+    fn execute_batch(&mut self, spec: BatchSpec<'_>) -> Result<BatchResult>;
+}
+```
+
+The exact output representation may later need adjustment.
+
+In particular, decode output should be allowed to preserve a batched representation if that is important for throughput.
+
+What matters here is the ownership and control boundary, not freezing `Vec<DeviceVec>` as the permanent decode API.
+
+### Design Intent
+
+The intent of this interface is:
+
+- scheduler remains the control plane
+- executor becomes the execution plane
+- TP is hidden inside the executor, not leaked into scheduler logic
+- `KvPool` and request admission stay in the scheduler
+
+This keeps the future shape clean:
+
+- `SingleGpuQwen3Executor`
+- `TensorParallelQwen3Executor`
+
+Both should be able to sit behind the same scheduler-facing interface.
+
+### Relationship To DP
+
+This abstraction is the right carrier for model-internal parallelism such as TP and later EP.
+
+It is not the right abstraction for service-layer data parallelism across multiple model replicas.
+
+If pegainfer later needs multiple model replicas, that should live above the executor layer. A `ModelExecutor` still represents one logical model replica, even if that replica internally spans multiple GPUs.
+
 ## What Success Looks Like
 
 The milestone is successful when all of the following are true:

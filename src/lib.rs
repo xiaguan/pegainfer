@@ -4,6 +4,7 @@ pub mod http_server;
 pub(crate) mod kv_pool;
 pub mod logging;
 pub mod model;
+pub(crate) mod model_executor;
 pub mod ops;
 #[allow(dead_code)]
 pub(crate) mod page_pool;

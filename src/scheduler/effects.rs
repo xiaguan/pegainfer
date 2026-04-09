@@ -1,0 +1,170 @@
+use tokio::sync::mpsc;
+
+use crate::server_engine::{FinishReason, TokenLogprob};
+
+use super::{ActiveRequestState, TokenEvent};
+
+pub(super) struct PromptEchoEffect {
+    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) ids: Vec<u32>,
+    pub(super) logprobs: Vec<Option<TokenLogprob>>,
+}
+
+pub(super) enum PendingEffect {
+    Finish {
+        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        finish_reason: FinishReason,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    EmitAndFinish {
+        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        token: u32,
+        logprob: Option<TokenLogprob>,
+        finish_reason: FinishReason,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    Promote {
+        state: ActiveRequestState,
+        first_token: u32,
+        logprob: Option<TokenLogprob>,
+    },
+    Drop,
+}
+
+pub(super) enum DecodeEffect {
+    Finish {
+        index: usize,
+        finish_reason: FinishReason,
+        completion_tokens: usize,
+    },
+    EmitAndContinue {
+        index: usize,
+        token: u32,
+        logprob: Option<TokenLogprob>,
+        completion_tokens: usize,
+    },
+    Drop {
+        index: usize,
+    },
+}
+
+pub(super) struct StepEffects {
+    pub(super) prompt_echoes: Vec<PromptEchoEffect>,
+    pub(super) pending: Vec<PendingEffect>,
+    pub(super) decode: Vec<DecodeEffect>,
+}
+
+impl StepEffects {
+    pub(super) fn empty() -> Self {
+        Self {
+            prompt_echoes: Vec::new(),
+            pending: Vec::new(),
+            decode: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn apply_effects(active: &mut Vec<ActiveRequestState>, effects: StepEffects) {
+    for echo in effects.prompt_echoes {
+        let _ = echo.token_tx.send(TokenEvent::PromptTokens {
+            ids: echo.ids,
+            logprobs: echo.logprobs,
+        });
+    }
+
+    let mut to_retire = Vec::new();
+    for effect in effects.decode {
+        match effect {
+            DecodeEffect::Finish {
+                index,
+                finish_reason,
+                completion_tokens,
+            } => {
+                let req = &active[index];
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason,
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens,
+                });
+                to_retire.push(index);
+            }
+            DecodeEffect::EmitAndContinue {
+                index,
+                token,
+                logprob,
+                completion_tokens,
+            } => {
+                let req = &mut active[index];
+                if req
+                    .token_tx
+                    .send(TokenEvent::Token { id: token, logprob })
+                    .is_err()
+                {
+                    to_retire.push(index);
+                } else {
+                    req.last_token = token;
+                    req.generated_count = completion_tokens;
+                }
+            }
+            DecodeEffect::Drop { index } => to_retire.push(index),
+        }
+    }
+    for &i in to_retire.iter().rev() {
+        active.swap_remove(i);
+    }
+
+    for effect in effects.pending {
+        match effect {
+            PendingEffect::Finish {
+                token_tx,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let _ = token_tx.send(TokenEvent::Finished {
+                    finish_reason,
+                    prompt_tokens,
+                    completion_tokens,
+                });
+            }
+            PendingEffect::EmitAndFinish {
+                token_tx,
+                token,
+                logprob,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                if token_tx
+                    .send(TokenEvent::Token { id: token, logprob })
+                    .is_ok()
+                {
+                    let _ = token_tx.send(TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                    });
+                }
+            }
+            PendingEffect::Promote {
+                state,
+                first_token,
+                logprob,
+            } => {
+                if state
+                    .token_tx
+                    .send(TokenEvent::Token {
+                        id: first_token,
+                        logprob,
+                    })
+                    .is_ok()
+                {
+                    active.push(state);
+                }
+            }
+            PendingEffect::Drop => {}
+        }
+    }
+}
