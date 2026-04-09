@@ -16,8 +16,12 @@ pub struct DeviceContext {
 
 impl DeviceContext {
     pub fn new() -> Result<Self> {
-        let ctx =
-            CudaContext::new(0).map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
+        Self::new_with_device(0)
+    }
+
+    pub fn new_with_device(device_ordinal: usize) -> Result<Self> {
+        let ctx = CudaContext::new(device_ordinal)
+            .map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
 
         // Disable multi-stream event tracking before creating streams.
         // We use a single compute stream, so no cross-stream synchronization is needed.
