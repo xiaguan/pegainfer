@@ -1,9 +1,10 @@
+use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::kv_pool::KvState;
+use crate::kv_pool::{KvPool, KvState};
 use crate::model::qwen3::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, TensorParallelConfig};
 use crate::ops;
@@ -29,15 +30,26 @@ impl KvStatePtr {
 }
 
 #[derive(Clone, Copy)]
-struct BatchDecodeBuffersPtr(*mut BatchDecodeBuffers);
+struct TokenSlicePtr {
+    ptr: *const u32,
+    len: usize,
+}
 
-// SAFETY: Each pointer targets one rank-local decode buffer set and is handed
-// to exactly one worker thread for the duration of a single decode step.
-unsafe impl Send for BatchDecodeBuffersPtr {}
+// SAFETY: These pointers borrow scheduler-owned request token buffers for the
+// duration of one synchronous executor step. The sender waits for the worker
+// response before those borrows can end.
+unsafe impl Send for TokenSlicePtr {}
 
-impl BatchDecodeBuffersPtr {
-    unsafe fn as_mut<'a>(self) -> &'a mut BatchDecodeBuffers {
-        unsafe { &mut *self.0 }
+impl TokenSlicePtr {
+    fn from_slice(tokens: &[u32]) -> Self {
+        Self {
+            ptr: tokens.as_ptr(),
+            len: tokens.len(),
+        }
+    }
+
+    unsafe fn as_slice<'a>(self) -> &'a [u32] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -193,8 +205,8 @@ impl<'a> TensorParallelDecodeStep<'a> {
 
     fn sample_tokens(self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
         let executor = self.executor;
-        let model = &executor.models[0];
-        let bufs = &mut executor.bufs[0];
+        let model = &executor.primary_model;
+        let bufs = &mut executor.primary_bufs;
         model.select_tokens_batch_varied(bufs, params, rng)
     }
 }
@@ -418,8 +430,10 @@ impl ModelExecutor for SingleGpuQwen3Executor {
 }
 
 pub(crate) struct TensorParallelQwen3Executor {
-    models: Vec<Qwen3Model>,
-    bufs: Vec<BatchDecodeBuffers>,
+    primary_model: Qwen3Model,
+    primary_bufs: BatchDecodeBuffers,
+    kv_pools: Vec<KvPool>,
+    workers: Vec<RankWorker>,
 }
 
 impl TensorParallelQwen3Executor {
@@ -457,15 +471,30 @@ impl TensorParallelQwen3Executor {
             bufs.push(model.create_batch_decode_bufs(max_bucket)?);
         }
 
-        Ok(Self { models, bufs })
+        let kv_pools = models.iter().map(|model| model.kv_pool().clone()).collect();
+        let primary_model = models.remove(0);
+        let primary_bufs = bufs.remove(0);
+        let workers = models
+            .into_iter()
+            .zip(bufs)
+            .enumerate()
+            .map(|(index, (model, bufs))| RankWorker::spawn(index + 1, model, bufs))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            primary_model,
+            primary_bufs,
+            kv_pools,
+            workers,
+        })
     }
 
     fn primary_model(&self) -> &Qwen3Model {
-        &self.models[0]
+        &self.primary_model
     }
 
     fn primary_bufs(&self) -> &BatchDecodeBuffers {
-        &self.bufs[0]
+        &self.primary_bufs
     }
 
     fn primary_device_ctx(&self) -> &DeviceContext {
@@ -477,9 +506,9 @@ impl TensorParallelQwen3Executor {
     }
 
     fn available_pages_inner(&self) -> usize {
-        self.models
+        self.kv_pools
             .iter()
-            .map(|model| model.kv_pool().available_pages())
+            .map(KvPool::available_pages)
             .min()
             .unwrap_or(0)
     }
@@ -499,7 +528,7 @@ impl TensorParallelQwen3Executor {
 
 impl ModelExecutor for TensorParallelQwen3Executor {
     fn alloc_kv(&self) -> RequestKvState {
-        RequestKvState::new(self.models.iter().map(|model| model.alloc_kv()).collect())
+        RequestKvState::new(self.kv_pools.iter().map(KvPool::alloc).collect())
     }
 
     fn page_size(&self) -> usize {
@@ -523,7 +552,7 @@ impl ModelExecutor for TensorParallelQwen3Executor {
     }
 
     fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        let tp_size = self.models.len();
+        let tp_size = self.kv_pools.len();
         let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
             .map(|_| Vec::with_capacity(plan.kv_states.len()))
             .collect();
@@ -533,51 +562,45 @@ impl ModelExecutor for TensorParallelQwen3Executor {
             }
         }
 
-        thread::scope(|scope| -> Result<PrefillResult> {
-            let mut handles = Vec::new();
-            for rank in 1..tp_size {
-                let model = &self.models[rank];
-                let prompts = plan.prompts;
-                let echo = plan.echo;
-                let local_kv_ptrs = std::mem::take(&mut kv_by_rank[rank]);
-                handles.push(scope.spawn(move || {
-                    bind_model_thread(model)?;
-                    let _cublas_guard = CublasThreadGuard;
-                    let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                        .into_iter()
-                        .map(|ptr| unsafe { ptr.as_mut() })
-                        .collect();
-                    model.batch_prefill(prompts, &mut local_kv_states, echo)
-                }));
-            }
+        let prompts: Vec<TokenSlicePtr> = plan
+            .prompts
+            .iter()
+            .map(|tokens| TokenSlicePtr::from_slice(tokens))
+            .collect();
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(worker.execute_prefill(
+                prompts.clone(),
+                std::mem::take(&mut kv_by_rank[rank + 1]),
+                plan.echo,
+            )?);
+        }
 
-            bind_model_thread(&self.models[0])?;
-            let _cublas_guard = CublasThreadGuard;
-            let result = {
-                let model = &self.models[0];
-                let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
-                let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                    .into_iter()
-                    .map(|ptr| unsafe { ptr.as_mut() })
-                    .collect();
-                model.batch_prefill(plan.prompts, &mut local_kv_states, plan.echo)?
-            };
+        bind_model_thread(&self.primary_model)?;
+        let _cublas_guard = CublasThreadGuard;
+        let result = {
+            let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
+            let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
+                .into_iter()
+                .map(|ptr| unsafe { ptr.as_mut() })
+                .collect();
+            self.primary_model
+                .batch_prefill(plan.prompts, &mut local_kv_states, plan.echo)?
+        };
 
-            for handle in handles {
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("tensor-parallel prefill thread panicked"))??;
-            }
+        for recv in pending {
+            recv.recv()
+                .map_err(|_| anyhow::anyhow!("tensor-parallel prefill worker dropped"))??;
+        }
 
-            Ok(PrefillResult {
-                logits: result.0,
-                all_position_logits: result.1,
-            })
+        Ok(PrefillResult {
+            logits: result.0,
+            all_position_logits: result.1,
         })
     }
 
     fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        let tp_size = self.models.len();
+        let tp_size = self.kv_pools.len();
         let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
             .map(|_| Vec::with_capacity(plan.kv_states.len()))
             .collect();
@@ -586,52 +609,34 @@ impl ModelExecutor for TensorParallelQwen3Executor {
                 kv_by_rank[rank].push(kv_state.shard_ptr(rank));
             }
         }
-        let buf_ptrs: Vec<BatchDecodeBuffersPtr> = self
-            .bufs
-            .iter_mut()
-            .map(|bufs| BatchDecodeBuffersPtr(bufs as *mut BatchDecodeBuffers))
-            .collect();
+        let token_ids = plan.token_ids.to_vec();
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(
+                worker
+                    .execute_decode(token_ids.clone(), std::mem::take(&mut kv_by_rank[rank + 1]))?,
+            );
+        }
 
-        thread::scope(|scope| -> Result<()> {
-            let mut handles = Vec::new();
-            for rank in 1..tp_size {
-                let model = &self.models[rank];
-                let token_ids = plan.token_ids;
-                let local_kv_ptrs = std::mem::take(&mut kv_by_rank[rank]);
-                let bufs_ptr = buf_ptrs[rank];
-                handles.push(scope.spawn(move || {
-                    bind_model_thread(model)?;
-                    let _cublas_guard = CublasThreadGuard;
-                    let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                        .into_iter()
-                        .map(|ptr| unsafe { ptr.as_mut() })
-                        .collect();
-                    let bufs = unsafe { bufs_ptr.as_mut() };
-                    model.batch_decode(token_ids, &mut local_kv_states, bufs)
-                }));
-            }
+        bind_model_thread(&self.primary_model)?;
+        let _cublas_guard = CublasThreadGuard;
+        {
+            let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
+            let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
+                .into_iter()
+                .map(|ptr| unsafe { ptr.as_mut() })
+                .collect();
+            self.primary_model.batch_decode(
+                plan.token_ids,
+                &mut local_kv_states,
+                &mut self.primary_bufs,
+            )?;
+        }
 
-            bind_model_thread(&self.models[0])?;
-            let _cublas_guard = CublasThreadGuard;
-            {
-                let model = &self.models[0];
-                let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
-                let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                    .into_iter()
-                    .map(|ptr| unsafe { ptr.as_mut() })
-                    .collect();
-                let bufs = unsafe { buf_ptrs[0].as_mut() };
-                model.batch_decode(plan.token_ids, &mut local_kv_states, bufs)?;
-            }
-
-            for handle in handles {
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("tensor-parallel decode thread panicked"))??;
-            }
-
-            Ok(())
-        })?;
+        for recv in pending {
+            recv.recv()
+                .map_err(|_| anyhow::anyhow!("tensor-parallel decode worker dropped"))??;
+        }
 
         Ok(DecodeStep::TensorParallel(TensorParallelDecodeStep {
             executor: self,
@@ -640,7 +645,7 @@ impl ModelExecutor for TensorParallelQwen3Executor {
     }
 
     fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        let tp_size = self.models.len();
+        let tp_size = self.kv_pools.len();
         let mut prefill_kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
             .map(|_| Vec::with_capacity(plan.prefill_kv_states.len()))
             .collect();
@@ -658,66 +663,242 @@ impl ModelExecutor for TensorParallelQwen3Executor {
             }
         }
 
-        thread::scope(|scope| -> Result<UnifiedResult> {
-            let mut handles = Vec::new();
-            for rank in 1..tp_size {
-                let model = &self.models[rank];
-                let prompts = plan.prefill_prompts;
-                let decode_tokens = plan.decode_tokens;
-                let prefill_kv_ptrs = std::mem::take(&mut prefill_kv_by_rank[rank]);
-                let decode_kv_ptrs = std::mem::take(&mut decode_kv_by_rank[rank]);
-                handles.push(scope.spawn(move || {
-                    bind_model_thread(model)?;
-                    let _cublas_guard = CublasThreadGuard;
-                    let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
-                        .into_iter()
-                        .map(|ptr| unsafe { ptr.as_mut() })
-                        .collect();
-                    let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
-                        .into_iter()
-                        .map(|ptr| unsafe { ptr.as_mut() })
-                        .collect();
-                    model.unified_step(
-                        prompts,
-                        &mut prefill_kv_states,
-                        decode_tokens,
-                        &mut decode_kv_states,
-                    )
-                }));
-            }
+        let prefill_prompts: Vec<TokenSlicePtr> = plan
+            .prefill_prompts
+            .iter()
+            .map(|tokens| TokenSlicePtr::from_slice(tokens))
+            .collect();
+        let decode_tokens = plan.decode_tokens.to_vec();
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            pending.push(worker.execute_unified(
+                prefill_prompts.clone(),
+                std::mem::take(&mut prefill_kv_by_rank[rank + 1]),
+                decode_tokens.clone(),
+                std::mem::take(&mut decode_kv_by_rank[rank + 1]),
+            )?);
+        }
 
-            bind_model_thread(&self.models[0])?;
-            let _cublas_guard = CublasThreadGuard;
-            let result = {
-                let model = &self.models[0];
-                let prefill_kv_ptrs = std::mem::take(&mut prefill_kv_by_rank[0]);
-                let decode_kv_ptrs = std::mem::take(&mut decode_kv_by_rank[0]);
-                let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
-                    .into_iter()
-                    .map(|ptr| unsafe { ptr.as_mut() })
-                    .collect();
-                let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
-                    .into_iter()
-                    .map(|ptr| unsafe { ptr.as_mut() })
-                    .collect();
-                model.unified_step(
-                    plan.prefill_prompts,
-                    &mut prefill_kv_states,
-                    plan.decode_tokens,
-                    &mut decode_kv_states,
-                )?
-            };
+        bind_model_thread(&self.primary_model)?;
+        let _cublas_guard = CublasThreadGuard;
+        let result = {
+            let prefill_kv_ptrs = std::mem::take(&mut prefill_kv_by_rank[0]);
+            let decode_kv_ptrs = std::mem::take(&mut decode_kv_by_rank[0]);
+            let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
+                .into_iter()
+                .map(|ptr| unsafe { ptr.as_mut() })
+                .collect();
+            let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
+                .into_iter()
+                .map(|ptr| unsafe { ptr.as_mut() })
+                .collect();
+            self.primary_model.unified_step(
+                plan.prefill_prompts,
+                &mut prefill_kv_states,
+                plan.decode_tokens,
+                &mut decode_kv_states,
+            )?
+        };
 
-            for handle in handles {
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("tensor-parallel unified thread panicked"))??;
-            }
+        for recv in pending {
+            recv.recv()
+                .map_err(|_| anyhow::anyhow!("tensor-parallel unified worker dropped"))??;
+        }
 
-            Ok(UnifiedResult {
-                prefill_logits: result.0,
-                decode_logits: result.1,
-            })
+        Ok(UnifiedResult {
+            prefill_logits: result.0,
+            decode_logits: result.1,
         })
+    }
+}
+
+impl Drop for TensorParallelQwen3Executor {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.shutdown();
+        }
+    }
+}
+
+enum WorkerCommand {
+    Prefill {
+        prompts: Vec<TokenSlicePtr>,
+        kv_ptrs: Vec<KvStatePtr>,
+        echo: bool,
+        resp: mpsc::Sender<Result<()>>,
+    },
+    Decode {
+        token_ids: Vec<u32>,
+        kv_ptrs: Vec<KvStatePtr>,
+        resp: mpsc::Sender<Result<()>>,
+    },
+    Unified {
+        prefill_prompts: Vec<TokenSlicePtr>,
+        prefill_kv_ptrs: Vec<KvStatePtr>,
+        decode_tokens: Vec<u32>,
+        decode_kv_ptrs: Vec<KvStatePtr>,
+        resp: mpsc::Sender<Result<()>>,
+    },
+    Shutdown,
+}
+
+struct RankWorker {
+    tx: mpsc::Sender<WorkerCommand>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl RankWorker {
+    fn spawn(rank: usize, model: Qwen3Model, mut bufs: BatchDecodeBuffers) -> Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name(format!("qwen3-tp-rank-{rank}"))
+            .spawn(move || {
+                let startup = bind_model_thread(&model).map(|_| CublasThreadGuard);
+                match startup {
+                    Ok(_guard) => {
+                        let _ = startup_tx.send(Ok(()));
+                        while let Ok(cmd) = rx.recv() {
+                            match cmd {
+                                WorkerCommand::Prefill {
+                                    prompts,
+                                    kv_ptrs,
+                                    echo,
+                                    resp,
+                                } => {
+                                    let prompts: Vec<&[u32]> = prompts
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_slice() })
+                                        .collect();
+                                    let mut kv_states: Vec<&mut KvState> = kv_ptrs
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_mut() })
+                                        .collect();
+                                    let result = model
+                                        .batch_prefill(&prompts, &mut kv_states, echo)
+                                        .map(|_| ());
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::Decode {
+                                    token_ids,
+                                    kv_ptrs,
+                                    resp,
+                                } => {
+                                    let mut kv_states: Vec<&mut KvState> = kv_ptrs
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_mut() })
+                                        .collect();
+                                    let result = model
+                                        .batch_decode(&token_ids, &mut kv_states, &mut bufs)
+                                        .map(|_| ());
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::Unified {
+                                    prefill_prompts,
+                                    prefill_kv_ptrs,
+                                    decode_tokens,
+                                    decode_kv_ptrs,
+                                    resp,
+                                } => {
+                                    let prefill_prompts: Vec<&[u32]> = prefill_prompts
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_slice() })
+                                        .collect();
+                                    let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_mut() })
+                                        .collect();
+                                    let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
+                                        .into_iter()
+                                        .map(|ptr| unsafe { ptr.as_mut() })
+                                        .collect();
+                                    let result = model
+                                        .unified_step(
+                                            &prefill_prompts,
+                                            &mut prefill_kv_states,
+                                            &decode_tokens,
+                                            &mut decode_kv_states,
+                                        )
+                                        .map(|_| ());
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::Shutdown => break,
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = startup_tx.send(Err(err));
+                    }
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn tensor-parallel worker {rank}: {e}"))?;
+        startup_rx.recv().map_err(|_| {
+            anyhow::anyhow!("tensor-parallel worker {rank} exited during startup")
+        })??;
+        Ok(Self {
+            tx,
+            handle: Some(handle),
+        })
+    }
+
+    fn execute_prefill(
+        &self,
+        prompts: Vec<TokenSlicePtr>,
+        kv_ptrs: Vec<KvStatePtr>,
+        echo: bool,
+    ) -> Result<mpsc::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(WorkerCommand::Prefill {
+                prompts,
+                kv_ptrs,
+                echo,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tensor-parallel prefill worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn execute_decode(
+        &self,
+        token_ids: Vec<u32>,
+        kv_ptrs: Vec<KvStatePtr>,
+    ) -> Result<mpsc::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(WorkerCommand::Decode {
+                token_ids,
+                kv_ptrs,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tensor-parallel decode worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn execute_unified(
+        &self,
+        prefill_prompts: Vec<TokenSlicePtr>,
+        prefill_kv_ptrs: Vec<KvStatePtr>,
+        decode_tokens: Vec<u32>,
+        decode_kv_ptrs: Vec<KvStatePtr>,
+    ) -> Result<mpsc::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(WorkerCommand::Unified {
+                prefill_prompts,
+                prefill_kv_ptrs,
+                decode_tokens,
+                decode_kv_ptrs,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tensor-parallel unified worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(WorkerCommand::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }

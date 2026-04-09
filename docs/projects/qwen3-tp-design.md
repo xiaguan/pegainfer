@@ -2,7 +2,7 @@
 
 > **TL;DR:** Add `TP=2` support for `Qwen3-4B` as the first model-parallel milestone. The goal is correctness and a clean architectural foundation for larger dense models and future MoE work, not a fully generalized distributed runtime on day one.
 >
-> **Status:** Active. `Qwen3-4B` has now been brought up end-to-end with `TP=2` on a single machine, but the implementation still carries first-pass runtime debt.
+> **Status:** Active. `Qwen3-4B` has now been brought up end-to-end with `TP=2` on a single machine. `TP=8` has also been smoke-tested on an 8x4090 host, but the implementation still carries first-pass runtime debt and has not yet gone through systematic correctness validation.
 
 ## Goal
 
@@ -171,23 +171,25 @@ No additional collective requirements are introduced by the first-pass embedding
 
 ### Runtime Bring-Up Notes
 
-The first end-to-end `TP=2` bring-up exposed two concrete runtime hazards that are worth recording because they are not obvious from the high-level TP partitioning design alone.
+The first end-to-end `TP=2` bring-up exposed a few concrete runtime hazards that are worth recording because they are not obvious from the high-level TP partitioning design alone.
 
 - `cuBLAS` handle and workspace state must not be process-global when TP ranks execute on different GPUs from different threads
 - TP worker threads must explicitly bind both the CUDA runtime device and the driver context before using cuBLAS, FlashInfer, or NCCL
 
-In practice, the initial TP implementation hit:
+In practice, the initial TP implementation initially hit:
 
 - an illegal memory access reported later in `paged_kv_scatter_cuda`
 - intermittent hangs after some requests had already succeeded
 
-The root cause was not the scheduler boundary. It was runtime state management:
+The root cause was not the scheduler boundary. It was runtime state management.
+
+These issues have now been fixed in the current bring-up implementation:
 
 - `cuBLAS` handles and workspaces needed to become thread-local
 - TP worker threads needed explicit per-thread device binding before GPU work
 - request-scoped worker-thread cuBLAS resources needed explicit teardown so repeated TP requests did not accumulate unstable per-thread state
 
-This means the first-pass TP executor is currently correct enough to run end-to-end, but the runtime shape is still more fragile than the eventual target design.
+This means the first-pass TP executor is now correct enough to run end-to-end, but the runtime shape is still more fragile than the eventual target design.
 
 ### First-Pass Validity Constraints
 
@@ -560,12 +562,25 @@ At this point, the implementation meets the basic smoke-test bar for `Qwen3-4B T
 - requests complete end-to-end through the existing OpenAI-compatible HTTP path
 - generated outputs are sensible and clearly non-degenerate
 
-However, a few important engineering issues remain open:
+The current implementation has also passed a narrower `TP=8` smoke test on an 8x4090 machine:
 
-- the current `TensorParallelQwen3Executor` still creates worker threads per step instead of using long-lived rank workers
-- TP correctness has only been smoke-tested so far; it still needs a deliberate TP-vs-TP=1 comparison path
+- eight-way weight load succeeds
+- the server reaches `Scheduler ready` and starts listening
+- simple completion requests return non-degenerate text
+
+That means the executor and sharding path are no longer merely `TP=2`-shaped, but `TP=8` should still be treated as an experimental validated configuration rather than a fully qualified support target.
+
+However, a few important engineering issues still remain open:
+
+- TP-vs-TP=1 correctness has only been smoke-tested so far; it still needs a deliberate comparison path
 - embedding and `lm_head` are still replicated by design in this first pass
-- some of the runtime fixes are pragmatic rather than final abstractions, especially around thread-scoped CUDA runtime / cuBLAS setup and teardown
+- some of the runtime fixes are pragmatic bring-up fixes rather than final abstractions, especially around thread-scoped CUDA runtime / cuBLAS setup and teardown
+
+The next practical steps should be:
+
+- turn the recent long-lived rank-worker implementation into the new baseline and commit it once it is revalidated
+- add a small TP-vs-TP=1 comparison harness for fixed prompts and deterministic decoding
+- then revisit vocab-side replication only after the execution and correctness story is stable
 
 So the right reading of the current status is:
 
