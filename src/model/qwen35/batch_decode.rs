@@ -21,7 +21,7 @@ impl Qwen35Model {
         let batch_size = params.len();
 
         let mut tokens = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
+        for (i, params_i) in params.iter().enumerate().take(batch_size) {
             let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
             let random_val: f32 = rand::RngExt::random(rng);
             let token = ops::gpu_sample_into(
@@ -32,7 +32,7 @@ impl Qwen35Model {
                 &mut bufs.sample_row_states,
                 &mut bufs.sample_valid,
                 &mut bufs.sample_out,
-                params[i],
+                params_i,
                 random_val,
             )?;
             tokens.push(token);
@@ -196,7 +196,7 @@ impl Qwen35Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         padded_bs: usize,
-        slot_states: &mut Vec<RecurrentState>,
+        slot_states: &mut [RecurrentState],
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -302,7 +302,7 @@ impl Qwen35Model {
     fn batch_decode_linear_attention_slots(
         &self,
         attn: &LinearAttentionLayer,
-        slot_states: &mut Vec<RecurrentState>,
+        slot_states: &mut [RecurrentState],
         layer_idx: usize,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
@@ -340,7 +340,7 @@ impl Qwen35Model {
                 self.config.linear_num_value_heads,
                 self.config.linear_key_head_dim,
                 self.config.linear_value_head_dim,
-            )?;
+            );
             ops::write_vec_into(&self.ctx, &bufs.gdr_tmp, &mut bufs.gdr_out, slot_idx)?;
         }
 

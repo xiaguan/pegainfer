@@ -228,7 +228,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // 7. MLP: fused gate+up GEMM → silu_mul → down → bufs.o_buf
         ops::gemm_into(
@@ -237,7 +237,7 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

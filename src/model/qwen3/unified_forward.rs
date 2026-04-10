@@ -17,6 +17,7 @@ use crate::ops::PrefillPagedPlan;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Decode attention metadata (allocated per unified step, not CUDA-graph safe).
+#[allow(clippy::struct_field_names)]
 struct DecodeAttentionMeta {
     page_indices_d: CudaSlice<i32>,
     page_indptr_d: CudaSlice<i32>,
@@ -141,7 +142,7 @@ impl Qwen3Model {
 
         // Decode attention metadata (built AFTER advance so seq_lens reflect new state)
         let decode_meta =
-            DecodeAttentionMeta::build(&self.ctx, &decode_kv_states, &decode_positions)?;
+            DecodeAttentionMeta::build(&self.ctx, decode_kv_states, &decode_positions)?;
 
         // ── 4. Process layers ─────────────────────────────────────────
         let kv_buffer = prefill_kv_states[0].buffer();
@@ -539,7 +540,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         ops::gemm_into(
             &self.ctx,
@@ -547,7 +548,7 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

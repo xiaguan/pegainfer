@@ -82,14 +82,14 @@ unsafe impl Sync for Qwen3Model {}
 impl Qwen3Model {
     pub fn from_safetensors_with_runtime(
         model_path: &str,
-        _runtime: ModelRuntimeConfig,
+        runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
         info!("Loading model from: {}", model_path);
-        debug!("Initializing GPU device {}", _runtime.device_ordinal);
-        let ctx = DeviceContext::new_with_device(_runtime.device_ordinal)?;
+        debug!("Initializing GPU device {}", runtime.device_ordinal);
+        let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
         let config = Config::from_file(model_path)?;
-        let tensor_parallel = _runtime.tensor_parallel.unwrap_or_default();
+        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
@@ -342,7 +342,7 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph: _runtime.enable_cuda_graph,
+            enable_cuda_graph: runtime.enable_cuda_graph,
             kv_pool,
             tensor_parallel,
             tp_comm: None,

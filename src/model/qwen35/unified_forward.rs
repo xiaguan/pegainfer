@@ -80,14 +80,16 @@ impl Qwen35Model {
         );
 
         // ── Prefill phase ─────────────────────────────────────────────────────
-        let prefill_logits = if !prefill_prompts.is_empty() {
-            self.batch_prefill(prefill_prompts, prefill_kv_states, prefill_recurrent_states)?
-        } else {
+        let prefill_logits = if prefill_prompts.is_empty() {
             Vec::new()
+        } else {
+            self.batch_prefill(prefill_prompts, prefill_kv_states, prefill_recurrent_states)?
         };
 
         // ── Decode phase ──────────────────────────────────────────────────────
-        let decode_logits = if !decode_tokens.is_empty() {
+        let decode_logits = if decode_tokens.is_empty() {
+            Vec::new()
+        } else {
             self.batch_decode_graph(decode_tokens, decode_kv_states, graph_state)?;
 
             // Extract per-request logits from the batch logits buffer.
@@ -98,8 +100,6 @@ impl Qwen35Model {
                 dlogits.push(logit);
             }
             dlogits
-        } else {
-            Vec::new()
         };
 
         Ok((prefill_logits, decode_logits))

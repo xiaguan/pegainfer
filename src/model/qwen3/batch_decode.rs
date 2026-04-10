@@ -117,7 +117,7 @@ impl Qwen3Model {
                 next_weight,
                 eps,
                 &mut bufs.normed,
-            )?;
+            );
         }
 
         // Output projection: logits [vocab_size, bs]
@@ -228,7 +228,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // MLP: fused gate+up GEMM → silu_mul_fused → down GEMM
         ops::gemm_into(
@@ -237,7 +237,7 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
@@ -371,7 +371,7 @@ mod tests {
 
         for (i, prompt) in prompts.iter().enumerate() {
             let mut state = model.create_state().unwrap();
-            model.forward(*prompt, &mut state).unwrap();
+            model.forward(prompt, &mut state).unwrap();
             let token = model.select_token(&mut state, &params, &mut rng).unwrap();
             first_tokens.push(token);
             std::mem::swap(&mut kv_states[i], &mut state.kv_state);

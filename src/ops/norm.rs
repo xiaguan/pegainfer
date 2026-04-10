@@ -80,7 +80,7 @@ pub(crate) fn fused_add_rms_norm_batch_into(
     weight: &DeviceVec,
     eps: f32,
     out: &mut HiddenStates,
-) -> Result<()> {
+) {
     assert_eq!(hidden.hidden_dim, residual.hidden_dim);
     assert_eq!(hidden.hidden_dim, out.hidden_dim);
     assert_eq!(hidden.seq_len, residual.seq_len);
@@ -102,7 +102,6 @@ pub(crate) fn fused_add_rms_norm_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-    Ok(())
 }
 
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).

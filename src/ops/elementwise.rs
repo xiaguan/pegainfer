@@ -90,7 +90,7 @@ pub(crate) fn silu_mul_fused_batch_into(
     ctx: &DeviceContext,
     gate_up: &HiddenStates,
     out: &mut HiddenStates,
-) -> Result<()> {
+) {
     let intermediate_size = out.hidden_dim;
     let bs = gate_up.seq_len;
     assert_eq!(
@@ -114,8 +114,6 @@ pub(crate) fn silu_mul_fused_batch_into(
             ctx.stream.cu_stream(),
         );
     }
-
-    Ok(())
 }
 
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)

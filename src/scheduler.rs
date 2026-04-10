@@ -122,7 +122,7 @@ impl PendingRequest {
 /// The scheduler exclusively owns request lifecycle and batching decisions.
 pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
     let executor = Qwen3Executor::single(model)?;
-    start_with_executor(executor, seed)
+    Ok(start_with_executor(executor, seed))
 }
 
 pub fn start_qwen3(
@@ -132,10 +132,10 @@ pub fn start_qwen3(
     seed: u64,
 ) -> Result<SchedulerHandle> {
     let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
-    start_with_executor(executor, seed)
+    Ok(start_with_executor(executor, seed))
 }
 
-pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> Result<SchedulerHandle> {
+pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> SchedulerHandle {
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -145,7 +145,7 @@ pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> Result<
         })
         .expect("failed to spawn scheduler thread");
 
-    Ok(SchedulerHandle { submit_tx })
+    SchedulerHandle { submit_tx }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────
@@ -176,18 +176,15 @@ fn scheduler_loop(
 
         // 2. Nothing active and nothing deferred → block until a request arrives.
         if active.is_empty() && deferred.is_empty() {
-            match submit_rx.blocking_recv() {
-                Some(req) => {
-                    deferred.push(PendingRequest::from_scheduler_request(
-                        RequestId(next_request_id),
-                        req,
-                    ));
-                    next_request_id += 1;
-                }
-                None => {
-                    info!("Scheduler: all handles dropped, exiting");
-                    return;
-                }
+            if let Some(req) = submit_rx.blocking_recv() {
+                deferred.push(PendingRequest::from_scheduler_request(
+                    RequestId(next_request_id),
+                    req,
+                ));
+                next_request_id += 1;
+            } else {
+                info!("Scheduler: all handles dropped, exiting");
+                return;
             }
             while let Ok(req) = submit_rx.try_recv() {
                 deferred.push(PendingRequest::from_scheduler_request(

@@ -126,21 +126,21 @@ impl TensorParallelConfig {
                 self.world_size
             ));
         }
-        if config.num_attention_heads % self.world_size != 0 {
+        if !config.num_attention_heads.is_multiple_of(self.world_size) {
             return Err(anyhow::anyhow!(
                 "num_attention_heads={} not divisible by tp world_size={}",
                 config.num_attention_heads,
                 self.world_size
             ));
         }
-        if config.num_key_value_heads % self.world_size != 0 {
+        if !config.num_key_value_heads.is_multiple_of(self.world_size) {
             return Err(anyhow::anyhow!(
                 "num_key_value_heads={} not divisible by tp world_size={}",
                 config.num_key_value_heads,
                 self.world_size
             ));
         }
-        if config.intermediate_size % self.world_size != 0 {
+        if !config.intermediate_size.is_multiple_of(self.world_size) {
             return Err(anyhow::anyhow!(
                 "intermediate_size={} not divisible by tp world_size={}",
                 config.intermediate_size,

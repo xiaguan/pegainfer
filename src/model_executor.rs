@@ -359,7 +359,7 @@ fn compute_logprobs_from_cpu(
         return None;
     }
 
-    let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
     let log_sum_exp = max_val + sum_exp.ln();
     let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
@@ -458,9 +458,9 @@ pub(crate) trait ModelExecutor: Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
-    fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult>;
-    fn execute_decode<'a>(&mut self, plan: DecodePlan<'a>) -> Result<DecodeResult>;
-    fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult>;
+    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
+    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
+    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 }
 
 struct Qwen3ExecutorMetadata {
@@ -580,7 +580,7 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    fn run_step(&self, step: StepCommand) -> Result<WorkerStepOutcome> {
+    fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
         let primary = self.primary.run_step(step.clone(), true)?;
         let mut pending = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
@@ -619,12 +619,12 @@ impl ModelExecutor for Qwen3Executor {
         Ok(())
     }
 
-    fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
+    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
         let step = StepCommand::Prefill {
             requests: plan.requests.to_vec(),
             echo: plan.echo,
         };
-        match self.run_step(step)? {
+        match self.run_step(&step)? {
             WorkerStepOutcome::Prefill(result) => Ok(result),
             other => Err(anyhow::anyhow!(
                 "prefill step returned unexpected payload: {}",
@@ -633,11 +633,11 @@ impl ModelExecutor for Qwen3Executor {
         }
     }
 
-    fn execute_decode<'a>(&mut self, plan: DecodePlan<'a>) -> Result<DecodeResult> {
+    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
         let step = StepCommand::Decode {
             requests: plan.requests.to_vec(),
         };
-        match self.run_step(step)? {
+        match self.run_step(&step)? {
             WorkerStepOutcome::Decode(result) => Ok(result),
             other => Err(anyhow::anyhow!(
                 "decode step returned unexpected payload: {}",
@@ -646,12 +646,12 @@ impl ModelExecutor for Qwen3Executor {
         }
     }
 
-    fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
+    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
         let step = StepCommand::Unified {
             prefill_requests: plan.prefill_requests.to_vec(),
             decode_requests: plan.decode_requests.to_vec(),
         };
-        match self.run_step(step)? {
+        match self.run_step(&step)? {
             WorkerStepOutcome::Unified(result) => Ok(result),
             other => Err(anyhow::anyhow!(
                 "unified step returned unexpected payload: {}",

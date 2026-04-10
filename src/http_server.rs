@@ -172,7 +172,9 @@ async fn handle_non_streaming(
     })?;
 
     // If echo, prepend prompt text
-    let echo_prefix = if !prompt_token_ids.is_empty() {
+    let echo_prefix = if prompt_token_ids.is_empty() {
+        None
+    } else {
         let prompt_text = state.tokenizer.decode(&prompt_token_ids).map_err(|e| {
             error!("Prompt detokenization error: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -180,8 +182,6 @@ async fn handle_non_streaming(
         let prefix_len = prompt_text.len();
         text = format!("{prompt_text}{text}");
         Some(prefix_len)
-    } else {
-        None
     };
 
     // Stop sequence truncation
@@ -277,6 +277,7 @@ async fn handle_non_streaming(
 
 // ── Streaming ───────────────────────────────────────────────────────────
 
+#[allow(clippy::needless_pass_by_value)]
 fn handle_streaming(
     state: Arc<AppState>,
     token_rx: mpsc::UnboundedReceiver<TokenEvent>,
@@ -327,6 +328,7 @@ fn handle_streaming(
 
 /// Runs in spawn_blocking: receives TokenEvents, incrementally decodes,
 /// handles stop sequences, sends StreamDeltas.
+#[allow(clippy::needless_pass_by_value)]
 fn streaming_bridge(
     tokenizer: Arc<Tokenizer>,
     mut token_rx: mpsc::UnboundedReceiver<TokenEvent>,
@@ -417,7 +419,13 @@ fn streaming_bridge(
             }) => {
                 // Flush decoder
                 if let Ok(Some(tail)) = decoder.finish() {
-                    if !stops.is_empty() {
+                    if stops.is_empty() {
+                        let _ = delta_tx.send(StreamDelta {
+                            text_delta: tail,
+                            finish_reason: None,
+                            usage: None,
+                        });
+                    } else {
                         let full = decoder.emitted_text().to_string();
                         if let Some((to_send, _)) = truncate_at_stop(&full, sent_len, &stops) {
                             if !to_send.is_empty() {
@@ -446,12 +454,6 @@ fn streaming_bridge(
                                 usage: None,
                             });
                         }
-                    } else {
-                        let _ = delta_tx.send(StreamDelta {
-                            text_delta: tail,
-                            finish_reason: None,
-                            usage: None,
-                        });
                     }
                 }
 
