@@ -34,6 +34,7 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
 parking_lot = "0.12.5"
+crossbeam-channel = "0.5"
 
 [features]
 reference = []
