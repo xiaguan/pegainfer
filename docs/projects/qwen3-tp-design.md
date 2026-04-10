@@ -468,6 +468,14 @@ loop {
 
 The primary value of this refactor is responsibility isolation, not reducing the line count of `scheduler.rs` by itself.
 
+Current status after the latest TP cleanup:
+
+- the scheduler no longer runs Qwen3 GPU execution directly
+- `tp_size == 1` and `tp_size > 1` both go through the same coarse-grained step protocol
+- rank 0 execution now happens on a primary worker thread rather than on the scheduler thread
+- scheduler-side work is limited to planning, command submission, and effect application
+- sampling policy remains controller-owned, but sampling execution and logprob extraction now run on the worker side
+
 ### Rust Sketch
 
 The following sketch is intentionally narrow. It is meant to capture the boundary, not to freeze the final implementation.

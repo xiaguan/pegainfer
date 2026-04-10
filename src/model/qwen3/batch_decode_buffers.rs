@@ -59,13 +59,6 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) kv_tile_indices_d: CudaSlice<i32>,
     pub(crate) kv_chunk_size_d: CudaSlice<i32>,
 
-    // Per-request sampling scratch (reused across requests in a loop)
-    pub(crate) sample_probs: CudaSlice<f32>,
-    pub(crate) sample_top1_value: CudaSlice<half::bf16>,
-    pub(crate) sample_row_states: CudaSlice<u8>,
-    pub(crate) sample_valid: CudaSlice<u8>,
-    pub(crate) sample_out: CudaSlice<i32>,
-
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
@@ -110,13 +103,6 @@ impl BatchDecodeBuffers {
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
-            sample_probs: ctx.stream.alloc_zeros(vocab_size)?,
-            sample_top1_value: ctx.stream.alloc_zeros(1)?,
-            sample_row_states: ctx
-                .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
-            sample_valid: ctx.stream.alloc_zeros(1)?,
-            sample_out: ctx.stream.alloc_zeros(bs)?,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()

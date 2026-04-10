@@ -6,8 +6,8 @@ use std::time::Instant;
 use super::config::{Config, TensorParallelConfig};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_1d_shard, load_tensor_2d,
-    load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
+    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
+    load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
 #[derive(Clone, Copy, Debug)]

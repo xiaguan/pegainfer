@@ -8,35 +8,6 @@ use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
 
 impl Qwen3Model {
-    /// Sample one token per request, each with its own sampling params.
-    pub(crate) fn select_tokens_batch_varied(
-        &self,
-        bufs: &mut BatchDecodeBuffers,
-        params: &[&crate::sampler::SamplingParams],
-        rng: &mut rand::rngs::StdRng,
-    ) -> Result<Vec<u32>> {
-        let batch_size = params.len();
-
-        let mut tokens = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
-            let random_val: f32 = rand::RngExt::random(rng);
-            let token = ops::gpu_sample_into(
-                &self.ctx,
-                &logits_i,
-                &mut bufs.sample_probs,
-                &mut bufs.sample_top1_value,
-                &mut bufs.sample_row_states,
-                &mut bufs.sample_valid,
-                &mut bufs.sample_out,
-                params[i],
-                random_val,
-            )?;
-            tokens.push(token);
-        }
-        Ok(tokens)
-    }
-
     /// Batch decode step: N requests, 1 new token each, one forward pass.
     ///
     /// When `enable_cuda_graph` is set, pads to the nearest bucket size and
@@ -295,6 +266,45 @@ mod tests {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
     }
 
+    fn sample_batch_tokens(
+        model: &Qwen3Model,
+        bufs: &BatchDecodeBuffers,
+        params: &[&SamplingParams],
+        rng: &mut StdRng,
+    ) -> Vec<u32> {
+        let mut scratch_probs = model
+            .ctx
+            .stream
+            .alloc_zeros(model.config.vocab_size)
+            .unwrap();
+        let mut scratch_top1 = model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut scratch_row_states = model
+            .ctx
+            .stream
+            .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+            .unwrap();
+        let mut scratch_valid = model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut scratch_out = model.ctx.stream.alloc_zeros(1).unwrap();
+        (0..params.len())
+            .map(|i| {
+                let logits_i = ops::extract_vec(&model.ctx, &bufs.logits, i).unwrap();
+                let random_val: f32 = rand::RngExt::random(rng);
+                ops::gpu_sample_into(
+                    &model.ctx,
+                    &logits_i,
+                    &mut scratch_probs,
+                    &mut scratch_top1,
+                    &mut scratch_row_states,
+                    &mut scratch_valid,
+                    &mut scratch_out,
+                    params[i],
+                    random_val,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
     ///
     /// Uses batch_decode with bs=1 (not ModelForward::forward) so the decode path
@@ -338,9 +348,7 @@ mod tests {
                 .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = vec![&params];
-            let batch_tokens = model
-                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
-                .unwrap();
+            let batch_tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             tokens.push(batch_tokens[0]);
         }
         tokens
@@ -397,9 +405,7 @@ mod tests {
                 .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
-            let tokens = model
-                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
-                .unwrap();
+            let tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             for (i, &tok) in tokens.iter().enumerate() {
                 all_tokens[i].push(tok);
             }

@@ -128,38 +128,6 @@ pub(crate) fn load_tensor_2d(
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-pub(crate) fn load_tensor_1d_shard(
-    ctx: &DeviceContext,
-    shards: &[SafeTensors],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-    offset: usize,
-    len: usize,
-) -> Result<DeviceVec> {
-    let tensor = find_tensor(shards, weight_map, name)?;
-    let shape = tensor.shape();
-    if shape.len() != 1 {
-        return Err(anyhow::anyhow!(
-            "Tensor '{}' expected 1D, got shape {:?}",
-            name,
-            shape
-        ));
-    }
-    if offset + len > shape[0] {
-        return Err(anyhow::anyhow!(
-            "1D shard out of bounds for '{}': offset={} len={} dim={}",
-            name,
-            offset,
-            len,
-            shape[0]
-        ));
-    }
-    let data = tensor.data();
-    let elems = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), shape[0]) };
-    DeviceVec::from_host(ctx, &elems[offset..offset + len])
-}
-
-#[allow(clippy::cast_ptr_alignment)]
 pub(crate) fn load_tensor_2d_row_shard(
     ctx: &DeviceContext,
     shards: &[SafeTensors],

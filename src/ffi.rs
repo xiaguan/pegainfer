@@ -123,17 +123,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn deinterleave_qkv_cuda(
-        qkv: *const Half,
-        q_out: *mut Half,
-        k_out: *mut Half,
-        v_out: *mut Half,
-        q_dim: i32,
-        kv_dim: i32,
-        bs: i32,
-        stream: CUstream,
-    );
-
     pub(crate) fn silu_mul_fused_cuda(
         gate_up: *const Half,
         out: *mut Half,
@@ -393,24 +382,6 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     );
-
-    // Append one K/V token per request to paged KV cache (FlashInfer).
-    pub(crate) fn paged_kv_append_cuda(
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        key: *const Half,
-        value: *const Half,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
 
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub(crate) fn paged_kv_scatter_cuda(

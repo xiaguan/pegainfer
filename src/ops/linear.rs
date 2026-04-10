@@ -83,43 +83,6 @@ pub(crate) fn linear(
     Ok(y)
 }
 
-/// Deinterleave fused QKV GEMM output [qkv_dim, bs] → q [q_dim, bs], k [kv_dim, bs], v [kv_dim, bs].
-/// Zero-copy split via a small copy kernel (data is ~73KB at bs=8, takes ~2μs).
-pub(crate) fn deinterleave_qkv_into(
-    ctx: &DeviceContext,
-    qkv: &HiddenStates,
-    q: &mut HiddenStates,
-    k: &mut HiddenStates,
-    v: &mut HiddenStates,
-) {
-    let q_dim = q.hidden_dim;
-    let kv_dim = k.hidden_dim;
-    let bs = qkv.seq_len;
-    debug_assert_eq!(qkv.hidden_dim, q_dim + 2 * kv_dim);
-    debug_assert_eq!(v.hidden_dim, kv_dim);
-    debug_assert_eq!(q.seq_len, bs);
-    debug_assert_eq!(k.seq_len, bs);
-    debug_assert_eq!(v.seq_len, bs);
-
-    let (qkv_ptr, _g0) = qkv.data.device_ptr(&ctx.stream);
-    let (q_ptr, _g1) = q.data.device_ptr_mut(&ctx.stream);
-    let (k_ptr, _g2) = k.data.device_ptr_mut(&ctx.stream);
-    let (v_ptr, _g3) = v.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::deinterleave_qkv_cuda(
-            qkv_ptr as *const ffi::Half,
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            v_ptr as *mut ffi::Half,
-            q_dim as i32,
-            kv_dim as i32,
-            bs as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-}
-
 /// GEMM: Y = weight @ X (batched linear projection)
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {

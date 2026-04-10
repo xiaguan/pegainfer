@@ -1,69 +1,320 @@
-use std::sync::mpsc;
+use std::collections::HashMap;
 use std::thread;
 
 use anyhow::Result;
-use rand::rngs::StdRng;
+use crossbeam_channel as channel;
 
 use crate::kv_pool::{KvPool, KvState};
 use crate::model::qwen3::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, TensorParallelConfig};
+use crate::model::{ModelRuntimeConfig, Qwen3Model, TensorParallelConfig};
 use crate::ops;
 use crate::sampler::SamplingParams;
+use crate::server_engine::TokenLogprob;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
-pub(crate) struct RequestKvState {
-    shards: Vec<KvState>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct RequestId(pub(crate) u64);
+
+#[derive(Clone)]
+pub(crate) struct PrefillStepItem {
+    pub(crate) request_id: RequestId,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) params: SamplingParams,
+    pub(crate) logprobs: usize,
+    pub(crate) echo: bool,
+    pub(crate) random_val: f32,
 }
 
-#[derive(Clone, Copy)]
-struct KvStatePtr(*mut KvState);
-
-// SAFETY: Each pointer targets a single rank-local KV shard. Callers only
-// construct one pointer per (request, rank) pair, so no two worker threads
-// mutate the same shard concurrently.
-unsafe impl Send for KvStatePtr {}
-
-impl KvStatePtr {
-    unsafe fn as_mut<'a>(self) -> &'a mut KvState {
-        unsafe { &mut *self.0 }
+impl PrefillStepItem {
+    fn as_slice(&self) -> &[u32] {
+        &self.prompt_tokens
     }
 }
 
 #[derive(Clone, Copy)]
-struct TokenSlicePtr {
-    ptr: *const u32,
-    len: usize,
+pub(crate) struct DecodeStepItem {
+    pub(crate) request_id: RequestId,
+    pub(crate) token_id: u32,
+    pub(crate) params: SamplingParams,
+    pub(crate) logprobs: usize,
+    pub(crate) random_val: f32,
 }
 
-// SAFETY: These pointers borrow scheduler-owned request token buffers for the
-// duration of one synchronous executor step. The sender waits for the worker
-// response before those borrows can end.
-unsafe impl Send for TokenSlicePtr {}
+type RequestStateBatch = Vec<(RequestId, KvState)>;
 
-impl TokenSlicePtr {
-    fn from_slice(tokens: &[u32]) -> Self {
+struct RequestStateStore {
+    states: HashMap<RequestId, KvState>,
+}
+
+impl RequestStateStore {
+    fn new() -> Self {
         Self {
-            ptr: tokens.as_ptr(),
-            len: tokens.len(),
+            states: HashMap::new(),
         }
     }
 
-    unsafe fn as_slice<'a>(self) -> &'a [u32] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    fn ensure_with<F>(&mut self, request_ids: &[RequestId], mut alloc: F)
+    where
+        F: FnMut() -> KvState,
+    {
+        for &request_id in request_ids {
+            self.states.entry(request_id).or_insert_with(&mut alloc);
+        }
+    }
+
+    fn drop_request(&mut self, request_id: RequestId) {
+        self.states.remove(&request_id);
+    }
+
+    fn take_batch(
+        &mut self,
+        request_ids: &[RequestId],
+        missing_context: &'static str,
+    ) -> Result<RequestStateBatch> {
+        request_ids
+            .iter()
+            .map(|request_id| {
+                self.states
+                    .remove(request_id)
+                    .ok_or_else(|| anyhow::anyhow!("{missing_context} for {:?}", request_id))
+                    .map(|kv| (*request_id, kv))
+            })
+            .collect()
+    }
+
+    fn restore_batch(&mut self, batch: RequestStateBatch) {
+        for (request_id, kv_state) in batch {
+            let replaced = self.states.insert(request_id, kv_state);
+            debug_assert!(replaced.is_none(), "request state restored twice");
+        }
     }
 }
 
-impl RequestKvState {
-    pub(crate) fn new(shards: Vec<KvState>) -> Self {
-        Self { shards }
-    }
+fn kv_state_refs(batch: &mut RequestStateBatch) -> Vec<&mut KvState> {
+    batch.iter_mut().map(|(_, kv_state)| kv_state).collect()
+}
 
-    fn shard_mut(&mut self, rank: usize) -> &mut KvState {
-        &mut self.shards[rank]
-    }
+fn execute_prefill_on_lane(
+    lane: &mut LocalQwen3Lane,
+    request_states: &mut RequestStateStore,
+    requests: &[PrefillStepItem],
+    echo: bool,
+    missing_context: &'static str,
+) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
+    let request_ids: Vec<RequestId> = requests.iter().map(|req| req.request_id).collect();
+    request_states.ensure_with(&request_ids, || lane.alloc_kv());
+    let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
+    let mut request_state_batch = request_states.take_batch(&request_ids, missing_context)?;
+    let mut kv_states = kv_state_refs(&mut request_state_batch);
+    let result = lane.execute_prefill(&prompts, &mut kv_states, echo);
+    request_states.restore_batch(request_state_batch);
+    result
+}
 
-    fn shard_ptr(&mut self, rank: usize) -> KvStatePtr {
-        KvStatePtr(&mut self.shards[rank])
+fn execute_decode_on_lane(
+    lane: &mut LocalQwen3Lane,
+    request_states: &mut RequestStateStore,
+    requests: &[DecodeStepItem],
+    missing_context: &'static str,
+) -> Result<()> {
+    let request_ids: Vec<RequestId> = requests.iter().map(|req| req.request_id).collect();
+    let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
+    let mut request_state_batch = request_states.take_batch(&request_ids, missing_context)?;
+    let mut kv_states = kv_state_refs(&mut request_state_batch);
+    let result = lane.execute_decode(&token_ids, &mut kv_states);
+    request_states.restore_batch(request_state_batch);
+    result
+}
+
+fn execute_unified_on_lane(
+    lane: &mut LocalQwen3Lane,
+    request_states: &mut RequestStateStore,
+    prefill_requests: &[PrefillStepItem],
+    decode_requests: &[DecodeStepItem],
+    prefill_missing_context: &'static str,
+    decode_missing_context: &'static str,
+) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+    let prefill_request_ids: Vec<RequestId> =
+        prefill_requests.iter().map(|req| req.request_id).collect();
+    let decode_request_ids: Vec<RequestId> =
+        decode_requests.iter().map(|req| req.request_id).collect();
+    request_states.ensure_with(&prefill_request_ids, || lane.alloc_kv());
+    let prefill_prompts: Vec<&[u32]> = prefill_requests
+        .iter()
+        .map(PrefillStepItem::as_slice)
+        .collect();
+    let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
+    let mut prefill_request_state_batch =
+        request_states.take_batch(&prefill_request_ids, prefill_missing_context)?;
+    let mut decode_request_state_batch =
+        request_states.take_batch(&decode_request_ids, decode_missing_context)?;
+    let mut prefill_kv_states = kv_state_refs(&mut prefill_request_state_batch);
+    let mut decode_kv_states = kv_state_refs(&mut decode_request_state_batch);
+    let result = lane.execute_unified(
+        &prefill_prompts,
+        &mut prefill_kv_states,
+        &decode_tokens,
+        &mut decode_kv_states,
+    );
+    request_states.restore_batch(prefill_request_state_batch);
+    request_states.restore_batch(decode_request_state_batch);
+    result
+}
+
+fn build_prefill_request_results(
+    lane: &mut LocalQwen3Lane,
+    requests: &[PrefillStepItem],
+    logits_vec: &[DeviceVec],
+    all_position_logits: Option<&HiddenStates>,
+    compute_prompt_logprobs: bool,
+) -> Result<Vec<PrefillRequestResult>> {
+    let mut token_offset = 0usize;
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (i, req) in requests.iter().enumerate() {
+        let first_token = lane.sample_from_logits(&logits_vec[i], &req.params, req.random_val)?;
+        let first_token_logprob = if req.logprobs > 0 {
+            Some(lane.extract_logprobs(&logits_vec[i], first_token, req.logprobs)?)
+        } else {
+            None
+        };
+        let prompt_logprobs = if req.echo {
+            if compute_prompt_logprobs {
+                let mut echo_logprobs = Vec::with_capacity(req.prompt_tokens.len());
+                echo_logprobs.push(None);
+                if let Some(all_logits) = all_position_logits {
+                    for j in 1..req.prompt_tokens.len() {
+                        let prev_pos = token_offset + j - 1;
+                        let target_token = req.prompt_tokens[j];
+                        echo_logprobs.push(lane.extract_prompt_logprobs(
+                            all_logits,
+                            prev_pos,
+                            target_token,
+                            req.logprobs,
+                        ));
+                    }
+                } else {
+                    for _ in 1..req.prompt_tokens.len() {
+                        echo_logprobs.push(None);
+                    }
+                }
+                Some(echo_logprobs)
+            } else {
+                Some(vec![None; req.prompt_tokens.len()])
+            }
+        } else {
+            None
+        };
+        token_offset += req.prompt_tokens.len();
+        outputs.push(PrefillRequestResult {
+            request_id: req.request_id,
+            first_token,
+            first_token_logprob,
+            prompt_logprobs,
+        });
+    }
+    Ok(outputs)
+}
+
+fn build_decode_request_results(
+    lane: &mut LocalQwen3Lane,
+    requests: &[DecodeStepItem],
+    logits: &[DeviceVec],
+) -> Result<Vec<DecodeRequestResult>> {
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (i, req) in requests.iter().enumerate() {
+        let token = lane.sample_from_logits(&logits[i], &req.params, req.random_val)?;
+        let logprob = if req.logprobs > 0 {
+            Some(lane.extract_logprobs(&logits[i], token, req.logprobs)?)
+        } else {
+            None
+        };
+        outputs.push(DecodeRequestResult {
+            request_id: req.request_id,
+            token,
+            logprob,
+        });
+    }
+    Ok(outputs)
+}
+
+fn execute_step_on_lane(
+    lane: &mut LocalQwen3Lane,
+    request_states: &mut RequestStateStore,
+    step: &StepCommand,
+    collect_result: bool,
+) -> Result<WorkerStepOutcome> {
+    match step {
+        StepCommand::Prefill { requests, echo } => {
+            let (logits, all_position_logits) = execute_prefill_on_lane(
+                lane,
+                request_states,
+                requests,
+                *echo,
+                "missing local request state",
+            )?;
+            if collect_result {
+                Ok(WorkerStepOutcome::Prefill(PrefillResult {
+                    requests: build_prefill_request_results(
+                        lane,
+                        requests,
+                        &logits,
+                        all_position_logits.as_ref(),
+                        *echo,
+                    )?,
+                }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::Decode { requests } => {
+            execute_decode_on_lane(
+                lane,
+                request_states,
+                requests,
+                "missing local decode request state",
+            )?;
+            if collect_result {
+                let logits: Vec<DeviceVec> = (0..requests.len())
+                    .map(|i| ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(WorkerStepOutcome::Decode(DecodeResult {
+                    requests: build_decode_request_results(lane, requests, &logits)?,
+                }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::Unified {
+            prefill_requests,
+            decode_requests,
+        } => {
+            let (prefill_logits, decode_logits) = execute_unified_on_lane(
+                lane,
+                request_states,
+                prefill_requests,
+                decode_requests,
+                "missing local unified prefill request state",
+                "missing local unified decode request state",
+            )?;
+            if collect_result {
+                Ok(WorkerStepOutcome::Unified(UnifiedResult {
+                    prefill_requests: build_prefill_request_results(
+                        lane,
+                        prefill_requests,
+                        &prefill_logits,
+                        None,
+                        false,
+                    )?,
+                    decode_requests: build_decode_request_results(
+                        lane,
+                        decode_requests,
+                        &decode_logits,
+                    )?,
+                }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
     }
 }
 
@@ -75,6 +326,66 @@ impl Drop for CublasThreadGuard {
             crate::ffi::cublas_destroy();
         }
     }
+}
+
+struct SamplingScratch {
+    probs: cudarc::driver::CudaSlice<f32>,
+    top1_value: cudarc::driver::CudaSlice<half::bf16>,
+    row_states: cudarc::driver::CudaSlice<u8>,
+    valid: cudarc::driver::CudaSlice<u8>,
+    out: cudarc::driver::CudaSlice<i32>,
+}
+
+impl SamplingScratch {
+    fn new(ctx: &DeviceContext, vocab_size: usize) -> Result<Self> {
+        Ok(Self {
+            probs: ctx.stream.alloc_zeros(vocab_size)?,
+            top1_value: ctx.stream.alloc_zeros(1)?,
+            row_states: ctx
+                .stream
+                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
+            valid: ctx.stream.alloc_zeros(1)?,
+            out: ctx.stream.alloc_zeros(1)?,
+        })
+    }
+}
+
+fn compute_logprobs_from_cpu(
+    logits_f32: &[f32],
+    sampled_token: u32,
+    top_k: usize,
+) -> Option<TokenLogprob> {
+    if logits_f32.is_empty() {
+        return None;
+    }
+
+    let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
+    let log_sum_exp = max_val + sum_exp.ln();
+    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
+
+    let k = top_k.min(logits_f32.len());
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+    if k > 0 {
+        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (idx, &val) in logits_f32.iter().enumerate() {
+            if best.len() < k || val > best.last().unwrap().1 {
+                let pos = best.partition_point(|&(_, v)| v > val);
+                best.insert(pos, (idx as u32, val));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+        }
+        for (idx, val) in best {
+            top.push((idx, val - log_sum_exp));
+        }
+    }
+
+    Some(TokenLogprob {
+        logprob: sampled_logprob,
+        top_logprobs: top,
+    })
 }
 
 fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
@@ -100,137 +411,83 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
 }
 
 pub(crate) struct PrefillPlan<'a> {
-    pub prompts: &'a [&'a [u32]],
-    pub kv_states: &'a mut [RequestKvState],
+    pub requests: &'a [PrefillStepItem],
     pub echo: bool,
 }
 
 pub(crate) struct DecodePlan<'a> {
-    pub token_ids: &'a [u32],
-    pub kv_states: &'a mut [&'a mut RequestKvState],
+    pub requests: &'a [DecodeStepItem],
 }
 
 pub(crate) struct UnifiedPlan<'a> {
-    pub prefill_prompts: &'a [&'a [u32]],
-    pub prefill_kv_states: &'a mut [RequestKvState],
-    pub decode_tokens: &'a [u32],
-    pub decode_kv_states: &'a mut [&'a mut RequestKvState],
+    pub prefill_requests: &'a [PrefillStepItem],
+    pub decode_requests: &'a [DecodeStepItem],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrefillRequestResult {
+    pub request_id: RequestId,
+    pub first_token: u32,
+    pub first_token_logprob: Option<TokenLogprob>,
+    pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodeRequestResult {
+    pub request_id: RequestId,
+    pub token: u32,
+    pub logprob: Option<TokenLogprob>,
 }
 
 pub(crate) struct PrefillResult {
-    pub logits: Vec<DeviceVec>,
-    pub all_position_logits: Option<HiddenStates>,
+    pub requests: Vec<PrefillRequestResult>,
+}
+
+pub(crate) struct DecodeResult {
+    pub requests: Vec<DecodeRequestResult>,
 }
 
 pub(crate) struct UnifiedResult {
-    pub prefill_logits: Vec<DeviceVec>,
-    pub decode_logits: Vec<DeviceVec>,
-}
-
-pub(crate) enum DecodeStep<'a> {
-    Single(SingleDecodeStep<'a>),
-    TensorParallel(TensorParallelDecodeStep<'a>),
-}
-
-impl<'a> DecodeStep<'a> {
-    pub(crate) fn snapshot_cpu_logits(&self, requested_topk: &[usize]) -> Vec<Option<Vec<f32>>> {
-        match self {
-            Self::Single(step) => step.snapshot_cpu_logits(requested_topk),
-            Self::TensorParallel(step) => step.snapshot_cpu_logits(requested_topk),
-        }
-    }
-
-    pub(crate) fn sample_tokens(
-        self,
-        params: &[&SamplingParams],
-        rng: &mut StdRng,
-    ) -> Result<Vec<u32>> {
-        match self {
-            Self::Single(step) => step.sample_tokens(params, rng),
-            Self::TensorParallel(step) => step.sample_tokens(params, rng),
-        }
-    }
-}
-
-pub(crate) struct SingleDecodeStep<'a> {
-    executor: &'a mut SingleGpuQwen3Executor,
-    batch_size: usize,
-}
-
-impl<'a> SingleDecodeStep<'a> {
-    fn snapshot_cpu_logits(&self, requested_topk: &[usize]) -> Vec<Option<Vec<f32>>> {
-        (0..self.batch_size)
-            .map(|i| {
-                if requested_topk[i] > 0 {
-                    ops::extract_vec(
-                        self.executor.device_ctx(),
-                        &self.executor.lane.decode_bufs().logits,
-                        i,
-                    )
-                    .ok()
-                    .and_then(|v| v.to_host(self.executor.device_ctx()).ok())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn sample_tokens(self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
-        self.executor.lane.select_tokens(params, rng)
-    }
-}
-
-pub(crate) struct TensorParallelDecodeStep<'a> {
-    executor: &'a mut TensorParallelQwen3Executor,
-    batch_size: usize,
-}
-
-impl<'a> TensorParallelDecodeStep<'a> {
-    fn snapshot_cpu_logits(&self, requested_topk: &[usize]) -> Vec<Option<Vec<f32>>> {
-        (0..self.batch_size)
-            .map(|i| {
-                if requested_topk[i] > 0 {
-                    ops::extract_vec(
-                        self.executor.primary_device_ctx(),
-                        &self.executor.primary_lane.decode_bufs().logits,
-                        i,
-                    )
-                    .ok()
-                    .and_then(|v| v.to_host(self.executor.primary_device_ctx()).ok())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn sample_tokens(self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
-        self.executor.primary_lane.select_tokens(params, rng)
-    }
+    pub prefill_requests: Vec<PrefillRequestResult>,
+    pub decode_requests: Vec<DecodeRequestResult>,
 }
 
 pub(crate) trait ModelExecutor: Send {
-    fn alloc_kv(&self) -> RequestKvState;
     fn page_size(&self) -> usize;
     fn available_pages(&self) -> usize;
-    fn device_ctx(&self) -> &DeviceContext;
-    fn vocab_size(&self) -> usize;
     fn is_stop_token(&self, token_id: u32) -> bool;
+    fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
     fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult>;
-    fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>>;
+    fn execute_decode<'a>(&mut self, plan: DecodePlan<'a>) -> Result<DecodeResult>;
     fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult>;
 }
 
-pub(crate) enum Qwen3Executor {
-    Single(SingleGpuQwen3Executor),
-    TensorParallel(TensorParallelQwen3Executor),
+struct Qwen3ExecutorMetadata {
+    page_size: usize,
+    stop_token_ids: Vec<u32>,
+}
+
+pub(crate) struct Qwen3Executor {
+    metadata: Qwen3ExecutorMetadata,
+    kv_pools: Vec<KvPool>,
+    primary: RankWorker,
+    workers: Vec<RankWorker>,
 }
 
 impl Qwen3Executor {
     pub(crate) fn single(model: Qwen3Model) -> Result<Self> {
-        Ok(Self::Single(SingleGpuQwen3Executor::new(model)?))
+        let metadata = Qwen3ExecutorMetadata {
+            page_size: model.kv_pool().layout().page_size,
+            stop_token_ids: model.config().stop_token_ids.clone(),
+        };
+        let kv_pool = model.kv_pool().clone();
+        Ok(Self {
+            metadata,
+            kv_pools: vec![kv_pool],
+            primary: RankWorker::spawn(0, LocalQwen3Lane::new(model)?)?,
+            workers: Vec::new(),
+        })
     }
 
     pub(crate) fn from_runtime(
@@ -251,78 +508,164 @@ impl Qwen3Executor {
                     device_ordinal: device_ordinals[0],
                 },
             )?;
-            Self::single(model)
-        } else {
-            Ok(Self::TensorParallel(TensorParallelQwen3Executor::new(
-                model_path,
-                enable_cuda_graph,
-                device_ordinals,
-            )?))
+            return Self::single(model);
         }
+
+        let world_size = device_ordinals.len();
+        let mut models = Vec::with_capacity(world_size);
+        for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
+            models.push(Qwen3Model::from_safetensors_with_runtime(
+                model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph,
+                    tensor_parallel: Some(TensorParallelConfig { rank, world_size }),
+                    device_ordinal,
+                },
+            )?);
+        }
+
+        let metadata = Qwen3ExecutorMetadata {
+            page_size: models[0].kv_pool().layout().page_size,
+            stop_token_ids: models[0].config().stop_token_ids.clone(),
+        };
+
+        let streams = models
+            .iter()
+            .map(|m| m.device_ctx().stream.clone())
+            .collect();
+        let comms = cudarc::nccl::safe::Comm::from_devices(streams)
+            .map_err(|e| anyhow::anyhow!("failed to initialize NCCL comms: {e:?}"))?;
+        for (model, comm) in models.iter_mut().zip(comms) {
+            model.attach_tp_comm(comm);
+        }
+
+        let kv_pools = models.iter().map(|model| model.kv_pool().clone()).collect();
+        let mut lanes = models
+            .into_iter()
+            .map(LocalQwen3Lane::new)
+            .collect::<Result<Vec<_>>>()?;
+        let primary = RankWorker::spawn(0, lanes.remove(0))?;
+        let workers = lanes
+            .into_iter()
+            .enumerate()
+            .map(|(index, lane)| RankWorker::spawn(index + 1, lane))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            metadata,
+            kv_pools,
+            primary,
+            workers,
+        })
+    }
+
+    fn wait_for_step_ack(
+        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
+        op_name: &'static str,
+    ) -> Result<()> {
+        for recv in pending {
+            match recv
+                .recv()
+                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
+            {
+                WorkerStepOutcome::Ack => {}
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
+                        other.kind()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_step(&self, step: StepCommand) -> Result<WorkerStepOutcome> {
+        let primary = self.primary.run_step(step.clone(), true)?;
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            pending.push(worker.run_step(step.clone(), false)?);
+        }
+        let primary_result = primary
+            .recv()
+            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
+        Self::wait_for_step_ack(pending, step.kind())?;
+        Ok(primary_result)
     }
 }
 
 impl ModelExecutor for Qwen3Executor {
-    fn alloc_kv(&self) -> RequestKvState {
-        match self {
-            Self::Single(executor) => executor.alloc_kv(),
-            Self::TensorParallel(executor) => executor.alloc_kv(),
-        }
-    }
-
     fn page_size(&self) -> usize {
-        match self {
-            Self::Single(executor) => executor.page_size(),
-            Self::TensorParallel(executor) => executor.page_size(),
-        }
+        self.metadata.page_size
     }
 
     fn available_pages(&self) -> usize {
-        match self {
-            Self::Single(executor) => executor.available_pages(),
-            Self::TensorParallel(executor) => executor.available_pages(),
-        }
-    }
-
-    fn device_ctx(&self) -> &DeviceContext {
-        match self {
-            Self::Single(executor) => executor.device_ctx(),
-            Self::TensorParallel(executor) => executor.device_ctx(),
-        }
-    }
-
-    fn vocab_size(&self) -> usize {
-        match self {
-            Self::Single(executor) => executor.vocab_size(),
-            Self::TensorParallel(executor) => executor.vocab_size(),
-        }
+        self.kv_pools
+            .iter()
+            .map(KvPool::available_pages)
+            .min()
+            .unwrap_or(0)
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
-        match self {
-            Self::Single(executor) => executor.is_stop_token(token_id),
-            Self::TensorParallel(executor) => executor.is_stop_token(token_id),
+        self.metadata.stop_token_ids.contains(&token_id)
+    }
+
+    fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
+        self.primary.drop_request(request_id)?;
+        for worker in &self.workers {
+            worker.drop_request(request_id)?;
         }
+        Ok(())
     }
 
     fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        match self {
-            Self::Single(executor) => executor.execute_prefill(plan),
-            Self::TensorParallel(executor) => executor.execute_prefill(plan),
+        let step = StepCommand::Prefill {
+            requests: plan.requests.to_vec(),
+            echo: plan.echo,
+        };
+        match self.run_step(step)? {
+            WorkerStepOutcome::Prefill(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "prefill step returned unexpected payload: {}",
+                other.kind()
+            )),
         }
     }
 
-    fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        match self {
-            Self::Single(executor) => executor.begin_decode(plan),
-            Self::TensorParallel(executor) => executor.begin_decode(plan),
+    fn execute_decode<'a>(&mut self, plan: DecodePlan<'a>) -> Result<DecodeResult> {
+        let step = StepCommand::Decode {
+            requests: plan.requests.to_vec(),
+        };
+        match self.run_step(step)? {
+            WorkerStepOutcome::Decode(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "decode step returned unexpected payload: {}",
+                other.kind()
+            )),
         }
     }
 
     fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        match self {
-            Self::Single(executor) => executor.execute_unified(plan),
-            Self::TensorParallel(executor) => executor.execute_unified(plan),
+        let step = StepCommand::Unified {
+            prefill_requests: plan.prefill_requests.to_vec(),
+            decode_requests: plan.decode_requests.to_vec(),
+        };
+        match self.run_step(step)? {
+            WorkerStepOutcome::Unified(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "unified step returned unexpected payload: {}",
+                other.kind()
+            )),
+        }
+    }
+}
+
+impl Drop for Qwen3Executor {
+    fn drop(&mut self) {
+        self.primary.shutdown();
+        for worker in &mut self.workers {
+            worker.shutdown();
         }
     }
 }
@@ -330,13 +673,19 @@ impl ModelExecutor for Qwen3Executor {
 struct LocalQwen3Lane {
     model: Qwen3Model,
     bufs: BatchDecodeBuffers,
+    sample_scratch: SamplingScratch,
 }
 
 impl LocalQwen3Lane {
     fn new(model: Qwen3Model) -> Result<Self> {
         let max_bucket = *BATCH_BUCKETS.last().unwrap();
         let bufs = model.create_batch_decode_bufs(max_bucket)?;
-        Ok(Self { model, bufs })
+        let sample_scratch = SamplingScratch::new(model.device_ctx(), model.config().vocab_size)?;
+        Ok(Self {
+            model,
+            bufs,
+            sample_scratch,
+        })
     }
 
     fn bind(&self) -> Result<CublasThreadGuard> {
@@ -348,29 +697,49 @@ impl LocalQwen3Lane {
         self.model.alloc_kv()
     }
 
-    fn kv_pool(&self) -> &KvPool {
-        self.model.kv_pool()
+    fn sample_from_logits(
+        &mut self,
+        logits: &DeviceVec,
+        params: &SamplingParams,
+        random_val: f32,
+    ) -> Result<u32> {
+        crate::ops::gpu_sample_into(
+            self.model.device_ctx(),
+            logits,
+            &mut self.sample_scratch.probs,
+            &mut self.sample_scratch.top1_value,
+            &mut self.sample_scratch.row_states,
+            &mut self.sample_scratch.valid,
+            &mut self.sample_scratch.out,
+            params,
+            random_val,
+        )
     }
 
-    fn device_ctx(&self) -> &DeviceContext {
-        self.model.device_ctx()
+    fn extract_logprobs(
+        &self,
+        logits: &DeviceVec,
+        sampled_token: u32,
+        top_k: usize,
+    ) -> Result<TokenLogprob> {
+        let logits_f32 = logits.to_host(self.model.device_ctx())?;
+        compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+            .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
     }
 
-    fn vocab_size(&self) -> usize {
-        self.model.config().vocab_size
-    }
-
-    fn is_stop_token(&self, token_id: u32) -> bool {
-        self.model.is_stop_token(token_id)
-    }
-
-    fn decode_bufs(&self) -> &BatchDecodeBuffers {
-        &self.bufs
-    }
-
-    fn select_tokens(&mut self, params: &[&SamplingParams], rng: &mut StdRng) -> Result<Vec<u32>> {
-        self.model
-            .select_tokens_batch_varied(&mut self.bufs, params, rng)
+    fn extract_prompt_logprobs(
+        &self,
+        all_logits: &HiddenStates,
+        prev_pos: usize,
+        target_token: u32,
+        top_k: usize,
+    ) -> Option<TokenLogprob> {
+        crate::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
+            .ok()
+            .and_then(|logits_vec| {
+                let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
+                compute_logprobs_from_cpu(&logits_f32, target_token, top_k)
+            })
     }
 
     fn execute_prefill(
@@ -403,533 +772,97 @@ impl LocalQwen3Lane {
     }
 }
 
-pub(crate) struct SingleGpuQwen3Executor {
-    lane: LocalQwen3Lane,
-}
-
-impl SingleGpuQwen3Executor {
-    fn new(model: Qwen3Model) -> Result<Self> {
-        Ok(Self {
-            lane: LocalQwen3Lane::new(model)?,
-        })
-    }
-
-    fn page_size_inner(&self) -> usize {
-        self.lane.kv_pool().layout().page_size
-    }
-
-    fn available_pages_inner(&self) -> usize {
-        self.lane.kv_pool().available_pages()
-    }
-
-    fn device_ctx_inner(&self) -> &DeviceContext {
-        self.lane.device_ctx()
-    }
-
-    fn vocab_size_inner(&self) -> usize {
-        self.lane.vocab_size()
-    }
-
-    fn is_stop_token_inner(&self, token_id: u32) -> bool {
-        self.lane.is_stop_token(token_id)
-    }
-}
-
-impl ModelExecutor for SingleGpuQwen3Executor {
-    fn alloc_kv(&self) -> RequestKvState {
-        RequestKvState::new(vec![self.lane.alloc_kv()])
-    }
-
-    fn page_size(&self) -> usize {
-        self.page_size_inner()
-    }
-
-    fn available_pages(&self) -> usize {
-        self.available_pages_inner()
-    }
-
-    fn device_ctx(&self) -> &DeviceContext {
-        self.device_ctx_inner()
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.vocab_size_inner()
-    }
-
-    fn is_stop_token(&self, token_id: u32) -> bool {
-        self.is_stop_token_inner(token_id)
-    }
-
-    fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        let _cublas_guard = self.lane.bind()?;
-        let mut local_kv_states: Vec<&mut KvState> = plan
-            .kv_states
-            .iter_mut()
-            .map(|state| state.shard_mut(0))
-            .collect();
-        let (logits, all_position_logits) =
-            self.lane
-                .execute_prefill(plan.prompts, &mut local_kv_states, plan.echo)?;
-        Ok(PrefillResult {
-            logits,
-            all_position_logits,
-        })
-    }
-
-    fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        let _cublas_guard = self.lane.bind()?;
-        let mut local_kv_states: Vec<&mut KvState> = plan
-            .kv_states
-            .iter_mut()
-            .map(|state| state.shard_mut(0))
-            .collect();
-        self.lane
-            .execute_decode(plan.token_ids, &mut local_kv_states)?;
-        Ok(DecodeStep::Single(SingleDecodeStep {
-            executor: self,
-            batch_size: plan.token_ids.len(),
-        }))
-    }
-
-    fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        let _cublas_guard = self.lane.bind()?;
-        let mut prefill_kv_states: Vec<&mut KvState> = plan
-            .prefill_kv_states
-            .iter_mut()
-            .map(|state| state.shard_mut(0))
-            .collect();
-        let mut decode_kv_states: Vec<&mut KvState> = plan
-            .decode_kv_states
-            .iter_mut()
-            .map(|state| state.shard_mut(0))
-            .collect();
-        let (prefill_logits, decode_logits) = self.lane.execute_unified(
-            plan.prefill_prompts,
-            &mut prefill_kv_states,
-            plan.decode_tokens,
-            &mut decode_kv_states,
-        )?;
-        Ok(UnifiedResult {
-            prefill_logits,
-            decode_logits,
-        })
-    }
-}
-
-pub(crate) struct TensorParallelQwen3Executor {
-    primary_lane: LocalQwen3Lane,
-    kv_pools: Vec<KvPool>,
-    workers: Vec<RankWorker>,
-}
-
-impl TensorParallelQwen3Executor {
-    fn new(model_path: &str, enable_cuda_graph: bool, device_ordinals: &[usize]) -> Result<Self> {
-        anyhow::ensure!(
-            !device_ordinals.is_empty(),
-            "tensor-parallel executor requires at least one device"
-        );
-        let world_size = device_ordinals.len();
-        let mut models = Vec::with_capacity(world_size);
-        for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
-            models.push(Qwen3Model::from_safetensors_with_runtime(
-                model_path,
-                ModelRuntimeConfig {
-                    enable_cuda_graph,
-                    tensor_parallel: Some(TensorParallelConfig { rank, world_size }),
-                    device_ordinal,
-                },
-            )?);
-        }
-
-        let streams = models
-            .iter()
-            .map(|m| m.device_ctx().stream.clone())
-            .collect();
-        let comms = cudarc::nccl::safe::Comm::from_devices(streams)
-            .map_err(|e| anyhow::anyhow!("failed to initialize NCCL comms: {e:?}"))?;
-        for (model, comm) in models.iter_mut().zip(comms) {
-            model.attach_tp_comm(comm);
-        }
-
-        let kv_pools = models.iter().map(|model| model.kv_pool().clone()).collect();
-        let mut lanes = models
-            .into_iter()
-            .map(LocalQwen3Lane::new)
-            .collect::<Result<Vec<_>>>()?;
-        let primary_lane = lanes.remove(0);
-        let workers = lanes
-            .into_iter()
-            .enumerate()
-            .map(|(index, lane)| RankWorker::spawn(index + 1, lane))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            primary_lane,
-            kv_pools,
-            workers,
-        })
-    }
-
-    fn tp_size(&self) -> usize {
-        self.kv_pools.len()
-    }
-
-    fn primary_model(&self) -> &Qwen3Model {
-        &self.primary_lane.model
-    }
-
-    fn primary_device_ctx(&self) -> &DeviceContext {
-        self.primary_model().device_ctx()
-    }
-
-    fn page_size_inner(&self) -> usize {
-        self.primary_model().kv_pool().layout().page_size
-    }
-
-    fn available_pages_inner(&self) -> usize {
-        self.kv_pools
-            .iter()
-            .map(KvPool::available_pages)
-            .min()
-            .unwrap_or(0)
-    }
-
-    fn device_ctx_inner(&self) -> &DeviceContext {
-        self.primary_device_ctx()
-    }
-
-    fn vocab_size_inner(&self) -> usize {
-        self.primary_model().config().vocab_size
-    }
-
-    fn is_stop_token_inner(&self, token_id: u32) -> bool {
-        self.primary_model().is_stop_token(token_id)
-    }
-
-    fn shard_kv_ptrs(&self, kv_states: &mut [RequestKvState]) -> Vec<Vec<KvStatePtr>> {
-        let tp_size = self.tp_size();
-        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(kv_states.len()))
-            .collect();
-        for kv_state in kv_states.iter_mut() {
-            for (rank, rank_kvs) in kv_by_rank.iter_mut().enumerate() {
-                rank_kvs.push(kv_state.shard_ptr(rank));
-            }
-        }
-        kv_by_rank
-    }
-
-    fn shard_kv_ptr_refs(&self, kv_states: &mut [&mut RequestKvState]) -> Vec<Vec<KvStatePtr>> {
-        let tp_size = self.tp_size();
-        let mut kv_by_rank: Vec<Vec<KvStatePtr>> = (0..tp_size)
-            .map(|_| Vec::with_capacity(kv_states.len()))
-            .collect();
-        for kv_state in kv_states.iter_mut() {
-            for (rank, rank_kvs) in kv_by_rank.iter_mut().enumerate() {
-                rank_kvs.push(kv_state.shard_ptr(rank));
-            }
-        }
-        kv_by_rank
-    }
-
-    fn wait_for_workers(
-        pending: Vec<mpsc::Receiver<Result<()>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        for recv in pending {
-            recv.recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??;
-        }
-        Ok(())
-    }
-
-    fn bind_primary(&self) -> Result<CublasThreadGuard> {
-        self.primary_lane.bind()
-    }
-
-    fn dispatch_prefill_workers(
-        &self,
-        prompts: Vec<TokenSlicePtr>,
-        mut kv_by_rank: Vec<Vec<KvStatePtr>>,
+#[derive(Clone)]
+enum StepCommand {
+    Prefill {
+        requests: Vec<PrefillStepItem>,
         echo: bool,
-    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(worker.execute_prefill(
-                prompts.clone(),
-                std::mem::take(&mut kv_by_rank[rank + 1]),
-                echo,
-            )?);
-        }
-        Ok(pending)
-    }
-
-    fn dispatch_decode_workers(
-        &self,
-        token_ids: Vec<u32>,
-        mut kv_by_rank: Vec<Vec<KvStatePtr>>,
-    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(
-                worker
-                    .execute_decode(token_ids.clone(), std::mem::take(&mut kv_by_rank[rank + 1]))?,
-            );
-        }
-        Ok(pending)
-    }
-
-    fn dispatch_unified_workers(
-        &self,
-        prefill_prompts: Vec<TokenSlicePtr>,
-        mut prefill_kv_by_rank: Vec<Vec<KvStatePtr>>,
-        decode_tokens: Vec<u32>,
-        mut decode_kv_by_rank: Vec<Vec<KvStatePtr>>,
-    ) -> Result<Vec<mpsc::Receiver<Result<()>>>> {
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            pending.push(worker.execute_unified(
-                prefill_prompts.clone(),
-                std::mem::take(&mut prefill_kv_by_rank[rank + 1]),
-                decode_tokens.clone(),
-                std::mem::take(&mut decode_kv_by_rank[rank + 1]),
-            )?);
-        }
-        Ok(pending)
-    }
+    },
+    Decode {
+        requests: Vec<DecodeStepItem>,
+    },
+    Unified {
+        prefill_requests: Vec<PrefillStepItem>,
+        decode_requests: Vec<DecodeStepItem>,
+    },
 }
 
-impl ModelExecutor for TensorParallelQwen3Executor {
-    fn alloc_kv(&self) -> RequestKvState {
-        RequestKvState::new(self.kv_pools.iter().map(KvPool::alloc).collect())
-    }
-
-    fn page_size(&self) -> usize {
-        self.page_size_inner()
-    }
-
-    fn available_pages(&self) -> usize {
-        self.available_pages_inner()
-    }
-
-    fn device_ctx(&self) -> &DeviceContext {
-        self.device_ctx_inner()
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.vocab_size_inner()
-    }
-
-    fn is_stop_token(&self, token_id: u32) -> bool {
-        self.is_stop_token_inner(token_id)
-    }
-
-    fn execute_prefill<'a>(&mut self, plan: PrefillPlan<'a>) -> Result<PrefillResult> {
-        let mut kv_by_rank = self.shard_kv_ptrs(plan.kv_states);
-        let prompts: Vec<TokenSlicePtr> = plan
-            .prompts
-            .iter()
-            .map(|tokens| TokenSlicePtr::from_slice(tokens))
-            .collect();
-        let pending = self.dispatch_prefill_workers(prompts, kv_by_rank.clone(), plan.echo)?;
-
-        let _cublas_guard = self.bind_primary()?;
-        let result = {
-            let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
-            let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                .into_iter()
-                .map(|ptr| unsafe { ptr.as_mut() })
-                .collect();
-            self.primary_lane
-                .execute_prefill(plan.prompts, &mut local_kv_states, plan.echo)?
-        };
-
-        Self::wait_for_workers(pending, "prefill")?;
-
-        Ok(PrefillResult {
-            logits: result.0,
-            all_position_logits: result.1,
-        })
-    }
-
-    fn begin_decode<'a>(&'a mut self, plan: DecodePlan<'a>) -> Result<DecodeStep<'a>> {
-        let mut kv_by_rank = self.shard_kv_ptr_refs(plan.kv_states);
-        let token_ids = plan.token_ids.to_vec();
-        let pending = self.dispatch_decode_workers(token_ids, kv_by_rank.clone())?;
-
-        let _cublas_guard = self.bind_primary()?;
-        {
-            let local_kv_ptrs = std::mem::take(&mut kv_by_rank[0]);
-            let mut local_kv_states: Vec<&mut KvState> = local_kv_ptrs
-                .into_iter()
-                .map(|ptr| unsafe { ptr.as_mut() })
-                .collect();
-            self.primary_lane
-                .execute_decode(plan.token_ids, &mut local_kv_states)?;
-        }
-
-        Self::wait_for_workers(pending, "decode")?;
-
-        Ok(DecodeStep::TensorParallel(TensorParallelDecodeStep {
-            executor: self,
-            batch_size: plan.token_ids.len(),
-        }))
-    }
-
-    fn execute_unified<'a>(&mut self, plan: UnifiedPlan<'a>) -> Result<UnifiedResult> {
-        let mut prefill_kv_by_rank = self.shard_kv_ptrs(plan.prefill_kv_states);
-        let mut decode_kv_by_rank = self.shard_kv_ptr_refs(plan.decode_kv_states);
-
-        let prefill_prompts: Vec<TokenSlicePtr> = plan
-            .prefill_prompts
-            .iter()
-            .map(|tokens| TokenSlicePtr::from_slice(tokens))
-            .collect();
-        let decode_tokens = plan.decode_tokens.to_vec();
-        let pending = self.dispatch_unified_workers(
-            prefill_prompts,
-            prefill_kv_by_rank.clone(),
-            decode_tokens,
-            decode_kv_by_rank.clone(),
-        )?;
-
-        let _cublas_guard = self.bind_primary()?;
-        let result = {
-            let prefill_kv_ptrs = std::mem::take(&mut prefill_kv_by_rank[0]);
-            let decode_kv_ptrs = std::mem::take(&mut decode_kv_by_rank[0]);
-            let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
-                .into_iter()
-                .map(|ptr| unsafe { ptr.as_mut() })
-                .collect();
-            let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
-                .into_iter()
-                .map(|ptr| unsafe { ptr.as_mut() })
-                .collect();
-            self.primary_lane.execute_unified(
-                plan.prefill_prompts,
-                &mut prefill_kv_states,
-                plan.decode_tokens,
-                &mut decode_kv_states,
-            )?
-        };
-
-        Self::wait_for_workers(pending, "unified")?;
-
-        Ok(UnifiedResult {
-            prefill_logits: result.0,
-            decode_logits: result.1,
-        })
-    }
-}
-
-impl Drop for TensorParallelQwen3Executor {
-    fn drop(&mut self) {
-        for worker in &mut self.workers {
-            worker.shutdown();
+impl StepCommand {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Prefill { .. } => "prefill",
+            Self::Decode { .. } => "decode",
+            Self::Unified { .. } => "unified",
         }
     }
 }
 
 enum WorkerCommand {
-    Prefill {
-        prompts: Vec<TokenSlicePtr>,
-        kv_ptrs: Vec<KvStatePtr>,
-        echo: bool,
-        resp: mpsc::Sender<Result<()>>,
+    RunStep {
+        step: StepCommand,
+        collect_result: bool,
+        resp: channel::Sender<Result<WorkerStepOutcome>>,
     },
-    Decode {
-        token_ids: Vec<u32>,
-        kv_ptrs: Vec<KvStatePtr>,
-        resp: mpsc::Sender<Result<()>>,
-    },
-    Unified {
-        prefill_prompts: Vec<TokenSlicePtr>,
-        prefill_kv_ptrs: Vec<KvStatePtr>,
-        decode_tokens: Vec<u32>,
-        decode_kv_ptrs: Vec<KvStatePtr>,
-        resp: mpsc::Sender<Result<()>>,
+    DropRequest {
+        request_id: RequestId,
+        resp: channel::Sender<Result<()>>,
     },
     Shutdown,
 }
 
+enum WorkerStepOutcome {
+    Ack,
+    Prefill(PrefillResult),
+    Decode(DecodeResult),
+    Unified(UnifiedResult),
+}
+
+impl WorkerStepOutcome {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Prefill(_) => "prefill",
+            Self::Decode(_) => "decode",
+            Self::Unified(_) => "unified",
+        }
+    }
+}
+
 struct RankWorker {
-    tx: mpsc::Sender<WorkerCommand>,
+    tx: channel::Sender<WorkerCommand>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RankWorker {
     fn spawn(rank: usize, mut lane: LocalQwen3Lane) -> Result<Self> {
-        let (tx, rx) = mpsc::channel();
-        let (startup_tx, startup_rx) = mpsc::channel();
+        let (tx, rx) = channel::unbounded();
+        let (startup_tx, startup_rx) = channel::bounded(1);
         let handle = thread::Builder::new()
             .name(format!("qwen3-tp-rank-{rank}"))
             .spawn(move || {
+                let mut request_states = RequestStateStore::new();
                 let startup = lane.bind();
                 match startup {
                     Ok(_guard) => {
                         let _ = startup_tx.send(Ok(()));
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
-                                WorkerCommand::Prefill {
-                                    prompts,
-                                    kv_ptrs,
-                                    echo,
+                                WorkerCommand::RunStep {
+                                    step,
+                                    collect_result,
                                     resp,
                                 } => {
-                                    let prompts: Vec<&[u32]> = prompts
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_slice() })
-                                        .collect();
-                                    let mut kv_states: Vec<&mut KvState> = kv_ptrs
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_mut() })
-                                        .collect();
-                                    let result = lane
-                                        .execute_prefill(&prompts, &mut kv_states, echo)
-                                        .map(|_| ());
+                                    let result = execute_step_on_lane(
+                                        &mut lane,
+                                        &mut request_states,
+                                        &step,
+                                        collect_result,
+                                    );
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::Decode {
-                                    token_ids,
-                                    kv_ptrs,
-                                    resp,
-                                } => {
-                                    let mut kv_states: Vec<&mut KvState> = kv_ptrs
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_mut() })
-                                        .collect();
-                                    let result =
-                                        lane.execute_decode(&token_ids, &mut kv_states).map(|_| ());
-                                    let _ = resp.send(result);
-                                }
-                                WorkerCommand::Unified {
-                                    prefill_prompts,
-                                    prefill_kv_ptrs,
-                                    decode_tokens,
-                                    decode_kv_ptrs,
-                                    resp,
-                                } => {
-                                    let prefill_prompts: Vec<&[u32]> = prefill_prompts
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_slice() })
-                                        .collect();
-                                    let mut prefill_kv_states: Vec<&mut KvState> = prefill_kv_ptrs
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_mut() })
-                                        .collect();
-                                    let mut decode_kv_states: Vec<&mut KvState> = decode_kv_ptrs
-                                        .into_iter()
-                                        .map(|ptr| unsafe { ptr.as_mut() })
-                                        .collect();
-                                    let result = lane
-                                        .execute_unified(
-                                            &prefill_prompts,
-                                            &mut prefill_kv_states,
-                                            &decode_tokens,
-                                            &mut decode_kv_states,
-                                        )
-                                        .map(|_| ());
-                                    let _ = resp.send(result);
+                                WorkerCommand::DropRequest { request_id, resp } => {
+                                    request_states.drop_request(request_id);
+                                    let _ = resp.send(Ok(()));
                                 }
                                 WorkerCommand::Shutdown => break,
                             }
@@ -950,58 +883,35 @@ impl RankWorker {
         })
     }
 
-    fn execute_prefill(
+    fn run_step(
         &self,
-        prompts: Vec<TokenSlicePtr>,
-        kv_ptrs: Vec<KvStatePtr>,
-        echo: bool,
-    ) -> Result<mpsc::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::channel();
+        step: StepCommand,
+        collect_result: bool,
+    ) -> Result<channel::Receiver<Result<WorkerStepOutcome>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
-            .send(WorkerCommand::Prefill {
-                prompts,
-                kv_ptrs,
-                echo,
+            .send(WorkerCommand::RunStep {
+                step,
+                collect_result,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel prefill worker channel closed"))?;
+            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
     }
 
-    fn execute_decode(
-        &self,
-        token_ids: Vec<u32>,
-        kv_ptrs: Vec<KvStatePtr>,
-    ) -> Result<mpsc::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::channel();
+    fn drop_request(&self, request_id: RequestId) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
-            .send(WorkerCommand::Decode {
-                token_ids,
-                kv_ptrs,
+            .send(WorkerCommand::DropRequest {
+                request_id,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel decode worker channel closed"))?;
-        Ok(resp_rx)
-    }
-
-    fn execute_unified(
-        &self,
-        prefill_prompts: Vec<TokenSlicePtr>,
-        prefill_kv_ptrs: Vec<KvStatePtr>,
-        decode_tokens: Vec<u32>,
-        decode_kv_ptrs: Vec<KvStatePtr>,
-    ) -> Result<mpsc::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::channel();
-        self.tx
-            .send(WorkerCommand::Unified {
-                prefill_prompts,
-                prefill_kv_ptrs,
-                decode_tokens,
-                decode_kv_ptrs,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel unified worker channel closed"))?;
-        Ok(resp_rx)
+            .map_err(|_| {
+                anyhow::anyhow!("tensor-parallel worker channel closed on drop_request")
+            })?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("tensor-parallel worker dropped drop_request response"))?
     }
 
     fn shutdown(&mut self) {

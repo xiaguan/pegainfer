@@ -18,13 +18,13 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::model::Qwen3Model;
-use crate::model_executor::{ModelExecutor, Qwen3Executor, RequestKvState};
+use crate::model_executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::sampler::SamplingParams;
 use crate::server_engine::{FinishReason, TokenLogprob};
 
 use self::effects::apply_effects;
 use self::plan::{build_next_plan, execute_plan};
-use self::resolve::{SampleScratch, resolve_step};
+use self::resolve::resolve_step;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -80,8 +80,8 @@ impl SchedulerHandle {
 
 /// An in-flight request being decoded.
 pub(super) struct ActiveRequestState {
+    pub(super) request_id: RequestId,
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
-    pub(super) kv: RequestKvState,
     pub(super) last_token: u32,
     pub(super) generated_count: usize,
     pub(super) max_tokens: usize,
@@ -91,12 +91,35 @@ pub(super) struct ActiveRequestState {
     pub(super) logprobs: usize,
 }
 
+pub(super) struct PendingRequest {
+    pub(super) request_id: RequestId,
+    pub(super) prompt_tokens: Vec<u32>,
+    pub(super) params: SamplingParams,
+    pub(super) max_tokens: usize,
+    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) logprobs: usize,
+    pub(super) echo: bool,
+}
+
+impl PendingRequest {
+    fn from_scheduler_request(request_id: RequestId, req: SchedulerRequest) -> Self {
+        Self {
+            request_id,
+            prompt_tokens: req.prompt_tokens,
+            params: req.params,
+            max_tokens: req.max_tokens,
+            token_tx: req.token_tx,
+            logprobs: req.logprobs,
+            echo: req.echo,
+        }
+    }
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────
 
 /// Start the scheduler thread. Returns a handle for submitting requests.
 ///
-/// The scheduler exclusively owns the request lifecycle and KV allocation state.
-/// No Mutex — only this thread touches the GPU.
+/// The scheduler exclusively owns request lifecycle and batching decisions.
 pub fn start(model: Qwen3Model, seed: u64) -> Result<SchedulerHandle> {
     let executor = Qwen3Executor::single(model)?;
     start_with_executor(executor, seed)
@@ -113,15 +136,12 @@ pub fn start_qwen3(
 }
 
 pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> Result<SchedulerHandle> {
-    // Sampling scratch — reused across prefill and unified-step sampling
-    let sample_scratch = SampleScratch::new(&executor)?;
-
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(executor, submit_rx, sample_scratch, seed);
+            scheduler_loop(executor, submit_rx, seed);
         })
         .expect("failed to spawn scheduler thread");
 
@@ -133,34 +153,48 @@ pub(crate) fn start_with_executor(executor: Qwen3Executor, seed: u64) -> Result<
 fn scheduler_loop(
     mut executor: Qwen3Executor,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
-    mut sample_scratch: SampleScratch,
     seed: u64,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequestState> = Vec::new();
+    let mut next_request_id = 0u64;
     // Requests that could not be admitted due to KV budget pressure.
     // Held here so they aren't lost; re-evaluated every loop iteration.
-    let mut deferred: Vec<SchedulerRequest> = Vec::new();
+    let mut deferred: Vec<PendingRequest> = Vec::new();
 
     info!("Scheduler ready");
 
     loop {
         // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
-            deferred.push(req);
+            deferred.push(PendingRequest::from_scheduler_request(
+                RequestId(next_request_id),
+                req,
+            ));
+            next_request_id += 1;
         }
 
         // 2. Nothing active and nothing deferred → block until a request arrives.
         if active.is_empty() && deferred.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => deferred.push(req),
+                Some(req) => {
+                    deferred.push(PendingRequest::from_scheduler_request(
+                        RequestId(next_request_id),
+                        req,
+                    ));
+                    next_request_id += 1;
+                }
                 None => {
                     info!("Scheduler: all handles dropped, exiting");
                     return;
                 }
             }
             while let Ok(req) = submit_rx.try_recv() {
-                deferred.push(req);
+                deferred.push(PendingRequest::from_scheduler_request(
+                    RequestId(next_request_id),
+                    req,
+                ));
+                next_request_id += 1;
             }
         }
 
@@ -170,8 +204,8 @@ fn scheduler_loop(
         let page_size = executor.page_size();
         let decode_reserve = active.len(); // one page per active request
         let mut budget = executor.available_pages().saturating_sub(decode_reserve);
-        let mut pending: Vec<SchedulerRequest> = Vec::new();
-        let mut still_deferred: Vec<SchedulerRequest> = Vec::new();
+        let mut pending: Vec<PendingRequest> = Vec::new();
+        let mut still_deferred: Vec<PendingRequest> = Vec::new();
         for req in deferred.drain(..) {
             let needed = req.prompt_tokens.len().div_ceil(page_size);
             if needed <= budget {
@@ -200,7 +234,7 @@ fn scheduler_loop(
                 continue;
             }
         };
-        let effects = resolve_step(&executor, &active, artifacts, &mut sample_scratch, &mut rng);
-        apply_effects(&mut active, effects);
+        let effects = resolve_step(&executor, &active, artifacts);
+        apply_effects(&mut executor, &mut active, effects);
     }
 }
