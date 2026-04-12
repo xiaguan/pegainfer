@@ -1,23 +1,28 @@
 use anyhow::Result;
+use cudarc::nccl::safe::{Comm, ReduceOp};
 use log::{debug, info};
 use std::time::Instant;
 
-use super::config::Config;
+use super::config::{Config, TensorParallelConfig};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
-    precompute_rope,
+    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
+    load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
     pub enable_cuda_graph: bool,
+    pub tensor_parallel: Option<TensorParallelConfig>,
+    pub device_ordinal: usize,
 }
 
 impl Default for ModelRuntimeConfig {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
+            tensor_parallel: None,
+            device_ordinal: 0,
         }
     }
 }
@@ -64,18 +69,28 @@ pub struct Qwen3Model {
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
     pub(super) kv_pool: crate::kv_pool::KvPool,
+    pub(super) tensor_parallel: TensorParallelConfig,
+    pub(super) tp_comm: Option<Comm>,
 }
+
+// SAFETY: Each model instance is pinned to a single CUDA device and is only
+// driven from one worker thread at a time. The TP path creates one model per
+// rank and never shares a single rank-local model concurrently across threads.
+unsafe impl Send for Qwen3Model {}
+unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
     pub fn from_safetensors_with_runtime(
         model_path: &str,
-        _runtime: ModelRuntimeConfig,
+        runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
         info!("Loading model from: {}", model_path);
-        debug!("Initializing GPU");
-        let ctx = DeviceContext::new()?;
+        debug!("Initializing GPU device {}", runtime.device_ordinal);
+        let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
         let config = Config::from_file(model_path)?;
+        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
+        tensor_parallel.validate_for(&config)?;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
@@ -99,31 +114,69 @@ impl Qwen3Model {
         };
 
         debug!(
-            "Loading layers to GPU: num_layers={}",
-            config.num_hidden_layers
+            "Loading layers to GPU: num_layers={}, tp_rank={}, tp_world_size={}",
+            config.num_hidden_layers, tensor_parallel.rank, tensor_parallel.world_size,
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let (q_row_offset, q_rows) =
+            tensor_parallel.shard_range(config.num_attention_heads * config.head_dim);
+        let (kv_row_offset, kv_rows) =
+            tensor_parallel.shard_range(config.num_key_value_heads * config.head_dim);
+        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
 
-            let q_proj = load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.self_attn.q_proj.weight", prefix),
-            )?;
-            let k_proj = load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.self_attn.k_proj.weight", prefix),
-            )?;
-            let v_proj = load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.self_attn.v_proj.weight", prefix),
-            )?;
+            let q_proj = if tensor_parallel.is_sharded() {
+                load_tensor_2d_row_shard(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.q_proj.weight", prefix),
+                    q_row_offset,
+                    q_rows,
+                )?
+            } else {
+                load_tensor_2d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.q_proj.weight", prefix),
+                )?
+            };
+            let k_proj = if tensor_parallel.is_sharded() {
+                load_tensor_2d_row_shard(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.k_proj.weight", prefix),
+                    kv_row_offset,
+                    kv_rows,
+                )?
+            } else {
+                load_tensor_2d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.k_proj.weight", prefix),
+                )?
+            };
+            let v_proj = if tensor_parallel.is_sharded() {
+                load_tensor_2d_row_shard(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.v_proj.weight", prefix),
+                    kv_row_offset,
+                    kv_rows,
+                )?
+            } else {
+                load_tensor_2d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.self_attn.v_proj.weight", prefix),
+                )?
+            };
             let q_dim = q_proj.rows;
             let kv_dim = k_proj.rows;
             let qkv_proj = DeviceMatrix::vstack(&ctx, &[&q_proj, &k_proj, &v_proj])?;
@@ -131,18 +184,40 @@ impl Qwen3Model {
             drop(k_proj);
             drop(v_proj);
 
-            let gate_proj = load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.mlp.gate_proj.weight", prefix),
-            )?;
-            let up_proj = load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.mlp.up_proj.weight", prefix),
-            )?;
+            let gate_proj = if tensor_parallel.is_sharded() {
+                load_tensor_2d_row_shard(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp.gate_proj.weight", prefix),
+                    inter_row_offset,
+                    inter_rows,
+                )?
+            } else {
+                load_tensor_2d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp.gate_proj.weight", prefix),
+                )?
+            };
+            let up_proj = if tensor_parallel.is_sharded() {
+                load_tensor_2d_row_shard(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp.up_proj.weight", prefix),
+                    inter_row_offset,
+                    inter_rows,
+                )?
+            } else {
+                load_tensor_2d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp.up_proj.weight", prefix),
+                )?
+            };
             let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
             drop(gate_proj);
             drop(up_proj);
@@ -156,12 +231,23 @@ impl Qwen3Model {
                 )?,
                 attention: Attention {
                     qkv_proj,
-                    o_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.o_proj.weight", prefix),
-                    )?,
+                    o_proj: if tensor_parallel.is_sharded() {
+                        load_tensor_2d_col_shard(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                            q_row_offset,
+                            q_rows,
+                        )?
+                    } else {
+                        load_tensor_2d(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                        )?
+                    },
                     q_norm: load_tensor_1d(
                         &ctx,
                         &shards,
@@ -185,12 +271,23 @@ impl Qwen3Model {
                 )?,
                 mlp: MLP {
                     gate_up_proj,
-                    down_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.down_proj.weight", prefix),
-                    )?,
+                    down_proj: if tensor_parallel.is_sharded() {
+                        load_tensor_2d_col_shard(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                            inter_row_offset,
+                            inter_rows,
+                        )?
+                    } else {
+                        load_tensor_2d(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                        )?
+                    },
                 },
             };
             layers.push(block);
@@ -212,7 +309,7 @@ impl Qwen3Model {
         let page_size = 16;
         let layout = crate::kv_pool::KvLayout::new(
             config.num_hidden_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
         );
@@ -230,7 +327,7 @@ impl Qwen3Model {
         let kv_pool = crate::kv_pool::KvPool::new(
             &ctx,
             config.num_hidden_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
             num_pages,
@@ -245,8 +342,10 @@ impl Qwen3Model {
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph: _runtime.enable_cuda_graph,
+            enable_cuda_graph: runtime.enable_cuda_graph,
             kv_pool,
+            tensor_parallel,
+            tp_comm: None,
         };
 
         if model.enable_cuda_graph {
@@ -270,6 +369,38 @@ impl Qwen3Model {
         &self.ctx
     }
 
+    pub(crate) fn local_num_attention_heads(&self) -> usize {
+        self.config.local_num_attention_heads(self.tensor_parallel)
+    }
+
+    pub(crate) fn local_num_key_value_heads(&self) -> usize {
+        self.config.local_num_key_value_heads(self.tensor_parallel)
+    }
+
+    pub(crate) fn local_intermediate_size(&self) -> usize {
+        self.config.local_intermediate_size(self.tensor_parallel)
+    }
+
+    pub(crate) fn local_q_dim(&self) -> usize {
+        self.config.local_q_dim(self.tensor_parallel)
+    }
+
+    pub(crate) fn local_kv_dim(&self) -> usize {
+        self.config.local_kv_dim(self.tensor_parallel)
+    }
+
+    pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
+        self.tp_comm = Some(comm);
+    }
+
+    pub(crate) fn all_reduce_hidden(&self, hidden: &mut crate::tensor::HiddenStates) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
+                .map_err(|e| anyhow::anyhow!("nccl all-reduce failed: {e:?}"))?;
+        }
+        Ok(())
+    }
+
     /// Allocate a fresh (empty) per-request KV state from the shared pool.
     pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
         self.kv_pool.alloc()
@@ -286,7 +417,11 @@ impl Qwen3Model {
     ) -> anyhow::Result<super::batch_decode_buffers::BatchDecodeBuffers> {
         super::batch_decode_buffers::BatchDecodeBuffers::new(
             &self.ctx,
-            &self.config,
+            self.config.hidden_size,
+            self.local_q_dim(),
+            self.local_kv_dim(),
+            self.local_intermediate_size(),
+            self.config.vocab_size,
             max_batch_size,
             self.kv_pool.capacity_pages(),
             self.kv_pool.padding_page_id(),

@@ -21,6 +21,7 @@ fn paged_attention_single_token_decode() {
         &model_path,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..Default::default()
         },
     )
     .expect("Failed to load model");
@@ -35,7 +36,7 @@ fn paged_attention_single_token_decode() {
     };
 
     // Use BOS token as single-token "prompt" — goes through decode path, not prefill
-    let bos_token = 151643u32; // Qwen3 BOS token
+    let bos_token = 151_643_u32; // Qwen3 BOS token
 
     // First forward: single token → decode path
     model
@@ -52,7 +53,7 @@ fn paged_attention_single_token_decode() {
     for i in 0..9 {
         model
             .forward(&[*tokens.last().unwrap()], &mut state)
-            .expect(&format!("Forward step {i} failed"));
+            .unwrap_or_else(|_| panic!("Forward step {i} failed"));
         let next = model
             .select_token(&mut state, &params, &mut rng)
             .expect("select_token failed");
@@ -64,7 +65,7 @@ fn paged_attention_single_token_decode() {
 
     // Basic sanity: should produce non-zero, valid tokens
     for &t in &tokens {
-        assert!(t < 151936, "Token {t} out of vocab range");
+        assert!(t < 151_936, "Token {t} out of vocab range");
     }
 
     // Verify determinism: reset and regenerate with same seed

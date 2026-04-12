@@ -4,7 +4,6 @@ use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
 
-use super::config::Config;
 use crate::kv_pool::KvState;
 use crate::model::cuda_graph::CudaGraphState;
 use crate::tensor::{DeviceContext, HiddenStates};
@@ -60,13 +59,6 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) kv_tile_indices_d: CudaSlice<i32>,
     pub(crate) kv_chunk_size_d: CudaSlice<i32>,
 
-    // Per-request sampling scratch (reused across requests in a loop)
-    pub(crate) sample_probs: CudaSlice<f32>,
-    pub(crate) sample_top1_value: CudaSlice<half::bf16>,
-    pub(crate) sample_row_states: CudaSlice<u8>,
-    pub(crate) sample_valid: CudaSlice<u8>,
-    pub(crate) sample_out: CudaSlice<i32>,
-
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
@@ -77,30 +69,31 @@ pub(crate) struct BatchDecodeBuffers {
 impl BatchDecodeBuffers {
     pub(crate) fn new(
         ctx: &DeviceContext,
-        config: &Config,
+        hidden_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
         max_batch_size: usize,
         max_total_pages: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
-        let h = config.hidden_size;
-        let q_dim = config.num_attention_heads * config.head_dim;
-        let kv_dim = config.num_key_value_heads * config.head_dim;
         let bs = max_batch_size;
 
         Ok(Self {
             max_batch_size: bs,
-            normed: HiddenStates::zeros(ctx, h, bs)?,
+            normed: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             q: HiddenStates::zeros(ctx, q_dim, bs)?,
             k: HiddenStates::zeros(ctx, kv_dim, bs)?,
             v: HiddenStates::zeros(ctx, kv_dim, bs)?,
             attn_out: HiddenStates::zeros(ctx, q_dim, bs)?,
-            attn_proj: HiddenStates::zeros(ctx, h, bs)?,
+            attn_proj: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             qkv_out: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * config.intermediate_size, bs)?,
-            mlp_act: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
-            mlp_out: HiddenStates::zeros(ctx, h, bs)?,
-            hidden: HiddenStates::zeros(ctx, h, bs)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * intermediate_size, bs)?,
+            mlp_act: HiddenStates::zeros(ctx, intermediate_size, bs)?,
+            mlp_out: HiddenStates::zeros(ctx, hidden_dim, bs)?,
+            hidden: HiddenStates::zeros(ctx, hidden_dim, bs)?,
+            logits: HiddenStates::zeros(ctx, vocab_size, bs)?,
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
             // Paged attention: worst case all requests use max_total_pages + padding slots
@@ -110,13 +103,6 @@ impl BatchDecodeBuffers {
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
-            sample_probs: ctx.stream.alloc_zeros(config.vocab_size)?,
-            sample_top1_value: ctx.stream.alloc_zeros(1)?,
-            sample_row_states: ctx
-                .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
-            sample_valid: ctx.stream.alloc_zeros(1)?,
-            sample_out: ctx.stream.alloc_zeros(bs)?,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()

@@ -19,7 +19,7 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
     num_value_heads: usize,
     key_dim: usize,
     val_dim: usize,
-) -> Result<()> {
+) {
     let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
     let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
@@ -44,8 +44,6 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
             ctx.stream.cu_stream(),
         );
     }
-
-    Ok(())
 }
 
 pub(crate) fn conv1d_decode_into(

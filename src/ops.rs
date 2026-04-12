@@ -31,7 +31,6 @@ pub(crate) use elementwise::{
     add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_fused_batch_into,
     write_vec_into,
 };
-pub(crate) use linear::deinterleave_qkv_into;
 pub(crate) use linear::{gemm_into, gemm_rows_into, linear};
 pub(crate) use norm::{
     fused_add_rms_norm_batch_into, rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into,

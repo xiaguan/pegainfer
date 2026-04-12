@@ -505,6 +505,7 @@ pub(crate) fn paged_attention_batch_decode_into(
     page_indices_d: &CudaSlice<i32>,
     page_indptr_d: &CudaSlice<i32>,
     last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
     request_indices_d: &CudaSlice<i32>,
     kv_tile_indices_d: &CudaSlice<i32>,
     kv_chunk_size_d: &CudaSlice<i32>,
@@ -528,15 +529,19 @@ pub(crate) fn paged_attention_batch_decode_into(
     let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
     let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
     let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);
+    let (pos_ptr, _gpos) = positions_d.device_ptr(&ctx.stream);
     let (ri_ptr, _gri) = request_indices_d.device_ptr(&ctx.stream);
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
     let stream = ctx.stream.cu_stream();
 
-    // Step 1: Append K/V to paged cache (batched)
+    // Step 1: Append K/V to paged cache (batched) using the same generic
+    // scatter path as prefill, with explicit request indices and positions.
+    let src_stride_n = (num_kv_heads * head_dim) as i64;
+    let src_stride_h = head_dim as i64;
     let result = unsafe {
-        ffi::paged_kv_append_cuda(
+        ffi::paged_kv_scatter_cuda(
             buf_ptr as *const ffi::Half,
             k_offset,
             v_offset,
@@ -545,16 +550,20 @@ pub(crate) fn paged_attention_batch_decode_into(
             lpl_ptr as *const i32,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
+            ri_ptr as *const i32,
+            pos_ptr as *const i32,
+            batch_size as i32,
             num_kv_heads as i32,
             head_dim as i32,
             page_size as i32,
-            batch_size as i32,
             stride_page,
+            src_stride_n,
+            src_stride_h,
             stream,
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_kv_append_cuda (batch) failed with error {result}");
+        anyhow::bail!("paged_kv_scatter_cuda (batch decode) failed with error {result}");
     }
 
     // Step 2: Paged attention decode (batched)
@@ -602,6 +611,7 @@ pub(crate) fn paged_attention_batch_decode_hd256_into(
     page_indices_d: &CudaSlice<i32>,
     page_indptr_d: &CudaSlice<i32>,
     last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
     request_indices_d: &CudaSlice<i32>,
     kv_tile_indices_d: &CudaSlice<i32>,
     kv_chunk_size_d: &CudaSlice<i32>,
@@ -626,14 +636,17 @@ pub(crate) fn paged_attention_batch_decode_hd256_into(
     let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
     let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
     let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);
+    let (pos_ptr, _gpos) = positions_d.device_ptr(&ctx.stream);
     let (ri_ptr, _gri) = request_indices_d.device_ptr(&ctx.stream);
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
     let stream = ctx.stream.cu_stream();
 
+    let src_stride_n = (num_kv_heads * head_dim) as i64;
+    let src_stride_h = head_dim as i64;
     let result = unsafe {
-        ffi::paged_kv_append_cuda(
+        ffi::paged_kv_scatter_cuda(
             buf_ptr as *const ffi::Half,
             k_offset,
             v_offset,
@@ -642,16 +655,20 @@ pub(crate) fn paged_attention_batch_decode_hd256_into(
             lpl_ptr as *const i32,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
+            ri_ptr as *const i32,
+            pos_ptr as *const i32,
+            batch_size as i32,
             num_kv_heads as i32,
             head_dim as i32,
             page_size as i32,
-            batch_size as i32,
             stride_page,
+            src_stride_n,
+            src_stride_h,
             stream,
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_kv_append_cuda (batch hd256) failed with error {result}");
+        anyhow::bail!("paged_kv_scatter_cuda (batch hd256 decode) failed with error {result}");
     }
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();

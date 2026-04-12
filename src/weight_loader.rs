@@ -127,6 +127,84 @@ pub(crate) fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
+#[allow(clippy::cast_ptr_alignment)]
+pub(crate) fn load_tensor_2d_row_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    row_offset: usize,
+    rows: usize,
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Tensor '{}' expected 2D, got shape {:?}",
+            name,
+            shape
+        ));
+    }
+    let total_rows = shape[0];
+    let cols = shape[1];
+    if row_offset + rows > total_rows {
+        return Err(anyhow::anyhow!(
+            "2D row shard out of bounds for '{}': row_offset={} rows={} total_rows={}",
+            name,
+            row_offset,
+            rows,
+            total_rows
+        ));
+    }
+    let data = tensor.data();
+    let elems =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), total_rows * cols) };
+    let start = row_offset * cols;
+    let end = (row_offset + rows) * cols;
+    DeviceMatrix::from_host(ctx, &elems[start..end], rows, cols)
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+pub(crate) fn load_tensor_2d_col_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    col_offset: usize,
+    cols: usize,
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Tensor '{}' expected 2D, got shape {:?}",
+            name,
+            shape
+        ));
+    }
+    let rows = shape[0];
+    let total_cols = shape[1];
+    if col_offset + cols > total_cols {
+        return Err(anyhow::anyhow!(
+            "2D col shard out of bounds for '{}': col_offset={} cols={} total_cols={}",
+            name,
+            col_offset,
+            cols,
+            total_cols
+        ));
+    }
+    let data = tensor.data();
+    let elems =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), rows * total_cols) };
+    let mut host = vec![bf16::ZERO; rows * cols];
+    for row in 0..rows {
+        let src = row * total_cols + col_offset;
+        let dst = row * cols;
+        host[dst..dst + cols].copy_from_slice(&elems[src..src + cols]);
+    }
+    DeviceMatrix::from_host(ctx, &host, rows, cols)
+}
+
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.
 /// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
 pub(crate) fn precompute_rope(

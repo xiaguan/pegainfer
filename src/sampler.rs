@@ -1,3 +1,4 @@
+#[derive(Clone, Copy)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: i32,

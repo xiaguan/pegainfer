@@ -76,12 +76,12 @@ impl Qwen3Model {
         kv_state: &mut KvState,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_heads = self.local_num_attention_heads();
+        let num_kv_heads = self.local_num_key_value_heads();
         let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
 
         // Allocate pages and advance before building the plan.
         kv_state.ensure_capacity(start_pos + seq_len)?;
@@ -148,8 +148,8 @@ impl Qwen3Model {
         plan: &PrefillPagedPlan,
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_heads = self.local_num_attention_heads();
+        let num_kv_heads = self.local_num_key_value_heads();
         let head_dim = self.config.head_dim;
 
         // 1. RMSNorm → bufs.normed
@@ -218,6 +218,7 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 5+6. Residual add + MLP RMSNorm (fused): hidden += o_buf; normed = rms_norm(hidden)
         ops::fused_add_rms_norm_batch_into(
@@ -227,7 +228,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // 7. MLP: fused gate+up GEMM → silu_mul → down → bufs.o_buf
         ops::gemm_into(
@@ -236,13 +237,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
@@ -285,7 +287,7 @@ impl Qwen3Model {
     pub(crate) fn batch_prefill(
         &self,
         prompts: &[&[u32]],
-        kv_states: &mut [KvState],
+        kv_states: &mut [&mut KvState],
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
@@ -311,8 +313,8 @@ impl Qwen3Model {
             &descs,
             &start_positions,
             &seq_lens,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
             self.config.head_dim,
         )?;
 
@@ -356,12 +358,9 @@ impl Qwen3Model {
         plan: &PrefillPagedPlan,
     ) -> Result<HiddenStates> {
         let total_tokens = hidden.seq_len;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
 
         let mut bufs = PrefillBuffers::new(
             &self.ctx,

@@ -8,6 +8,6 @@ mod prefill;
 mod unified_forward;
 mod weights;
 
-pub use config::Config;
+pub use config::{Config, TensorParallelConfig};
 pub use forward::Qwen3State;
 pub use weights::{ModelRuntimeConfig, Qwen3Model};

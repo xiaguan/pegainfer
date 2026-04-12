@@ -6,7 +6,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
@@ -27,6 +27,14 @@ struct Args {
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to disable)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graph: bool,
+
+    /// CUDA device ordinal for single-GPU Qwen3 loads
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
+
+    /// Tensor-parallel world size for Qwen3
+    #[arg(long, default_value_t = 1)]
+    tp_size: usize,
 
     /// Enable request tracing and write trace JSON files to this directory
     #[arg(long)]
@@ -58,26 +66,30 @@ async fn main() {
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, cuda_graph={}",
+        "Runtime options: model_path={}, cuda_graph={}, device_ordinal={}, tp_size={}",
         args.model_path.display(),
-        args.cuda_graph
+        args.cuda_graph,
+        args.device_ordinal,
+        args.tp_size
     );
 
     let app = match model_type {
         ModelType::Qwen3 => {
-            let model = Qwen3Model::from_safetensors_with_runtime(
-                model_path,
-                ModelRuntimeConfig {
-                    enable_cuda_graph: args.cuda_graph,
-                },
-            )
-            .expect("Failed to load Qwen3 model");
-
             let tokenizer =
                 Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
             let model_id = pegainfer::server_engine::model_id_from_path(model_path);
-
-            let handle = pegainfer::scheduler::start(model, 42).expect("Failed to start scheduler");
+            let device_ordinals: Vec<usize> = if args.tp_size == 1 {
+                vec![args.device_ordinal]
+            } else {
+                (0..args.tp_size).collect()
+            };
+            let handle = pegainfer::scheduler::start_qwen3(
+                model_path,
+                args.cuda_graph,
+                &device_ordinals,
+                42,
+            )
+            .expect("Failed to start Qwen3 scheduler");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis(),);
 

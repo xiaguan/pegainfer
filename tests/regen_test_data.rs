@@ -143,7 +143,7 @@ fn generate_text_scheduler(
     tokenizer.decode(&tokens).expect("decode failed")
 }
 
-fn write_golden_json(output_path: &Path, model_name: &str, cases_json: Vec<serde_json::Value>) {
+fn write_golden_json(output_path: &Path, model_name: &str, cases_json: &[serde_json::Value]) {
     let data = serde_json::json!({
         "model_name": model_name,
         "engine": "pegainfer",
@@ -161,7 +161,7 @@ fn lock_gpu_regen_test() -> MutexGuard<'static, ()> {
     // These tests each load a full model onto the same GPU, so they must not run concurrently.
     GPU_REGEN_TEST_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[test]
@@ -188,6 +188,7 @@ fn regen_test_data() {
         &model_path,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..Default::default()
         },
     )
     .expect("Failed to load model");
@@ -210,7 +211,7 @@ fn regen_test_data() {
         }));
     }
 
-    write_golden_json(&output_path, &model_name, cases_json);
+    write_golden_json(&output_path, &model_name, &cases_json);
 }
 
 #[test]
@@ -254,5 +255,5 @@ fn regen_test_data_qwen35() {
         }));
     }
 
-    write_golden_json(&output_path, &model_name, cases_json);
+    write_golden_json(&output_path, &model_name, &cases_json);
 }

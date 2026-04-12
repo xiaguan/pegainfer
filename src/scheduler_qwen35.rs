@@ -111,6 +111,7 @@ pub fn start_with_capacity(
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
+#[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     model: Qwen35Model,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
@@ -134,12 +135,11 @@ fn scheduler_loop(
 
         // 2. Nothing active and nothing pending → block until a request arrives
         if active.is_empty() && pending.is_empty() {
-            match submit_rx.blocking_recv() {
-                Some(req) => pending.push(req),
-                None => {
-                    info!("Qwen3.5 scheduler: all handles dropped, exiting");
-                    return;
-                }
+            if let Some(req) = submit_rx.blocking_recv() {
+                pending.push(req)
+            } else {
+                info!("Qwen3.5 scheduler: all handles dropped, exiting");
+                return;
             }
             while let Ok(req) = submit_rx.try_recv() {
                 pending.push(req);
@@ -706,7 +706,7 @@ fn compute_logprobs_from_cpu(
         return None;
     }
 
-    let max_val = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
     let log_sum_exp = max_val + sum_exp.ln();
 

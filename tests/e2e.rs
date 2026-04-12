@@ -114,6 +114,7 @@ fn test_e2e_generation() {
         &model_path,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..Default::default()
         },
     )
     .expect("Failed to load model");

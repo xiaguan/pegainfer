@@ -2,6 +2,21 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorParallelConfig {
+    pub rank: usize,
+    pub world_size: usize,
+}
+
+impl Default for TensorParallelConfig {
+    fn default() -> Self {
+        Self {
+            rank: 0,
+            world_size: 1,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub hidden_size: usize,
@@ -62,6 +77,26 @@ impl Config {
         self.stop_token_ids.contains(&token_id)
     }
 
+    pub fn local_num_attention_heads(&self, tp: TensorParallelConfig) -> usize {
+        self.num_attention_heads / tp.world_size
+    }
+
+    pub fn local_num_key_value_heads(&self, tp: TensorParallelConfig) -> usize {
+        self.num_key_value_heads / tp.world_size
+    }
+
+    pub fn local_intermediate_size(&self, tp: TensorParallelConfig) -> usize {
+        self.intermediate_size / tp.world_size
+    }
+
+    pub fn local_q_dim(&self, tp: TensorParallelConfig) -> usize {
+        self.local_num_attention_heads(tp) * self.head_dim
+    }
+
+    pub fn local_kv_dim(&self, tp: TensorParallelConfig) -> usize {
+        self.local_num_key_value_heads(tp) * self.head_dim
+    }
+
     fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
         let generation_config_path = format!("{}/generation_config.json", model_path);
         match fs::read_to_string(&generation_config_path) {
@@ -76,5 +111,51 @@ impl Config {
             }
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+impl TensorParallelConfig {
+    pub fn validate_for(self, config: &Config) -> Result<()> {
+        if self.world_size == 0 {
+            return Err(anyhow::anyhow!("tensor_parallel.world_size must be >= 1"));
+        }
+        if self.rank >= self.world_size {
+            return Err(anyhow::anyhow!(
+                "tensor_parallel.rank {} must be < world_size {}",
+                self.rank,
+                self.world_size
+            ));
+        }
+        if !config.num_attention_heads.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "num_attention_heads={} not divisible by tp world_size={}",
+                config.num_attention_heads,
+                self.world_size
+            ));
+        }
+        if !config.num_key_value_heads.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "num_key_value_heads={} not divisible by tp world_size={}",
+                config.num_key_value_heads,
+                self.world_size
+            ));
+        }
+        if !config.intermediate_size.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "intermediate_size={} not divisible by tp world_size={}",
+                config.intermediate_size,
+                self.world_size
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn shard_range(self, total: usize) -> (usize, usize) {
+        let shard_len = total / self.world_size;
+        (self.rank * shard_len, shard_len)
+    }
+
+    pub fn is_sharded(self) -> bool {
+        self.world_size > 1
     }
 }

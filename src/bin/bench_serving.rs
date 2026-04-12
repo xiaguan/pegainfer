@@ -1595,12 +1595,11 @@ fn dispatch(
     model: &mut dyn BenchModel,
     tokenizer: &Tokenizer,
 ) -> Result<()> {
-    match &cli.command {
-        Command::Snapshot(args) => run_snapshot(model, cli, model_type, args),
-        _ => {
-            let report = run_command(cli, model_type, load_ms, model, tokenizer)?;
-            emit_report(cli, &report)
-        }
+    if let Command::Snapshot(args) = &cli.command {
+        run_snapshot(model, cli, model_type, args)
+    } else {
+        let report = run_command(cli, model_type, load_ms, model, tokenizer)?;
+        emit_report(cli, &report)
     }
 }
 
@@ -1631,6 +1630,8 @@ fn main() -> Result<()> {
     debug!("Detected model type: {:?}", model_type);
     let runtime = ModelRuntimeConfig {
         enable_cuda_graph: cli.cuda_graph,
+        tensor_parallel: None,
+        device_ordinal: 0,
     };
     let load_start = Instant::now();
 

@@ -12,7 +12,7 @@ pub(crate) mod kv_cache;
 pub mod qwen3;
 pub mod qwen35;
 
-pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
+pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State, TensorParallelConfig};
 pub use qwen35::Qwen35Model;
 
 // ============================================================================

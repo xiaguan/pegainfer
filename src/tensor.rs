@@ -12,12 +12,27 @@ use crate::ffi;
 pub struct DeviceContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    pub device_ordinal: usize,
 }
 
 impl DeviceContext {
     pub fn new() -> Result<Self> {
-        let ctx =
-            CudaContext::new(0).map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
+        Self::new_with_device(0)
+    }
+
+    pub fn new_with_device(device_ordinal: usize) -> Result<Self> {
+        unsafe {
+            let err = ffi::cuda_set_device(device_ordinal as i32);
+            if err != 0 {
+                return Err(anyhow!(
+                    "Failed to set CUDA device {}: cudaError={}",
+                    device_ordinal,
+                    err
+                ));
+            }
+        }
+        let ctx = CudaContext::new(device_ordinal)
+            .map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
 
         // Disable multi-stream event tracking before creating streams.
         // We use a single compute stream, so no cross-stream synchronization is needed.
@@ -36,7 +51,11 @@ impl DeviceContext {
             ffi::cublas_init();
         }
 
-        Ok(Self { ctx, stream })
+        Ok(Self {
+            ctx,
+            stream,
+            device_ordinal,
+        })
     }
 
     /// Synchronize stream

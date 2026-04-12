@@ -3,6 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 /// Maximum prefill sequence length for Qwen3.5 full-attention paged kernels.
 pub(crate) const MAX_SEQ: usize = 20_000;
+const HEAD_DIM: usize = 256;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
@@ -195,8 +196,6 @@ impl Qwen35Model {
         let c = &self.config;
         let attn_out_dim = c.full_attn_q_dim();
         let eps = c.rms_norm_eps;
-        const HEAD_DIM: usize = 256;
-
         let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
         let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;
         let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;

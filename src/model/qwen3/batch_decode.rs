@@ -8,35 +8,6 @@ use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
 
 impl Qwen3Model {
-    /// Sample one token per request, each with its own sampling params.
-    pub(crate) fn select_tokens_batch_varied(
-        &self,
-        bufs: &mut BatchDecodeBuffers,
-        params: &[&crate::sampler::SamplingParams],
-        rng: &mut rand::rngs::StdRng,
-    ) -> Result<Vec<u32>> {
-        let batch_size = params.len();
-
-        let mut tokens = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
-            let random_val: f32 = rand::RngExt::random(rng);
-            let token = ops::gpu_sample_into(
-                &self.ctx,
-                &logits_i,
-                &mut bufs.sample_probs,
-                &mut bufs.sample_top1_value,
-                &mut bufs.sample_row_states,
-                &mut bufs.sample_valid,
-                &mut bufs.sample_out,
-                params[i],
-                random_val,
-            )?;
-            tokens.push(token);
-        }
-        Ok(tokens)
-    }
-
     /// Batch decode step: N requests, 1 new token each, one forward pass.
     ///
     /// When `enable_cuda_graph` is set, pads to the nearest bucket size and
@@ -146,7 +117,7 @@ impl Qwen3Model {
                 next_weight,
                 eps,
                 &mut bufs.normed,
-            )?;
+            );
         }
 
         // Output projection: logits [vocab_size, bs]
@@ -172,18 +143,34 @@ impl Qwen3Model {
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
 
-        // QKV fused projection: one GEMM [q_dim+2*kv_dim, hidden] @ normed → deinterleave
-        ops::gemm_into(
+        // Match prefill numerics: compute Q/K/V via row-sliced GEMMs instead of
+        // fused qkv GEMM + deinterleave. The fused path is mathematically
+        // equivalent but diverges enough under shard-local TP to flip greedy
+        // decode in parity tests.
+        let q_dim = layer.attention.q_dim;
+        let kv_dim = layer.attention.kv_dim;
+        ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
+            0,
+            q_dim,
             &bufs.normed,
-            &mut bufs.qkv_out,
-        );
-        ops::deinterleave_qkv_into(
-            &self.ctx,
-            &bufs.qkv_out,
             &mut bufs.q,
+        );
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.attention.qkv_proj,
+            q_dim,
+            kv_dim,
+            &bufs.normed,
             &mut bufs.k,
+        );
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.attention.qkv_proj,
+            q_dim + kv_dim,
+            kv_dim,
+            &bufs.normed,
             &mut bufs.v,
         );
 
@@ -197,8 +184,8 @@ impl Qwen3Model {
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_d,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
             self.config.head_dim,
             eps,
         );
@@ -215,11 +202,12 @@ impl Qwen3Model {
             &bufs.page_indices_d,
             &bufs.page_indptr_d,
             &bufs.last_page_len_d,
+            &bufs.positions_d,
             &bufs.request_indices_d,
             &bufs.kv_tile_indices_d,
             &bufs.kv_chunk_size_d,
             &mut bufs.attn_out,
-            self.config.num_attention_heads,
+            self.local_num_attention_heads(),
             bs,
         )?;
 
@@ -230,6 +218,7 @@ impl Qwen3Model {
             &bufs.attn_out,
             &mut bufs.attn_proj,
         );
+        self.all_reduce_hidden(&mut bufs.attn_proj)?;
 
         // Residual + LayerNorm
         ops::fused_add_rms_norm_batch_into(
@@ -239,7 +228,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             eps,
             &mut bufs.normed,
-        )?;
+        );
 
         // MLP: fused gate+up GEMM → silu_mul_fused → down GEMM
         ops::gemm_into(
@@ -248,13 +237,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.mlp_act,
             &mut bufs.mlp_out,
         );
+        self.all_reduce_hidden(&mut bufs.mlp_out)?;
 
         Ok(())
     }
@@ -274,6 +264,45 @@ mod tests {
 
     fn get_model_path() -> String {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
+    }
+
+    fn sample_batch_tokens(
+        model: &Qwen3Model,
+        bufs: &BatchDecodeBuffers,
+        params: &[&SamplingParams],
+        rng: &mut StdRng,
+    ) -> Vec<u32> {
+        let mut scratch_probs = model
+            .ctx
+            .stream
+            .alloc_zeros(model.config.vocab_size)
+            .unwrap();
+        let mut scratch_top1 = model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut scratch_row_states = model
+            .ctx
+            .stream
+            .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+            .unwrap();
+        let mut scratch_valid = model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut scratch_out = model.ctx.stream.alloc_zeros(1).unwrap();
+        (0..params.len())
+            .map(|i| {
+                let logits_i = ops::extract_vec(&model.ctx, &bufs.logits, i).unwrap();
+                let random_val: f32 = rand::RngExt::random(rng);
+                ops::gpu_sample_into(
+                    &model.ctx,
+                    &logits_i,
+                    &mut scratch_probs,
+                    &mut scratch_top1,
+                    &mut scratch_row_states,
+                    &mut scratch_valid,
+                    &mut scratch_out,
+                    params[i],
+                    random_val,
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
@@ -300,7 +329,11 @@ mod tests {
         let mut kv_state = std::mem::replace(&mut state.kv_state, model.kv_pool.alloc());
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
-            &model.config,
+            model.config.hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config.vocab_size,
             1,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),
@@ -315,9 +348,7 @@ mod tests {
                 .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = vec![&params];
-            let batch_tokens = model
-                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
-                .unwrap();
+            let batch_tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             tokens.push(batch_tokens[0]);
         }
         tokens
@@ -340,7 +371,7 @@ mod tests {
 
         for (i, prompt) in prompts.iter().enumerate() {
             let mut state = model.create_state().unwrap();
-            model.forward(*prompt, &mut state).unwrap();
+            model.forward(prompt, &mut state).unwrap();
             let token = model.select_token(&mut state, &params, &mut rng).unwrap();
             first_tokens.push(token);
             std::mem::swap(&mut kv_states[i], &mut state.kv_state);
@@ -356,7 +387,11 @@ mod tests {
         };
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
-            &model.config,
+            model.config.hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config.vocab_size,
             max_bs,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),
@@ -370,9 +405,7 @@ mod tests {
                 .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
-            let tokens = model
-                .select_tokens_batch_varied(&mut bufs, &params_refs, &mut rng)
-                .unwrap();
+            let tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             for (i, &tok) in tokens.iter().enumerate() {
                 all_tokens[i].push(tok);
             }
@@ -398,6 +431,8 @@ mod tests {
                 &model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph: false,
+                    tensor_parallel: None,
+                    device_ordinal: 0,
                 },
             )
             .unwrap();
@@ -419,9 +454,8 @@ mod tests {
 
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
             let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let (logits_vec, _) = model
-                .batch_prefill(&prompts, &mut kv_states, false)
-                .unwrap();
+            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
 
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {
@@ -493,6 +527,8 @@ mod tests {
                 &model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph: true,
+                    tensor_parallel: None,
+                    device_ordinal: 0,
                 },
             )
             .unwrap();

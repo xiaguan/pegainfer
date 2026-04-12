@@ -17,17 +17,23 @@ use crate::ops::PrefillPagedPlan;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Decode attention metadata (allocated per unified step, not CUDA-graph safe).
+#[allow(clippy::struct_field_names)]
 struct DecodeAttentionMeta {
     page_indices_d: CudaSlice<i32>,
     page_indptr_d: CudaSlice<i32>,
     last_page_len_d: CudaSlice<i32>,
+    positions_d: CudaSlice<i32>,
     request_indices_d: CudaSlice<i32>,
     kv_tile_indices_d: CudaSlice<i32>,
     kv_chunk_size_d: CudaSlice<i32>,
 }
 
 impl DecodeAttentionMeta {
-    fn build(ctx: &DeviceContext, kv_states: &[&mut KvState]) -> Result<Self> {
+    fn build(
+        ctx: &DeviceContext,
+        kv_states: &[&mut KvState],
+        decode_positions: &[usize],
+    ) -> Result<Self> {
         let num_decode = kv_states.len();
 
         let mut all_page_indices = Vec::new();
@@ -45,11 +51,13 @@ impl DecodeAttentionMeta {
 
         let request_indices: Vec<i32> = (0..num_decode as i32).collect();
         let kv_tile_indices = vec![0i32; num_decode];
+        let positions: Vec<i32> = decode_positions.iter().map(|&p| p as i32).collect();
 
         Ok(Self {
             page_indices_d: ctx.stream.clone_htod(&all_page_indices)?,
             page_indptr_d: ctx.stream.clone_htod(&indptr)?,
             last_page_len_d: ctx.stream.clone_htod(&last_page_lens)?,
+            positions_d: ctx.stream.clone_htod(&positions)?,
             request_indices_d: ctx.stream.clone_htod(&request_indices)?,
             kv_tile_indices_d: ctx.stream.clone_htod(&kv_tile_indices)?,
             kv_chunk_size_d: ctx.stream.clone_htod(&chunk_sizes)?,
@@ -69,7 +77,7 @@ impl Qwen3Model {
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
-        prefill_kv_states: &mut [KvState],
+        prefill_kv_states: &mut [&mut KvState],
         decode_tokens: &[u32],
         decode_kv_states: &mut [&mut KvState],
     ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
@@ -127,13 +135,14 @@ impl Qwen3Model {
             &prefill_descs,
             &prefill_start_positions,
             &prefill_seq_lens,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
             self.config.head_dim,
         )?;
 
         // Decode attention metadata (built AFTER advance so seq_lens reflect new state)
-        let decode_meta = DecodeAttentionMeta::build(&self.ctx, &decode_kv_states)?;
+        let decode_meta =
+            DecodeAttentionMeta::build(&self.ctx, decode_kv_states, &decode_positions)?;
 
         // ── 4. Process layers ─────────────────────────────────────────
         let kv_buffer = prefill_kv_states[0].buffer();
@@ -198,12 +207,9 @@ impl Qwen3Model {
         layout: &KvLayout,
     ) -> Result<HiddenStates> {
         let total_tokens = total_prefill + num_decode;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
 
         let mut bufs = PrefillBuffers::new(
             &self.ctx,
@@ -249,11 +255,11 @@ impl Qwen3Model {
         layout: &KvLayout,
     ) -> Result<()> {
         let total_tokens = total_prefill + num_decode;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_heads = self.local_num_attention_heads();
+        let num_kv_heads = self.local_num_key_value_heads();
         let head_dim = self.config.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let q_dim = num_heads * head_dim;
+        let kv_dim = self.local_kv_dim();
+        let q_dim = self.local_q_dim();
         let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let k_offset = (layer_idx * layout.layer_stride) as i64;
@@ -378,12 +384,16 @@ impl Qwen3Model {
             let (pi_ptr, _) = decode_meta.page_indices_d.device_ptr(&self.ctx.stream);
             let (pip_ptr, _) = decode_meta.page_indptr_d.device_ptr(&self.ctx.stream);
             let (lpl_ptr, _) = decode_meta.last_page_len_d.device_ptr(&self.ctx.stream);
+            let (pos_ptr, _) = decode_meta.positions_d.device_ptr(&self.ctx.stream);
+            let (ri_ptr, _) = decode_meta.request_indices_d.device_ptr(&self.ctx.stream);
 
             let k_decode = k_base + col_byte_offset(kv_dim, total_prefill);
             let v_decode = v_base + col_byte_offset(kv_dim, total_prefill);
+            let src_stride_n = kv_dim as i64;
+            let src_stride_h = head_dim as i64;
 
             let result = unsafe {
-                ffi::paged_kv_append_cuda(
+                ffi::paged_kv_scatter_cuda(
                     buf_ptr as *const ffi::Half,
                     k_offset,
                     v_offset,
@@ -392,17 +402,21 @@ impl Qwen3Model {
                     lpl_ptr as *const i32,
                     k_decode as *const ffi::Half,
                     v_decode as *const ffi::Half,
+                    ri_ptr as *const i32,
+                    pos_ptr as *const i32,
+                    num_decode as i32,
                     num_kv_heads as i32,
                     head_dim as i32,
                     layout.page_size as i32,
-                    num_decode as i32,
                     stride_page,
+                    src_stride_n,
+                    src_stride_h,
                     self.ctx.stream.cu_stream(),
                 )
             };
             if result != 0 {
                 anyhow::bail!(
-                    "unified paged_kv_append failed for layer {layer_idx} with error {result}"
+                    "unified paged_kv_scatter failed for layer {layer_idx} with error {result}"
                 );
             }
         }
@@ -516,6 +530,7 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // ── 7+8. Residual add + MLP RMSNorm (fused) ─────────────────
         ops::fused_add_rms_norm_batch_into(
@@ -525,7 +540,7 @@ impl Qwen3Model {
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        )?;
+        );
 
         ops::gemm_into(
             &self.ctx,
@@ -533,13 +548,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // ── 9. Residual add → hidden_out ─────────────────────────────
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;

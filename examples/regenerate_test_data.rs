@@ -54,6 +54,7 @@ fn main() {
         MODEL_PATH,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..Default::default()
         },
     )
     .expect("Failed to load model");
