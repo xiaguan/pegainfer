@@ -1,6 +1,6 @@
 # Qwen3 Tensor Parallelism Design
 
-> **TL;DR:** Add `TP=2` support for `Qwen3-4B` as the first model-parallel milestone. The goal is correctness and a clean architectural foundation for larger dense models and future MoE work, not a fully generalized distributed runtime on day one.
+> **TL;DR:** Add `TP=2` support for `Qwen3-4B` as the first model-parallel milestone. The goal is correctness and a clean architectural foundation for larger dense models and future MoE work, with the runtime moving toward a controller-plus-workers broadcast execution model instead of scheduler-owned cross-thread mutable state.
 >
 > **Status:** Active. `Qwen3-4B` has now been brought up end-to-end with `TP=2` on a single machine. `TP=8` has also been smoke-tested on an 8x4090 host, but the implementation still carries first-pass runtime debt and has not yet gone through systematic correctness validation.
 
@@ -418,6 +418,145 @@ These boundaries isolate three different change vectors:
 - batching and admission policy change the scheduler
 - TP and other model-parallel execution strategies change the executor
 - sampling, logprobs, echo, and finish handling change step-result resolution
+
+## Controller / Worker Broadcast Execution Model
+
+The execution model for Qwen3 tensor parallelism should now be treated as part of the main TP design, not as a separate note.
+
+The core idea is:
+
+- one controller decides the next step
+- one primary worker plus zero or more additional rank workers execute it
+- an ordered broadcast command stream keeps worker-local state synchronized
+
+This is the direction we want for the steady-state runtime. The earlier shape where the scheduler owned rank-local mutable state and worker threads borrowed into it was acceptable for bring-up, but it should not be the long-term architecture.
+
+### What We Are Rejecting
+
+We do not want the long-term design to rely on:
+
+- the scheduler thread owning all rank-local KV or execution objects
+- worker threads borrowing `&mut` access into those objects
+- raw pointer wrappers and timing assumptions as the main cross-thread correctness mechanism
+
+Tensor parallelism is a replicated local-state problem, not a shared-mutable-state problem.
+
+### Controller Responsibilities
+
+The controller is the only place that decides:
+
+- which requests participate in the next step
+- whether the next step is prefill, decode, or unified
+- which high-level lifecycle transitions should happen
+- which ordered command should be broadcast next
+
+The controller should not directly execute GPU work, including rank 0 work. Rank 0 should execute on the primary worker thread under the same protocol as the additional ranks.
+
+### Worker Responsibilities
+
+Each worker owns its rank-local execution state, including:
+
+- its local model shard
+- its local decode buffers
+- its local KV state
+- its local per-request execution state keyed by request identity
+
+The scheduler should continue to own user-facing lifecycle state such as streaming handles, sampling params, generation counters, and finish bookkeeping. This preserves the existing control-plane role while moving rank-local execution state to the workers.
+
+### Request Identity
+
+The broadcast protocol should use an explicit process-local request identity:
+
+- `RequestId(u64)`
+
+The controller assigns it from a monotonically increasing counter. Protocol messages should identify requests by `RequestId`, not by slot indices or by aligning multiple parallel vectors.
+
+### Command Protocol
+
+The protocol should stay coarse-grained and step-oriented. The primary commands are:
+
+- `RunPrefillStep`
+- `RunDecodeStep`
+- `RunUnifiedStep`
+- `DropRequest`
+- `Shutdown`
+
+We explicitly prefer this over exposing low-level commands such as `EnsureCapacity`, `Advance`, or `Reset` as first-class protocol messages. Internal KV mutation details should remain implementation details of one step whenever possible.
+
+For step payloads, the command shape should stay request-oriented:
+
+- `RunPrefillStep { requests: Vec<PrefillStepItem>, echo: bool }`
+- `RunDecodeStep { requests: Vec<DecodeStepItem> }`
+- `RunUnifiedStep { prefill: Vec<PrefillStepItem>, decode: Vec<DecodeStepItem> }`
+
+At minimum:
+
+- `PrefillStepItem` contains `request_id` and prompt tokens
+- `DecodeStepItem` contains `request_id` and the decode token
+
+### Synchronization Rule
+
+The runtime should obey one simple rule:
+
+- no worker starts command `N + 1` until all workers have finished command `N`
+
+This gives deterministic ordering, simpler failure handling, and avoids reintroducing cross-thread mutable-borrow coupling through the side door.
+
+### Execution Shape
+
+Qwen3 should keep one executor shape:
+
+- one `Qwen3Executor`
+- one primary local lane
+- zero or more additional rank workers
+
+Under this model:
+
+- single-GPU execution is the `tp_size == 1` case
+- tensor parallel execution is the `tp_size > 1` case
+
+The controller-side protocol should not split into unrelated single-GPU and TP command families. Both modes should use the same coarse-grained `StepCommand`, with broadcast fanout degenerating naturally to the single-worker case.
+
+### Result Ownership
+
+For now, result flow should stay asymmetric:
+
+- non-primary workers return acknowledgement or step failure only
+- the primary worker returns the step artifacts needed by the controller
+
+This keeps workers responsible for local execution while the controller remains responsible for resolving execution artifacts into scheduler-visible effects.
+
+### Sampling Ownership
+
+Sampling is split into two responsibilities:
+
+- the controller owns sampling policy and random input generation
+- the primary worker executes GPU sampling and logprob extraction
+
+Concretely, `SamplingParams` and per-step random values travel with the step items, worker threads run the GPU sampling path, and the controller consumes CPU-visible step artifacts after execution.
+
+### Request Destruction
+
+Request destruction should remain an explicit protocol action:
+
+- `DropRequest { request_id }`
+
+This keeps lifecycle transitions visible at the command layer instead of hiding them inside unrelated step commands.
+
+### Near-Term Cleanup Direction
+
+For the next cleanup passes, we should bias toward:
+
+- worker-owned rank-local state
+- broadcast command protocol
+- explicit barrier semantics
+- request-oriented payloads
+
+We should bias away from:
+
+- controller ownership of rank-local execution objects
+- command payloads that smuggle `&mut` semantics through raw pointers
+- designs that depend on multiple parallel vectors and positional alignment to identify one logical request
 
 Without these boundaries, those changes accumulate in the same scheduler functions and the runtime becomes harder to extend in predictable ways.
 
