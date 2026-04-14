@@ -1,0 +1,682 @@
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use log::{debug, info};
+use std::collections::HashMap;
+use std::time::Instant;
+
+use super::config::{DsV3Config, FfnType};
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::weight_loader::{
+    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
+};
+
+// ---------------------------------------------------------------------------
+// FP8 weight: raw e4m3 bytes + block-wise scale_inv
+// ---------------------------------------------------------------------------
+
+/// FP8 weight matrix with block-wise dequantization scales.
+///
+/// Stored as raw `u8` on GPU (1 byte per element, fp8_e4m3fn) plus a 2D f32
+/// scale_inv tensor. During forward, a CUDA kernel dequantizes on-the-fly:
+///   bf16_val = fp8_val * scale_inv[row_block][col_block]
+/// where block indices are (row / block_size[0], col / block_size[1]).
+pub(crate) struct Fp8Matrix {
+    /// Raw FP8 e4m3 data on GPU: [rows * cols] bytes
+    pub(crate) data: CudaSlice<u8>,
+    /// Block-wise inverse scales: [ceil(rows/block_h), ceil(cols/block_w)] f32
+    pub(crate) scale_inv: CudaSlice<f32>,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) scale_rows: usize,
+    pub(crate) scale_cols: usize,
+}
+
+// ---------------------------------------------------------------------------
+// MLA attention weights
+// ---------------------------------------------------------------------------
+
+/// Multi-head Latent Attention (MLA) weights for one layer.
+///
+/// KV path:  hidden → kv_a_proj [576, 7168] → (split c_KV 512d, k_rope 64d)
+///                                            → kv_a_layernorm(c_KV)
+///                                            → kv_b_proj [32768, 512] → (k_nope, v)
+///
+/// Q path:   hidden → q_a_proj [1536, 7168]  → q_a_layernorm
+///                  → q_b_proj [24576, 1536]  → (q_nope, q_rope)
+pub(super) struct MlaWeights {
+    // Q low-rank path
+    pub(super) q_a_proj: Fp8Matrix,
+    pub(super) q_a_layernorm: DeviceVec,
+    pub(super) q_b_proj: Fp8Matrix,
+
+    // KV compressed path
+    pub(super) kv_a_proj_with_mqa: Fp8Matrix,
+    pub(super) kv_a_layernorm: DeviceVec,
+    pub(super) kv_b_proj: Fp8Matrix,
+
+    // Output
+    pub(super) o_proj: Fp8Matrix,
+}
+
+// ---------------------------------------------------------------------------
+// Dense FFN weights (layers 0..first_k_dense_replace)
+// ---------------------------------------------------------------------------
+
+pub(super) struct DenseFFN {
+    pub(super) gate_proj: Fp8Matrix,
+    pub(super) up_proj: Fp8Matrix,
+    pub(super) down_proj: Fp8Matrix,
+}
+
+// ---------------------------------------------------------------------------
+// MoE FFN weights (layers first_k_dense_replace..num_hidden_layers)
+// ---------------------------------------------------------------------------
+
+/// Single expert FFN weights.
+pub(super) struct ExpertFFN {
+    pub(super) gate_proj: Fp8Matrix,
+    pub(super) up_proj: Fp8Matrix,
+    pub(super) down_proj: Fp8Matrix,
+}
+
+/// MoE gate (router) weights.
+pub(super) struct MoeGate {
+    /// Router weight: [n_routed_experts, hidden_size] bf16
+    pub(super) weight: DeviceMatrix,
+    /// Score correction bias: [n_routed_experts] f32
+    pub(super) e_score_correction_bias: CudaSlice<f32>,
+}
+
+/// Full MoE layer: gate + routed experts + shared expert.
+pub(super) struct MoeFfnWeights {
+    pub(super) gate: MoeGate,
+    pub(super) experts: Vec<ExpertFFN>,
+    pub(super) shared_expert: ExpertFFN,
+}
+
+// ---------------------------------------------------------------------------
+// Transformer block
+// ---------------------------------------------------------------------------
+
+pub(super) enum FfnWeights {
+    Dense(DenseFFN),
+    MoE(MoeFfnWeights),
+}
+
+pub(super) struct TransformerBlock {
+    pub(super) input_layernorm: DeviceVec,
+    pub(super) mla: MlaWeights,
+    pub(super) post_attention_layernorm: DeviceVec,
+    pub(super) ffn: FfnWeights,
+}
+
+// ---------------------------------------------------------------------------
+// Top-level model
+// ---------------------------------------------------------------------------
+
+/// DeepSeek-V3.2 model weights.
+pub struct DsV3Model {
+    pub(super) ctx: DeviceContext,
+    pub(super) config: DsV3Config,
+    pub(super) embed_tokens: DeviceMatrix,
+    pub(super) lm_head: Option<DeviceMatrix>,
+    pub(super) layers: Vec<TransformerBlock>,
+    pub(super) norm: DeviceVec,
+}
+
+unsafe impl Send for DsV3Model {}
+unsafe impl Sync for DsV3Model {}
+
+// ---------------------------------------------------------------------------
+// FP8 loading helpers
+// ---------------------------------------------------------------------------
+
+fn find_tensor<'a>(
+    shards: &'a [safetensors::SafeTensors<'a>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<safetensors::tensor::TensorView<'a>> {
+    if let Some(&idx) = weight_map.get(name) {
+        shards[idx]
+            .tensor(name)
+            .map_err(|e| anyhow::anyhow!("Failed to load tensor '{}': {}", name, e))
+    } else {
+        for shard in shards {
+            if let Ok(t) = shard.tensor(name) {
+                return Ok(t);
+            }
+        }
+        Err(anyhow::anyhow!("Tensor '{}' not found in any shard", name))
+    }
+}
+
+/// Load an FP8 weight matrix and its block-wise scale_inv tensor.
+fn load_fp8_matrix(
+    ctx: &DeviceContext,
+    shards: &[safetensors::SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    weight_name: &str,
+    scale_name: &str,
+) -> Result<Fp8Matrix> {
+    // Load raw FP8 data (1 byte per element)
+    let weight_tensor = find_tensor(shards, weight_map, weight_name)?;
+    let shape = weight_tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 2,
+        "FP8 weight '{}' expected 2D, got {:?}",
+        weight_name,
+        shape
+    );
+    let rows = shape[0];
+    let cols = shape[1];
+    let raw_data = weight_tensor.data();
+    anyhow::ensure!(
+        raw_data.len() == rows * cols,
+        "FP8 weight '{}' size mismatch: expected {} bytes, got {}",
+        weight_name,
+        rows * cols,
+        raw_data.len()
+    );
+    let data = ctx
+        .stream
+        .clone_htod(raw_data)
+        .map_err(|e| anyhow::anyhow!("H2D copy for '{}' failed: {}", weight_name, e))?;
+
+    // Load scale_inv (f32)
+    let scale_tensor = find_tensor(shards, weight_map, scale_name)?;
+    let scale_shape = scale_tensor.shape();
+    anyhow::ensure!(
+        scale_shape.len() == 2,
+        "Scale '{}' expected 2D, got {:?}",
+        scale_name,
+        scale_shape
+    );
+    let scale_rows = scale_shape[0];
+    let scale_cols = scale_shape[1];
+    let scale_bytes = scale_tensor.data();
+    anyhow::ensure!(
+        scale_bytes.len() == scale_rows * scale_cols * 4,
+        "Scale '{}' size mismatch",
+        scale_name
+    );
+    let scale_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(scale_bytes.as_ptr().cast::<f32>(), scale_rows * scale_cols)
+    };
+    let scale_inv = ctx
+        .stream
+        .clone_htod(scale_f32)
+        .map_err(|e| anyhow::anyhow!("H2D copy for '{}' failed: {}", scale_name, e))?;
+
+    Ok(Fp8Matrix {
+        data,
+        scale_inv,
+        rows,
+        cols,
+        scale_rows,
+        scale_cols,
+    })
+}
+
+/// Load a 1D f32 tensor from safetensors.
+fn load_1d_f32(
+    ctx: &DeviceContext,
+    shards: &[safetensors::SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<CudaSlice<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let data = tensor.data();
+    anyhow::ensure!(
+        data.len() % 4 == 0,
+        "f32 tensor '{}' byte length not multiple of 4",
+        name
+    );
+    let f32_slice: &[f32] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), data.len() / 4) };
+    ctx.stream
+        .clone_htod(f32_slice)
+        .map_err(|e| anyhow::anyhow!("H2D copy for '{}' failed: {}", name, e))
+}
+
+// ---------------------------------------------------------------------------
+// Model loading
+// ---------------------------------------------------------------------------
+
+impl DsV3Model {
+    /// Load the full model (all layers). Will OOM on a single GPU — intended
+    /// for multi-GPU loading where weights are sharded externally.
+    pub fn from_safetensors(model_path: &str, device_ordinal: usize) -> Result<Self> {
+        Self::load(model_path, device_ordinal, None)
+    }
+
+    /// Load only the first `max_layers` layers. Useful for single-GPU testing.
+    pub fn from_safetensors_partial(
+        model_path: &str,
+        device_ordinal: usize,
+        max_layers: usize,
+    ) -> Result<Self> {
+        Self::load(model_path, device_ordinal, Some(max_layers))
+    }
+
+    fn load(model_path: &str, device_ordinal: usize, max_layers: Option<usize>) -> Result<Self> {
+        info!("Loading DeepSeek-V3.2 from: {}", model_path);
+        debug!("Initializing GPU device {}", device_ordinal);
+        let ctx = DeviceContext::new_with_device(device_ordinal)?;
+
+        let config = DsV3Config::from_file(model_path)?;
+        let num_layers_to_load = max_layers
+            .map(|m| m.min(config.num_hidden_layers))
+            .unwrap_or(config.num_hidden_layers);
+        info!(
+            "Config: hidden={}, layers={} (loading {}), dense={}, moe={}, experts={}, heads={}, vocab={}",
+            config.hidden_size,
+            config.num_hidden_layers,
+            num_layers_to_load,
+            config.num_dense_layers(),
+            config.num_moe_layers(),
+            config.n_routed_experts,
+            config.num_attention_heads,
+            config.vocab_size,
+        );
+        info!(
+            "MLA: q_lora_rank={}, kv_lora_rank={}, qk_nope={}, qk_rope={}, v={}",
+            config.q_lora_rank,
+            config.kv_lora_rank,
+            config.qk_nope_head_dim,
+            config.qk_rope_head_dim,
+            config.v_head_dim,
+        );
+
+        let (shard_paths, weight_map) = load_shard_info(model_path)?;
+        info!("Loading {} safetensor shard(s)", shard_paths.len());
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards = deserialize_shards(&mmaps)?;
+
+        let t_gpu = Instant::now();
+
+        // Embedding (bf16)
+        debug!("Loading embeddings");
+        let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
+        debug!(
+            "embed_tokens: [{}, {}]",
+            embed_tokens.rows, embed_tokens.cols
+        );
+
+        // LM head (bf16) — skip for partial loads to save memory
+        let lm_head = if max_layers.is_some() {
+            debug!("Partial load: skipping LM head");
+            None
+        } else if config.tie_word_embeddings {
+            debug!("Using tied embeddings for LM head");
+            None
+        } else {
+            debug!("Loading LM head");
+            Some(load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                "lm_head.weight",
+            )?)
+        };
+
+        // Layers
+        info!("Loading {} transformer layers", num_layers_to_load);
+        let mut layers = Vec::with_capacity(num_layers_to_load);
+        for i in 0..num_layers_to_load {
+            let prefix = format!("model.layers.{}", i);
+            let attn_prefix = format!("{}.self_attn", prefix);
+
+            // MLA weights (all layers have the same attention structure)
+            let mla = MlaWeights {
+                q_a_proj: load_fp8_matrix(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.q_a_proj.weight", attn_prefix),
+                    &format!("{}.q_a_proj.weight_scale_inv", attn_prefix),
+                )?,
+                q_a_layernorm: load_tensor_1d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.q_a_layernorm.weight", attn_prefix),
+                )?,
+                q_b_proj: load_fp8_matrix(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.q_b_proj.weight", attn_prefix),
+                    &format!("{}.q_b_proj.weight_scale_inv", attn_prefix),
+                )?,
+                kv_a_proj_with_mqa: load_fp8_matrix(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.kv_a_proj_with_mqa.weight", attn_prefix),
+                    &format!("{}.kv_a_proj_with_mqa.weight_scale_inv", attn_prefix),
+                )?,
+                kv_a_layernorm: load_tensor_1d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.kv_a_layernorm.weight", attn_prefix),
+                )?,
+                kv_b_proj: load_fp8_matrix(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.kv_b_proj.weight", attn_prefix),
+                    &format!("{}.kv_b_proj.weight_scale_inv", attn_prefix),
+                )?,
+                o_proj: load_fp8_matrix(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.o_proj.weight", attn_prefix),
+                    &format!("{}.o_proj.weight_scale_inv", attn_prefix),
+                )?,
+            };
+
+            // FFN: Dense or MoE
+            let ffn = match config.layer_types[i] {
+                FfnType::Dense => {
+                    let mlp_prefix = format!("{}.mlp", prefix);
+                    FfnWeights::Dense(DenseFFN {
+                        gate_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.gate_proj.weight", mlp_prefix),
+                            &format!("{}.gate_proj.weight_scale_inv", mlp_prefix),
+                        )?,
+                        up_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.up_proj.weight", mlp_prefix),
+                            &format!("{}.up_proj.weight_scale_inv", mlp_prefix),
+                        )?,
+                        down_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.down_proj.weight", mlp_prefix),
+                            &format!("{}.down_proj.weight_scale_inv", mlp_prefix),
+                        )?,
+                    })
+                }
+                FfnType::MoE => {
+                    let mlp_prefix = format!("{}.mlp", prefix);
+
+                    // Gate (router) — bf16 weight + f32 bias
+                    let gate = MoeGate {
+                        weight: load_tensor_2d(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.gate.weight", mlp_prefix),
+                        )?,
+                        e_score_correction_bias: load_1d_f32(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.gate.e_score_correction_bias", mlp_prefix),
+                        )?,
+                    };
+
+                    // Routed experts
+                    let mut experts = Vec::with_capacity(config.n_routed_experts);
+                    for e in 0..config.n_routed_experts {
+                        let ep = format!("{}.experts.{}", mlp_prefix, e);
+                        experts.push(ExpertFFN {
+                            gate_proj: load_fp8_matrix(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.gate_proj.weight", ep),
+                                &format!("{}.gate_proj.weight_scale_inv", ep),
+                            )?,
+                            up_proj: load_fp8_matrix(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.up_proj.weight", ep),
+                                &format!("{}.up_proj.weight_scale_inv", ep),
+                            )?,
+                            down_proj: load_fp8_matrix(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.down_proj.weight", ep),
+                                &format!("{}.down_proj.weight_scale_inv", ep),
+                            )?,
+                        });
+                    }
+
+                    // Shared expert
+                    let sep = format!("{}.shared_experts", mlp_prefix);
+                    let shared_expert = ExpertFFN {
+                        gate_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.gate_proj.weight", sep),
+                            &format!("{}.gate_proj.weight_scale_inv", sep),
+                        )?,
+                        up_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.up_proj.weight", sep),
+                            &format!("{}.up_proj.weight_scale_inv", sep),
+                        )?,
+                        down_proj: load_fp8_matrix(
+                            &ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{}.down_proj.weight", sep),
+                            &format!("{}.down_proj.weight_scale_inv", sep),
+                        )?,
+                    };
+
+                    FfnWeights::MoE(MoeFfnWeights {
+                        gate,
+                        experts,
+                        shared_expert,
+                    })
+                }
+            };
+
+            let block = TransformerBlock {
+                input_layernorm: load_tensor_1d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.input_layernorm.weight", prefix),
+                )?,
+                mla,
+                post_attention_layernorm: load_tensor_1d(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.post_attention_layernorm.weight", prefix),
+                )?,
+                ffn,
+            };
+
+            let ffn_type = config.layer_types[i];
+            debug!(
+                "Loaded layer {}/{}: {:?}",
+                i + 1,
+                num_layers_to_load,
+                ffn_type,
+            );
+            layers.push(block);
+        }
+
+        // Final norm — skip for partial loads (it's in a late shard)
+        let norm = if max_layers.is_some() {
+            debug!("Partial load: using zeros for final norm");
+            DeviceVec::zeros(&ctx, config.hidden_size)?
+        } else {
+            load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?
+        };
+
+        ctx.sync()?;
+        let loaded_desc = if max_layers.is_some() {
+            format!(
+                "{}/{} layers (partial)",
+                num_layers_to_load, config.num_hidden_layers
+            )
+        } else {
+            "all layers".to_string()
+        };
+        info!(
+            "GPU transfer complete in {:.1}s ({})",
+            t_gpu.elapsed().as_secs_f64(),
+            loaded_desc,
+        );
+        info!("DeepSeek-V3.2 model loaded successfully");
+
+        Ok(Self {
+            ctx,
+            config,
+            embed_tokens,
+            lm_head,
+            layers,
+            norm,
+        })
+    }
+
+    pub(crate) fn config(&self) -> &DsV3Config {
+        &self.config
+    }
+
+    pub(crate) fn device_ctx(&self) -> &DeviceContext {
+        &self.ctx
+    }
+
+    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::dsv3::config::DsV3Config;
+
+    fn get_dsv3_model_path() -> Option<String> {
+        std::env::var("PEGAINFER_DSV3_MODEL_PATH").ok()
+    }
+
+    #[test]
+    fn dsv3_config_parse() {
+        let model_path = match get_dsv3_model_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipped: set PEGAINFER_DSV3_MODEL_PATH to run");
+                return;
+            }
+        };
+        let config = DsV3Config::from_file(&model_path).expect("config parse failed");
+
+        assert_eq!(config.hidden_size, 7168);
+        assert_eq!(config.num_hidden_layers, 61);
+        assert_eq!(config.num_attention_heads, 128);
+        assert_eq!(config.vocab_size, 129280);
+
+        // MLA
+        assert_eq!(config.q_lora_rank, 1536);
+        assert_eq!(config.kv_lora_rank, 512);
+        assert_eq!(config.qk_nope_head_dim, 128);
+        assert_eq!(config.qk_rope_head_dim, 64);
+        assert_eq!(config.v_head_dim, 128);
+        assert_eq!(config.q_head_dim(), 192);
+        assert_eq!(config.kv_a_proj_dim(), 576);
+        assert_eq!(config.kv_b_proj_dim(), 128 * 256); // 32768
+        assert_eq!(config.q_b_proj_dim(), 128 * 192); // 24576
+        assert_eq!(config.o_proj_input_dim(), 128 * 128); // 16384
+
+        // MoE
+        assert_eq!(config.first_k_dense_replace, 3);
+        assert_eq!(config.n_routed_experts, 256);
+        assert_eq!(config.n_shared_experts, 1);
+        assert_eq!(config.num_experts_per_tok, 8);
+        assert_eq!(config.moe_intermediate_size, 2048);
+        assert_eq!(config.num_dense_layers(), 3);
+        assert_eq!(config.num_moe_layers(), 58);
+
+        // FP8
+        assert_eq!(config.weight_block_size, [128, 128]);
+
+        // Layer types
+        assert_eq!(config.layer_types[0], super::super::config::FfnType::Dense);
+        assert_eq!(config.layer_types[2], super::super::config::FfnType::Dense);
+        assert_eq!(config.layer_types[3], super::super::config::FfnType::MoE);
+        assert_eq!(config.layer_types[60], super::super::config::FfnType::MoE);
+
+        eprintln!("Config parsed OK: softmax_mscale={}", config.softmax_mscale);
+    }
+
+    /// Load embedding + 4 layers (3 dense + 1 MoE) on a single GPU.
+    /// Covers both FP8 matrix loading and MoE expert loading paths.
+    #[test]
+    #[ignore]
+    fn dsv3_partial_load_4_layers() {
+        let model_path = match get_dsv3_model_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipped: set PEGAINFER_DSV3_MODEL_PATH to run");
+                return;
+            }
+        };
+        crate::logging::init_stderr("info");
+
+        let model =
+            DsV3Model::from_safetensors_partial(&model_path, 0, 4).expect("partial load failed");
+
+        assert_eq!(model.layers.len(), 4);
+        assert_eq!(model.embed_tokens.rows, 129280);
+        assert_eq!(model.embed_tokens.cols, 7168);
+
+        // Layer 0: dense FFN
+        match &model.layers[0].ffn {
+            FfnWeights::Dense(d) => {
+                assert_eq!(d.gate_proj.rows, 18432);
+                assert_eq!(d.gate_proj.cols, 7168);
+            }
+            _ => panic!("Layer 0 should be Dense"),
+        }
+
+        // Layer 0 MLA shapes
+        let mla = &model.layers[0].mla;
+        assert_eq!(mla.q_a_proj.rows, 1536);
+        assert_eq!(mla.q_a_proj.cols, 7168);
+        assert_eq!(mla.q_b_proj.rows, 24576);
+        assert_eq!(mla.q_b_proj.cols, 1536);
+        assert_eq!(mla.kv_a_proj_with_mqa.rows, 576);
+        assert_eq!(mla.kv_a_proj_with_mqa.cols, 7168);
+        assert_eq!(mla.kv_b_proj.rows, 32768);
+        assert_eq!(mla.kv_b_proj.cols, 512);
+        assert_eq!(mla.o_proj.rows, 7168);
+        assert_eq!(mla.o_proj.cols, 16384);
+
+        // Layer 3: MoE FFN
+        match &model.layers[3].ffn {
+            FfnWeights::MoE(moe) => {
+                assert_eq!(moe.experts.len(), 256);
+                assert_eq!(moe.experts[0].gate_proj.rows, 2048);
+                assert_eq!(moe.experts[0].gate_proj.cols, 7168);
+                assert_eq!(moe.gate.weight.rows, 256);
+                assert_eq!(moe.gate.weight.cols, 7168);
+            }
+            _ => panic!("Layer 3 should be MoE"),
+        }
+
+        // Check VRAM usage
+        let (free, total) = cudarc::driver::result::mem_get_info().unwrap();
+        let used_mb = (total - free) / (1024 * 1024);
+        eprintln!("VRAM used after partial load: {} MB", used_mb);
+    }
+}
