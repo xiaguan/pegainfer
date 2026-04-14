@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 0.5 完成 — FP8 forward 已验证对齐，进入 Phase 1 (MLA forward)
+> **Status**: Phase 1 进行中 — MLA forward 全流程已实现（decode path），编译通过，待验证
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: KV cache 改 per-layer paged (page_size=64) + FlashMLA dense decode kernel 集成。
+> **Next action**: YaRN RoPE cos/sin cache 预计算 → 端到端验证（前 3 层 hidden states vs HF reference）。
 
 ---
 
@@ -74,11 +74,14 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 - [x] KV cache 改 per-layer paged buffer（page_size=64），适配 FlashMLA 期望的 `[num_blocks, 64, h_kv, head_dim]`
 - [x] FlashMLA dense decode kernel 集成（`build.rs` 编译 + thin C wrapper + Rust FFI），同 DeepGEMM 模式
-- [ ] MLA projection：hidden → c_KV (512d) + k_R (64d)，q → q_C + q_R
-- [ ] Decode 时 absorb 优化（W_UK @ c_KV 还原 K，或 absorb 进 W_O）
-- [ ] RoPE 仅作用于 k_R / q_R 部分
-- [ ] Dense FFN forward（TP8 AllReduce）
-- [ ] RMSNorm, residual, embedding
+- [x] FP8 linear ops 封装（`ops/fp8.rs`）：`fp8_quantize_into` / `fp8_gemm_into` / `fp8_linear_into`，支持共享量化
+- [x] Absorbed weight 预计算（`weights.rs` 加载时 CPU dequant kv_b_proj → W_UK/W_UV bf16）
+- [x] cuBLAS strided batched GEMM（`csrc/linear.cu`）用于 Q absorption / V de-absorption
+- [x] MLA CUDA kernels（`csrc/mla.cu`）：partial RMSNorm、k_rope RoPE、q_rope extract+RoPE+copy、KV cache write
+- [x] MLA forward 全流程（`forward.rs`）：Q/KV path + absorption + FlashMLA 3-phase + de-absorption + o_proj + Dense FFN
+- [ ] YaRN RoPE cos/sin cache 预计算并挂到 DsV3Model
+- [ ] 端到端验证：前 3 层 hidden states 与 HF reference 对齐
+- [ ] Prefill path（当前 decode only，bs=1 per request）
 
 验收：前 3 层 logits/hidden states 与 reference 对齐。
 
@@ -201,6 +204,228 @@ D 的 128B swizzle 导致 `TMA_D_BLOCK_N = 128 / sizeof(bf16) = 64`，kernel 发
 
 SM90 smem capacity = 232448 bytes (227 KB)，两组 config 均在容量内。1D1D 相同 block 尺寸只能跑 7/4 stages，1D2D 多出 1 stage 因为 D buffer 更小且无 per-stage SFB。
 
+## MLA Forward 实现要点
+
+> 后来者看这里，不用重新挖。
+
+### 维度速查
+
+| 名称 | 值 | 含义 |
+|------|------|------|
+| hidden_size | 7168 | 隐藏维度 |
+| num_heads | 128 | 注意力头数 |
+| q_lora_rank | 1536 | Q 低秩压缩维度 |
+| kv_lora_rank | 512 | KV 低秩压缩维度 |
+| qk_nope_head_dim | 128 | 每头 Q/K 非 RoPE 维度 |
+| qk_rope_head_dim | 64 | 每头 Q/K RoPE 维度 |
+| v_head_dim | 128 | 每头 V 维度 |
+| q_head_dim | 192 | = nope 128 + rope 64 |
+| kv_a_proj_dim | 576 | = kv_lora_rank 512 + rope 64 |
+| kv_b_head_dim | 256 | = nope 128 + v 128 |
+
+### 权重矩阵形状
+
+所有 FP8 权重存储为 `[output_dim, input_dim]`。GEMM 用法: `Y[M, N] = W[M, K] @ X[K, N]`。
+
+| 权重 | 形状 | 类型 | 输入 → 输出 |
+|------|------|------|-------------|
+| q_a_proj | [1536, 7168] | FP8 | hidden → q_compressed |
+| q_a_layernorm | [1536] | bf16 | RMSNorm weight |
+| q_b_proj | [24576, 1536] | FP8 | q_compressed → q_full (128×192) |
+| kv_a_proj | [576, 7168] | FP8 | hidden → [c_kv(512), k_rope(64)] |
+| kv_a_layernorm | [512] | bf16 | RMSNorm weight (只 norm c_kv 部分) |
+| kv_b_proj | [32768, 512] | FP8 | c_kv → [k_nope(128), v(128)] × 128 heads |
+| o_proj | [7168, 16384] | FP8 | attn_output (128×128) → hidden |
+
+### MLA 数据流（Decode，含 Absorption）
+
+MLA 的核心优化：不在 decode 时展开 kv_b_proj（会产生 32768d），而是把 kv_b_proj 的信息"吸收"进 Q 侧和 O 侧。
+
+```
+hidden [7168]
+  │
+  ├─── Q Path ────────────────────────────────────────────────────
+  │   FP8 quantize → q_a_proj [1536, 7168]      → q_compressed [1536]
+  │   RMSNorm(q_a_layernorm)                     → q_compressed [1536]
+  │   FP8 quantize → q_b_proj [24576, 1536]      → q_full [24576] = 128 heads × 192
+  │   ↓ per head h:
+  │   split → q_nope_h [128] + q_rope_h [64]
+  │   RoPE(q_rope_h)
+  │   ★ Q absorption: q_absorbed_h = q_nope_h @ W_UK_h → [512]
+  │   assemble → q_h = [q_absorbed_h(512), q_rope_h(64)] = [576]
+  │   ↓ all heads:
+  │   Q_absorbed [128, 576]     ← FlashMLA 的 Q 输入
+  │
+  ├─── KV Path ───────────────────────────────────────────────────
+  │   FP8 quantize → kv_a_proj [576, 7168]       → kv_a [576]
+  │   split → c_kv [512] + k_rope [64]
+  │   RMSNorm(kv_a_layernorm, only c_kv part)    → c_kv [512]
+  │   RoPE(k_rope)
+  │   concat → [c_kv(512), k_rope(64)] = [576]   → 写入 KV cache
+  │
+  ├─── FlashMLA Decode ──────────────────────────────────────────
+  │   Q: [batch, 128, 1, 576]  (q_seq_per_hk=128, h_k=1)
+  │   K cache: [num_blocks, 64, 1, 576]  (per-layer paged)
+  │   → attn_out [batch, 1, 128, 512]  (d_v = kv_lora_rank)
+  │   ≈ [128, 512] per token    ← 每头 512d，是 c_kv 的 attention 加权
+  │
+  ├─── V De-absorption + O Projection ──────────────────────────
+  │   ★ V de-absorption per head h:
+  │   v_out_h = attn_out_h [512] @ W_UV_h^T [512, 128] → [128]
+  │   concat all heads → [128 × 128] = [16384]
+  │   FP8 quantize → o_proj [7168, 16384]        → attn_output [7168]
+  │
+  └─── Residual: hidden += attn_output
+```
+
+### Absorption 原理
+
+标准 MLA attention per head h:
+```
+score_h = (q_nope_h @ k_nope_h^T) + (q_rope_h @ k_rope^T)
+        = (q_nope_h @ (W_UK_h @ c_kv)^T) + (q_rope_h @ k_rope^T)
+        = (q_nope_h @ W_UK_h) @ c_kv^T + q_rope_h @ k_rope^T
+```
+
+定义 `q_absorbed_h = [q_nope_h @ W_UK_h, q_rope_h]` (576d)，`kv_cache = [c_kv, k_rope]` (576d)，则：
+```
+score_h = q_absorbed_h @ kv_cache^T   ← 一次 dot product，FlashMLA 直接算
+```
+
+V 侧类似：标准路径 `v_h = W_UV_h @ c_kv`，absorption 后 FlashMLA 直接用 c_kv 做 V（d_v=512），出来再做 `v_out_h = attn_out_h @ W_UV_h^T` 还原到 v_head_dim=128。
+
+### W_UK / W_UV 提取
+
+kv_b_proj 是 FP8 [32768, 512] = [128 heads × 256, 512]。每头 256 = k_nope 128 + v 128。
+
+**加载时一次性 dequant**，提取两组 bf16 权重：
+
+```
+kv_b_proj_bf16 [32768, 512] → reshape [128, 256, 512]
+W_UK_h = kv_b_proj_bf16[h, 0:128,   :] → [128, 512]   # K nope 权重
+W_UV_h = kv_b_proj_bf16[h, 128:256, :] → [128, 512]   # V 权重
+```
+
+存储为两个 bf16 buffer：
+- `w_uk`: [128, 128, 512] → 内存 128 × 128 × 512 × 2 = 16 MB/layer
+- `w_uv`: [128, 128, 512] → 16 MB/layer
+- 合计 32 MB/layer × 61 = ~2 GB，可接受
+
+### Q Absorption 的 GEMM 策略
+
+q_full 输出格式：`[h0_nope(128), h0_rope(64), h1_nope(128), h1_rope(64), ...]` — nope 和 rope 交替排列。
+
+**cuBLAS Strided Batched GEMM**（`cublasGemmStridedBatchedEx`，支持 bs > 1）:
+
+```
+Q absorption: C_h = W_UK_h^T @ q_nope_h    (per head, batch = 128 heads)
+
+cuBLAS column-major 视角 (W_UK_h 存储 [nope, kv_lora] row-major = [kv_lora, nope] col-major):
+  opA = N:  A_h = W_UK_h col-major [kv_lora=512, nope=128],  lda=512
+  opB = N:  B_h = q_nope_h col-major [nope=128, bs],          ldb=q_b_proj_dim(24576)
+  C_h = q_absorbed col-major [kv_lora=512, bs],               ldc=num_heads*kv_a_proj_dim(73728)
+  m=512, n=bs, k=128
+
+  strideA = nope * kv_lora = 128 * 512 = 65536    (between heads in W_UK)
+  strideB = q_head_dim = 192                        (between heads in q_full interleaved layout)
+  strideC = kv_a_proj_dim = 576                     (between heads in FlashMLA Q buffer)
+```
+
+stride_B=192 利用 q_full 的 nope/rope 交替布局，自然跳过 rope gap。stride_C=576 直接写入 FlashMLA Q 的 absorbed 部分，rope 部分由 `mla_rope_q_copy_cuda` 填充。
+
+V de-absorption 类似:
+```
+V de-absorption: C_h = W_UV_h @ attn_out_h
+
+  opA = T:  A_h col-major [kv_lora=512, v_dim=128], lda=512, → transposed [v_dim, kv_lora]
+  opB = N:  B_h = attn_out_h col-major [kv_lora=512, bs],    ldb=num_heads*kv_lora(65536)
+  C_h = v_out_h col-major [v_dim=128, bs],                   ldc=o_proj_input_dim(16384)
+  m=128, n=bs, k=512
+
+  strideA = v_dim * kv_lora = 128 * 512 = 65536
+  strideB = kv_lora = 512
+  strideC = v_dim = 128
+```
+
+**为什么用 cuBLAS 不用 DeepGEMM einsum？** Absorption 是标准 bf16 batched GEMM，不涉及 FP8 block-scale 或 TMA descriptor。cuBLAS 已经 init 且对这些尺寸性能好。DeepGEMM einsum 的 JIT 基础设施搬过来工程量大、收益不大。
+
+### FlashMLA 调用参数（DSV3 具体值）
+
+```
+flash_mla_decode(
+    q:          [batch, 128, 1, 576]    // q_seq_per_hk = seqlen_q * (h_q/h_k) = 1*128
+    kcache:     [num_blocks, 64, 1, 576] // per-layer paged buffer 的 layer slice
+    o:          [batch, 1, 128, 512]
+    ...
+    h_q: 128,  h_k: 1,  d_k: 576,  d_v: 512,
+    softmax_scale: (192)^{-0.5} * yarn_mscale²,
+    is_causal: 0  (decode 不需要 causal mask)
+)
+```
+
+**关键 stride 计算**（flash_mla.cu 内部）:
+```
+q_batch_stride = 128 × 1 × 576 = 73728
+q_row_stride   = 1 × 576 = 576
+q_head_stride  = 576
+o_batch_stride = 1 × 128 × 512 = 65536
+o_row_stride   = 512
+o_head_stride  = 128 × 512 = 65536
+```
+
+### FP8 Linear Pipeline
+
+每次 FP8 GEMM 前需要做 activation FP8 量化。封装为 `fp8_linear_into`:
+
+```
+input [hidden_dim, bs] bf16
+  → fp8_quantize_1x128:  fp8_act [M, K] + scale_a [ceil(K/128), padded(M,4)]
+  → fp8_gemm_cuda:       output [N, bs] bf16
+```
+
+**共享量化**：同一 input 同时供 q_a_proj 和 kv_a_proj 时，FP8 量化只做一次。
+
+**Scratch buffer 策略**：FP8 activation buf 和 scale buf 大小取决于 input 维度，预分配最大尺寸（hidden_size=7168 对应 7168 bytes fp8 + 56×padded(M,4)×4 bytes scales）。
+
+### RoPE 处理
+
+MLA 的 RoPE 只作用于 rope 维度（64d），不影响 nope 维度：
+- q_rope: q_full 中每头的 [h*192+128 : h*192+192]（交替排列）
+- k_rope: kv_a 输出的 [512:576]（连续 64d）
+
+DSV3 使用 YaRN RoPE，参数在 config 中。softmax_scale 需要乘 `mscale²`。
+
+### Dense FFN Forward（前 3 层）
+
+```
+normed [7168, bs]  (post_attention_layernorm 输出)
+  FP8 quantize → gate_proj [18432, 7168]  → gate [18432, bs]
+  FP8 quantize → up_proj   [18432, 7168]  → up   [18432, bs]
+  (共享同一份 normed FP8 量化)
+  silu(gate) * up                          → act  [18432, bs]
+  FP8 quantize → down_proj [7168, 18432]  → ffn_out [7168, bs]
+  residual: hidden += ffn_out
+```
+
+### 现有基础设施映射
+
+| 需要的操作 | 函数 | 位置 |
+|-----------|------|------|
+| Embedding lookup | `ops::embedding_batch` | ✅ 直接用 |
+| RMSNorm batched | `ops::rms_norm_batch_into` | ✅ 直接用 |
+| Fused add + RMSNorm | `ops::fused_add_rms_norm_batch_into` | ✅ 直接用 |
+| SiLU × up (分离 gate/up) | `ops::silu_mul_batch_into` | ✅ 直接用 |
+| BF16 GEMM | `ops::gemm_into` | ✅ 直接用 |
+| FP8 quantize + GEMM | `ops::fp8::fp8_linear_into` | ✅ 已封装 |
+| FP8 shared quantize | `ops::fp8::fp8_quantize_into` + `fp8_gemm_into` | ✅ 已封装 |
+| FlashMLA 3-phase | `ffi::flash_mla_{get_metadata,decode,combine}` | ✅ forward.rs 直接调 FFI |
+| Strided batched GEMM | `ffi::gemm_strided_batched_cuda` | ✅ 已新增（`csrc/linear.cu`） |
+| MLA RoPE (k_rope) | `ffi::mla_rope_kv_cuda` | ✅ 已新增（`csrc/mla.cu`） |
+| MLA RoPE (q_rope extract+copy) | `ffi::mla_rope_q_copy_cuda` | ✅ 已新增 |
+| Partial RMSNorm (c_kv only) | `ffi::rms_norm_partial_cuda` | ✅ 已新增 |
+| KV cache write (scatter) | `ffi::mla_kv_cache_write_cuda` | ✅ 已新增 |
+| YaRN RoPE cos/sin precompute | — | ❌ 需新增（复用 `precompute_rope`，64d rope_dim） |
+
 ## 探索方向
 
 - **Decode 侧 SM 分区 overlap**: 双 micro-batch decode，attention 与 MoE dispatch+compute+combine 通过 SM 分区并行。RTX 5070 Ti 实验表明 32 SM (46%) 达峰值 89%。需验证 H20 的 SM-bandwidth 曲线和共享 HBM 时的干扰。
@@ -226,3 +451,8 @@ SM90 smem capacity = 232448 bytes (227 KB)，两组 config 均在容量内。1D1
 | 2026-04-14 | norm 权重 f32→bf16 转换 | DSV3 checkpoint 中 layernorm 权重存为 f32，而 Qwen3 系列为 bf16。`load_tensor_1d` 直接按 bf16 读会长度翻倍。新增 `load_1d_f32_as_bf16` 做显式转换 |
 | 2026-04-14 | MLA attention 用 FlashMLA | DeepSeek 自研 MLA kernel（`third_party/FlashMLA`），SM90 dense decode 达 3000 GB/s / 660 TFLOPS (H800)。kernel 天然适配 DSV3 MLA 维度：`head_size_k=576` (c_KV 512 + k_R 64)，`head_size_v=512`，MQA 模式 (`h_kv=1`)。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
 | 2026-04-14 | KV cache 切 per-layer paged，page_size=64 | FlashMLA dense decode 硬性要求 `page_block_size=64`（`dense_decode.h:67`），且 kcache 为 per-layer 独立 buffer `[num_blocks, page_block_size, num_heads_k, head_size_k]`。现有 `KvPool` all-layers-in-one-page 布局（`kv_pool.rs`）改为 per-layer paged buffer，`PagePool`/`KvState` 分配逻辑不变，`KvLayout` 几何调整即可 |
+| 2026-04-14 | Absorption 用 cuBLAS strided batched GEMM，不用 DeepGEMM einsum | Absorption/de-absorption 是标准 bf16 batched GEMM（非 FP8 block-scale），无需 TMA descriptor。cuBLAS `cublasGemmStridedBatchedEx` 已 init 且对 [128,512]×[128,bs] 这类尺寸性能好。DeepGEMM einsum 虽有现成 `bhr,hdr->bhd` kernel，但 JIT 基础设施（`compiler->build`、torch tensor 胶水）搬过来工程量大且 bf16 场景收益不大 |
+| 2026-04-14 | W_UK/W_UV CPU dequant | kv_b_proj FP8 [32768, 512] 在加载时一次性 CPU dequant 到 bf16，拆成 W_UK/W_UV 上传 GPU。32 MB/layer × 61 ≈ 2 GB 可接受。CPU dequant 避免写 GPU dequant kernel，加载是一次性开销 |
+| 2026-04-14 | Partial RMSNorm kernel | kv_a_layernorm 只 norm c_kv 前 512d，保留 k_rope 后 64d。标准 `rms_norm_batch_into` 会 norm 整个 576d。新增 `rms_norm_partial_cuda`（`csrc/mla.cu`）做 sub-range norm |
+| 2026-04-14 | MLA RoPE 用 half-split 格式 | DSV3 用 transformers 标准 `rotate_half`：pairs 是 (x[i], x[i+half_dim])，与 Qwen3 `precompute_rope` 的 cos/sin cache 布局一致。不是 interleaved pairs |
+| 2026-04-14 | Dense FFN 分离 gate/up | Qwen3 gate_up fused 为一个投影 → `silu_mul_fused_batch_into`。DSV3 gate_proj 和 up_proj 是独立 FP8 权重 → 用 `silu_mul_batch_into`（分离 gate/up 输入）。共享 FP8 量化（normed 只量化一次供两个投影） |

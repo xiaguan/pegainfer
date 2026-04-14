@@ -77,4 +77,35 @@ void gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bf
                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+// Strided batched GEMM: C_i = alpha * op(A_i) * op(B_i) for i in [0, batch_count)
+// All bf16 inputs and outputs, fp32 accumulation.
+// Used for MLA Q absorption and V de-absorption.
+void gemm_strided_batched_cuda(
+    int transa,  // 0 = N, 1 = T
+    int transb,  // 0 = N, 1 = T
+    int m, int n, int k,
+    const __nv_bfloat16 *A, int lda, long long stride_a,
+    const __nv_bfloat16 *B, int ldb, long long stride_b,
+    __nv_bfloat16 *C, int ldc, long long stride_c,
+    int batch_count,
+    cudaStream_t stream)
+{
+  const float h_alpha = 1.0f;
+  const float h_beta = 0.0f;
+  cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasSetStream(g_cublas_prefill_handle, stream);
+  cublasGemmStridedBatchedEx(
+      g_cublas_prefill_handle,
+      opA, opB,
+      m, n, k,
+      &h_alpha,
+      A, CUDA_R_16BF, lda, stride_a,
+      B, CUDA_R_16BF, ldb, stride_b,
+      &h_beta,
+      C, CUDA_R_16BF, ldc, stride_c,
+      batch_count,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 } // extern "C"

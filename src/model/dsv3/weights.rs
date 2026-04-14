@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use half::bf16;
 use log::{debug, info};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -104,6 +105,8 @@ pub(super) enum FfnWeights {
 pub(super) struct TransformerBlock {
     pub(super) input_layernorm: DeviceVec,
     pub(super) mla: MlaWeights,
+    /// Pre-computed absorbed MLA weights (W_UK, W_UV from kv_b_proj dequant).
+    pub(super) absorbed: AbsorbedMlaWeights,
     pub(super) post_attention_layernorm: DeviceVec,
     pub(super) ffn: FfnWeights,
 }
@@ -120,6 +123,22 @@ pub struct DsV3Model {
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
+}
+
+/// Pre-computed absorbed MLA weights for one layer.
+///
+/// At load time, kv_b_proj [32768, 512] FP8 is dequantized and split:
+///   reshape as [128 heads, 256, 512] → per head [k_nope(128), v(128)] × 512
+///   W_UK_h = kv_b_proj_bf16[h, 0:128,   :] → [128, 512]   (K nope weights)
+///   W_UV_h = kv_b_proj_bf16[h, 128:256, :] → [128, 512]   (V weights)
+///
+/// Stored contiguously: w_uk [128, 128, 512], w_uv [128, 128, 512] in bf16.
+/// Each head's sub-matrix is row-major [head_dim, kv_lora_rank].
+pub(crate) struct AbsorbedMlaWeights {
+    /// W_UK: [num_heads, qk_nope_head_dim, kv_lora_rank] bf16
+    pub(crate) w_uk: CudaSlice<bf16>,
+    /// W_UV: [num_heads, v_head_dim, kv_lora_rank] bf16
+    pub(crate) w_uv: CudaSlice<bf16>,
 }
 
 unsafe impl Send for DsV3Model {}
@@ -255,6 +274,123 @@ fn load_1d_f32(
     ctx.stream
         .clone_htod(f32_slice)
         .map_err(|e| anyhow::anyhow!("H2D copy for '{}' failed: {}", name, e))
+}
+
+/// Dequantize an FP8 matrix on CPU and return bf16 host data.
+fn dequant_fp8_to_bf16_host(
+    ctx: &DeviceContext,
+    fp8: &Fp8Matrix,
+    block_h: usize,
+    block_w: usize,
+) -> Vec<bf16> {
+    // Download FP8 data and scales to CPU
+    let fp8_host: Vec<u8> = ctx.stream.clone_dtoh(&fp8.data).expect("D2H fp8 data");
+    let scale_host: Vec<f32> = ctx
+        .stream
+        .clone_dtoh(&fp8.scale_inv)
+        .expect("D2H scale_inv");
+    ctx.stream.synchronize().expect("sync");
+
+    let rows = fp8.rows;
+    let cols = fp8.cols;
+    let mut out = vec![bf16::from_f32(0.0); rows * cols];
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let raw_byte = fp8_host[r * cols + c];
+            // FP8 e4m3: sign(1) | exp(4) | man(3), bias=7
+            let fp8_f32 = fp8_e4m3_to_f32(raw_byte);
+            let scale_r = r / block_h;
+            let scale_c = c / block_w;
+            // scale_inv layout: [ceil(rows/block_h), ceil(cols/block_w)]
+            // stored row-major: scale_inv[scale_r][scale_c]
+            let scale_idx = scale_r * fp8.scale_cols + scale_c;
+            let scale = scale_host[scale_idx];
+            out[r * cols + c] = bf16::from_f32(fp8_f32 * scale);
+        }
+    }
+    out
+}
+
+/// Convert FP8 e4m3 byte to f32.
+fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = (bits >> 7) & 1;
+    let exp = (bits >> 3) & 0xF;
+    let man = bits & 0x7;
+
+    if exp == 0 && man == 0 {
+        return if sign == 1 { -0.0 } else { 0.0 };
+    }
+    // e4m3 special: exp=15, man=7 is NaN (no inf in e4m3)
+    if exp == 15 && man == 7 {
+        return f32::NAN;
+    }
+
+    let bias = 7i32;
+    let (effective_exp, effective_man) = if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(1-bias) * (0.man)
+        (1 - bias, man as f32 / 8.0)
+    } else {
+        // Normal: value = (-1)^sign * 2^(exp-bias) * (1.man)
+        (exp as i32 - bias, 1.0 + man as f32 / 8.0)
+    };
+
+    let val = effective_man * (2.0f32).powi(effective_exp);
+    if sign == 1 { -val } else { val }
+}
+
+/// Compute absorbed MLA weights from kv_b_proj for one layer.
+fn compute_absorbed_weights(
+    ctx: &DeviceContext,
+    kv_b_proj: &Fp8Matrix,
+    num_heads: usize,
+    qk_nope_head_dim: usize,
+    v_head_dim: usize,
+    kv_lora_rank: usize,
+    block_size: [usize; 2],
+) -> Result<AbsorbedMlaWeights> {
+    let kv_b_head_dim = qk_nope_head_dim + v_head_dim; // 256
+    assert_eq!(kv_b_proj.rows, num_heads * kv_b_head_dim);
+    assert_eq!(kv_b_proj.cols, kv_lora_rank);
+
+    // Dequantize to bf16 on CPU
+    let bf16_data = dequant_fp8_to_bf16_host(ctx, kv_b_proj, block_size[0], block_size[1]);
+
+    // Split into W_UK and W_UV
+    // kv_b_proj_bf16: [num_heads * kv_b_head_dim, kv_lora_rank] row-major
+    // For head h: rows [h*kv_b_head_dim .. (h+1)*kv_b_head_dim]
+    //   W_UK_h: first qk_nope_head_dim rows → [qk_nope_head_dim, kv_lora_rank]
+    //   W_UV_h: next v_head_dim rows         → [v_head_dim, kv_lora_rank]
+
+    let uk_size = num_heads * qk_nope_head_dim * kv_lora_rank;
+    let uv_size = num_heads * v_head_dim * kv_lora_rank;
+    let mut w_uk_host = Vec::with_capacity(uk_size);
+    let mut w_uv_host = Vec::with_capacity(uv_size);
+
+    for h in 0..num_heads {
+        let head_offset = h * kv_b_head_dim * kv_lora_rank;
+        // W_UK_h: first qk_nope_head_dim rows
+        for r in 0..qk_nope_head_dim {
+            let row_start = head_offset + r * kv_lora_rank;
+            w_uk_host.extend_from_slice(&bf16_data[row_start..row_start + kv_lora_rank]);
+        }
+        // W_UV_h: next v_head_dim rows
+        for r in 0..v_head_dim {
+            let row_start = head_offset + (qk_nope_head_dim + r) * kv_lora_rank;
+            w_uv_host.extend_from_slice(&bf16_data[row_start..row_start + kv_lora_rank]);
+        }
+    }
+
+    let w_uk = ctx
+        .stream
+        .clone_htod(&w_uk_host)
+        .map_err(|e| anyhow::anyhow!("H2D w_uk failed: {e}"))?;
+    let w_uv = ctx
+        .stream
+        .clone_htod(&w_uv_host)
+        .map_err(|e| anyhow::anyhow!("H2D w_uv failed: {e}"))?;
+
+    Ok(AbsorbedMlaWeights { w_uk, w_uv })
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +642,17 @@ impl DsV3Model {
                 }
             };
 
+            // Pre-compute absorbed MLA weights (W_UK, W_UV) from kv_b_proj
+            let absorbed = compute_absorbed_weights(
+                &ctx,
+                &mla.kv_b_proj,
+                config.num_attention_heads,
+                config.qk_nope_head_dim,
+                config.v_head_dim,
+                config.kv_lora_rank,
+                config.weight_block_size,
+            )?;
+
             let block = TransformerBlock {
                 input_layernorm: load_1d_f32_as_bf16(
                     &ctx,
@@ -514,6 +661,7 @@ impl DsV3Model {
                     &format!("{}.input_layernorm.weight", prefix),
                 )?,
                 mla,
+                absorbed,
                 post_attention_layernorm: load_1d_f32_as_bf16(
                     &ctx,
                     &shards,

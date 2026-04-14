@@ -114,6 +114,27 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Strided batched GEMM: C_i = op(A_i) @ op(B_i), bf16, fp32 accumulation.
+    // Used for MLA Q absorption / V de-absorption.
+    pub(crate) fn gemm_strided_batched_cuda(
+        transa: i32, // 0 = N, 1 = T
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const Half,
+        lda: i32,
+        stride_a: i64,
+        b: *const Half,
+        ldb: i32,
+        stride_b: i64,
+        c: *mut Half,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    );
+
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub(crate) fn embedding_decode_cuda(
         embed: *const Half,
@@ -498,6 +519,64 @@ unsafe extern "C" {
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
+
+    // ========================================================================
+    // MLA kernels (csrc/mla.cu)
+    // ========================================================================
+
+    // RoPE on k_rope portion of kv_a (in-place).
+    pub(crate) fn mla_rope_kv_cuda(
+        kv_a: *mut Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        kv_a_proj_dim: i32,
+        kv_lora_rank: i32,
+        rope_dim: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
+    // Copy q_rope from q_full interleaved layout → FlashMLA Q buffer, with RoPE.
+    pub(crate) fn mla_rope_q_copy_cuda(
+        q_full: *const Half,
+        q_mla: *mut Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        q_b_proj_dim: i32,
+        q_head_dim: i32,
+        nope_dim: i32,
+        rope_dim: i32,
+        num_heads: i32,
+        kv_a_proj_dim: i32,
+        kv_lora_rank: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
+    // Write kv_a [kv_dim, bs] to paged KV cache for one layer.
+    pub(crate) fn mla_kv_cache_write_cuda(
+        kv_a: *const Half,
+        kv_buffer: *mut Half,
+        page_indices: *const i32,
+        kv_dim: i32,
+        page_size: i32,
+        start_pos: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+
+    // RMSNorm on first norm_dim elements of each token's vector (in-place).
+    pub(crate) fn rms_norm_partial_cuda(
+        x: *mut Half,
+        weight: *const Half,
+        total_dim: i32,
+        norm_dim: i32,
+        bs: i32,
+        eps: f32,
+        stream: CUstream,
+    );
 
     // ========================================================================
     // DeepGEMM FP8 GEMM — 1D2D variant (SM90a)

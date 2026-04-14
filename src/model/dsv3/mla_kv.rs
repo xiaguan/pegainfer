@@ -139,6 +139,11 @@ impl MlaKvPool {
     pub(crate) fn layer_offset(&self, layer: usize) -> usize {
         layer * self.inner.num_pages * self.inner.layout.page_kv_len
     }
+
+    /// Get the underlying buffer reference (for kernel access).
+    pub(crate) fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.inner.buffer
+    }
 }
 
 /// Per-request MLA KV state.

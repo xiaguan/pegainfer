@@ -3,6 +3,7 @@
 mod attention;
 mod elementwise;
 mod embedding;
+pub(crate) mod fp8;
 mod linear;
 mod norm;
 mod recurrent;
