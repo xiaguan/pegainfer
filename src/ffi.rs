@@ -536,6 +536,68 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // ========================================================================
+    // FlashMLA dense decode (SM90a)
+    // ========================================================================
+
+    // Phase 1: Compute tile scheduler metadata for FlashMLA split-KV.
+    pub(crate) fn flash_mla_get_metadata(
+        batch_size: i32,
+        seqlen_q: i32,
+        seqlens_k: *const i32,             // [batch_size]
+        tile_scheduler_metadata: *mut i32, // [num_sm_parts, 8]
+        num_splits: *mut i32,              // [batch_size + 1]
+        num_sm_parts: i32,
+        stream: CUstream,
+    );
+
+    // Phase 2: Main MLA split-KV attention kernel (bf16).
+    // q:      bf16 [batch, q_seq_per_hk, h_k, d_k]
+    // kcache: bf16 [num_blocks, 64, h_k, d_k]  (one layer's paged KV)
+    // o:      bf16 [batch, h_k, q_seq_per_hk, d_v]
+    pub(crate) fn flash_mla_decode(
+        q: *const Half,
+        kcache: *const Half,
+        o: *mut Half,
+        lse: *mut f32,
+        lse_accum: *mut f32,
+        o_accum: *mut f32,
+        block_table: *const i32, // [batch, max_blocks_per_seq]
+        seqlens_k: *const i32,   // [batch]
+        tile_scheduler_metadata: *const i32,
+        num_splits: *const i32,
+        batch_size: i32,
+        seqlen_q: i32,
+        q_seq_per_hk: i32,
+        h_q: i32,
+        h_k: i32,
+        d_k: i32,
+        d_v: i32,
+        num_blocks: i32,
+        max_blocks_per_seq: i32,
+        num_sm_parts: i32,
+        total_num_splits: i32,
+        softmax_scale: f32,
+        is_causal: i32,
+        stream: CUstream,
+    );
+
+    // Phase 3: Combine split-KV partial results.
+    pub(crate) fn flash_mla_combine(
+        lse: *mut f32,
+        out: *mut Half, // bf16
+        lse_accum: *mut f32,
+        o_accum: *mut f32,
+        tile_scheduler_metadata: *const i32,
+        num_splits: *const i32,
+        batch_size: i32,
+        seqlen_q: i32,
+        h_q: i32,
+        d_v: i32,
+        num_sm_parts: i32,
+        stream: CUstream,
+    );
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub(crate) fn paged_attention_decode_cuda(
         q: *const Half,

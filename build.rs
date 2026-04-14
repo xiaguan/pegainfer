@@ -501,6 +501,9 @@ fn main() {
     // DeepGEMM files are compiled separately with SM90a + C++20
     let deepgemm_cuda_files = BTreeSet::from(["fp8_gemm.cu"]);
 
+    // FlashMLA wrapper — compiled separately with SM90a + C++20 + FlashMLA headers
+    let flashmla_cuda_files = BTreeSet::from(["flash_mla.cu"]);
+
     // Other SM90a files (FP8 intrinsics, no DeepGEMM headers needed)
     let sm90_cuda_files = BTreeSet::from(["fp8_quantize.cu"]);
 
@@ -514,6 +517,7 @@ fn main() {
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
                 && !deepgemm_cuda_files.contains(file_name)
+                && !flashmla_cuda_files.contains(file_name)
                 && !sm90_cuda_files.contains(file_name)
             {
                 Some(path)
@@ -629,6 +633,92 @@ fn main() {
             dg_num_sms
         );
 
+        // FlashMLA dense decode — SM90a + C++20 + FlashMLA's own CUTLASS
+        let flashmla_include_args = [
+            "-I",
+            "third_party/FlashMLA/csrc",
+            "-I",
+            "third_party/FlashMLA/csrc/kerutils/include",
+            "-I",
+            "third_party/FlashMLA/csrc/sm90",
+            "-I",
+            "third_party/FlashMLA/csrc/cutlass/include",
+            "-I",
+            "third_party/FlashMLA/csrc/cutlass/tools/util/include",
+        ];
+
+        // FlashMLA kernel source files (compiled from third_party)
+        let flashmla_kernel_sources = [
+            "third_party/FlashMLA/csrc/sm90/decode/dense/instantiations/bf16.cu",
+            "third_party/FlashMLA/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+            "third_party/FlashMLA/csrc/smxx/decode/combine/combine.cu",
+        ];
+
+        let flashmla_nvcc_base_args = [
+            "-O3",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "--std=c++20",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            "-DFLASH_MLA_DISABLE_FP16",
+            "--compiler-options",
+            "-fPIC",
+        ];
+
+        for source in &flashmla_kernel_sources {
+            let cu_file = Path::new(source);
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("flashmla_{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args(["-c", source, "-o", &obj_file.to_string_lossy()])
+                .args(&flashmla_nvcc_base_args)
+                .args(&flashmla_include_args)
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (FlashMLA SM90a)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
+
+        // FlashMLA C wrapper (csrc/flash_mla.cu)
+        for file_name in &flashmla_cuda_files {
+            let cu_file = csrc_dir.join(file_name);
+            if !cu_file.exists() {
+                continue;
+            }
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args([
+                    "-c",
+                    &cu_file.to_string_lossy(),
+                    "-o",
+                    &obj_file.to_string_lossy(),
+                ])
+                .args(&flashmla_nvcc_base_args)
+                .args(&flashmla_include_args)
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (FlashMLA SM90a)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
+
+        println!("cargo:warning=FlashMLA dense decode compiled for SM90a");
+
         // SM90a files that only need FP8 intrinsics (no DeepGEMM/CUTLASS headers)
         for file_name in &sm90_cuda_files {
             let cu_file = csrc_dir.join(file_name);
@@ -696,6 +786,7 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=third_party/DeepGEMM/deep_gemm/include/");
+    println!("cargo:rerun-if-changed=third_party/FlashMLA/csrc/");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");

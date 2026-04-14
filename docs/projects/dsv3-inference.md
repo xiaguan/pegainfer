@@ -2,7 +2,7 @@
 
 > **Status**: Phase 0.5 完成 — FP8 forward 已验证对齐，进入 Phase 1 (MLA forward)
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: MLA attention kernel — 压缩 KV cache (c_KV 512d + k_R 64d)，decode 时 absorb 优化。
+> **Next action**: KV cache 改 per-layer paged (page_size=64) + FlashMLA dense decode kernel 集成。
 
 ---
 
@@ -72,7 +72,9 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 目标：MLA attention + Dense FFN 前向，前 3 层 hidden states 与 HF 对齐。
 
-- [ ] MLA attention kernel — 压缩 KV cache (c_KV 512d + k_R 64d)
+- [x] KV cache 改 per-layer paged buffer（page_size=64），适配 FlashMLA 期望的 `[num_blocks, 64, h_kv, head_dim]`
+- [x] FlashMLA dense decode kernel 集成（`build.rs` 编译 + thin C wrapper + Rust FFI），同 DeepGEMM 模式
+- [ ] MLA projection：hidden → c_KV (512d) + k_R (64d)，q → q_C + q_R
 - [ ] Decode 时 absorb 优化（W_UK @ c_KV 还原 K，或 absorb 进 W_O）
 - [ ] RoPE 仅作用于 k_R / q_R 部分
 - [ ] Dense FFN forward（TP8 AllReduce）
@@ -127,6 +129,8 @@ Qwen3 TP 已跑通多卡推理，DSV3 多卡部分可直接参考：
 | `attach_tp_comm` 模式 | `qwen3/weights.rs:392` | 同一模式：load → attach comm → run |
 | DeepGEMM FP8 kernel | `third_party/DeepGEMM/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh` | kernel 直接用；host 侧 TMA setup 已重写（`csrc/fp8_gemm.cu`），bf16 输出 |
 | DeepGEMM grouped GEMM | 同上，`GemmType::GroupedContiguous` / `GroupedMasked` | MoE expert 计算直接可用 |
+| FlashMLA dense decode | `third_party/FlashMLA/csrc/sm90/decode/dense/` | SM90 MLA decode kernel；host 侧 torch 胶水已重写（`csrc/flash_mla.cu`），3-phase: metadata → decode → combine |
+| MLA paged KV cache | `src/model/dsv3/mla_kv.rs` | per-layer paged buffer (page_size=64)，`MlaKvPool`/`MlaKvState`，天然匹配 FlashMLA kcache 格式 |
 
 ## DeepGEMM 1D2D 集成要点
 
@@ -220,3 +224,5 @@ SM90 smem capacity = 232448 bytes (227 KB)，两组 config 均在容量内。1D1
 | 2026-04-14 | 1D2D AOT config: 64×128/8stages + 128×128/5stages | 依据 DeepGEMM heuristics (`sm90.hpp`)：block_m<=64 用 1 warpgroup (128 math threads)，否则 2 warpgroups (256)。stages 取 SM90 smem 容量 232448 下的最大值。kMajorSFB=K 匹配 DSV3 checkpoint scale layout，kSwizzleDMode=128 匹配 bf16 block_n=128，kNumLastStages=0 因 SM90 kernel 不使用该参数 |
 | 2026-04-14 | 1D2D 输出 bf16 (非 fp32) | DeepGEMM 1D2D API 强制 `d.scalar_type() == torch::kBFloat16`。kernel 内部 fp32 accumulator → bf16 cast 后经 TMA store 写回。DSV3 forward 后续层本就需要 bf16 输入，省去显式 cast |
 | 2026-04-14 | norm 权重 f32→bf16 转换 | DSV3 checkpoint 中 layernorm 权重存为 f32，而 Qwen3 系列为 bf16。`load_tensor_1d` 直接按 bf16 读会长度翻倍。新增 `load_1d_f32_as_bf16` 做显式转换 |
+| 2026-04-14 | MLA attention 用 FlashMLA | DeepSeek 自研 MLA kernel（`third_party/FlashMLA`），SM90 dense decode 达 3000 GB/s / 660 TFLOPS (H800)。kernel 天然适配 DSV3 MLA 维度：`head_size_k=576` (c_KV 512 + k_R 64)，`head_size_v=512`，MQA 模式 (`h_kv=1`)。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
+| 2026-04-14 | KV cache 切 per-layer paged，page_size=64 | FlashMLA dense decode 硬性要求 `page_block_size=64`（`dense_decode.h:67`），且 kcache 为 per-layer 独立 buffer `[num_blocks, page_block_size, num_heads_k, head_size_k]`。现有 `KvPool` all-layers-in-one-page 布局（`kv_pool.rs`）改为 per-layer paged buffer，`PagePool`/`KvState` 分配逻辑不变，`KvLayout` 几何调整即可 |
