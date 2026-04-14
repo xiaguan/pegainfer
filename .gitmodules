@@ -1,3 +1,6 @@
 [submodule "third_party/flashinfer"]
 	path = third_party/flashinfer
 	url = https://github.com/flashinfer-ai/flashinfer
+[submodule "third_party/DeepGEMM"]
+	path = third_party/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git

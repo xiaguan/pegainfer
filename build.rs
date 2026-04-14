@@ -498,6 +498,9 @@ fn main() {
     let replaced_cuda_files =
         BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
 
+    // DeepGEMM files are compiled separately with SM90a + C++20
+    let deepgemm_cuda_files = BTreeSet::from(["fp8_gemm.cu"]);
+
     let csrc_dir = Path::new("csrc");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
         .expect("Failed to read csrc/ directory")
@@ -507,6 +510,7 @@ fn main() {
             let file_name = path.file_name()?.to_str()?;
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
+                && !deepgemm_cuda_files.contains(file_name)
             {
                 Some(path)
             } else {
@@ -566,6 +570,64 @@ fn main() {
         obj_files.push(obj_file);
     }
 
+    // DeepGEMM FP8 GEMM — SM90a only (requires TMA + WGMMA)
+    let has_sm90 = sm_targets
+        .iter()
+        .any(|sm| sm.parse::<u32>().map(|v| v >= 90).unwrap_or(false));
+
+    if has_sm90 {
+        let dg_num_sms = std::env::var("PEGAINFER_DG_NUM_SMS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(132);
+
+        for file_name in &deepgemm_cuda_files {
+            let cu_file = csrc_dir.join(file_name);
+            if !cu_file.exists() {
+                continue;
+            }
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args([
+                    "-c",
+                    &cu_file.to_string_lossy(),
+                    "-o",
+                    &obj_file.to_string_lossy(),
+                    "-O3",
+                    "-gencode=arch=compute_90a,code=sm_90a",
+                    "--std=c++20",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--compiler-options",
+                    "-fPIC",
+                    "-I",
+                    "third_party/DeepGEMM/deep_gemm/include",
+                    "-I",
+                    "third_party/DeepGEMM/third-party/cutlass/include",
+                    &format!("-DDG_NUM_SMS={}", dg_num_sms),
+                ])
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (DeepGEMM SM90a)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
+
+        println!(
+            "cargo:warning=DeepGEMM FP8 GEMM compiled for SM90a (DG_NUM_SMS={})",
+            dg_num_sms
+        );
+    } else {
+        println!("cargo:warning=Skipping DeepGEMM FP8 GEMM (no SM90+ target detected)");
+    }
+
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
     ar_args.extend(
@@ -595,8 +657,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed=csrc/");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=third_party/DeepGEMM/deep_gemm/include/");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_DG_NUM_SMS");
 }

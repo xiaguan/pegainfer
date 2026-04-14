@@ -499,6 +499,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // ========================================================================
+    // DeepGEMM FP8 GEMM (SM90a)
+    // ========================================================================
+
+    // FP8 block-scale GEMM via DeepGEMM: D[M,N] = A[M,K] @ B[N,K]^T
+    // A, B: FP8 e4m3, row-major. scale_a/b: FP32 block-wise scales (MN-major).
+    // Output D is FP32 row-major.
+    pub(crate) fn fp8_gemm_cuda(
+        a: *const u8,
+        scale_a: *const f32,
+        b: *const u8,
+        scale_b: *const f32,
+        d: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    );
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub(crate) fn paged_attention_decode_cuda(
         q: *const Half,
