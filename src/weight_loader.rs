@@ -243,6 +243,85 @@ pub(crate) fn precompute_rope(
     Ok((cos_cache, sin_cache))
 }
 
+/// Precompute YaRN RoPE cos/sin cache as contiguous GPU buffers.
+///
+/// Matches the transformers `_compute_yarn_parameters` implementation:
+///   - Low-frequency dimensions use interpolation (scaled by `factor`).
+///   - High-frequency dimensions use extrapolation (original frequencies).
+///   - Smooth linear ramp between `beta_fast` and `beta_slow` correction bounds.
+///
+/// Layout: [max_seq_len * head_dim] — half-split pairs, same as `precompute_rope`.
+pub(crate) fn precompute_yarn_rope(
+    ctx: &DeviceContext,
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    factor: f32,
+    original_max_position_embeddings: usize,
+) -> Result<(DeviceVec, DeviceVec)> {
+    let half_dim = head_dim / 2;
+
+    // pos_freqs = theta ^ (arange(0, head_dim, 2) / head_dim)
+    let pos_freqs: Vec<f32> = (0..half_dim)
+        .map(|i| theta.powf((i as f32 * 2.0) / head_dim as f32))
+        .collect();
+
+    let inv_freq_extrapolation: Vec<f32> = pos_freqs.iter().map(|&f| 1.0 / f).collect();
+    let inv_freq_interpolation: Vec<f32> = pos_freqs.iter().map(|&f| 1.0 / (factor * f)).collect();
+
+    // find_correction_dim from transformers
+    let find_correction_dim = |num_rotations: f32| -> f32 {
+        let numerator = head_dim as f32
+            * ((original_max_position_embeddings as f32)
+                / (num_rotations * 2.0 * std::f32::consts::PI))
+                .ln();
+        let denominator = 2.0 * theta.ln();
+        numerator / denominator
+    };
+
+    let low_f = find_correction_dim(beta_fast);
+    let high_f = find_correction_dim(beta_slow);
+    let low = low_f.floor().max(0.0) as usize;
+    let high = high_f.ceil().min((head_dim - 1) as f32) as usize;
+
+    // Build blended inv_freq
+    let mut inv_freq = vec![0.0f32; half_dim];
+    for i in 0..half_dim {
+        let ramp = if low == high {
+            if i < low { 0.0 } else { 1.0 }
+        } else {
+            let t = (i as f32 - low as f32) / (high as f32 - low as f32);
+            t.clamp(0.0, 1.0)
+        };
+        // inv_freq_extrapolation_factor = 1 - ramp
+        inv_freq[i] = inv_freq_interpolation[i] * ramp + inv_freq_extrapolation[i] * (1.0 - ramp);
+    }
+
+    // Build cos/sin cache with half-split layout
+    let total = max_seq_len * head_dim;
+    let mut cos_host = vec![bf16::ZERO; total];
+    let mut sin_host = vec![bf16::ZERO; total];
+
+    for pos in 0..max_seq_len {
+        let base = pos * head_dim;
+        for i in 0..half_dim {
+            let freq = pos as f32 * inv_freq[i];
+            let cos_val = bf16::from_f32(freq.cos());
+            let sin_val = bf16::from_f32(freq.sin());
+            cos_host[base + i] = cos_val;
+            cos_host[base + i + half_dim] = cos_val;
+            sin_host[base + i] = sin_val;
+            sin_host[base + i + half_dim] = sin_val;
+        }
+    }
+
+    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;
+    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?;
+    Ok((cos_cache, sin_cache))
+}
+
 #[allow(clippy::cast_ptr_alignment)]
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
 /// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).
@@ -309,4 +388,133 @@ pub(crate) fn load_shard_info_fixed(
     }
 
     Ok((shard_files, weight_map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_precompute_yarn_rope_against_transformers() {
+        // DSV3-like params
+        let head_dim = 64;
+        let theta = 10000.0f32;
+        let beta_fast = 32.0f32;
+        let beta_slow = 1.0f32;
+        let factor = 40.0f32;
+        let orig_max = 4096usize;
+        let max_seq_len = 163840usize;
+
+        // We can't run GPU code without a device, but we can test the host math
+        // by replicating the frequency computation here.
+        let half_dim = head_dim / 2;
+
+        let pos_freqs: Vec<f32> = (0..half_dim)
+            .map(|i| theta.powf((i as f32 * 2.0) / head_dim as f32))
+            .collect();
+
+        let inv_freq_extrapolation: Vec<f32> = pos_freqs.iter().map(|&f| 1.0 / f).collect();
+        let inv_freq_interpolation: Vec<f32> =
+            pos_freqs.iter().map(|&f| 1.0 / (factor * f)).collect();
+
+        let find_correction_dim = |num_rotations: f32| -> f32 {
+            let numerator = head_dim as f32
+                * ((orig_max as f32) / (num_rotations * 2.0 * std::f32::consts::PI)).ln();
+            let denominator = 2.0 * theta.ln();
+            numerator / denominator
+        };
+
+        let low_f = find_correction_dim(beta_fast);
+        let high_f = find_correction_dim(beta_slow);
+        let low = low_f.floor().max(0.0) as usize;
+        let high = high_f.ceil().min((head_dim - 1) as f32) as usize;
+
+        assert_eq!(low, 10);
+        assert_eq!(high, 23);
+
+        let mut inv_freq = vec![0.0f32; half_dim];
+        for i in 0..half_dim {
+            let ramp = if low == high {
+                if i < low { 0.0 } else { 1.0 }
+            } else {
+                let t = (i as f32 - low as f32) / (high as f32 - low as f32);
+                t.clamp(0.0, 1.0)
+            };
+            inv_freq[i] =
+                inv_freq_interpolation[i] * ramp + inv_freq_extrapolation[i] * (1.0 - ramp);
+        }
+
+        // Expected values from Python/transformers reference
+        let expected_inv_freq_first5 = [1.0f32, 0.7498942, 0.56234133, 0.42169651, 0.31622776];
+        for (i, &exp) in expected_inv_freq_first5.iter().enumerate() {
+            assert!(
+                (inv_freq[i] - exp).abs() < 1e-6,
+                "inv_freq[{}] = {} != {}",
+                i,
+                inv_freq[i],
+                exp
+            );
+        }
+
+        let expected_inv_freq_30_31 = [4.4456983e-06f32, 3.3338035e-06];
+        assert!((inv_freq[30] - expected_inv_freq_30_31[0]).abs() < 1e-12);
+        assert!((inv_freq[31] - expected_inv_freq_30_31[1]).abs() < 1e-12);
+
+        // cos/sin at pos=100 for first 5 elements
+        let pos = 100usize;
+        let mut cos_host = vec![bf16::ZERO; max_seq_len * head_dim];
+        let mut sin_host = vec![bf16::ZERO; max_seq_len * head_dim];
+        for p in 0..max_seq_len {
+            let base = p * head_dim;
+            for i in 0..half_dim {
+                let freq = p as f32 * inv_freq[i];
+                let cos_val = bf16::from_f32(freq.cos());
+                let sin_val = bf16::from_f32(freq.sin());
+                cos_host[base + i] = cos_val;
+                cos_host[base + i + half_dim] = cos_val;
+                sin_host[base + i] = sin_val;
+                sin_host[base + i + half_dim] = sin_val;
+            }
+        }
+
+        let base = pos * head_dim;
+        let expected_cos_100 = [0.8623189f32, 0.9175962, 0.9509410, -0.2394990, 0.9786828];
+        let expected_sin_100 = [-0.5063657f32, -0.3975137, -0.3093725, -0.9708966, 0.2053776];
+
+        for i in 0..5 {
+            let cos_f = cos_host[base + i].to_f32();
+            let sin_f = sin_host[base + i].to_f32();
+            // bf16 rounding tolerance
+            assert!(
+                (cos_f - expected_cos_100[i]).abs() < 1e-2,
+                "cos[100, {}] = {} != {}",
+                i,
+                cos_f,
+                expected_cos_100[i]
+            );
+            assert!(
+                (sin_f - expected_sin_100[i]).abs() < 1e-2,
+                "sin[100, {}] = {} != {}",
+                i,
+                sin_f,
+                expected_sin_100[i]
+            );
+        }
+
+        // Check half-split symmetry
+        for i in 0..half_dim {
+            assert_eq!(
+                cos_host[base + i],
+                cos_host[base + i + half_dim],
+                "cos half-split mismatch at i={}",
+                i
+            );
+            assert_eq!(
+                sin_host[base + i],
+                sin_host[base + i + half_dim],
+                "sin half-split mismatch at i={}",
+                i
+            );
+        }
+    }
 }

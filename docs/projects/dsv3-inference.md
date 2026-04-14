@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 1 进行中 — MLA forward 全流程已实现（decode path），编译通过，待验证
+> **Status**: Phase 1 进行中 — YaRN RoPE cache 已预计算并挂到 DsV3Model，待端到端验证
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: YaRN RoPE cos/sin cache 预计算 → 端到端验证（前 3 层 hidden states vs HF reference）。
+> **Next action**: 端到端验证（前 3 层 hidden states vs HF reference）。
 
 ---
 
@@ -13,6 +13,11 @@
 - DSV3 FP8 权重 ~671GB → 放完剩 ~460GB 给 KV cache + activation，宽裕
 - BF16 (~1.34TB) 放不下，**FP8 是必需项**
 - H20 bandwidth-bound (4TB/s HBM)，对 MLA decode 友好
+
+## 本地环境速查
+
+- **Python (transformers / 验证脚本)**: `/root/develop/xingming/vllm_test/.venv/bin/python`
+- **模型权重目录**: 通过环境变量 `PEGAINFER_DSV3_MODEL_PATH` 传入
 
 ## 并行策略
 
@@ -79,7 +84,7 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 - [x] cuBLAS strided batched GEMM（`csrc/linear.cu`）用于 Q absorption / V de-absorption
 - [x] MLA CUDA kernels（`csrc/mla.cu`）：partial RMSNorm、k_rope RoPE、q_rope extract+RoPE+copy、KV cache write
 - [x] MLA forward 全流程（`forward.rs`）：Q/KV path + absorption + FlashMLA 3-phase + de-absorption + o_proj + Dense FFN
-- [ ] YaRN RoPE cos/sin cache 预计算并挂到 DsV3Model
+- [x] YaRN RoPE cos/sin cache 预计算并挂到 DsV3Model
 - [ ] 端到端验证：前 3 层 hidden states 与 HF reference 对齐
 - [ ] Prefill path（当前 decode only，bs=1 per request）
 

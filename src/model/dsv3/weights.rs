@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use super::config::{DsV3Config, FfnType};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{deserialize_shards, load_shard_info, load_tensor_2d, mmap_shards};
+use crate::weight_loader::{
+    deserialize_shards, load_shard_info, load_tensor_2d, mmap_shards, precompute_yarn_rope,
+};
 
 // ---------------------------------------------------------------------------
 // FP8 weight: raw e4m3 bytes + block-wise scale_inv
@@ -123,6 +125,9 @@ pub struct DsV3Model {
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
+    /// Precomputed YaRN RoPE cos/sin cache: [max_seq_len, qk_rope_head_dim] bf16
+    pub(super) cos_cache: DeviceVec,
+    pub(super) sin_cache: DeviceVec,
 }
 
 /// Pre-computed absorbed MLA weights for one layer.
@@ -689,6 +694,22 @@ impl DsV3Model {
             load_1d_f32_as_bf16(&ctx, &shards, &weight_map, "model.norm.weight")?
         };
 
+        // Precompute YaRN RoPE cos/sin cache
+        debug!(
+            "Precomputing YaRN RoPE cache (head_dim={}, max_seq_len={})",
+            config.qk_rope_head_dim, config.max_position_embeddings
+        );
+        let (cos_cache, sin_cache) = precompute_yarn_rope(
+            &ctx,
+            config.qk_rope_head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+            config.yarn_beta_fast,
+            config.yarn_beta_slow,
+            config.yarn_factor,
+            config.yarn_original_max_position_embeddings,
+        )?;
+
         ctx.sync()?;
         let loaded_desc = if max_layers.is_some() {
             format!(
@@ -712,6 +733,8 @@ impl DsV3Model {
             lm_head,
             layers,
             norm,
+            cos_cache,
+            sin_cache,
         })
     }
 

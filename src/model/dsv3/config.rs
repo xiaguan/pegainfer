@@ -140,8 +140,14 @@ pub(crate) struct DsV3Config {
     // === RoPE ===
     pub(crate) rope_theta: f32,
     pub(crate) max_position_embeddings: usize,
-    /// YaRN mscale applied to softmax scale
+    /// YaRN attention scaling factor applied to softmax scale
     pub(crate) softmax_mscale: f32,
+
+    // === YaRN parameters ===
+    pub(crate) yarn_beta_fast: f32,
+    pub(crate) yarn_beta_slow: f32,
+    pub(crate) yarn_factor: f32,
+    pub(crate) yarn_original_max_position_embeddings: usize,
 
     // === FP8 ===
     /// Weight block size for dequantization, e.g. [128, 128]
@@ -179,13 +185,31 @@ impl DsV3Config {
             })
             .collect();
 
-        // YaRN mscale for softmax scaling
-        let softmax_mscale = match &raw.rope_scaling {
-            Some(rs) if rs.mscale_all_dim > 0.0 => {
-                let mscale = yarn_get_mscale(rs.factor, rs.mscale_all_dim);
-                mscale * mscale
+        // YaRN parameters and attention scaling factor
+        let (
+            softmax_mscale,
+            yarn_beta_fast,
+            yarn_beta_slow,
+            yarn_factor,
+            yarn_original_max_position_embeddings,
+        ) = match &raw.rope_scaling {
+            Some(rs) => {
+                let mscale = yarn_get_mscale(rs.factor, rs.mscale);
+                let mscale_all_dim = yarn_get_mscale(rs.factor, rs.mscale_all_dim);
+                let attention_factor = if mscale_all_dim > 0.0 {
+                    mscale / mscale_all_dim
+                } else {
+                    mscale
+                };
+                (
+                    attention_factor,
+                    rs.beta_fast as f32,
+                    rs.beta_slow as f32,
+                    rs.factor as f32,
+                    rs.original_max_position_embeddings,
+                )
             }
-            _ => 1.0,
+            None => (1.0, 32.0, 1.0, 1.0, raw.max_position_embeddings),
         };
 
         let weight_block_size = raw
@@ -223,6 +247,11 @@ impl DsV3Config {
             rope_theta: raw.rope_theta as f32,
             max_position_embeddings: raw.max_position_embeddings,
             softmax_mscale,
+
+            yarn_beta_fast,
+            yarn_beta_slow,
+            yarn_factor,
+            yarn_original_max_position_embeddings,
 
             weight_block_size,
 
@@ -303,11 +332,10 @@ impl DsV3Config {
     }
 }
 
-/// YaRN mscale function (from DeepSeek/transformers).
-fn yarn_get_mscale(scale: f64, mscale_all_dim: f64) -> f32 {
+/// YaRN attention scaling factor (from transformers modeling_rope_utils).
+fn yarn_get_mscale(scale: f64, mscale: f64) -> f32 {
     if scale <= 1.0 {
         return 1.0;
     }
-    let val = 0.1 * mscale_all_dim.ln() + 1.0;
-    (val * scale.ln() + 1.0) as f32
+    (0.1 * mscale * scale.ln() + 1.0) as f32
 }

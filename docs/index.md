@@ -2,7 +2,7 @@
 
 | Path | TL;DR |
 | --- | --- |
-| `projects/dsv3-inference.md` | DSV3-0324 671B on 8xH20-3e: Phase 1 MLA forward 全流程已实现 (decode path)，编译通过，待 YaRN RoPE + E2E 验证 |
+| `projects/dsv3-inference.md` | DSV3-0324 671B on 8xH20-3e: Phase 1 MLA forward 全流程已实现 (decode path)，YaRN RoPE cache 已挂到 DsV3Model，待前 3 层 E2E 验证 |
 | `projects/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |
 | `projects/continuous-batching.md` | Phase 1-2 done. Scheduler thread with prefill-priority, batch decode, channel-based streaming. Next: multi-request throughput testing |
 | `projects/q2-2026-plan.md` | Q2 plan: W1 harden batching, W2 PegaInfer+PegaFlow native, W3 differentiation. Competitive intel: Qwen3.5 is both competitors' Achilles' heel, startup time 215s vs seconds, observability as product moat. MTP deferred to Q3 |
