@@ -1,0 +1,15 @@
+{
+  "token_ids": [
+    1,
+    9707,
+    2991,
+    553,
+    374,
+    264,
+    1296
+  ],
+  "hidden_size": 7168,
+  "q_lora_rank": 1536,
+  "rms_norm_eps": 1e-06,
+  "seq_len": 7
+}

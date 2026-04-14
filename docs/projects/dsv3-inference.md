@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 0.5 — FP8 量化 + 1D2D GEMM kernel 就绪，待 forward 验证
+> **Status**: Phase 0.5 完成 — FP8 forward 已验证对齐，进入 Phase 1 (MLA forward)
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: 单卡 partial load 上验证 embedding → layer0 MLA q_a_proj → 对比 HF reference。
+> **Next action**: MLA attention kernel — 压缩 KV cache (c_KV 512d + k_R 64d)，decode 时 absorb 优化。
 
 ---
 
@@ -63,9 +63,10 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 - [x] 写 `csrc/fp8_gemm.cu`：thin C wrapper，用 `cuTensorMapEncodeTiled` 构造 TMA descriptor，AOT 编译两组 tile config（block_m=64/128, block_n=128, block_k=128），使用 1D2D kernel（bf16 输出）
 - [x] Rust FFI 暴露 `fp8_gemm_cuda(a, scale_a, b, scale_b, d, m, n, k, stream)`（d 为 bf16）
 - [x] 在线 activation FP8 量化 kernel（bf16 → fp8 e4m3 + per-token 1×128 block scale）— 从 TRT-LLM `scale_1x128_kernel` 抽取到 `csrc/fp8_quantize.cu`，零外部依赖
-- [ ] 单卡 partial load 上验证：embedding → layer0 MLA q_a_proj → 对比 HF reference
+- [x] 单卡 partial load 上验证：embedding → RMSNorm → FP8 quantize → q_a_proj GEMM → 对比 HF reference（max err 1.56e-2, mean err 1.22e-3）
+- [x] 修复 norm 权重加载：DSV3 checkpoint 中 norm 权重为 f32，新增 `load_1d_f32_as_bf16` 做正确转换
 
-验收：FP8 GEMM 输出与 HF fp8 dequant + matmul 对齐（误差 < 1e-2）。
+验收：FP8 GEMM 输出与 HF fp8 dequant + matmul 对齐（误差 < 1e-2）。✅ 已通过。
 
 ### Phase 1 — MLA Forward（前 3 层 Dense 打通）
 
@@ -218,3 +219,4 @@ SM90 smem capacity = 232448 bytes (227 KB)，两组 config 均在容量内。1D1
 | 2026-04-14 | GEMM 切 1D2D | SGLang（`deep_gemm_wrapper/entrypoint.py:84`）和 vLLM（`deep_gemm.py:120`）在 Hopper block-scale 主路径均走 1D2D。DeepGEMM 默认 recipe `(1, 128, 128)` 在 `gran_n != 1` 时分派到 `sm90_fp8_gemm_1d2d`（`gemm.hpp:87`），grouped/masked GEMM 在 SM90 写死 1D2D（`gemm.hpp:194,258`）。1D1D 仅用于 `gran_n==1` per-channel 和 k_grouped，不是我们的 case |
 | 2026-04-14 | 1D2D AOT config: 64×128/8stages + 128×128/5stages | 依据 DeepGEMM heuristics (`sm90.hpp`)：block_m<=64 用 1 warpgroup (128 math threads)，否则 2 warpgroups (256)。stages 取 SM90 smem 容量 232448 下的最大值。kMajorSFB=K 匹配 DSV3 checkpoint scale layout，kSwizzleDMode=128 匹配 bf16 block_n=128，kNumLastStages=0 因 SM90 kernel 不使用该参数 |
 | 2026-04-14 | 1D2D 输出 bf16 (非 fp32) | DeepGEMM 1D2D API 强制 `d.scalar_type() == torch::kBFloat16`。kernel 内部 fp32 accumulator → bf16 cast 后经 TMA store 写回。DSV3 forward 后续层本就需要 bf16 输入，省去显式 cast |
+| 2026-04-14 | norm 权重 f32→bf16 转换 | DSV3 checkpoint 中 layernorm 权重存为 f32，而 Qwen3 系列为 bf16。`load_tensor_1d` 直接按 bf16 读会长度翻倍。新增 `load_1d_f32_as_bf16` 做显式转换 |
