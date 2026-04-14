@@ -500,20 +500,38 @@ unsafe extern "C" {
     ) -> i32;
 
     // ========================================================================
-    // DeepGEMM FP8 GEMM (SM90a)
+    // DeepGEMM FP8 GEMM — 1D2D variant (SM90a)
     // ========================================================================
 
-    // FP8 block-scale GEMM via DeepGEMM: D[M,N] = A[M,K] @ B[N,K]^T
-    // A, B: FP8 e4m3, row-major. scale_a/b: FP32 block-wise scales (MN-major).
-    // Output D is FP32 row-major.
+    // FP8 block-scale GEMM via DeepGEMM 1D2D: D[M,N] = A[M,K] @ B[N,K]^T
+    // A, B: FP8 e4m3, row-major.
+    // scale_a: FP32 dequant scales [ceil(K/128), padded(M, 4)] K-chunk-major (1D per-token).
+    // scale_b: FP32 dequant scales [ceil(N/128), ceil(K/128)] K-major (2D per-block).
+    // Output D is BF16 row-major.
     pub(crate) fn fp8_gemm_cuda(
         a: *const u8,
         scale_a: *const f32,
         b: *const u8,
         scale_b: *const f32,
-        d: *mut f32,
+        d: *mut Half,
         m: i32,
         n: i32,
+        k: i32,
+        stream: CUstream,
+    );
+
+    // ========================================================================
+    // FP8 activation quantization (SM90a)
+    // ========================================================================
+
+    // bf16 [M, K] -> fp8 e4m3 [M, K] + dequant scales [ceil(K/128), padded(M, 4)]
+    // Scale layout is K-chunk-major to match DeepGEMM TMA descriptor.
+    // Extracted from TRT-LLM's scale_1x128_kernel.
+    pub(crate) fn fp8_quantize_1x128_cuda(
+        input: *const Half, // bf16 [M, K] (Half = bf16 in our codebase)
+        output: *mut u8,    // fp8 e4m3 [M, K]
+        scales: *mut f32,   // [ceil(K/128), padded(M, 4)]
+        m: i32,
         k: i32,
         stream: CUstream,
     );

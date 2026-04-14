@@ -501,6 +501,9 @@ fn main() {
     // DeepGEMM files are compiled separately with SM90a + C++20
     let deepgemm_cuda_files = BTreeSet::from(["fp8_gemm.cu"]);
 
+    // Other SM90a files (FP8 intrinsics, no DeepGEMM headers needed)
+    let sm90_cuda_files = BTreeSet::from(["fp8_quantize.cu"]);
+
     let csrc_dir = Path::new("csrc");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
         .expect("Failed to read csrc/ directory")
@@ -511,6 +514,7 @@ fn main() {
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
                 && !deepgemm_cuda_files.contains(file_name)
+                && !sm90_cuda_files.contains(file_name)
             {
                 Some(path)
             } else {
@@ -624,6 +628,40 @@ fn main() {
             "cargo:warning=DeepGEMM FP8 GEMM compiled for SM90a (DG_NUM_SMS={})",
             dg_num_sms
         );
+
+        // SM90a files that only need FP8 intrinsics (no DeepGEMM/CUTLASS headers)
+        for file_name in &sm90_cuda_files {
+            let cu_file = csrc_dir.join(file_name);
+            if !cu_file.exists() {
+                continue;
+            }
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args([
+                    "-c",
+                    &cu_file.to_string_lossy(),
+                    "-o",
+                    &obj_file.to_string_lossy(),
+                    "-O3",
+                    "-gencode=arch=compute_90a,code=sm_90a",
+                    "--std=c++17",
+                    "--expt-relaxed-constexpr",
+                    "--compiler-options",
+                    "-fPIC",
+                ])
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (SM90a FP8)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
     } else {
         println!("cargo:warning=Skipping DeepGEMM FP8 GEMM (no SM90+ target detected)");
     }

@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 0 — 骨架搭建中
+> **Status**: Phase 0.5 — FP8 量化 + 1D2D GEMM kernel 就绪，待 forward 验证
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: Phase 0.5 — activation FP8 量化 kernel + 单卡 q_a_proj forward 验证。
+> **Next action**: 单卡 partial load 上验证 embedding → layer0 MLA q_a_proj → 对比 HF reference。
 
 ---
 
@@ -50,7 +50,7 @@ DeepGEMM 架构分三层，我们只取底两层：
 [取]   JIT 编译逻辑                     ← nvcc 编译 template instantiation → cubin
    ↓
 [取]   CUDA Kernel headers              ← deep_gemm/include/，纯 CUDA + CUTLASS header-only
-       (sm90_fp8_gemm_1d1d.cuh)
+       (sm90_fp8_gemm_1d2d.cuh)
 ```
 
 torch 在 DeepGEMM 中仅用于两件事（均可平替）：
@@ -60,9 +60,9 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 集成步骤：
 
 - [x] `build.rs` 加 DeepGEMM include path（`third_party/DeepGEMM/deep_gemm/include` + CUTLASS headers），SM90a + C++20 + `--expt-relaxed-constexpr`
-- [x] 写 `csrc/fp8_gemm.cu`：thin C wrapper，用 `cuTensorMapEncodeTiled` 构造 TMA descriptor，AOT 编译两组 tile config（block_m=64/128, block_n=128, block_k=128）
-- [x] Rust FFI 暴露 `fp8_gemm_cuda(a, scale_a, b, scale_b, d, m, n, k, stream)`
-- [ ] 在线 activation FP8 量化 kernel（bf16 → fp8 + block-wise scale）
+- [x] 写 `csrc/fp8_gemm.cu`：thin C wrapper，用 `cuTensorMapEncodeTiled` 构造 TMA descriptor，AOT 编译两组 tile config（block_m=64/128, block_n=128, block_k=128），使用 1D2D kernel（bf16 输出）
+- [x] Rust FFI 暴露 `fp8_gemm_cuda(a, scale_a, b, scale_b, d, m, n, k, stream)`（d 为 bf16）
+- [x] 在线 activation FP8 量化 kernel（bf16 → fp8 e4m3 + per-token 1×128 block scale）— 从 TRT-LLM `scale_1x128_kernel` 抽取到 `csrc/fp8_quantize.cu`，零外部依赖
 - [ ] 单卡 partial load 上验证：embedding → layer0 MLA q_a_proj → 对比 HF reference
 
 验收：FP8 GEMM 输出与 HF fp8 dequant + matmul 对齐（误差 < 1e-2）。
@@ -124,8 +124,77 @@ Qwen3 TP 已跑通多卡推理，DSV3 多卡部分可直接参考：
 | NCCL AllReduce bench | `benches/nccl_bench.rs` | 已有 TP2 PCIe 数据，需补 8 卡 NVLink 数据 |
 | `ModelExecutor` trait | `model_executor.rs:455-464` | DSV3 executor 实现同一 trait |
 | `attach_tp_comm` 模式 | `qwen3/weights.rs:392` | 同一模式：load → attach comm → run |
-| DeepGEMM FP8 kernel | `third_party/DeepGEMM/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh` | kernel 直接用；host 侧 TMA setup 需重写（去 torch） |
+| DeepGEMM FP8 kernel | `third_party/DeepGEMM/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh` | kernel 直接用；host 侧 TMA setup 已重写（`csrc/fp8_gemm.cu`），bf16 输出 |
 | DeepGEMM grouped GEMM | 同上，`GemmType::GroupedContiguous` / `GroupedMasked` | MoE expert 计算直接可用 |
+
+## DeepGEMM 1D2D 集成要点
+
+> 后来者看这里，不用重新挖。
+
+### 1D1D vs 1D2D 的区别
+
+| | 1D1D | 1D2D |
+|---|---|---|
+| Scale A (activation) | 1D per-token `[ceil(K/128), padded(M,4)]` | 同左 |
+| Scale B (weight) | 1D per-channel `[ceil(K/128), padded(N,4)]` | **2D per-block `[ceil(N/128), ceil(K/128)]`** |
+| SFB 加载方式 | TMA descriptor | **全局内存直接读（math warp）** |
+| 输出类型 | FP32 | **BF16** |
+| D TMA descriptor | 无 swizzle, FP32 | **128B swizzle, BF16** |
+
+**用哪个？** Hopper block-scale FP8 主路径全走 1D2D。SGLang（`deep_gemm_wrapper/entrypoint.py:84`）和 vLLM（`deep_gemm.py:120`）均如此。DeepGEMM 默认 recipe `(1, 128, 128)` 在 `gran_n != 1` 时分派到 1D2D（`gemm.hpp:87`）。1D1D 仅用于 `gran_n==1` (per-channel) 和 k_grouped GEMM — 不是我们的场景。
+
+DSV3 checkpoint 权重 scale 本身就是 2D block-scale `[ceil(N/128), ceil(K/128)]`，天然匹配 1D2D 的 `kMajorSFB = Major::K`。
+
+### Kernel 模板参数（对比 1D1D）
+
+1D2D 比 1D1D 多三个模板参数：
+
+```
+kMajorSFB        — cute::UMMA::Major::K (DSV3 权重 scale K-major) 或 Major::MN
+kSwizzleDMode    — BF16 输出的 TMA swizzle: 128 (block_n=128 时)
+kNumLastStages   — SM90 kernel body 不使用，保留给 SM100，AOT 设 0 即可
+epilogue_type_t  — EpilogueIdentity（普通 GEMM）或 EpilogueHeadSplits（MHA 分头）
+```
+
+1D1D 最后一个参数是 `cd_dtype_t = float`；1D2D 替换为 `epilogue_type_t`（输出固定 bf16）。
+
+### TMA Descriptor 设置
+
+| Descriptor | 数据类型 | gmem layout | smem block | swizzle |
+|---|---|---|---|---|
+| A | UINT8 (fp8) | [M, K] row-major | [block_m, block_k] | 128B |
+| B | UINT8 (fp8) | [N, K] row-major | [block_n, block_k] | 128B |
+| SFA | FLOAT32 | [ceil(K/128), padded(M,4)] K-chunk-major | [block_m, 1] | 无 |
+| D | **BFLOAT16** | [M, N] row-major | [block_m, block_n] | **128B** |
+
+**SFB 不走 TMA** — kernel 里 math warp 直接 `__ldg()` 从全局内存读。这是 1D2D 和 1D1D 的核心区别。
+
+D 的 128B swizzle 导致 `TMA_D_BLOCK_N = 128 / sizeof(bf16) = 64`，kernel 发两次 TMA store 覆盖 block_n=128。
+
+### Kernel Launch Args（1D2D 签名）
+
+```
+(sfb,              // float* — 直接指针，不是 TMA
+ grouped_layout,   // int* — Normal GEMM 传 nullptr
+ shape_m, shape_n, shape_k,   // uint32_t
+ tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa)
+```
+
+对比 1D1D: `(gmem_a, gmem_b, grouped_layout, tensor_map_buffer, shapes, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd)` — 注意顺序和数量都不同。
+
+### Shared Memory 用量
+
+1D2D 比 1D1D 省显存：D 缩小一半 (bf16 vs fp32)，且无 per-stage SFB。
+
+| 组件 | Config 1 (64×128, 8 stages) | Config 2 (128×128, 5 stages) |
+|---|---|---|
+| smem_d (bf16) | 16384 | 32768 |
+| stages × (A+B+SFA) | 8 × 24832 = 198656 | 5 × 33280 = 166400 |
+| smem_sfb (K=7168) | 224 | 224 |
+| barriers | 128 | 80 |
+| **Total** | **≈ 215 KB** | **≈ 199 KB** |
+
+SM90 smem capacity = 232448 bytes (227 KB)，两组 config 均在容量内。1D1D 相同 block 尺寸只能跑 7/4 stages，1D2D 多出 1 stage 因为 D buffer 更小且无 per-stage SFB。
 
 ## 探索方向
 
@@ -144,3 +213,8 @@ Qwen3 TP 已跑通多卡推理，DSV3 多卡部分可直接参考：
 | 2026-04-14 | DeepGEMM AOT 编译 | DSV3 矩阵尺寸已知，build.rs nvcc 预编译固定 tile config，不需要运行时 JIT |
 | 2026-04-14 | DeepGEMM 编译选项 | SM90a (`-gencode=arch=compute_90a,code=sm_90a`) + C++20 + `--expt-relaxed-constexpr --expt-extended-lambda`，需要 DeepGEMM 自带 CUTLASS v2.1.1 (不可与 flashinfer 的 v4.4.2 混用) |
 | 2026-04-14 | 两组 tile config | block_m=64/block_n=128/7stages (decode小M) + block_m=128/block_n=128/4stages (prefill大M)，kNumSMs 默认 132 可通过 `PEGAINFER_DG_NUM_SMS` 覆盖 |
+| 2026-04-14 | activation 量化从 TRT-LLM 抽取 | flashinfer 的 `mxfp8_quantize` 是 SM100/SF_VEC=32 格式，不匹配 DeepGEMM 的 1×128 block-scale。flashinfer 自己支持 DSV3 也是靠 TRT-LLM 内嵌的 `scale_1x128_kernel`（`fp8_blockscale_gemm_kernel.cuh`）。直接抽取该 kernel 到 `csrc/fp8_quantize.cu`，去掉所有 TRT-LLM 依赖 |
+| 2026-04-14 | Scale 布局 K-chunk-major | TRT-LLM `scale_1x128_kernel` 输出 dequant scale 为 `[ceil(K/128), padded(M, 4)]`（K-chunk 维在前，M 维在内），与 DeepGEMM TMA scale descriptor 期望一致。注意不是 `[M, ceil(K/128)]` |
+| 2026-04-14 | GEMM 切 1D2D | SGLang（`deep_gemm_wrapper/entrypoint.py:84`）和 vLLM（`deep_gemm.py:120`）在 Hopper block-scale 主路径均走 1D2D。DeepGEMM 默认 recipe `(1, 128, 128)` 在 `gran_n != 1` 时分派到 `sm90_fp8_gemm_1d2d`（`gemm.hpp:87`），grouped/masked GEMM 在 SM90 写死 1D2D（`gemm.hpp:194,258`）。1D1D 仅用于 `gran_n==1` per-channel 和 k_grouped，不是我们的 case |
+| 2026-04-14 | 1D2D AOT config: 64×128/8stages + 128×128/5stages | 依据 DeepGEMM heuristics (`sm90.hpp`)：block_m<=64 用 1 warpgroup (128 math threads)，否则 2 warpgroups (256)。stages 取 SM90 smem 容量 232448 下的最大值。kMajorSFB=K 匹配 DSV3 checkpoint scale layout，kSwizzleDMode=128 匹配 bf16 block_n=128，kNumLastStages=0 因 SM90 kernel 不使用该参数 |
+| 2026-04-14 | 1D2D 输出 bf16 (非 fp32) | DeepGEMM 1D2D API 强制 `d.scalar_type() == torch::kBFloat16`。kernel 内部 fp32 accumulator → bf16 cast 后经 TMA store 写回。DSV3 forward 后续层本就需要 bf16 输入，省去显式 cast |
