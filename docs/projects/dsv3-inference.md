@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 2a 完成 — TP1 EP8 多卡加载（8x H20，56s 并行加载）
-> **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: Phase 2b — DeepEP intranode 编译集成，或 Phase 2c — MoE routing kernel。
+> **Status**: Phase 2c MoE forward 完成（routing + expert FFN + shared expert），走路线 B 直推 8 卡端到端
+> **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
+> **Next action**: Phase 2b — DeepEP intranode 集成（EP8 唯一跨卡通信），然后补 final norm + lm_head + forward loop → 全模型 logits 对齐。
 
 ---
 
@@ -94,31 +94,40 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 目标：8 卡 TP8/EP8 prefill forward 跑通，全 61 层 output logits 与 reference 对齐。
 
-#### Phase 2a — 多卡 Executor
+#### Phase 2a — 多卡 Executor ✅
 
-- [ ] DSV3 多卡 executor（仿 Qwen3 `Qwen3Executor` 模式：per-rank DeviceContext + RankWorker + WorkerCommand）
-- [ ] NCCL Comm 初始化（`Comm::from_devices()`，用于 attention TP8 AllReduce）
-- [ ] TP8 权重切分加载：attention FP8 row/col shard，Dense FFN FP8 row/col shard
-- [ ] EP8 权重分配加载：每卡加载 32 routed experts（rank×32 到 (rank+1)×32），shared expert 全卡复制
-- [ ] Embedding/norm 权重全卡复制
+- [x] DSV3 多卡 executor（per-rank DeviceContext + 8 线程并行加载，56s）
+- [x] EP8 权重分配加载：每卡 32 routed experts + shared expert 全卡复制
+- [x] Embedding/norm/attention 权重全卡复制（TP1：不切分 attention）
 
 #### Phase 2b — DeepEP Intranode 集成
+
+EP8 跨卡通信，端到端的唯一硬卡点。
 
 - [ ] `build.rs` 编译 DeepEP intranode kernel（`-DDISABLE_NVSHMEM`，SM90，`kNumRanks=8` AOT 实例化）
 - [ ] C wrapper（`csrc/deep_ep.cu`）：Buffer 管理（NVLink buffer alloc + IPC handle exchange + barrier signals）
 - [ ] Rust FFI：`deep_ep_create_buffer` / `deep_ep_dispatch_layout` / `deep_ep_intranode_dispatch` / `deep_ep_intranode_combine`
 - [ ] IPC handle 交换（`cudaIpcGetMemHandle` + 跨线程传递，替代 `torch.distributed.all_gather_object`）
 
-#### Phase 2c — MoE Forward
+#### Phase 2c — MoE Forward ✅
 
-- [ ] Sigmoid gating + TopK-8 routing + group-limited normalization（`csrc/moe.cu`）
-- [ ] DeepEP dispatch（token → expert 所在卡）
-- [ ] Expert FFN 计算（FP8 grouped GEMM 或 per-expert batched GEMM）
-- [ ] DeepEP combine（结果加权 reduce → 原卡）
-- [ ] Shared expert 本地计算 + 加回（FP8 gate/up/down，同 Dense FFN 但尺寸 2048）
-- [ ] 全模型 prefill logits 对齐
+- [x] Sigmoid gating + TopK-8 routing + group-limited normalization（`csrc/moe.cu`）
+- [x] Shared expert 本地 FFN
+- [x] Routed expert FFN（per-expert sequential FP8 GEMM，decode 路径）
+- [x] MoE forward 集成到 `forward_layer`（`forward.rs:forward_moe`）
 
-验收：给定 prompt，8 卡 prefill output logits 与 reference 一致。
+#### Phase 2d — 端到端 Prefill
+
+DeepEP 就绪后，补齐剩余胶水打通全模型。
+
+- [ ] `forward_moe` 接入 DeepEP dispatch/combine（替代当前 EP1 local-only 路径）
+- [ ] Final RMSNorm + lm_head GEMM（`tie_word_embeddings` → 复用 embedding 矩阵）
+- [ ] Executor forward loop：61 层 `forward_layer` + KV cache per-layer 管理
+- [ ] Token-by-token decode 做验证（避开 prefill attention kernel，逐 token 跑 decode）
+- [ ] 全模型 output logits 与 Python reference 对齐
+- [ ] （可选）Grouped GEMM（DeepGEMM `GroupedContiguous`）替代 per-expert sequential
+
+验收：给定 prompt，8 卡 token-by-token forward output logits 与 reference 一致。
 
 ### Phase 3 — 生成循环 + 服务化
 
@@ -483,6 +492,8 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | 2026-04-15 | DeepEP 做 EP8 All-to-All | DeepSeek 自研 MoE 通信库（`third_party/DeepEP`，MIT 协议）。intranode kernel 通过 NVLink IPC buffer 实现 All-to-All，达 153-158 GB/s（H800 NVLink）。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
 | 2026-04-15 | DeepEP 只用 intranode | 8x H20 单机场景只需 intranode normal kernels（NVLink），编译时 `-DDISABLE_NVSHMEM` 去掉 RDMA 依赖。Low-latency kernels 留给后续 decode 优化 |
 | 2026-04-15 | Prefill 优先 | Phase 2 先跑通 8 卡 prefill，decode 留 Phase 3。prefill 用 intranode normal kernels（支持大 batch），decode 后续视需要引入 low-latency kernels |
+| 2026-04-15 | MoE 不用 FlashInfer，用 DeepGEMM grouped GEMM + 自写 routing | FlashInfer MoE 深度绑定 TRT-LLM 基础设施（JIT 编译、CUTLASS extensions、TVM-FFI），剥离代价大于自写。routing kernel（sigmoid + group-limited TopK）逻辑确定，自写几十行 CUDA。grouped GEMM 直接用已集成的 DeepGEMM `GroupedContiguous`。FlashInfer MoE 核心竞争力在 Blackwell SM100+ CuTe DSL 融合 pipeline，SM90 (H20) 收益不大 |
+| 2026-04-15 | 路线 B：跳过单卡 MoE 验证，直推 8 卡端到端 | DeepEP 是 EP8 唯一跨卡通信，其余（final norm、lm_head、forward loop）都是一天内的活。先啃 DeepEP，然后一步到位全模型 logits 对齐。验证用 token-by-token decode 避开 prefill attention kernel |
 
 ## DeepEP Intranode 集成要点
 

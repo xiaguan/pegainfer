@@ -677,6 +677,40 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // ========================================================================
+    // MoE routing + helpers (csrc/moe.cu)
+    // ========================================================================
+
+    // DSV3 MoE routing: sigmoid + bias + group-limited TopK + normalize + scale.
+    // logits:    bf16 [num_experts, bs] (gate_weight @ normed output)
+    // bias:      f32  [num_experts] (e_score_correction_bias)
+    // topk_idx:  i32  [bs * topk] output
+    // topk_wt:   f32  [bs * topk] output
+    pub(crate) fn moe_routing_cuda(
+        logits: *const Half,
+        bias: *const f32,
+        topk_idx: *mut i32,
+        topk_wt: *mut f32,
+        num_experts: i32,
+        bs: i32,
+        topk: i32,
+        n_group: i32,
+        topk_group: i32,
+        norm_topk_prob: i32,
+        routed_scaling_factor: f32,
+        stream: CUstream,
+    );
+
+    // Weighted add: out[i] += scale * x[i], bf16, element-wise.
+    // Used to accumulate weighted expert outputs into hidden states.
+    pub(crate) fn moe_weighted_add_cuda(
+        out: *mut Half,
+        x: *const Half,
+        scale: f32,
+        n: i32,
+        stream: CUstream,
+    );
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub(crate) fn paged_attention_decode_cuda(
         q: *const Half,

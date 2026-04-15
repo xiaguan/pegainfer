@@ -1,11 +1,14 @@
-//! DeepSeek-V3.2 MLA forward pass — Phase 1 (Dense layers only).
+//! DeepSeek-V3.2 MLA + MoE forward pass.
 //!
-//! Implements the full MLA forward with absorption:
+//! MLA (Multi-head Latent Attention) with absorption:
 //!   Q path:  hidden → q_a_proj → q_a_norm → q_b_proj → Q absorption + RoPE
 //!   KV path: hidden → kv_a_proj → split → kv_a_norm(c_kv) + RoPE(k_rope) → KV cache
 //!   Attention: FlashMLA decode (3-phase)
 //!   Output: V de-absorption → o_proj → residual
-//!   FFN: gate_proj, up_proj, silu*up, down_proj → residual
+//!
+//! MoE (Mixture of Experts):
+//!   Routing: gate GEMM → sigmoid + group-limited TopK-8
+//!   Shared expert FFN + per-expert routed FFN → weighted accumulation
 
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -13,7 +16,7 @@ use half::bf16;
 
 use super::config::DsV3Config;
 use super::mla_kv::{MlaKvPool, MlaKvState};
-use super::weights::{DsV3Model, FfnWeights, TransformerBlock};
+use super::weights::{DsV3Model, FfnWeights, MoeFfnWeights};
 use crate::ffi;
 use crate::ops;
 use crate::ops::fp8::{Fp8Scratch, fp8_gemm_into, fp8_linear_into, fp8_quantize_into};
@@ -45,7 +48,7 @@ pub(crate) struct MlaForwardBuffers {
     attn_proj_out: HiddenStates,
     /// Normed hidden for current layer.
     normed: HiddenStates,
-    /// FFN gate output: [intermediate_size, bs]
+    /// FFN gate output: [intermediate_size, bs] (also used for shared/routed expert FFN)
     ffn_gate: HiddenStates,
     /// FFN up output: [intermediate_size, bs]
     ffn_up: HiddenStates,
@@ -67,6 +70,24 @@ pub(crate) struct MlaForwardBuffers {
     block_table_d: CudaSlice<i32>,
     /// Page indices for KV cache write: [max_pages]
     page_indices_d: CudaSlice<i32>,
+
+    // ---- MoE routing & expert FFN buffers ----
+    /// Router logits: [n_routed_experts, bs] bf16
+    router_logits: HiddenStates,
+    /// TopK expert indices: [bs * num_experts_per_tok] i32
+    topk_indices: CudaSlice<i32>,
+    /// TopK expert weights: [bs * num_experts_per_tok] f32
+    topk_weights: CudaSlice<f32>,
+    /// FP8 scratch for moe_intermediate_size inputs (expert down_proj)
+    fp8_moe_intermediate: Fp8Scratch,
+    /// MoE expert gate output: [moe_intermediate_size, bs]
+    moe_gate: HiddenStates,
+    /// MoE expert up output: [moe_intermediate_size, bs]
+    moe_up: HiddenStates,
+    /// MoE expert act: [moe_intermediate_size, bs]
+    moe_act: HiddenStates,
+    /// MoE expert down output: [hidden_size, bs]
+    moe_down: HiddenStates,
 }
 
 // Number of SM partitions for FlashMLA.
@@ -82,9 +103,11 @@ impl MlaForwardBuffers {
         let kv_lora = config.kv_lora_rank;
         let o_proj_in = config.o_proj_input_dim();
         let intermediate = config.intermediate_size;
+        let moe_intermediate = config.moe_intermediate_size;
+        let n_routed_experts = config.n_routed_experts;
+        let topk = config.num_experts_per_tok;
 
         // FP8 scratch: max over all projection input dims
-        let max_k = hidden.max(q_lora).max(kv_lora).max(intermediate);
         let fp8_hidden = Fp8Scratch::new(ctx, max_bs, hidden);
         let fp8_q_compressed = Fp8Scratch::new(ctx, max_bs, q_lora);
         let fp8_intermediate = Fp8Scratch::new(ctx, max_bs, intermediate.max(o_proj_in));
@@ -122,6 +145,16 @@ impl MlaForwardBuffers {
         let block_table_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * max_blocks_per_seq)?;
         let page_indices_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_blocks_per_seq)?;
 
+        // MoE buffers
+        let router_logits = HiddenStates::zeros(ctx, n_routed_experts, max_bs)?;
+        let topk_indices: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * topk)?;
+        let topk_weights: CudaSlice<f32> = ctx.stream.alloc_zeros(max_bs * topk)?;
+        let fp8_moe_intermediate = Fp8Scratch::new(ctx, max_bs, moe_intermediate);
+        let moe_gate = HiddenStates::zeros(ctx, moe_intermediate, max_bs)?;
+        let moe_up = HiddenStates::zeros(ctx, moe_intermediate, max_bs)?;
+        let moe_act = HiddenStates::zeros(ctx, moe_intermediate, max_bs)?;
+        let moe_down = HiddenStates::zeros(ctx, hidden, max_bs)?;
+
         Ok(Self {
             fp8_hidden,
             fp8_q_compressed,
@@ -147,6 +180,14 @@ impl MlaForwardBuffers {
             seqlens_k_d,
             block_table_d,
             page_indices_d,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            fp8_moe_intermediate,
+            moe_gate,
+            moe_up,
+            moe_act,
+            moe_down,
         })
     }
 }
@@ -517,9 +558,8 @@ impl DsV3Model {
                     }
                 }
             }
-            FfnWeights::MoE(_) => {
-                // MoE not implemented in Phase 1
-                unimplemented!("MoE forward not yet implemented");
+            FfnWeights::MoE(moe) => {
+                self.forward_moe(hidden, moe, bufs)?;
             }
         }
 
@@ -666,6 +706,236 @@ impl DsV3Model {
                     num_sm_parts,
                     ctx.stream.cu_stream(),
                 );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// MoE forward: routing + shared expert FFN + routed expert FFN.
+    ///
+    /// For decode (bs=1), each token selects `num_experts_per_tok` experts.
+    /// Expert FFN is run sequentially per-expert; outputs are weighted and
+    /// accumulated into `hidden`.
+    fn forward_moe(
+        &self,
+        hidden: &mut HiddenStates,
+        moe: &MoeFfnWeights,
+        bufs: &mut MlaForwardBuffers,
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let bs = hidden.seq_len;
+        let topk = config.num_experts_per_tok;
+        // bufs.normed is already populated by the caller (fused_add_rms_norm).
+
+        // ==================================================================
+        // 1. Router: gate_weight @ normed → router_logits [n_routed_experts, bs]
+        // ==================================================================
+        bufs.router_logits.seq_len = bs;
+        {
+            let (w_ptr, _gw) = moe.gate.weight.data.device_ptr(&ctx.stream);
+            let (x_ptr, _gx) = bufs.normed.data.device_ptr(&ctx.stream);
+            let (y_ptr, _gy) = bufs.router_logits.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::gemm_cuda(
+                    w_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    config.n_routed_experts as i32,
+                    bs as i32,
+                    config.hidden_size as i32,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
+        // 2. Routing kernel: sigmoid + group-limited TopK
+        // ==================================================================
+        {
+            let (logits_ptr, _gl) = bufs.router_logits.data.device_ptr(&ctx.stream);
+            let (bias_ptr, _gb) = moe.gate.e_score_correction_bias.device_ptr(&ctx.stream);
+            let (idx_ptr, _gi) = bufs.topk_indices.device_ptr_mut(&ctx.stream);
+            let (wt_ptr, _gw) = bufs.topk_weights.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::moe_routing_cuda(
+                    logits_ptr as *const ffi::Half,
+                    bias_ptr as *const f32,
+                    idx_ptr as *mut i32,
+                    wt_ptr as *mut f32,
+                    config.n_routed_experts as i32,
+                    bs as i32,
+                    topk as i32,
+                    config.n_group as i32,
+                    config.topk_group as i32,
+                    config.norm_topk_prob as i32,
+                    config.routed_scaling_factor,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
+        // 3. Read routing results to CPU (small: bs * topk ints + floats)
+        // ==================================================================
+        let topk_idx_host: Vec<i32> = ctx
+            .stream
+            .clone_dtoh(&bufs.topk_indices.slice(..bs * topk))?;
+        let topk_wt_host: Vec<f32> = ctx
+            .stream
+            .clone_dtoh(&bufs.topk_weights.slice(..bs * topk))?;
+        ctx.sync()?;
+
+        // ==================================================================
+        // 4. Shared expert FFN (runs on all tokens, same as dense FFN)
+        // ==================================================================
+        {
+            let expert = &moe.shared_expert;
+
+            // Shared FP8 quantize normed (reuse fp8_hidden from attention path)
+            fp8_quantize_into(ctx, &bufs.normed, &mut bufs.fp8_hidden);
+
+            bufs.moe_gate.seq_len = bs;
+            fp8_gemm_into(
+                ctx,
+                bs,
+                config.hidden_size,
+                &expert.gate_proj,
+                &bufs.fp8_hidden,
+                &mut bufs.moe_gate,
+            );
+
+            bufs.moe_up.seq_len = bs;
+            fp8_gemm_into(
+                ctx,
+                bs,
+                config.hidden_size,
+                &expert.up_proj,
+                &bufs.fp8_hidden,
+                &mut bufs.moe_up,
+            );
+
+            bufs.moe_act.seq_len = bs;
+            ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+            bufs.moe_down.seq_len = bs;
+            fp8_linear_into(
+                ctx,
+                &bufs.moe_act,
+                &expert.down_proj,
+                &mut bufs.fp8_moe_intermediate,
+                &mut bufs.moe_down,
+            );
+
+            // hidden += shared_expert_output
+            let n = (config.hidden_size * bs) as i32;
+            let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+            let (s_ptr, _gs) = bufs.moe_down.data.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::add_cuda(
+                    h_ptr as *const ffi::Half,
+                    s_ptr as *const ffi::Half,
+                    h_ptr as *mut ffi::Half,
+                    n,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
+        // 5. Routed expert FFN (per-expert sequential, decode-optimized)
+        // ==================================================================
+        // For each token, run its topk selected experts and accumulate
+        // weighted outputs into hidden.
+        //
+        // Current implementation: per-token, per-expert sequential FFN.
+        // Decode bs=1 → 8 expert FFN calls (one per selected expert).
+        // TODO: for prefill bs>1, use grouped GEMM (DeepGEMM GroupedContiguous).
+        let (ep_start, _ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
+
+        for token_idx in 0..bs {
+            // FP8 quantize this token's normed hidden.
+            // For bs=1 normed is already the right shape; for bs>1 we need to
+            // point fp8_quantize at the right column.
+            let n_tok = 1usize;
+            if bs == 1 {
+                fp8_quantize_into(ctx, &bufs.normed, &mut bufs.fp8_hidden);
+            } else {
+                // Create a single-token view by offsetting into normed's buffer.
+                let offset_elems = token_idx * config.hidden_size;
+                let token_view = HiddenStates {
+                    data: ctx.stream.clone_dtod(
+                        &bufs
+                            .normed
+                            .data
+                            .slice(offset_elems..offset_elems + config.hidden_size),
+                    )?,
+                    hidden_dim: config.hidden_size,
+                    seq_len: 1,
+                };
+                fp8_quantize_into(ctx, &token_view, &mut bufs.fp8_hidden);
+            }
+
+            for k in 0..topk {
+                let expert_idx = topk_idx_host[token_idx * topk + k] as usize;
+                let weight = topk_wt_host[token_idx * topk + k];
+
+                // Map global expert index to local (EP-sharded) index
+                let local_idx = expert_idx - ep_start;
+                let expert = &moe.experts[local_idx];
+
+                // gate_proj: [moe_intermediate, hidden] @ [hidden, 1] → [moe_intermediate, 1]
+                bufs.moe_gate.seq_len = n_tok;
+                fp8_gemm_into(
+                    ctx,
+                    n_tok,
+                    config.hidden_size,
+                    &expert.gate_proj,
+                    &bufs.fp8_hidden,
+                    &mut bufs.moe_gate,
+                );
+
+                // up_proj
+                bufs.moe_up.seq_len = n_tok;
+                fp8_gemm_into(
+                    ctx,
+                    n_tok,
+                    config.hidden_size,
+                    &expert.up_proj,
+                    &bufs.fp8_hidden,
+                    &mut bufs.moe_up,
+                );
+
+                // silu(gate) * up → act
+                bufs.moe_act.seq_len = n_tok;
+                ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+                // down_proj: [hidden, moe_intermediate] @ [moe_intermediate, 1] → [hidden, 1]
+                bufs.moe_down.seq_len = n_tok;
+                fp8_linear_into(
+                    ctx,
+                    &bufs.moe_act,
+                    &expert.down_proj,
+                    &mut bufs.fp8_moe_intermediate,
+                    &mut bufs.moe_down,
+                );
+
+                // hidden[:, token_idx] += weight * expert_output
+                let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+                let h_token_ptr = (h_ptr
+                    + (token_idx * config.hidden_size * std::mem::size_of::<bf16>()) as u64)
+                    as *mut ffi::Half;
+                let (e_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::moe_weighted_add_cuda(
+                        h_token_ptr,
+                        e_ptr as *const ffi::Half,
+                        weight,
+                        config.hidden_size as i32,
+                        ctx.stream.cu_stream(),
+                    );
+                }
             }
         }
 
