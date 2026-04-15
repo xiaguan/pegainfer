@@ -129,6 +129,8 @@ pub struct DsV3Model {
     /// Precomputed YaRN RoPE cos/sin cache: [max_seq_len, qk_rope_head_dim] bf16
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
+    /// DeepEP intranode buffer for EP All-to-All (None if EP1).
+    pub(super) deep_ep_buffer: Option<super::deep_ep::DeepEpBuffer>,
 }
 
 /// Pre-computed absorbed MLA weights for one layer.
@@ -789,6 +791,7 @@ impl DsV3Model {
             norm,
             cos_cache,
             sin_cache,
+            deep_ep_buffer: None,
         })
     }
 

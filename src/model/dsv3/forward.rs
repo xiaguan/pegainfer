@@ -88,6 +88,40 @@ pub(crate) struct MlaForwardBuffers {
     moe_act: HiddenStates,
     /// MoE expert down output: [hidden_size, bs]
     moe_down: HiddenStates,
+
+    // ---- DeepEP dispatch/combine buffers (EP > 1) ----
+    /// TopK indices as i64 (DeepEP uses TOPK_IDX_BITS=64): [bs * topk]
+    topk_indices_i64: CudaSlice<i64>,
+    /// num_tokens_per_rank: [num_ranks] i32
+    num_tokens_per_rank: CudaSlice<i32>,
+    /// num_tokens_per_expert: [n_routed_experts] i32
+    num_tokens_per_expert: CudaSlice<i32>,
+    /// is_token_in_rank: [bs * num_ranks] bool
+    is_token_in_rank: CudaSlice<u8>,
+    /// channel_prefix_matrix: [num_ranks * num_channels] i32
+    channel_prefix_matrix: CudaSlice<i32>,
+    /// rank_prefix_matrix_copy: [num_ranks * num_ranks] i32
+    rank_prefix_matrix_copy: CudaSlice<i32>,
+    /// recv_x: received tokens after dispatch [max_recv_tokens * hidden_size] bf16
+    ep_recv_x: CudaSlice<bf16>,
+    /// recv_src_idx: [max_recv_tokens] i32
+    ep_recv_src_idx: CudaSlice<i32>,
+    /// recv_topk_idx: [max_recv_tokens * topk] i64
+    ep_recv_topk_idx: CudaSlice<i64>,
+    /// recv_topk_weights: [max_recv_tokens * topk] f32
+    ep_recv_topk_weights: CudaSlice<f32>,
+    /// recv_channel_offset: [num_ranks * num_channels] i32
+    ep_recv_channel_offset: CudaSlice<i32>,
+    /// send_head: [max_tokens * num_ranks] i32
+    ep_send_head: CudaSlice<i32>,
+    /// combined_x output: [bs * hidden_size] bf16
+    ep_combined_x: CudaSlice<bf16>,
+    /// combined_topk_weights: [bs * topk] f32
+    ep_combined_topk_weights: CudaSlice<f32>,
+
+    // ---- Final output ----
+    /// Output logits: [vocab_size, bs] bf16
+    logits: HiddenStates,
 }
 
 // Number of SM partitions for FlashMLA.
@@ -155,6 +189,34 @@ impl MlaForwardBuffers {
         let moe_act = HiddenStates::zeros(ctx, moe_intermediate, max_bs)?;
         let moe_down = HiddenStates::zeros(ctx, hidden, max_bs)?;
 
+        // DeepEP dispatch/combine buffers
+        // Max recv tokens: conservative upper bound — each rank can receive up to
+        // max_bs * topk tokens in the worst case (all tokens route to one rank).
+        let num_ranks = 8usize; // EP8
+        let num_channels = 10usize; // num_sms/2 default
+        let max_recv_tokens = max_bs * topk * num_ranks; // generous upper bound
+        let topk_indices_i64: CudaSlice<i64> = ctx.stream.alloc_zeros(max_bs * topk)?;
+        let num_tokens_per_rank: CudaSlice<i32> = ctx.stream.alloc_zeros(num_ranks)?;
+        let num_tokens_per_expert: CudaSlice<i32> = ctx.stream.alloc_zeros(n_routed_experts)?;
+        let is_token_in_rank: CudaSlice<u8> = ctx.stream.alloc_zeros(max_bs * num_ranks)?;
+        let channel_prefix_matrix: CudaSlice<i32> =
+            ctx.stream.alloc_zeros(num_ranks * num_channels)?;
+        let rank_prefix_matrix_copy: CudaSlice<i32> =
+            ctx.stream.alloc_zeros(num_ranks * num_ranks)?;
+        let ep_recv_x: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_recv_tokens * hidden)?;
+        let ep_recv_src_idx: CudaSlice<i32> = ctx.stream.alloc_zeros(max_recv_tokens)?;
+        let ep_recv_topk_idx: CudaSlice<i64> = ctx.stream.alloc_zeros(max_recv_tokens * topk)?;
+        let ep_recv_topk_weights: CudaSlice<f32> =
+            ctx.stream.alloc_zeros(max_recv_tokens * topk)?;
+        let ep_recv_channel_offset: CudaSlice<i32> =
+            ctx.stream.alloc_zeros(num_ranks * num_channels)?;
+        let ep_send_head: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * num_ranks)?;
+        let ep_combined_x: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_bs * hidden)?;
+        let ep_combined_topk_weights: CudaSlice<f32> = ctx.stream.alloc_zeros(max_bs * topk)?;
+
+        // Final output logits
+        let logits = HiddenStates::zeros(ctx, config.vocab_size, max_bs)?;
+
         Ok(Self {
             fp8_hidden,
             fp8_q_compressed,
@@ -188,11 +250,59 @@ impl MlaForwardBuffers {
             moe_up,
             moe_act,
             moe_down,
+            topk_indices_i64,
+            num_tokens_per_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            channel_prefix_matrix,
+            rank_prefix_matrix_copy,
+            ep_recv_x,
+            ep_recv_src_idx,
+            ep_recv_topk_idx,
+            ep_recv_topk_weights,
+            ep_recv_channel_offset,
+            ep_send_head,
+            ep_combined_x,
+            ep_combined_topk_weights,
+            logits,
         })
     }
 }
 
 impl DsV3Model {
+    /// Final projection: RMSNorm → lm_head GEMM → logits.
+    ///
+    /// Returns a reference to the logits buffer `[vocab_size, bs]` inside `bufs`.
+    pub(crate) fn forward_final<'a>(
+        &self,
+        hidden: &HiddenStates,
+        bufs: &'a mut MlaForwardBuffers,
+    ) -> &'a HiddenStates {
+        let ctx = &self.ctx;
+        let bs = hidden.seq_len;
+
+        // Final RMSNorm
+        bufs.normed.seq_len = bs;
+        ops::rms_norm_batch_into(
+            ctx,
+            hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        );
+
+        // lm_head GEMM: logits = output_projection @ normed
+        bufs.logits.seq_len = bs;
+        ops::gemm_into(
+            ctx,
+            self.output_projection(),
+            &bufs.normed,
+            &mut bufs.logits,
+        );
+
+        &bufs.logits
+    }
+
     /// Forward pass for dense layers (layers 0..first_k_dense_replace).
     ///
     /// Processes all tokens in `hidden` through the attention + FFN pipeline for one layer.
@@ -596,7 +706,6 @@ impl DsV3Model {
         // Pad block_table to rectangular [bs, max_blocks_per_seq]
         let padding_page = kv_pool.padding_page_id();
         let mut block_table_rect = vec![padding_page; bs * max_blocks_per_seq];
-        let mut offset = 0;
         for (i, kv) in kv_states.iter().enumerate() {
             let pages = kv.page_indices_i32();
             for (j, &p) in pages.iter().enumerate() {
@@ -777,18 +886,7 @@ impl DsV3Model {
         }
 
         // ==================================================================
-        // 3. Read routing results to CPU (small: bs * topk ints + floats)
-        // ==================================================================
-        let topk_idx_host: Vec<i32> = ctx
-            .stream
-            .clone_dtoh(&bufs.topk_indices.slice(..bs * topk))?;
-        let topk_wt_host: Vec<f32> = ctx
-            .stream
-            .clone_dtoh(&bufs.topk_weights.slice(..bs * topk))?;
-        ctx.sync()?;
-
-        // ==================================================================
-        // 4. Shared expert FFN (runs on all tokens, same as dense FFN)
+        // 3. Shared expert FFN (runs on all tokens, same as dense FFN)
         // ==================================================================
         {
             let expert = &moe.shared_expert;
@@ -844,25 +942,46 @@ impl DsV3Model {
         }
 
         // ==================================================================
-        // 5. Routed expert FFN (per-expert sequential, decode-optimized)
+        // 4. Routed expert FFN
         // ==================================================================
-        // For each token, run its topk selected experts and accumulate
-        // weighted outputs into hidden.
-        //
-        // Current implementation: per-token, per-expert sequential FFN.
-        // Decode bs=1 → 8 expert FFN calls (one per selected expert).
-        // TODO: for prefill bs>1, use grouped GEMM (DeepGEMM GroupedContiguous).
+        if self.parallel.is_ep_sharded() {
+            self.forward_moe_ep(hidden, moe, bufs)?;
+        } else {
+            self.forward_moe_local(hidden, moe, bufs)?;
+        }
+
+        Ok(())
+    }
+
+    /// EP1 routed expert FFN: per-token, per-expert sequential.
+    /// All experts are local — no cross-GPU communication needed.
+    fn forward_moe_local(
+        &self,
+        hidden: &mut HiddenStates,
+        moe: &MoeFfnWeights,
+        bufs: &mut MlaForwardBuffers,
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let bs = hidden.seq_len;
+        let topk = config.num_experts_per_tok;
+
+        // Read routing results to CPU
+        let topk_idx_host: Vec<i32> = ctx
+            .stream
+            .clone_dtoh(&bufs.topk_indices.slice(..bs * topk))?;
+        let topk_wt_host: Vec<f32> = ctx
+            .stream
+            .clone_dtoh(&bufs.topk_weights.slice(..bs * topk))?;
+        ctx.sync()?;
+
         let (ep_start, _ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
 
         for token_idx in 0..bs {
-            // FP8 quantize this token's normed hidden.
-            // For bs=1 normed is already the right shape; for bs>1 we need to
-            // point fp8_quantize at the right column.
             let n_tok = 1usize;
             if bs == 1 {
                 fp8_quantize_into(ctx, &bufs.normed, &mut bufs.fp8_hidden);
             } else {
-                // Create a single-token view by offsetting into normed's buffer.
                 let offset_elems = token_idx * config.hidden_size;
                 let token_view = HiddenStates {
                     data: ctx.stream.clone_dtod(
@@ -881,11 +1000,9 @@ impl DsV3Model {
                 let expert_idx = topk_idx_host[token_idx * topk + k] as usize;
                 let weight = topk_wt_host[token_idx * topk + k];
 
-                // Map global expert index to local (EP-sharded) index
                 let local_idx = expert_idx - ep_start;
                 let expert = &moe.experts[local_idx];
 
-                // gate_proj: [moe_intermediate, hidden] @ [hidden, 1] → [moe_intermediate, 1]
                 bufs.moe_gate.seq_len = n_tok;
                 fp8_gemm_into(
                     ctx,
@@ -896,7 +1013,6 @@ impl DsV3Model {
                     &mut bufs.moe_gate,
                 );
 
-                // up_proj
                 bufs.moe_up.seq_len = n_tok;
                 fp8_gemm_into(
                     ctx,
@@ -907,11 +1023,9 @@ impl DsV3Model {
                     &mut bufs.moe_up,
                 );
 
-                // silu(gate) * up → act
                 bufs.moe_act.seq_len = n_tok;
                 ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
 
-                // down_proj: [hidden, moe_intermediate] @ [moe_intermediate, 1] → [hidden, 1]
                 bufs.moe_down.seq_len = n_tok;
                 fp8_linear_into(
                     ctx,
@@ -921,7 +1035,6 @@ impl DsV3Model {
                     &mut bufs.moe_down,
                 );
 
-                // hidden[:, token_idx] += weight * expert_output
                 let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
                 let h_token_ptr = (h_ptr
                     + (token_idx * config.hidden_size * std::mem::size_of::<bf16>()) as u64)
@@ -936,6 +1049,355 @@ impl DsV3Model {
                         ctx.stream.cu_stream(),
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// EP>1 routed expert FFN: DeepEP dispatch → local expert compute → combine.
+    fn forward_moe_ep(
+        &self,
+        hidden: &mut HiddenStates,
+        moe: &MoeFfnWeights,
+        bufs: &mut MlaForwardBuffers,
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let bs = hidden.seq_len;
+        let topk = config.num_experts_per_tok;
+        let hidden_size = config.hidden_size;
+
+        let ep_buf = self
+            .deep_ep_buffer
+            .as_ref()
+            .expect("DeepEP buffer must be initialized for EP > 1");
+        let ep_config = &ep_buf.config;
+        let rank = ep_buf.rank();
+        let num_ranks = ep_buf.num_ranks();
+        let num_channels = ep_config.num_channels();
+        let (ep_start, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
+
+        // hidden_int4 = hidden_size * sizeof(bf16) / sizeof(int4) = hidden_size * 2 / 16
+        let hidden_int4 = (hidden_size * 2 / 16) as i32;
+
+        // ==================================================================
+        // Step 1: Cast topk_indices i32 → i64 for DeepEP
+        // ==================================================================
+        {
+            let (idx_ptr, _gi) = bufs.topk_indices.device_ptr(&ctx.stream);
+            let (idx64_ptr, _gi64) = bufs.topk_indices_i64.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::cast_i32_to_i64_cuda(
+                    idx_ptr as *const i32,
+                    idx64_ptr as *mut i64,
+                    (bs * topk) as i32,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
+        // Step 2: get_dispatch_layout — compute routing metadata
+        // ==================================================================
+        {
+            let (idx64_ptr, _gi) = bufs.topk_indices_i64.device_ptr(&ctx.stream);
+            let (ntpr_ptr, _g1) = bufs.num_tokens_per_rank.device_ptr_mut(&ctx.stream);
+            let (ntpe_ptr, _g2) = bufs.num_tokens_per_expert.device_ptr_mut(&ctx.stream);
+            let (itr_ptr, _g3) = bufs.is_token_in_rank.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::deep_ep_get_dispatch_layout(
+                    idx64_ptr as *const i64,
+                    ntpr_ptr as *mut i32,
+                    ntpe_ptr as *mut i32,
+                    itr_ptr as *mut bool,
+                    bs as i32,
+                    topk as i32,
+                    num_ranks,
+                    config.n_routed_experts as i32,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
+        // Step 3: notify_dispatch — exchange token counts via NVLink
+        // ==================================================================
+        ep_buf.reset_recv_counters();
+        let num_memset_int = {
+            // Number of ints to memset in NVLink buffer for this dispatch.
+            // This covers the rank prefix matrix + channel metadata.
+            let prefix_matrix_ints = num_ranks * num_ranks;
+            let expert_prefix_ints = num_ranks * (config.n_routed_experts as i32 / num_ranks);
+            let channel_ints = num_channels * num_ranks * 5; // 5 control arrays
+            (prefix_matrix_ints + expert_prefix_ints + channel_ints) as i32
+        };
+
+        {
+            let (ntpr_ptr, _g1) = bufs.num_tokens_per_rank.device_ptr(&ctx.stream);
+            let (ntpe_ptr, _g2) = bufs.num_tokens_per_expert.device_ptr(&ctx.stream);
+            let (itr_ptr, _g3) = bufs.is_token_in_rank.device_ptr(&ctx.stream);
+            let (cpm_ptr, _g4) = bufs.channel_prefix_matrix.device_ptr_mut(&ctx.stream);
+            let (rpm_ptr, _g5) = bufs.rank_prefix_matrix_copy.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::deep_ep_notify_dispatch(
+                    ntpr_ptr as *const i32,
+                    ep_buf.moe_recv_counter_mapped(),
+                    num_ranks,
+                    ntpe_ptr as *const i32,
+                    ep_buf.moe_recv_expert_counter_mapped(),
+                    config.n_routed_experts as i32,
+                    bs as i32,
+                    itr_ptr as *const bool,
+                    cpm_ptr as *mut i32,
+                    rpm_ptr as *mut i32,
+                    num_memset_int,
+                    1, // expert_alignment
+                    ep_buf.buffer_ptrs_gpu(),
+                    ep_buf.barrier_signal_ptrs_gpu(),
+                    rank,
+                    ctx.stream.cu_stream(),
+                    ep_config.num_sms,
+                );
+            }
+        }
+
+        // Sync to read recv count from host-mapped memory
+        ctx.sync()?;
+        let num_recv_tokens = ep_buf.read_recv_count();
+
+        // ==================================================================
+        // Step 4: dispatch — send tokens to target ranks via NVLink
+        // ==================================================================
+        {
+            let (normed_ptr, _gn) = bufs.normed.data.device_ptr(&ctx.stream);
+            let (idx64_ptr, _gi) = bufs.topk_indices_i64.device_ptr(&ctx.stream);
+            let (wt_ptr, _gw) = bufs.topk_weights.device_ptr(&ctx.stream);
+            let (itr_ptr, _g3) = bufs.is_token_in_rank.device_ptr(&ctx.stream);
+            let (cpm_ptr, _g4) = bufs.channel_prefix_matrix.device_ptr(&ctx.stream);
+
+            let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
+            let (recv_si_ptr, _grs) = bufs.ep_recv_src_idx.device_ptr_mut(&ctx.stream);
+            let (recv_ti_ptr, _grt) = bufs.ep_recv_topk_idx.device_ptr_mut(&ctx.stream);
+            let (recv_tw_ptr, _grw) = bufs.ep_recv_topk_weights.device_ptr_mut(&ctx.stream);
+            let (recv_co_ptr, _grc) = bufs.ep_recv_channel_offset.device_ptr_mut(&ctx.stream);
+            let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
+
+            unsafe {
+                ffi::deep_ep_intranode_dispatch(
+                    recv_x_ptr as *mut std::ffi::c_void,
+                    std::ptr::null_mut(), // recv_x_scales — no FP8 for dispatch (bf16 tokens)
+                    recv_si_ptr as *mut i32,
+                    recv_ti_ptr as *mut i64,
+                    recv_tw_ptr as *mut f32,
+                    recv_co_ptr as *mut i32,
+                    sh_ptr as *mut i32,
+                    normed_ptr as *const std::ffi::c_void, // send normed hidden (bf16)
+                    std::ptr::null(),                      // x_scales — no FP8
+                    idx64_ptr as *const i64,
+                    wt_ptr as *const f32,
+                    itr_ptr as *const bool,
+                    cpm_ptr as *const i32,
+                    bs as i32,
+                    0, // num_worst_tokens
+                    hidden_int4,
+                    topk as i32,
+                    config.n_routed_experts as i32,
+                    0, // num_scales — no FP8
+                    0, // scale_token_stride
+                    0, // scale_hidden_stride
+                    ep_buf.buffer_ptrs_gpu(),
+                    rank,
+                    num_ranks,
+                    ctx.stream.cu_stream(),
+                    ep_config.num_sms,
+                    ep_config.num_max_nvl_chunked_send_tokens,
+                    ep_config.num_max_nvl_chunked_recv_tokens,
+                );
+            }
+        }
+
+        // ==================================================================
+        // Step 5: Run local expert FFN on received tokens
+        // ==================================================================
+        // recv_x: [num_recv_tokens, hidden_size] bf16 (row-major from dispatch)
+        // We need to transpose to column-major [hidden_size, num_recv_tokens] for our GEMM.
+        // For decode (small num_recv_tokens), we process per-token sequentially.
+        //
+        // Read recv_topk_idx to know which local expert each recv'd token goes to.
+        if num_recv_tokens > 0 {
+            let recv_topk_idx_host: Vec<i64> = ctx.stream.clone_dtoh(
+                &bufs
+                    .ep_recv_topk_idx
+                    .slice(..num_recv_tokens as usize * topk),
+            )?;
+            let recv_topk_wt_host: Vec<f32> = ctx.stream.clone_dtoh(
+                &bufs
+                    .ep_recv_topk_weights
+                    .slice(..num_recv_tokens as usize * topk),
+            )?;
+            ctx.sync()?;
+
+            // Process each received token through its designated local expert.
+            // Each recv'd token has topk expert indices, but only the ones in
+            // our local range [ep_start, ep_start + ep_count) should be computed.
+            for tok in 0..num_recv_tokens as usize {
+                // Create a view of this token in recv_x (row-major from dispatch).
+                // DeepEP dispatch outputs recv_x in row-major: [num_recv_tokens, hidden].
+                // Our GEMM expects column-major [hidden, bs].
+                // For bs=1 per token, row-major [1, hidden] == column-major [hidden, 1].
+                let offset = tok * hidden_size;
+                let token_view = HiddenStates {
+                    data: ctx
+                        .stream
+                        .clone_dtod(&bufs.ep_recv_x.slice(offset..offset + hidden_size))?,
+                    hidden_dim: hidden_size,
+                    seq_len: 1,
+                };
+                fp8_quantize_into(ctx, &token_view, &mut bufs.fp8_hidden);
+
+                for k in 0..topk {
+                    let expert_idx = recv_topk_idx_host[tok * topk + k] as usize;
+                    let weight = recv_topk_wt_host[tok * topk + k];
+
+                    // Skip experts not in our local range
+                    if expert_idx < ep_start || expert_idx >= ep_start + ep_count {
+                        continue;
+                    }
+                    let local_idx = expert_idx - ep_start;
+                    let expert = &moe.experts[local_idx];
+
+                    bufs.moe_gate.seq_len = 1;
+                    fp8_gemm_into(
+                        ctx,
+                        1,
+                        hidden_size,
+                        &expert.gate_proj,
+                        &bufs.fp8_hidden,
+                        &mut bufs.moe_gate,
+                    );
+
+                    bufs.moe_up.seq_len = 1;
+                    fp8_gemm_into(
+                        ctx,
+                        1,
+                        hidden_size,
+                        &expert.up_proj,
+                        &bufs.fp8_hidden,
+                        &mut bufs.moe_up,
+                    );
+
+                    bufs.moe_act.seq_len = 1;
+                    ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+                    bufs.moe_down.seq_len = 1;
+                    fp8_linear_into(
+                        ctx,
+                        &bufs.moe_act,
+                        &expert.down_proj,
+                        &mut bufs.fp8_moe_intermediate,
+                        &mut bufs.moe_down,
+                    );
+
+                    // Write expert output back to recv_x buffer (in-place, weighted).
+                    // For the combine step, we need the expert output in recv_x position.
+                    // Accumulate weighted output into the recv_x slot for this token.
+                    let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
+                    let recv_tok_ptr = (recv_x_ptr + (offset * std::mem::size_of::<bf16>()) as u64)
+                        as *mut ffi::Half;
+                    let (e_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
+
+                    if k == 0 {
+                        // First expert for this token: overwrite (not add)
+                        // scale * expert_output → recv_x slot
+                        // We need a fused scale+copy. Use weighted_add with a zeroed destination.
+                        // Simpler: memset the slot to 0, then weighted_add.
+                        unsafe {
+                            ffi::cudaMemsetAsync(
+                                recv_tok_ptr as *mut std::ffi::c_void,
+                                0,
+                                hidden_size * std::mem::size_of::<bf16>(),
+                                ctx.stream.cu_stream(),
+                            );
+                            ffi::moe_weighted_add_cuda(
+                                recv_tok_ptr,
+                                e_ptr as *const ffi::Half,
+                                weight,
+                                hidden_size as i32,
+                                ctx.stream.cu_stream(),
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            ffi::moe_weighted_add_cuda(
+                                recv_tok_ptr,
+                                e_ptr as *const ffi::Half,
+                                weight,
+                                hidden_size as i32,
+                                ctx.stream.cu_stream(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==================================================================
+        // Step 6: combine — gather expert outputs back to source ranks
+        // ==================================================================
+        {
+            let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
+            let (wt_ptr, _gw) = bufs.topk_weights.device_ptr(&ctx.stream);
+            let (si_ptr, _gs) = bufs.ep_recv_src_idx.device_ptr(&ctx.stream);
+            let (rpm_ptr, _g5) = bufs.rank_prefix_matrix_copy.device_ptr(&ctx.stream);
+            let (cpm_ptr, _g4) = bufs.channel_prefix_matrix.device_ptr(&ctx.stream);
+            let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
+
+            let (combined_ptr, _gc) = bufs.ep_combined_x.device_ptr_mut(&ctx.stream);
+            let (combined_wt_ptr, _gcw) = bufs.ep_combined_topk_weights.device_ptr_mut(&ctx.stream);
+
+            unsafe {
+                ffi::deep_ep_intranode_combine(
+                    combined_ptr as *mut std::ffi::c_void,
+                    combined_wt_ptr as *mut f32,
+                    recv_x_ptr as *const std::ffi::c_void,
+                    wt_ptr as *const f32,
+                    si_ptr as *const i32,
+                    rpm_ptr as *const i32,
+                    cpm_ptr as *const i32,
+                    sh_ptr as *mut i32,
+                    bs as i32,
+                    num_recv_tokens,
+                    hidden_size as i32,
+                    topk as i32,
+                    ep_buf.buffer_ptrs_gpu(),
+                    rank,
+                    num_ranks,
+                    ctx.stream.cu_stream(),
+                    ep_config.num_sms,
+                    ep_config.num_max_nvl_chunked_send_tokens,
+                    ep_config.num_max_nvl_chunked_recv_tokens,
+                );
+            }
+        }
+
+        // ==================================================================
+        // Step 7: Add combined routed expert output to hidden
+        // ==================================================================
+        // combined_x is [bs, hidden_size] row-major from combine.
+        // For bs=1: [1, hidden] row == [hidden, 1] col, direct add works.
+        {
+            let n = (hidden_size * bs) as i32;
+            let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+            let (c_ptr, _gc) = bufs.ep_combined_x.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::add_cuda(
+                    h_ptr as *const ffi::Half,
+                    c_ptr as *const ffi::Half,
+                    h_ptr as *mut ffi::Half,
+                    n,
+                    ctx.stream.cu_stream(),
+                );
             }
         }
 

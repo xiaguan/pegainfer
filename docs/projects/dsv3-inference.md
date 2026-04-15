@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 2c MoE forward 完成（routing + expert FFN + shared expert），走路线 B 直推 8 卡端到端
+> **Status**: Phase 2b DeepEP 集成代码完成（编译通过，未测试），Phase 2d final norm + lm_head 完成
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
-> **Next action**: Phase 2b — DeepEP intranode 集成（EP8 唯一跨卡通信），然后补 final norm + lm_head + forward loop → 全模型 logits 对齐。
+> **Next action**: Phase 2d — Executor forward loop（61 层 `forward_layer` + KV cache per-layer 管理 + 8 rank 同步 DeepEP），然后全模型 logits 对齐。
 
 ---
 
@@ -104,10 +104,12 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 EP8 跨卡通信，端到端的唯一硬卡点。
 
-- [ ] `build.rs` 编译 DeepEP intranode kernel（`-DDISABLE_NVSHMEM`，SM90，`kNumRanks=8` AOT 实例化）
-- [ ] C wrapper（`csrc/deep_ep.cu`）：Buffer 管理（NVLink buffer alloc + IPC handle exchange + barrier signals）
-- [ ] Rust FFI：`deep_ep_create_buffer` / `deep_ep_dispatch_layout` / `deep_ep_intranode_dispatch` / `deep_ep_intranode_combine`
-- [ ] IPC handle 交换（`cudaIpcGetMemHandle` + 跨线程传递，替代 `torch.distributed.all_gather_object`）
+- [x] `build.rs` 编译 DeepEP intranode kernel（`-DDISABLE_NVSHMEM -DTOPK_IDX_BITS=64`，SM90a）
+- [x] C wrapper（`csrc/deep_ep.cu`）：5 个 extern "C" 函数（layout, barrier, notify_dispatch, dispatch, combine）
+- [x] Rust FFI（`ffi.rs`）：DeepEP 5 函数 + CUDA IPC/HostAlloc/Memcpy helpers + i32→i64 cast kernel
+- [x] Buffer 管理（`deep_ep.rs`）：NVLink buffer alloc + IPC handle exchange (Arc<Barrier> + Arc<Mutex<>>) + host-mapped recv counters
+- [x] Executor 集成（`executor.rs`）：EP>1 时并行初始化 DeepEP buffers，挂到 DsV3Model
+- [x] Forward 集成（`forward.rs`）：`forward_moe_ep` 实现完整 dispatch→compute→combine pipeline
 
 #### Phase 2c — MoE Forward ✅
 
@@ -120,8 +122,8 @@ EP8 跨卡通信，端到端的唯一硬卡点。
 
 DeepEP 就绪后，补齐剩余胶水打通全模型。
 
-- [ ] `forward_moe` 接入 DeepEP dispatch/combine（替代当前 EP1 local-only 路径）
-- [ ] Final RMSNorm + lm_head GEMM（`tie_word_embeddings` → 复用 embedding 矩阵）
+- [x] `forward_moe` 接入 DeepEP dispatch/combine（`forward_moe_ep`，替代 EP1 local-only 路径）
+- [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
 - [ ] Executor forward loop：61 层 `forward_layer` + KV cache per-layer 管理
 - [ ] Token-by-token decode 做验证（避开 prefill attention kernel，逐 token 跑 decode）
 - [ ] 全模型 output logits 与 Python reference 对齐

@@ -159,6 +159,21 @@ __global__ void moe_routing_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Cast i32 → i64 (for DeepEP topk_idx compatibility)
+// ---------------------------------------------------------------------------
+
+__global__ void cast_i32_to_i64_kernel(
+    const int* __restrict__ in,
+    int64_t* __restrict__ out,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = static_cast<int64_t>(in[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Weighted add: out[i] += scale * x[i], bf16, element-wise
 // ---------------------------------------------------------------------------
 
@@ -233,6 +248,18 @@ void moe_weighted_add_cuda(
         (const __nv_bfloat16*)x,
         scale,
         n);
+}
+
+void cast_i32_to_i64_cuda(
+    const int* in_data,
+    int64_t* out_data,
+    int n,
+    void* stream)
+{
+    const int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    cast_i32_to_i64_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        in_data, out_data, n);
 }
 
 } // extern "C"

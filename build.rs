@@ -504,6 +504,9 @@ fn main() {
     // FlashMLA wrapper — compiled separately with SM90a + C++20 + FlashMLA headers
     let flashmla_cuda_files = BTreeSet::from(["flash_mla.cu"]);
 
+    // DeepEP wrapper — compiled separately with SM90a + C++17 + DeepEP kernel headers
+    let deepep_cuda_files = BTreeSet::from(["deep_ep.cu"]);
+
     // Other SM90a files (FP8 intrinsics, no DeepGEMM headers needed)
     let sm90_cuda_files = BTreeSet::from(["fp8_quantize.cu"]);
 
@@ -518,6 +521,7 @@ fn main() {
                 && !replaced_cuda_files.contains(file_name)
                 && !deepgemm_cuda_files.contains(file_name)
                 && !flashmla_cuda_files.contains(file_name)
+                && !deepep_cuda_files.contains(file_name)
                 && !sm90_cuda_files.contains(file_name)
             {
                 Some(path)
@@ -719,6 +723,80 @@ fn main() {
 
         println!("cargo:warning=FlashMLA dense decode compiled for SM90a");
 
+        // DeepEP intranode kernels — SM90a + C++17 + DISABLE_NVSHMEM
+        let deepep_kernel_sources = [
+            "third_party/DeepEP/csrc/kernels/intranode.cu",
+            "third_party/DeepEP/csrc/kernels/layout.cu",
+            "third_party/DeepEP/csrc/kernels/runtime.cu",
+        ];
+
+        let deepep_include_args = ["-I", "third_party/DeepEP/csrc/kernels"];
+
+        let deepep_nvcc_base_args = [
+            "-O3",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "--std=c++17",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--compiler-options",
+            "-fPIC",
+            "-DDISABLE_NVSHMEM",
+            "-DTOPK_IDX_BITS=64",
+        ];
+
+        for source in &deepep_kernel_sources {
+            let cu_file = Path::new(source);
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("deepep_{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args(["-c", source, "-o", &obj_file.to_string_lossy()])
+                .args(&deepep_nvcc_base_args)
+                .args(&deepep_include_args)
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (DeepEP SM90a)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
+
+        // DeepEP C wrapper (csrc/deep_ep.cu)
+        for file_name in &deepep_cuda_files {
+            let cu_file = csrc_dir.join(file_name);
+            if !cu_file.exists() {
+                continue;
+            }
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{}_cuda.o", stem));
+
+            let status = Command::new(&nvcc)
+                .args([
+                    "-c",
+                    &cu_file.to_string_lossy(),
+                    "-o",
+                    &obj_file.to_string_lossy(),
+                ])
+                .args(&deepep_nvcc_base_args)
+                .args(&deepep_include_args)
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
+
+            assert!(
+                status.success(),
+                "nvcc compilation failed for {} (DeepEP SM90a)",
+                cu_file.display()
+            );
+
+            obj_files.push(obj_file);
+        }
+
+        println!("cargo:warning=DeepEP intranode kernels compiled for SM90a");
+
         // SM90a files that only need FP8 intrinsics (no DeepGEMM/CUTLASS headers)
         for file_name in &sm90_cuda_files {
             let cu_file = csrc_dir.join(file_name);
@@ -787,6 +865,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=third_party/DeepGEMM/deep_gemm/include/");
     println!("cargo:rerun-if-changed=third_party/FlashMLA/csrc/");
+    println!("cargo:rerun-if-changed=third_party/DeepEP/csrc/kernels/");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");

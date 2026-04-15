@@ -3,6 +3,23 @@ use cudarc::driver::sys::{CUresult, CUstream};
 // Half type (16-bit float) - same layout as CUDA half
 pub(crate) type Half = u16;
 
+/// cudaIpcMemHandle_t — 64-byte opaque handle for IPC memory sharing.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct CudaIpcMemHandle {
+    pub reserved: [u8; 64],
+}
+
+/// cudaMemcpyKind constants
+pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+
+/// cudaHostAlloc flags
+pub(crate) const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
+
+/// cudaIpcMemLazyEnablePeerAccess
+pub(crate) const CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: u32 = 0x01;
+
 // CUDA kernels - all use half precision
 unsafe extern "C" {
     pub(crate) fn rms_norm_cuda(
@@ -701,6 +718,14 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Cast i32 → i64 (for DeepEP topk_idx compatibility).
+    pub(crate) fn cast_i32_to_i64_cuda(
+        in_data: *const i32,
+        out_data: *mut i64,
+        n: i32,
+        stream: CUstream,
+    );
+
     // Weighted add: out[i] += scale * x[i], bf16, element-wise.
     // Used to accumulate weighted expert outputs into hidden states.
     pub(crate) fn moe_weighted_add_cuda(
@@ -710,6 +735,152 @@ unsafe extern "C" {
         n: i32,
         stream: CUstream,
     );
+
+    // ========================================================================
+    // DeepEP intranode All-to-All (csrc/deep_ep.cu)
+    // ========================================================================
+
+    // Compute dispatch layout: which tokens go to which ranks/experts.
+    pub(crate) fn deep_ep_get_dispatch_layout(
+        topk_idx: *const i64,            // [num_tokens * num_topk]
+        num_tokens_per_rank: *mut i32,   // [num_ranks] output
+        num_tokens_per_expert: *mut i32, // [num_experts] output
+        is_token_in_rank: *mut bool,     // [num_tokens * num_ranks] output
+        num_tokens: i32,
+        num_topk: i32,
+        num_ranks: i32,
+        num_experts: i32,
+        stream: CUstream,
+    );
+
+    // Intranode NVLink barrier.
+    pub(crate) fn deep_ep_intranode_barrier(
+        barrier_signal_ptrs_gpu: *mut *mut i32,
+        rank: i32,
+        num_ranks: i32,
+        stream: CUstream,
+    );
+
+    // Exchange token counts via NVLink IPC buffer.
+    // Writes num_recv_tokens to moe_recv_counter_mapped (host-mapped memory).
+    pub(crate) fn deep_ep_notify_dispatch(
+        num_tokens_per_rank: *const i32,
+        moe_recv_counter_mapped: *mut i32,
+        num_ranks: i32,
+        num_tokens_per_expert: *const i32,
+        moe_recv_expert_counter_mapped: *mut i32,
+        num_experts: i32,
+        num_tokens: i32,
+        is_token_in_rank: *const bool,
+        channel_prefix_matrix: *mut i32,
+        rank_prefix_matrix_copy: *mut i32,
+        num_memset_int: i32,
+        expert_alignment: i32,
+        buffer_ptrs_gpu: *mut *mut std::ffi::c_void,
+        barrier_signal_ptrs_gpu: *mut *mut i32,
+        rank: i32,
+        stream: CUstream,
+        num_sms: i32,
+    );
+
+    // Dispatch tokens to target ranks via NVLink.
+    pub(crate) fn deep_ep_intranode_dispatch(
+        recv_x: *mut std::ffi::c_void,
+        recv_x_scales: *mut f32,
+        recv_src_idx: *mut i32,
+        recv_topk_idx: *mut i64,
+        recv_topk_weights: *mut f32,
+        recv_channel_offset: *mut i32,
+        send_head: *mut i32,
+        x: *const std::ffi::c_void,
+        x_scales: *const f32,
+        topk_idx: *const i64,
+        topk_weights: *const f32,
+        is_token_in_rank: *const bool,
+        channel_prefix_matrix: *const i32,
+        num_tokens: i32,
+        num_worst_tokens: i32,
+        hidden_int4: i32,
+        num_topk: i32,
+        num_experts: i32,
+        num_scales: i32,
+        scale_token_stride: i32,
+        scale_hidden_stride: i32,
+        buffer_ptrs_gpu: *mut *mut std::ffi::c_void,
+        rank: i32,
+        num_ranks: i32,
+        stream: CUstream,
+        num_sms: i32,
+        num_max_send_tokens: i32,
+        num_recv_buffer_tokens: i32,
+    );
+
+    // Combine expert outputs back to source ranks via NVLink.
+    pub(crate) fn deep_ep_intranode_combine(
+        combined_x: *mut std::ffi::c_void,
+        combined_topk_weights: *mut f32,
+        x: *const std::ffi::c_void,
+        topk_weights: *const f32,
+        src_idx: *const i32,
+        rank_prefix_matrix: *const i32,
+        channel_prefix_matrix: *const i32,
+        send_head: *mut i32,
+        num_tokens: i32,
+        num_recv_tokens: i32,
+        hidden: i32,
+        num_topk: i32,
+        buffer_ptrs_gpu: *mut *mut std::ffi::c_void,
+        rank: i32,
+        num_ranks: i32,
+        stream: CUstream,
+        num_sms: i32,
+        num_max_send_tokens: i32,
+        num_recv_buffer_tokens: i32,
+    );
+
+    // ========================================================================
+    // CUDA runtime helpers for DeepEP buffer management
+    // ========================================================================
+
+    // cudaMalloc / cudaFree
+    pub(crate) fn cudaMalloc(devptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
+    pub(crate) fn cudaFree(devptr: *mut std::ffi::c_void) -> i32;
+    pub(crate) fn cudaMemset(devptr: *mut std::ffi::c_void, value: i32, count: usize) -> i32;
+    pub(crate) fn cudaMemsetAsync(
+        devptr: *mut std::ffi::c_void,
+        value: i32,
+        count: usize,
+        stream: CUstream,
+    ) -> i32;
+
+    // IPC memory handle exchange
+    pub(crate) fn cudaIpcGetMemHandle(
+        handle: *mut CudaIpcMemHandle,
+        devptr: *mut std::ffi::c_void,
+    ) -> i32;
+    pub(crate) fn cudaIpcOpenMemHandle(
+        devptr: *mut *mut std::ffi::c_void,
+        handle: CudaIpcMemHandle,
+        flags: u32,
+    ) -> i32;
+    pub(crate) fn cudaIpcCloseMemHandle(devptr: *mut std::ffi::c_void) -> i32;
+
+    // Host-mapped memory for CPU-GPU sync
+    pub(crate) fn cudaHostAlloc(phost: *mut *mut std::ffi::c_void, size: usize, flags: u32) -> i32;
+    pub(crate) fn cudaHostGetDevicePointer(
+        pdevice: *mut *mut std::ffi::c_void,
+        phost: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> i32;
+    pub(crate) fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> i32;
+
+    // Device memory copy
+    pub(crate) fn cudaMemcpy(
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: i32,
+    ) -> i32;
 
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub(crate) fn paged_attention_decode_cuda(

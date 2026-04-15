@@ -1,6 +1,7 @@
 //! DSV3 multi-GPU executor: loads models across GPUs with EP/TP sharding
 //! and coordinates forward passes.
 
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
@@ -8,6 +9,7 @@ use crossbeam_channel as channel;
 use log::info;
 
 use super::config::ParallelConfig;
+use super::deep_ep::{self, DeepEpBuffer, DeepEpConfig};
 use super::weights::DsV3Model;
 use crate::tensor::DeviceContext;
 
@@ -94,6 +96,67 @@ impl DsV3Executor {
         );
 
         // TODO: when tp_size > 1, init NCCL comms here and attach to models
+
+        // Init DeepEP intranode buffers for EP > 1
+        let mut models = models;
+        if ep_size > 1 {
+            let config = &models[0].config();
+            let hidden = config.hidden_size;
+            let num_topk = config.num_experts_per_tok;
+            let ep_config = DeepEpConfig::default();
+
+            let (exchange, barrier) = deep_ep::new_ipc_exchange(world_size);
+
+            // Collect device info before spawning threads (avoids borrow conflict).
+            // Cast CUstream to usize to satisfy Send bound (raw ptrs are !Send).
+            let rank_info: Vec<_> = models
+                .iter()
+                .map(|m| {
+                    let ctx = m.device_ctx();
+                    (ctx.device_ordinal, ctx.stream.cu_stream() as usize)
+                })
+                .collect();
+
+            // Allocate buffers and exchange IPC handles in parallel
+            let buffers: Vec<DeepEpBuffer> = thread::scope(|s| {
+                let handles: Vec<_> = rank_info
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, &(device_ordinal, cu_stream_usize))| {
+                        let exchange = Arc::clone(&exchange);
+                        let barrier = Arc::clone(&barrier);
+                        s.spawn(move || -> Result<DeepEpBuffer> {
+                            unsafe {
+                                let err = crate::ffi::cuda_set_device(device_ordinal as i32);
+                                anyhow::ensure!(err == 0, "cuda_set_device failed: {err}");
+                            }
+                            let cu_stream = cu_stream_usize as cudarc::driver::sys::CUstream;
+
+                            let mut buf = DeepEpBuffer::alloc(
+                                rank, world_size, hidden, num_topk, ep_config, cu_stream,
+                            )?;
+                            buf.exchange_ipc_handles(&exchange, &barrier)?;
+                            Ok(buf)
+                        })
+                    })
+                    .collect();
+
+                handles
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, h)| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("rank {} DeepEP init panicked", rank))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+
+            for (model, buf) in models.iter_mut().zip(buffers) {
+                model.deep_ep_buffer = Some(buf);
+            }
+            info!("DeepEP intranode buffers initialized for EP{}", ep_size);
+        }
 
         // Spawn per-rank worker threads
         let mut ranks = Vec::with_capacity(world_size);
