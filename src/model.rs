@@ -13,7 +13,7 @@ pub mod dsv3;
 pub mod qwen3;
 pub mod qwen35;
 
-pub use dsv3::DsV3Model;
+pub use dsv3::{DsV3Executor, DsV3Model, ParallelConfig};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State, TensorParallelConfig};
 pub use qwen35::Qwen35Model;
 

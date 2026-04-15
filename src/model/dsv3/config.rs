@@ -9,6 +9,64 @@ pub(crate) enum FfnType {
     MoE,
 }
 
+// ---------------------------------------------------------------------------
+// Parallel configuration (TP + EP)
+// ---------------------------------------------------------------------------
+
+/// Parallelism configuration for DSV3 multi-GPU inference.
+///
+/// TP (Tensor Parallel): shards attention/dense-FFN weights across ranks,
+///   requires AllReduce after o_proj and down_proj.
+/// EP (Expert Parallel): distributes MoE routed experts across ranks,
+///   requires All-to-All dispatch/combine.
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelConfig {
+    /// Tensor-parallel rank (0-based). TP1 means no sharding.
+    pub tp_rank: usize,
+    pub tp_size: usize,
+    /// Expert-parallel rank (0-based).
+    pub ep_rank: usize,
+    pub ep_size: usize,
+}
+
+impl Default for ParallelConfig {
+    fn default() -> Self {
+        Self {
+            tp_rank: 0,
+            tp_size: 1,
+            ep_rank: 0,
+            ep_size: 1,
+        }
+    }
+}
+
+impl ParallelConfig {
+    /// Number of routed experts assigned to each EP rank.
+    pub fn experts_per_rank(&self, total_experts: usize) -> usize {
+        assert!(
+            total_experts % self.ep_size == 0,
+            "total experts {} not divisible by ep_size {}",
+            total_experts,
+            self.ep_size
+        );
+        total_experts / self.ep_size
+    }
+
+    /// Range of expert indices [start, start + count) for this EP rank.
+    pub fn local_expert_range(&self, total_experts: usize) -> (usize, usize) {
+        let per_rank = self.experts_per_rank(total_experts);
+        (self.ep_rank * per_rank, per_rank)
+    }
+
+    pub fn is_ep_sharded(&self) -> bool {
+        self.ep_size > 1
+    }
+
+    pub fn is_tp_sharded(&self) -> bool {
+        self.tp_size > 1
+    }
+}
+
 /// FP8 block-wise quantization configuration.
 #[derive(Debug, Deserialize)]
 pub(crate) struct QuantizationConfig {

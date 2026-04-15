@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 1 完成 — 前 3 层 MLA + Dense FFN forward 精度对齐（mean_err < 0.1）
+> **Status**: Phase 2a 完成 — TP1 EP8 多卡加载（8x H20，56s 并行加载）
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: Phase 2 — MoE forward + 多卡基础设施（EP8 All-to-All, TP8 权重切分）。
+> **Next action**: Phase 2b — DeepEP intranode 编译集成，或 Phase 2c — MoE routing kernel。
 
 ---
 
@@ -17,7 +17,7 @@
 ## 本地环境速查
 
 - **Python (transformers / 验证脚本)**: `/root/develop/xingming/vllm_test/.venv/bin/python`
-- **模型权重目录**: 通过环境变量 `PEGAINFER_DSV3_MODEL_PATH` 传入
+- **模型权重目录**: `/data/models/DeepSeek-V3.2`（通过环境变量 `PEGAINFER_DSV3_MODEL_PATH` 传入）
 
 ## 并行策略
 
@@ -90,18 +90,35 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 验收：前 3 层 hidden states 与 reference 对齐。✅ 已通过（`dsv3_forward_3_layers` 测试，reference 由 `tools/dsv3_ref/verify_phase1.py` 生成）。
 
-### Phase 2 — MoE Forward（全模型 prefill）
+### Phase 2 — MoE Forward + 多卡（8x H20 prefill）
 
-目标：MoE routing + expert dispatch/combine，全 61 层 prefill forward 跑通。
+目标：8 卡 TP8/EP8 prefill forward 跑通，全 61 层 output logits 与 reference 对齐。
 
-- [ ] Sigmoid gating + TopK-8 routing + normalization
-- [ ] EP8 All-to-All dispatch（token → expert 所在卡）
-- [ ] Expert FFN 计算
-- [ ] EP8 All-to-All combine（结果 → 原卡）
-- [ ] Shared expert 本地计算 + 加回
+#### Phase 2a — 多卡 Executor
+
+- [ ] DSV3 多卡 executor（仿 Qwen3 `Qwen3Executor` 模式：per-rank DeviceContext + RankWorker + WorkerCommand）
+- [ ] NCCL Comm 初始化（`Comm::from_devices()`，用于 attention TP8 AllReduce）
+- [ ] TP8 权重切分加载：attention FP8 row/col shard，Dense FFN FP8 row/col shard
+- [ ] EP8 权重分配加载：每卡加载 32 routed experts（rank×32 到 (rank+1)×32），shared expert 全卡复制
+- [ ] Embedding/norm 权重全卡复制
+
+#### Phase 2b — DeepEP Intranode 集成
+
+- [ ] `build.rs` 编译 DeepEP intranode kernel（`-DDISABLE_NVSHMEM`，SM90，`kNumRanks=8` AOT 实例化）
+- [ ] C wrapper（`csrc/deep_ep.cu`）：Buffer 管理（NVLink buffer alloc + IPC handle exchange + barrier signals）
+- [ ] Rust FFI：`deep_ep_create_buffer` / `deep_ep_dispatch_layout` / `deep_ep_intranode_dispatch` / `deep_ep_intranode_combine`
+- [ ] IPC handle 交换（`cudaIpcGetMemHandle` + 跨线程传递，替代 `torch.distributed.all_gather_object`）
+
+#### Phase 2c — MoE Forward
+
+- [ ] Sigmoid gating + TopK-8 routing + group-limited normalization（`csrc/moe.cu`）
+- [ ] DeepEP dispatch（token → expert 所在卡）
+- [ ] Expert FFN 计算（FP8 grouped GEMM 或 per-expert batched GEMM）
+- [ ] DeepEP combine（结果加权 reduce → 原卡）
+- [ ] Shared expert 本地计算 + 加回（FP8 gate/up/down，同 Dense FFN 但尺寸 2048）
 - [ ] 全模型 prefill logits 对齐
 
-验收：给定 prompt，output logits 与 reference 一致。
+验收：给定 prompt，8 卡 prefill output logits 与 reference 一致。
 
 ### Phase 3 — 生成循环 + 服务化
 
@@ -463,3 +480,105 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | 2026-04-14 | Dense FFN 分离 gate/up | Qwen3 gate_up fused 为一个投影 → `silu_mul_fused_batch_into`。DSV3 gate_proj 和 up_proj 是独立 FP8 权重 → 用 `silu_mul_batch_into`（分离 gate/up 输入）。共享 FP8 量化（normed 只量化一次供两个投影） |
 | 2026-04-15 | Phase 1 验证用 unabsorbed reference | transformers 不支持 DSV3.2，无法用 HF model 做 reference。改为 `tools/dsv3_ref/verify_phase1.py` 手动加载 safetensors + FP8 dequant，走 **unabsorbed** MLA 路径（标准 QKV + attention）做 f32 reference。数学上等价于 absorbed 路径（证明见 doc「Absorption 原理」节）。单 token decode (pos=0) 下 attention 是 trivial 的（softmax=1.0），但验证了全部投影、norm、RoPE、absorption/de-absorption、FFN 残差 |
 | 2026-04-15 | Phase 1 精度阈值 | 3 层 forward mean_err < 0.1，max_err < 5×layer_count。FP8 量化误差在 mean 维度控制良好（0.026 → 0.093），max 维度个别 outlier 达 2.8–3.7（7168 维中 < 0.1% 维度），属于 FP8 block-scale 正常范围 |
+| 2026-04-15 | DeepEP 做 EP8 All-to-All | DeepSeek 自研 MoE 通信库（`third_party/DeepEP`，MIT 协议）。intranode kernel 通过 NVLink IPC buffer 实现 All-to-All，达 153-158 GB/s（H800 NVLink）。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
+| 2026-04-15 | DeepEP 只用 intranode | 8x H20 单机场景只需 intranode normal kernels（NVLink），编译时 `-DDISABLE_NVSHMEM` 去掉 RDMA 依赖。Low-latency kernels 留给后续 decode 优化 |
+| 2026-04-15 | Prefill 优先 | Phase 2 先跑通 8 卡 prefill，decode 留 Phase 3。prefill 用 intranode normal kernels（支持大 batch），decode 后续视需要引入 low-latency kernels |
+
+## DeepEP Intranode 集成要点
+
+> 后来者看这里，不用重新挖。
+
+### 架构分层
+
+```
+[不用] Python API (deep_ep/buffer.py)        ← 依赖 torch.distributed, pybind11
+   ↓
+[不用] Host C++ (csrc/deep_ep.cpp)           ← 依赖 torch::Tensor, ATen, pybind11
+   ↓
+[取]   Kernel API (csrc/kernels/api.cuh)     ← 纯 C 函数签名，参数全是 raw pointer + int
+   ↓
+[取]   CUDA Kernels (csrc/kernels/*.cu)      ← 纯 CUDA，无外部依赖
+```
+
+### 三种模式（只用第一种）
+
+| 模式 | 场景 | 通信方式 | 文件 | 我们用？ |
+|------|------|---------|------|---------|
+| Intranode normal | prefill / training | NVLink IPC | `intranode.cu` | ✅ |
+| Internode normal | 多机 prefill | NVLink + RDMA (NVSHMEM) | `internode.cu` | ✗ |
+| Low-latency | decode | pure RDMA (NVSHMEM) | `internode_ll.cu` | ✗（留 Phase 3） |
+
+### Intranode 数据流
+
+```
+Step 1: get_dispatch_layout(topk_idx, num_experts)
+  → num_tokens_per_rank [8]
+  → is_token_in_rank [num_tokens, 8]
+  → num_tokens_per_expert [256]
+
+Step 2: notify_dispatch(...)  ← NVLink barrier + 交换 token counts
+  → GPU 间通过 IPC buffer 交换 per-rank size prefix matrix
+  → CPU busy-wait 读 mapped host memory 获取 recv count（不兼容 CUDA Graph）
+
+Step 3: intranode::dispatch(x, topk_idx, topk_weights, is_token_in_rank, ...)
+  → recv_x [num_recv_tokens, hidden]          ← 本卡收到的 tokens
+  → recv_topk_idx [num_recv_tokens, num_topk]  ← 对应 expert indices
+  → recv_topk_weights [num_recv_tokens, num_topk]
+  → recv_src_idx [num_recv_tokens]              ← combine 时用
+  → handle (prefix matrices + send_head)
+
+Step 4: [本地 expert FFN 计算]
+
+Step 5: intranode::combine(x_out, topk_weights, src_idx, handle, ...)
+  → combined_x [num_orig_tokens, hidden]       ← 加权 reduce 回原卡
+```
+
+### Buffer 管理（需重写的 host 侧逻辑）
+
+DeepEP Buffer 构造过程（`deep_ep.cpp` 构造函数）：
+
+1. 每卡 `cudaMalloc` 分配 NVLink buffer（大小由 `Config::get_nvl_buffer_size_hint()` 计算）
+2. `cudaIpcGetMemHandle` 获取本卡 buffer 的 IPC handle
+3. 通过 all_gather 交换 IPC handles（原实现用 `torch.distributed`，我们改为 Rust 线程间直传）
+4. `cudaIpcOpenMemHandle` 打开其他 7 卡的 buffer → `buffer_ptrs[8]`
+5. 上传 `buffer_ptrs` 到 GPU（`buffer_ptrs_gpu`）
+6. 同样方式交换 barrier signal buffer → `barrier_signal_ptrs[8]` / `barrier_signal_ptrs_gpu`
+7. 分配 mapped host memory（`cudaHostAlloc` + `cudaHostGetDevicePointer`）用于 CPU-GPU 同步：
+   - `moe_recv_counter_mapped`：总 recv token count
+   - `moe_recv_expert_counter_mapped`：per-expert recv token count
+8. 分配 workspace（32 MB）
+
+### Kernel 编译选项
+
+```
+-DDISABLE_NVSHMEM          # 去掉 RDMA 依赖
+-DTOPK_IDX_BITS=64         # DSV3 用 int64 topk indices（与 Python 端一致）
+SM90a                       # H20 = SM90
+```
+
+intranode kernel 模板参数 `kNumRanks` 需 AOT 实例化为 8（在 `launch.cuh` 的 `LAUNCH_DISPATCH` 宏展开）。
+
+### Config 参数（8 卡 intranode）
+
+```
+num_sms = 20           # 通信占用的 SM 数（偶数，每 2 个 SM 一个 channel）
+num_max_nvl_chunked_send_tokens = 6    # dispatch config for EP8
+num_max_nvl_chunked_recv_tokens = 256  # dispatch config for EP8
+```
+
+NVLink buffer 大小估算（`get_nvl_buffer_size_hint`）：
+```
+channels = num_sms / 2 = 10
+per_channel = 8 ranks × (2*1+3) ints + 8 × 256 × hidden_bytes + ...
+```
+DSV3 hidden=7168 bf16 → hidden_bytes=14336 → 约 300 MB/卡 NVLink buffer。
+
+### 与 DeepGEMM/FlashMLA 集成对比
+
+| | DeepGEMM | FlashMLA | DeepEP |
+|---|---|---|---|
+| kernel 依赖 | header-only CUTLASS | SM90 MLA kernel | 纯 CUDA + configs.cuh |
+| torch 在 host 侧的角色 | metadata accessor | metadata accessor | **重度使用**（tensor alloc, stream mgmt, IPC exchange） |
+| 我们需要重写的 host 逻辑 | TMA descriptor setup | 3-phase launch 参数计算 | **Buffer 管理 + IPC exchange + CPU-GPU sync** |
+| 编译复杂度 | 高（CUTLASS headers, TMA） | 中 | 低（纯 CUDA runtime） |
+| NVSHMEM 依赖 | 无 | 无 | intranode 无需（`-DDISABLE_NVSHMEM`） |

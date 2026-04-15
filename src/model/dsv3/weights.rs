@@ -5,7 +5,7 @@ use log::{debug, info};
 use std::collections::HashMap;
 use std::time::Instant;
 
-use super::config::{DsV3Config, FfnType};
+use super::config::{DsV3Config, FfnType, ParallelConfig};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_2d, mmap_shards, precompute_yarn_rope,
@@ -121,6 +121,7 @@ pub(super) struct TransformerBlock {
 pub struct DsV3Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: DsV3Config,
+    pub(super) parallel: ParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
@@ -406,7 +407,7 @@ impl DsV3Model {
     /// Load the full model (all layers). Will OOM on a single GPU — intended
     /// for multi-GPU loading where weights are sharded externally.
     pub fn from_safetensors(model_path: &str, device_ordinal: usize) -> Result<Self> {
-        Self::load(model_path, device_ordinal, None)
+        Self::load(model_path, device_ordinal, None, ParallelConfig::default())
     }
 
     /// Load only the first `max_layers` layers. Useful for single-GPU testing.
@@ -415,11 +416,49 @@ impl DsV3Model {
         device_ordinal: usize,
         max_layers: usize,
     ) -> Result<Self> {
-        Self::load(model_path, device_ordinal, Some(max_layers))
+        Self::load(
+            model_path,
+            device_ordinal,
+            Some(max_layers),
+            ParallelConfig::default(),
+        )
     }
 
-    fn load(model_path: &str, device_ordinal: usize, max_layers: Option<usize>) -> Result<Self> {
-        info!("Loading DeepSeek-V3.2 from: {}", model_path);
+    /// Load model with expert-parallel sharding.
+    /// Each rank loads only its slice of routed experts; everything else is replicated.
+    pub fn from_safetensors_parallel(
+        model_path: &str,
+        device_ordinal: usize,
+        parallel: ParallelConfig,
+    ) -> Result<Self> {
+        Self::load(model_path, device_ordinal, None, parallel)
+    }
+
+    /// Load partial model with expert-parallel sharding. For testing.
+    pub fn from_safetensors_partial_parallel(
+        model_path: &str,
+        device_ordinal: usize,
+        max_layers: usize,
+        parallel: ParallelConfig,
+    ) -> Result<Self> {
+        Self::load(model_path, device_ordinal, Some(max_layers), parallel)
+    }
+
+    fn load(
+        model_path: &str,
+        device_ordinal: usize,
+        max_layers: Option<usize>,
+        parallel: ParallelConfig,
+    ) -> Result<Self> {
+        info!(
+            "Loading DeepSeek-V3.2 from: {} (device={}, tp={}/{}, ep={}/{})",
+            model_path,
+            device_ordinal,
+            parallel.tp_rank,
+            parallel.tp_size,
+            parallel.ep_rank,
+            parallel.ep_size,
+        );
         debug!("Initializing GPU device {}", device_ordinal);
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
 
@@ -584,9 +623,11 @@ impl DsV3Model {
                         )?,
                     };
 
-                    // Routed experts
-                    let mut experts = Vec::with_capacity(config.n_routed_experts);
-                    for e in 0..config.n_routed_experts {
+                    // Routed experts — load only this rank's slice under EP
+                    let (expert_start, num_local_experts) =
+                        parallel.local_expert_range(config.n_routed_experts);
+                    let mut experts = Vec::with_capacity(num_local_experts);
+                    for e in expert_start..expert_start + num_local_experts {
                         let ep = format!("{}.experts.{}", mlp_prefix, e);
                         experts.push(ExpertFFN {
                             gate_proj: load_fp8_matrix(
@@ -677,12 +718,24 @@ impl DsV3Model {
             };
 
             let ffn_type = config.layer_types[i];
-            debug!(
-                "Loaded layer {}/{}: {:?}",
-                i + 1,
-                num_layers_to_load,
-                ffn_type,
-            );
+            if ffn_type == FfnType::MoE && parallel.is_ep_sharded() {
+                let (start, count) = parallel.local_expert_range(config.n_routed_experts);
+                debug!(
+                    "Loaded layer {}/{}: {:?} (experts {}..{}, shared)",
+                    i + 1,
+                    num_layers_to_load,
+                    ffn_type,
+                    start,
+                    start + count,
+                );
+            } else {
+                debug!(
+                    "Loaded layer {}/{}: {:?}",
+                    i + 1,
+                    num_layers_to_load,
+                    ffn_type,
+                );
+            }
             layers.push(block);
         }
 
@@ -729,6 +782,7 @@ impl DsV3Model {
         Ok(Self {
             ctx,
             config,
+            parallel,
             embed_tokens,
             lm_head,
             layers,
@@ -744,6 +798,10 @@ impl DsV3Model {
 
     pub(crate) fn device_ctx(&self) -> &DeviceContext {
         &self.ctx
+    }
+
+    pub(crate) fn parallel(&self) -> &ParallelConfig {
+        &self.parallel
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
