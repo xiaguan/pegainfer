@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 1 进行中 — YaRN RoPE cache 已预计算并挂到 DsV3Model，待端到端验证
+> **Status**: Phase 1 完成 — 前 3 层 MLA + Dense FFN forward 精度对齐（mean_err < 0.1）
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP8/EP8。
-> **Next action**: 端到端验证（前 3 层 hidden states vs HF reference）。
+> **Next action**: Phase 2 — MoE forward + 多卡基础设施（EP8 All-to-All, TP8 权重切分）。
 
 ---
 
@@ -85,10 +85,10 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 - [x] MLA CUDA kernels（`csrc/mla.cu`）：partial RMSNorm、k_rope RoPE、q_rope extract+RoPE+copy、KV cache write
 - [x] MLA forward 全流程（`forward.rs`）：Q/KV path + absorption + FlashMLA 3-phase + de-absorption + o_proj + Dense FFN
 - [x] YaRN RoPE cos/sin cache 预计算并挂到 DsV3Model
-- [ ] 端到端验证：前 3 层 hidden states 与 HF reference 对齐
+- [x] 端到端验证：前 3 层 hidden states 与 unabsorbed reference 对齐（Layer 0: mean_err=0.026, Layer 1: 0.093, Layer 2: 0.089）
 - [ ] Prefill path（当前 decode only，bs=1 per request）
 
-验收：前 3 层 logits/hidden states 与 reference 对齐。
+验收：前 3 层 hidden states 与 reference 对齐。✅ 已通过（`dsv3_forward_3_layers` 测试，reference 由 `tools/dsv3_ref/verify_phase1.py` 生成）。
 
 ### Phase 2 — MoE Forward（全模型 prefill）
 
@@ -429,7 +429,7 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | MLA RoPE (q_rope extract+copy) | `ffi::mla_rope_q_copy_cuda` | ✅ 已新增 |
 | Partial RMSNorm (c_kv only) | `ffi::rms_norm_partial_cuda` | ✅ 已新增 |
 | KV cache write (scatter) | `ffi::mla_kv_cache_write_cuda` | ✅ 已新增 |
-| YaRN RoPE cos/sin precompute | — | ❌ 需新增（复用 `precompute_rope`，64d rope_dim） |
+| YaRN RoPE cos/sin precompute | `precompute_yarn_rope` (`weight_loader.rs`) | ✅ 已实现，挂到 `DsV3Model.cos_cache/sin_cache` |
 
 ## 探索方向
 
@@ -461,3 +461,5 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | 2026-04-14 | Partial RMSNorm kernel | kv_a_layernorm 只 norm c_kv 前 512d，保留 k_rope 后 64d。标准 `rms_norm_batch_into` 会 norm 整个 576d。新增 `rms_norm_partial_cuda`（`csrc/mla.cu`）做 sub-range norm |
 | 2026-04-14 | MLA RoPE 用 half-split 格式 | DSV3 用 transformers 标准 `rotate_half`：pairs 是 (x[i], x[i+half_dim])，与 Qwen3 `precompute_rope` 的 cos/sin cache 布局一致。不是 interleaved pairs |
 | 2026-04-14 | Dense FFN 分离 gate/up | Qwen3 gate_up fused 为一个投影 → `silu_mul_fused_batch_into`。DSV3 gate_proj 和 up_proj 是独立 FP8 权重 → 用 `silu_mul_batch_into`（分离 gate/up 输入）。共享 FP8 量化（normed 只量化一次供两个投影） |
+| 2026-04-15 | Phase 1 验证用 unabsorbed reference | transformers 不支持 DSV3.2，无法用 HF model 做 reference。改为 `tools/dsv3_ref/verify_phase1.py` 手动加载 safetensors + FP8 dequant，走 **unabsorbed** MLA 路径（标准 QKV + attention）做 f32 reference。数学上等价于 absorbed 路径（证明见 doc「Absorption 原理」节）。单 token decode (pos=0) 下 attention 是 trivial 的（softmax=1.0），但验证了全部投影、norm、RoPE、absorption/de-absorption、FFN 残差 |
+| 2026-04-15 | Phase 1 精度阈值 | 3 层 forward mean_err < 0.1，max_err < 5×layer_count。FP8 量化误差在 mean 维度控制良好（0.026 → 0.093），max 维度个别 outlier 达 2.8–3.7（7168 维中 < 0.1% 维度），属于 FP8 block-scale 正常范围 |

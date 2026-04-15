@@ -1,0 +1,14 @@
+{
+  "token_id": 1,
+  "position": 0,
+  "num_layers": 3,
+  "hidden_size": 7168,
+  "num_attention_heads": 128,
+  "q_lora_rank": 1536,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "rms_norm_eps": 1e-06,
+  "softmax_mscale": 1.0
+}
