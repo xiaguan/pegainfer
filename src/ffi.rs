@@ -815,6 +815,19 @@ unsafe extern "C" {
         num_recv_buffer_tokens: i32,
     );
 
+    // Barrier + zero NVL buffer + preprocess send_head before combine.
+    pub(crate) fn deep_ep_cached_notify_combine(
+        buffer_ptrs_gpu: *mut *mut std::ffi::c_void,
+        send_head: *mut i32,
+        num_channels: i32,
+        num_recv_tokens: i32,
+        num_memset_int: i32,
+        barrier_signal_ptrs_gpu: *mut *mut i32,
+        rank: i32,
+        num_ranks: i32,
+        stream: CUstream,
+    );
+
     // Combine expert outputs back to source ranks via NVLink.
     pub(crate) fn deep_ep_intranode_combine(
         combined_x: *mut std::ffi::c_void,
@@ -864,6 +877,14 @@ unsafe extern "C" {
         flags: u32,
     ) -> i32;
     pub(crate) fn cudaIpcCloseMemHandle(devptr: *mut std::ffi::c_void) -> i32;
+
+    // Peer device access (intra-process cross-GPU memory access)
+    pub(crate) fn cudaDeviceCanAccessPeer(
+        can_access: *mut i32,
+        device: i32,
+        peer_device: i32,
+    ) -> i32;
+    pub(crate) fn cudaDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> i32;
 
     // Host-mapped memory for CPU-GPU sync
     pub(crate) fn cudaHostAlloc(phost: *mut *mut std::ffi::c_void, size: usize, flags: u32) -> i32;

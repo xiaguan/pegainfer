@@ -741,6 +741,7 @@ fn main() {
             "--compiler-options",
             "-fPIC",
             "-DDISABLE_NVSHMEM",
+            "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
             "-DTOPK_IDX_BITS=64",
         ];
 

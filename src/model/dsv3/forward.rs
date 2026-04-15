@@ -270,6 +270,65 @@ impl MlaForwardBuffers {
 }
 
 impl DsV3Model {
+    /// Full forward pass: embedding → all layers → final norm + lm_head.
+    ///
+    /// Processes tokens sequentially (token-by-token decode) since `forward_layer`
+    /// is decode-only. Each token is processed as bs=1 through all 61 layers,
+    /// building up the KV cache. Logits are returned for the last token only.
+    ///
+    /// `token_ids`: token IDs for this request (len = seq_len).
+    /// `positions`: absolute positions for each token (len = seq_len).
+    /// Returns a reference to the logits buffer `[vocab_size, 1]` inside `bufs`.
+    pub(crate) fn forward_prefill<'a>(
+        &self,
+        token_ids: &[u32],
+        positions: &[i32],
+        kv_state: &mut MlaKvState,
+        bufs: &'a mut MlaForwardBuffers,
+        kv_pool: &MlaKvPool,
+    ) -> Result<&'a HiddenStates> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let seq_len = token_ids.len();
+        assert_eq!(seq_len, positions.len());
+
+        let num_layers = self.layers.len();
+
+        // Process each token sequentially through all layers (token-by-token).
+        // This avoids the need for a prefill attention kernel.
+        for t in 0..seq_len {
+            // Embedding for this single token
+            let token_ids_gpu = ctx.stream.clone_htod(&[token_ids[t]])?;
+            let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, 1)?;
+            hidden.seq_len = 1;
+            crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+
+            let pos = [positions[t]];
+
+            // Forward through all layers for this token
+            let mut kv_refs: Vec<&mut MlaKvState> = vec![kv_state];
+            for layer_idx in 0..num_layers {
+                self.forward_layer(
+                    layer_idx,
+                    &mut hidden,
+                    &mut kv_refs,
+                    &pos,
+                    bufs,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    kv_pool,
+                )?;
+            }
+
+            // Only compute logits for the last token
+            if t == seq_len - 1 {
+                return Ok(self.forward_final(&hidden, bufs));
+            }
+        }
+
+        unreachable!("seq_len must be > 0")
+    }
+
     /// Final projection: RMSNorm → lm_head GEMM → logits.
     ///
     /// Returns a reference to the logits buffer `[vocab_size, bs]` inside `bufs`.
@@ -1157,7 +1216,7 @@ impl DsV3Model {
                     ep_buf.barrier_signal_ptrs_gpu(),
                     rank,
                     ctx.stream.cu_stream(),
-                    ep_config.num_sms,
+                    num_channels, // notify_dispatch expects num_channels, not num_sms
                 );
             }
         }
@@ -1211,7 +1270,7 @@ impl DsV3Model {
                     num_ranks,
                     ctx.stream.cu_stream(),
                     ep_config.num_sms,
-                    ep_config.num_max_nvl_chunked_send_tokens,
+                    ep_config.dispatch_max_send_tokens,
                     ep_config.num_max_nvl_chunked_recv_tokens,
                 );
             }
@@ -1343,6 +1402,34 @@ impl DsV3Model {
         }
 
         // ==================================================================
+        // Step 5.5: cached_notify_combine — barrier + zero NVL buffer for combine
+        // ==================================================================
+        // The combine kernel uses a different buffer layout than dispatch:
+        //   dispatch starts at buffer + kNumRanks² ints (skips rank_prefix_matrix)
+        //   combine starts at buffer + 0
+        // After dispatch, the buffer beginning contains the rank_prefix_matrix
+        // which overlaps combine's channel_head_idx. We must zero the combine
+        // channel control area (head_idx + tail_idx) and preprocess send_head.
+        {
+            let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
+            // combine channel control: 2 arrays of (num_channels * num_ranks) ints
+            let combine_memset_int = 2 * num_channels * num_ranks;
+            unsafe {
+                ffi::deep_ep_cached_notify_combine(
+                    ep_buf.buffer_ptrs_gpu(),
+                    sh_ptr as *mut i32,
+                    num_channels,
+                    num_recv_tokens,
+                    combine_memset_int,
+                    ep_buf.barrier_signal_ptrs_gpu(),
+                    rank,
+                    num_ranks,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        // ==================================================================
         // Step 6: combine — gather expert outputs back to source ranks
         // ==================================================================
         {
@@ -1375,7 +1462,7 @@ impl DsV3Model {
                     num_ranks,
                     ctx.stream.cu_stream(),
                     ep_config.num_sms,
-                    ep_config.num_max_nvl_chunked_send_tokens,
+                    ep_config.combine_max_send_tokens,
                     ep_config.num_max_nvl_chunked_recv_tokens,
                 );
             }

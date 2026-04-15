@@ -6,10 +6,13 @@ use std::thread;
 
 use anyhow::Result;
 use crossbeam_channel as channel;
+use half::bf16;
 use log::info;
 
 use super::config::ParallelConfig;
 use super::deep_ep::{self, DeepEpBuffer, DeepEpConfig};
+use super::forward::MlaForwardBuffers;
+use super::mla_kv::{MlaKvPool, MlaKvState};
 use super::weights::DsV3Model;
 use crate::tensor::DeviceContext;
 
@@ -32,6 +35,13 @@ enum RankCommand {
     /// Synchronize — wait for all prior GPU work on this rank to complete.
     Sync {
         resp: channel::Sender<Result<()>>,
+    },
+    /// Run full forward pass (embedding → all layers → logits) and return
+    /// the output logits as host bf16 vec.
+    Forward {
+        token_ids: Arc<Vec<u32>>,
+        positions: Arc<Vec<i32>>,
+        resp: channel::Sender<Result<Vec<bf16>>>,
     },
     Shutdown,
 }
@@ -105,7 +115,7 @@ impl DsV3Executor {
             let num_topk = config.num_experts_per_tok;
             let ep_config = DeepEpConfig::default();
 
-            let (exchange, barrier) = deep_ep::new_ipc_exchange(world_size);
+            let (exchange, barrier) = deep_ep::new_intra_process_exchange(world_size);
 
             // Collect device info before spawning threads (avoids borrow conflict).
             // Cast CUstream to usize to satisfy Send bound (raw ptrs are !Send).
@@ -117,7 +127,7 @@ impl DsV3Executor {
                 })
                 .collect();
 
-            // Allocate buffers and exchange IPC handles in parallel
+            // Allocate buffers and exchange pointers via peer access (intra-process)
             let buffers: Vec<DeepEpBuffer> = thread::scope(|s| {
                 let handles: Vec<_> = rank_info
                     .iter()
@@ -135,7 +145,7 @@ impl DsV3Executor {
                             let mut buf = DeepEpBuffer::alloc(
                                 rank, world_size, hidden, num_topk, ep_config, cu_stream,
                             )?;
-                            buf.exchange_ipc_handles(&exchange, &barrier)?;
+                            buf.exchange_pointers(&exchange, &barrier, device_ordinal as i32)?;
                             Ok(buf)
                         })
                     })
@@ -193,9 +203,43 @@ impl DsV3Executor {
         Ok(())
     }
 
-    /// Get a reference to the model on a specific rank.
-    /// Only valid from the rank's own thread — returns None if called
-    /// from outside. For testing, use the _unchecked variant.
+    /// Run full forward pass across all ranks and return logits from rank 0.
+    ///
+    /// All ranks must participate (DeepEP is collective). Returns logits
+    /// `[vocab_size]` from rank 0 (all ranks produce identical logits for TP1).
+    pub fn forward(&self, token_ids: &[u32], positions: &[i32]) -> Result<Vec<bf16>> {
+        let token_ids = Arc::new(token_ids.to_vec());
+        let positions = Arc::new(positions.to_vec());
+
+        let receivers: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|r| {
+                let (tx, rx) = channel::bounded(1);
+                r.tx.send(RankCommand::Forward {
+                    token_ids: Arc::clone(&token_ids),
+                    positions: Arc::clone(&positions),
+                    resp: tx,
+                })
+                .map_err(|_| anyhow::anyhow!("rank {} channel closed", r.rank))
+                .map(|_| rx)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Collect results — all ranks must complete (collective ops).
+        // Return logits from rank 0.
+        let mut rank0_logits = None;
+        for (rank, rx) in receivers.into_iter().enumerate() {
+            let logits = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("rank {} dropped forward response", rank))??;
+            if rank == 0 {
+                rank0_logits = Some(logits);
+            }
+        }
+        rank0_logits.ok_or_else(|| anyhow::anyhow!("no rank 0 logits"))
+    }
+
     pub fn rank_count(&self) -> usize {
         self.ranks.len()
     }
@@ -233,6 +277,42 @@ fn bind_device(ctx: &DeviceContext) -> Result<()> {
     Ok(())
 }
 
+/// Per-rank state for forward passes (lazily initialized on first Forward).
+struct RankForwardState {
+    bufs: MlaForwardBuffers,
+    kv_pool: MlaKvPool,
+    kv_state: MlaKvState,
+}
+
+impl RankForwardState {
+    fn init(model: &DsV3Model, max_bs: usize) -> Result<Self> {
+        let ctx = model.device_ctx();
+        let config = model.config();
+        let num_layers = model.layers.len();
+
+        let bufs = MlaForwardBuffers::new(ctx, config, max_bs)?;
+        let kv_pool = MlaKvPool::new(
+            ctx,
+            num_layers,
+            config.kv_lora_rank,
+            config.qk_rope_head_dim,
+            64,  // page_size (FlashMLA requires 64)
+            128, // num_pages — enough for ~8K tokens
+        )?;
+        let kv_state = kv_pool.alloc();
+
+        Ok(Self {
+            bufs,
+            kv_pool,
+            kv_state,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.kv_state.reset();
+    }
+}
+
 impl RankHandle {
     fn spawn(rank: usize, model: DsV3Model) -> Result<Self> {
         let (tx, rx) = channel::unbounded();
@@ -244,10 +324,48 @@ impl RankHandle {
                 match bind_device(model.device_ctx()) {
                     Ok(()) => {
                         let _ = startup_tx.send(Ok(()));
+                        let mut fwd_state: Option<RankForwardState> = None;
+
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
                                 RankCommand::Sync { resp } => {
                                     let result = model.device_ctx().sync();
+                                    let _ = resp.send(result);
+                                }
+                                RankCommand::Forward {
+                                    token_ids,
+                                    positions,
+                                    resp,
+                                } => {
+                                    let result = (|| -> Result<Vec<bf16>> {
+                                        // Lazy init forward state on first call
+                                        let state = match &mut fwd_state {
+                                            Some(s) => s,
+                                            None => {
+                                                let max_bs = 64; // generous for prefill
+                                                fwd_state =
+                                                    Some(RankForwardState::init(&model, max_bs)?);
+                                                fwd_state.as_mut().unwrap()
+                                            }
+                                        };
+                                        state.reset();
+
+                                        let logits = model.forward_prefill(
+                                            &token_ids,
+                                            &positions,
+                                            &mut state.kv_state,
+                                            &mut state.bufs,
+                                            &state.kv_pool,
+                                        )?;
+
+                                        // Copy logits to host
+                                        let ctx = model.device_ctx();
+                                        let len = logits.hidden_dim * logits.seq_len;
+                                        let host: Vec<bf16> =
+                                            ctx.stream.clone_dtoh(&logits.data.slice(..len))?;
+                                        ctx.sync()?;
+                                        Ok(host)
+                                    })();
                                     let _ = resp.send(result);
                                 }
                                 RankCommand::Shutdown => break,
@@ -369,5 +487,138 @@ mod tests {
         }
 
         eprintln!("TP1 EP2 partial load verified: rank0 experts 0..128, rank1 experts 128..256");
+    }
+
+    /// Full 61-layer forward on 8 GPUs (TP1 EP8).
+    ///
+    /// Runs token-by-token forward through all layers and compares output
+    /// logits against Python references (generated by gen_logits_ref.py).
+    /// Tests multiple prompts with a single model load.
+    ///
+    /// Requirements:
+    /// - PEGAINFER_DSV3_MODEL_PATH set to model weights directory
+    /// - Reference data in test_data/dsv3_logits_ref/ (run gen_logits_ref.py first)
+    /// - 8x H20 GPUs available
+    #[test]
+    #[ignore]
+    fn dsv3_forward_full_ep8() {
+        let model_path = match get_dsv3_model_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipped: set PEGAINFER_DSV3_MODEL_PATH to run");
+                return;
+            }
+        };
+        crate::logging::init_stderr("info");
+
+        // Load manifest
+        let ref_dir = "test_data/dsv3_logits_ref";
+        let manifest_path = format!("{}/manifest.json", ref_dir);
+        if !std::path::Path::new(&manifest_path).exists() {
+            eprintln!(
+                "Skipped: run 'cd tools/dsv3_ref && \
+                 /root/develop/xingming/vllm_test/.venv/bin/python gen_logits_ref.py \
+                 --model-path <path> --output-dir ../../test_data/dsv3_logits_ref' first"
+            );
+            return;
+        }
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let prompts = manifest["prompts"].as_array().unwrap();
+        eprintln!("{} prompts to verify", prompts.len());
+
+        // Load model (full 61 layers, 8 GPUs) — once for all prompts
+        let device_ordinals: Vec<usize> = (0..8).collect();
+        let executor =
+            DsV3Executor::load(&model_path, &device_ordinals, 1).expect("TP1 EP8 load failed");
+        eprintln!("Model loaded on {} GPUs\n", executor.world_size());
+
+        let mut all_passed = true;
+
+        for entry in prompts {
+            let prompt = entry["prompt"].as_str().unwrap();
+            let token_ids: Vec<u32> = entry["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let ref_generated_id = entry["generated_token_id"].as_u64().unwrap() as usize;
+            let top10_ids: Vec<usize> = entry["top10_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+
+            eprintln!("========================================");
+            eprintln!("Prompt: {:?}  ({} tokens)", prompt, token_ids.len());
+            eprintln!("========================================");
+
+            // Build positions: [0, 1, 2, ..., seq_len-1]
+            let positions: Vec<i32> = (0..token_ids.len() as i32).collect();
+
+            // Run forward
+            let start = std::time::Instant::now();
+            let logits_bf16 = executor
+                .forward(&token_ids, &positions)
+                .expect("forward failed");
+            let elapsed = start.elapsed();
+            eprintln!(
+                "  Forward: {:.2}s ({} tokens x 61 layers)",
+                elapsed.as_secs_f64(),
+                token_ids.len(),
+            );
+
+            // Convert to f32 and find our top-K
+            let logits_f32: Vec<f32> = logits_bf16.iter().map(|x| x.to_f32()).collect();
+            let mut indexed: Vec<(usize, f32)> = logits_f32.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            eprintln!(
+                "  Ours  top-5: {}",
+                indexed[..5]
+                    .iter()
+                    .map(|(id, v)| format!("({}, {:.2})", id, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            eprintln!("  Ref   top-5: {:?}", &top10_ids[..5.min(top10_ids.len())]);
+
+            // Check top-1 (greedy decode token)
+            let top1_match = indexed[0].0 == ref_generated_id;
+            eprintln!(
+                "  Top-1: ours=id{} ref=id{} {}",
+                indexed[0].0,
+                ref_generated_id,
+                if top1_match { "MATCH" } else { "MISMATCH" }
+            );
+
+            // Check top-5 overlap
+            let our_top5: std::collections::HashSet<usize> =
+                indexed.iter().take(5).map(|x| x.0).collect();
+            let ref_top5: std::collections::HashSet<usize> =
+                top10_ids.iter().take(5).copied().collect();
+            let overlap = our_top5.intersection(&ref_top5).count();
+            eprintln!("  Top-5 overlap: {}/5", overlap);
+
+            if !top1_match {
+                eprintln!("  FAILED: top-1 mismatch");
+                all_passed = false;
+            }
+            if overlap < 3 {
+                eprintln!("  FAILED: top-5 overlap < 3");
+                all_passed = false;
+            }
+
+            eprintln!();
+        }
+
+        assert!(all_passed, "Some prompts failed verification");
+        eprintln!(
+            "Phase 2d full forward verification PASSED ({} prompts)",
+            prompts.len()
+        );
     }
 }

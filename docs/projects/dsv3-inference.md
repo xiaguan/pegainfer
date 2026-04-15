@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 2b DeepEP 集成代码完成（编译通过，未测试），Phase 2d final norm + lm_head 完成
+> **Status**: Phase 2d DeepEP combine timeout 调试中
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
-> **Next action**: Phase 2d — Executor forward loop（61 层 `forward_layer` + KV cache per-layer 管理 + 8 rank 同步 DeepEP），然后全模型 logits 对齐。
+> **Next action**: Phase 2d — 修复 DeepEP combine kernel timeout，然后验证 8 卡全模型 logits 对齐。
 
 ---
 
@@ -124,12 +124,50 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 - [x] `forward_moe` 接入 DeepEP dispatch/combine（`forward_moe_ep`，替代 EP1 local-only 路径）
 - [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
-- [ ] Executor forward loop：61 层 `forward_layer` + KV cache per-layer 管理
-- [ ] Token-by-token decode 做验证（避开 prefill attention kernel，逐 token 跑 decode）
-- [ ] 全模型 output logits 与 Python reference 对齐
+- [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV3Executor::forward` 8 rank 并行 dispatch）
+- [ ] **DeepEP combine timeout** — dispatch/combine 跨卡通信 kernel hang，详见下方调试记录
+- [ ] 全模型 output logits 与 Python reference 对齐（`gen_logits_ref.py` 生成 reference，`dsv3_forward_full_ep8` 测试比对）
 - [ ] （可选）Grouped GEMM（DeepGEMM `GroupedContiguous`）替代 per-expert sequential
 
 验收：给定 prompt，8 卡 token-by-token forward output logits 与 reference 一致。
+
+#### DeepEP Combine Timeout 调试记录
+
+**症状**: `dsv3_forward_full_ep8` 在第一个 MoE 层（layer 3）的 combine 阶段 hang ~100s 后 `trap()`，报
+`DeepEP timeout for combine receivers, rank N, responsible_channel = M, expect = -1`。
+随后 `CUDA_ERROR_LAUNCH_FAILED`。每次复现 timeout 的 rank 和 channel 不同。
+
+**已修复的 bug**:
+
+1. **CUDA IPC → Peer Access**（`deep_ep.rs`）
+   - 原实现用 `cudaIpcGetMemHandle` + `cudaIpcOpenMemHandle` 交换 NVLink buffer 指针
+   - 单进程多 GPU 下 IPC 报 error 201 (`cudaErrorDeviceUninitialized`) — IPC 设计给跨进程，跨设备同进程不行
+   - 改为 `cudaDeviceEnablePeerAccess` + 直接共享指针（`IntraProcessExchange`）
+   - 结果：DeepEP init 成功，8 rank 各连 7 peers
+
+2. **notify_dispatch num_channels vs num_sms**（`forward.rs:1219`）
+   - `deep_ep_notify_dispatch` 的 `num_sms` 参数传给 intranode kernel，kernel 直接当 `num_channels` 用
+   - 原代码传 `num_sms=20`，应传 `num_channels=10` (= num_sms/2)
+   - 导致 `channel_prefix_matrix` 越界写（20 channels × 8 ranks = 160 ints，实际只有 10 channels = 80 ints）
+   - 修复后 timeout 从 "rank 0 ch 3" 变为其他 rank/ch，确认修复相关但不充分
+
+3. **dispatch/combine max_send_tokens 混用**（`forward.rs`）
+   - dispatch 和 combine 的 `max_send_tokens` 不同：dispatch=6, combine=4（EP8 intranode config）
+   - 原代码两处都用同一个值 6
+   - 拆分为 `DeepEpConfig { dispatch_max_send_tokens: 6, combine_max_send_tokens: 4 }`
+
+4. **DISABLE_AGGRESSIVE_PTX_INSTRS 编译标志**（`build.rs`）
+   - DeepEP `setup.py` 默认 `-DDISABLE_AGGRESSIVE_PTX_INSTRS`，我们编译时漏了
+   - 没有此标志时 `st_na_global` 用 `st.global.L1::no_allocate`，`ld_nc_global` 用 `ld.global.nc` — 非一致性指令
+   - 已添加到 `build.rs` 的 `deepep_nvcc_base_args`
+   - 但单独加此标志**仍然 timeout**
+
+**当前分析方向**:
+
+- combine receiver 看到的 `channel_tail_idx` 始终为 -1 或 0，说明 dispatch 数据从未到达远端 buffer
+- DeepEP 设计为 IPC buffer（`cudaIpcOpenMemHandle` 映射到本进程地址空间），我们改为 peer access（`cudaDeviceEnablePeerAccess` + 直接指针）
+- 关键疑问：DeepEP 的 ring buffer 协议（`st_release_sys_global` 信号 + `ld_acquire_sys_global` 等待）在 peer access 下是否与 IPC 行为一致？SM90 cooperative kernel launch (`cudaLaunchKernelEx` with cluster dims) 在 peer access 下是否正常？
+- `num_memset_int` 计算可能有偏差（包含不该 memset 的 `prefix_matrix_ints`），但多清零不应导致 hang
 
 ### Phase 3 — 生成循环 + 服务化
 

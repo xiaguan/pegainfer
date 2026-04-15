@@ -22,18 +22,23 @@ const NUM_MAX_LOCAL_EXPERTS: usize = 1024;
 pub(crate) struct DeepEpConfig {
     /// Number of SMs used for communication (even number, each 2 SMs = 1 channel).
     pub num_sms: i32,
-    /// Max tokens that can be sent per chunk (dispatch config).
-    pub num_max_nvl_chunked_send_tokens: i32,
-    /// Max tokens that can be received per chunk.
+    /// Max tokens sent per chunk in dispatch.
+    pub dispatch_max_send_tokens: i32,
+    /// Max tokens sent per chunk in combine.
+    pub combine_max_send_tokens: i32,
+    /// Max tokens that can be received per chunk (shared for dispatch + combine).
     pub num_max_nvl_chunked_recv_tokens: i32,
 }
 
 impl Default for DeepEpConfig {
     fn default() -> Self {
-        // Defaults for EP8 intranode (from DeepEP Python API)
+        // Defaults for EP8 intranode, from DeepEP Python API:
+        //   dispatch: Config(20, 6, 256, 6, 128)
+        //   combine:  Config(20, 4, 256, 6, 128)
         Self {
             num_sms: 20,
-            num_max_nvl_chunked_send_tokens: 6,
+            dispatch_max_send_tokens: 6,
+            combine_max_send_tokens: 4,
             num_max_nvl_chunked_recv_tokens: 256,
         }
     }
@@ -83,11 +88,24 @@ pub(crate) struct DeepEpBuffer {
 unsafe impl Send for DeepEpBuffer {}
 unsafe impl Sync for DeepEpBuffer {}
 
-/// Shared state for IPC handle exchange between ranks.
-pub(crate) struct IpcExchange {
-    buffer_handles: Vec<ffi::CudaIpcMemHandle>,
-    barrier_handles: Vec<ffi::CudaIpcMemHandle>,
+/// Shared state for intra-process pointer exchange between ranks.
+///
+/// In a single-process multi-GPU setup, we can share device pointers
+/// directly instead of going through IPC handles (which are designed
+/// for inter-process sharing and don't work cross-device within the
+/// same process — error 201 cudaErrorDeviceUninitialized).
+pub(crate) struct IntraProcessExchange {
+    /// buffer_ptrs[rank] = raw device pointer to that rank's NVLink buffer
+    buffer_ptrs: Vec<*mut std::ffi::c_void>,
+    /// barrier_ptrs[rank] = raw device pointer to that rank's barrier buffer
+    barrier_ptrs: Vec<*mut std::ffi::c_void>,
+    /// device_ordinals[rank] = CUDA device ordinal for that rank
+    device_ordinals: Vec<i32>,
 }
+
+// Raw pointers inside the exchange are only accessed under Mutex protection
+unsafe impl Send for IntraProcessExchange {}
+unsafe impl Sync for IntraProcessExchange {}
 
 /// Calculate NVLink buffer size for intranode dispatch/combine.
 /// Mirrors `Config::get_nvl_buffer_size_hint()` from DeepEP Python API.
@@ -252,76 +270,65 @@ impl DeepEpBuffer {
         })
     }
 
-    /// Exchange IPC handles between all ranks and open remote buffers.
+    /// Exchange buffer pointers between all ranks (intra-process).
     ///
-    /// Must be called from each rank's thread concurrently. Uses the shared
-    /// `exchange` mutex and `barrier` to coordinate.
-    pub fn exchange_ipc_handles(
+    /// Instead of IPC handles (which require separate processes), we share
+    /// device pointers directly and enable peer access for cross-GPU memory.
+    /// Must be called from each rank's thread concurrently.
+    pub fn exchange_pointers(
         &mut self,
-        exchange: &Arc<Mutex<IpcExchange>>,
+        exchange: &Arc<Mutex<IntraProcessExchange>>,
         barrier: &Arc<Barrier>,
+        device_ordinal: i32,
     ) -> Result<()> {
-        // Step 1: Get our IPC handles and store them in the shared exchange
-        let mut nvl_handle = ffi::CudaIpcMemHandle {
-            reserved: [0u8; 64],
-        };
-        let err = unsafe { ffi::cudaIpcGetMemHandle(&mut nvl_handle, self.nvl_buffer_local) };
-        ensure!(err == 0, "cudaIpcGetMemHandle (NVL) failed: {err}");
-
-        let mut bar_handle = ffi::CudaIpcMemHandle {
-            reserved: [0u8; 64],
-        };
-        let err = unsafe { ffi::cudaIpcGetMemHandle(&mut bar_handle, self.barrier_local) };
-        ensure!(err == 0, "cudaIpcGetMemHandle (barrier) failed: {err}");
-
+        // Step 1: Deposit our local pointers in the shared exchange
         {
             let mut ex = exchange.lock().unwrap();
-            ex.buffer_handles[self.rank] = nvl_handle;
-            ex.barrier_handles[self.rank] = bar_handle;
+            ex.buffer_ptrs[self.rank] = self.nvl_buffer_local;
+            ex.barrier_ptrs[self.rank] = self.barrier_local;
+            ex.device_ordinals[self.rank] = device_ordinal;
         }
 
-        // Step 2: Wait for all ranks to deposit their handles
+        // Step 2: Wait for all ranks to deposit their pointers
         barrier.wait();
 
-        // Step 3: Open remote handles
-        let handles = {
+        // Step 3: Enable peer access to all remote devices and copy pointers
+        let (all_buf_ptrs, all_bar_ptrs) = {
             let ex = exchange.lock().unwrap();
-            (ex.buffer_handles.clone(), ex.barrier_handles.clone())
+            (ex.buffer_ptrs.clone(), ex.barrier_ptrs.clone())
         };
 
         for r in 0..self.num_ranks {
             if r == self.rank {
                 continue;
             }
-            // Open NVLink buffer
-            let mut remote_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            // Enable peer access from our device to the remote device
+            let remote_dev = {
+                let ex = exchange.lock().unwrap();
+                ex.device_ordinals[r]
+            };
+            let mut can_access: i32 = 0;
             let err = unsafe {
-                ffi::cudaIpcOpenMemHandle(
-                    &mut remote_ptr,
-                    handles.0[r],
-                    ffi::CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
-                )
+                ffi::cudaDeviceCanAccessPeer(&mut can_access, device_ordinal, remote_dev)
             };
             ensure!(
                 err == 0,
-                "cudaIpcOpenMemHandle (NVL, rank {r}) failed: {err}"
+                "cudaDeviceCanAccessPeer({device_ordinal}, {remote_dev}) failed: {err}"
             );
-            self.buffer_ptrs[r] = remote_ptr;
+            ensure!(
+                can_access != 0,
+                "device {device_ordinal} cannot access peer device {remote_dev}"
+            );
+            let err = unsafe { ffi::cudaDeviceEnablePeerAccess(remote_dev, 0) };
+            // Error 704 = cudaErrorPeerAccessAlreadyEnabled — that's fine
+            ensure!(
+                err == 0 || err == 704,
+                "cudaDeviceEnablePeerAccess({remote_dev}) from device {device_ordinal} failed: {err}"
+            );
 
-            // Open barrier signal buffer
-            let mut remote_bar: *mut std::ffi::c_void = ptr::null_mut();
-            let err = unsafe {
-                ffi::cudaIpcOpenMemHandle(
-                    &mut remote_bar,
-                    handles.1[r],
-                    ffi::CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
-                )
-            };
-            ensure!(
-                err == 0,
-                "cudaIpcOpenMemHandle (barrier, rank {r}) failed: {err}"
-            );
-            self.barrier_ptrs[r] = remote_bar as *mut i32;
+            // Use the remote pointer directly (same process address space)
+            self.buffer_ptrs[r] = all_buf_ptrs[r];
+            self.barrier_ptrs[r] = all_bar_ptrs[r] as *mut i32;
         }
 
         // Step 4: Upload pointer arrays to GPU
@@ -355,11 +362,11 @@ impl DeepEpBuffer {
         ensure!(err == 0, "cudaMemcpy barrier_ptrs_gpu failed: {err}");
         self.barrier_ptrs_gpu = gpu_bar_ptrs as *mut *mut i32;
 
-        // Step 5: Wait for all ranks to finish opening handles
+        // Step 5: Wait for all ranks to finish
         barrier.wait();
 
         info!(
-            "Rank {}: DeepEP IPC handles exchanged, {} peers connected",
+            "Rank {}: DeepEP peer access enabled, {} peers connected",
             self.rank,
             self.num_ranks - 1
         );
@@ -420,17 +427,10 @@ impl DeepEpBuffer {
 impl Drop for DeepEpBuffer {
     fn drop(&mut self) {
         unsafe {
-            // Close IPC handles for remote ranks
-            for r in 0..self.num_ranks {
-                if r != self.rank {
-                    if !self.buffer_ptrs[r].is_null() {
-                        ffi::cudaIpcCloseMemHandle(self.buffer_ptrs[r]);
-                    }
-                    if !self.barrier_ptrs[r].is_null() {
-                        ffi::cudaIpcCloseMemHandle(self.barrier_ptrs[r] as *mut std::ffi::c_void);
-                    }
-                }
-            }
+            // No IPC handles to close — intra-process peer access uses direct pointers.
+            // Remote buffer_ptrs/barrier_ptrs point into other ranks' allocations
+            // and must NOT be freed here.
+
             // Free GPU pointer arrays
             if !self.buffer_ptrs_gpu.is_null() {
                 ffi::cudaFree(self.buffer_ptrs_gpu as *mut std::ffi::c_void);
@@ -459,21 +459,14 @@ impl Drop for DeepEpBuffer {
     }
 }
 
-/// Create IPC exchange state for a set of ranks.
-pub(crate) fn new_ipc_exchange(num_ranks: usize) -> (Arc<Mutex<IpcExchange>>, Arc<Barrier>) {
-    let exchange = Arc::new(Mutex::new(IpcExchange {
-        buffer_handles: vec![
-            ffi::CudaIpcMemHandle {
-                reserved: [0u8; 64]
-            };
-            num_ranks
-        ],
-        barrier_handles: vec![
-            ffi::CudaIpcMemHandle {
-                reserved: [0u8; 64]
-            };
-            num_ranks
-        ],
+/// Create intra-process exchange state for a set of ranks.
+pub(crate) fn new_intra_process_exchange(
+    num_ranks: usize,
+) -> (Arc<Mutex<IntraProcessExchange>>, Arc<Barrier>) {
+    let exchange = Arc::new(Mutex::new(IntraProcessExchange {
+        buffer_ptrs: vec![ptr::null_mut(); num_ranks],
+        barrier_ptrs: vec![ptr::null_mut(); num_ranks],
+        device_ordinals: vec![0; num_ranks],
     }));
     let barrier = Arc::new(Barrier::new(num_ranks));
     (exchange, barrier)

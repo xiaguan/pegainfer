@@ -156,6 +156,34 @@ extern "C" void deep_ep_intranode_dispatch(
 }
 
 // ============================================================================
+// Intranode cached_notify_combine: barrier + zero buffer + preprocess send_head
+// Must be called between dispatch and combine to reset the NVL buffer layout.
+// ============================================================================
+
+extern "C" void deep_ep_cached_notify_combine(
+    void** buffer_ptrs_gpu,
+    int* send_head,
+    int num_channels,
+    int num_recv_tokens,
+    int num_memset_int,
+    int** barrier_signal_ptrs_gpu,
+    int rank,
+    int num_ranks,
+    cudaStream_t stream)
+{
+    intranode::cached_notify_combine(
+        buffer_ptrs_gpu,
+        send_head,
+        num_channels,
+        num_recv_tokens,
+        num_memset_int,
+        barrier_signal_ptrs_gpu,
+        rank,
+        num_ranks,
+        stream);
+}
+
+// ============================================================================
 // Intranode combine: gather expert outputs back to source ranks
 // ============================================================================
 
