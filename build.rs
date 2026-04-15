@@ -501,8 +501,8 @@ fn main() {
     // DeepGEMM files are compiled separately with SM90a + C++20
     let deepgemm_cuda_files = BTreeSet::from(["fp8_gemm.cu"]);
 
-    // FlashMLA wrapper — compiled separately with SM90a + C++20 + FlashMLA headers
-    let flashmla_cuda_files = BTreeSet::from(["flash_mla.cu"]);
+    // FlashMLA wrappers — compiled separately with SM90a + C++20 + FlashMLA headers
+    let flashmla_cuda_files = BTreeSet::from(["flash_mla.cu", "flash_mla_prefill.cu"]);
 
     // DeepEP wrapper — compiled separately with SM90a + C++17 + DeepEP kernel headers
     let deepep_cuda_files = BTreeSet::from(["deep_ep.cu"]);
@@ -653,9 +653,13 @@ fn main() {
 
         // FlashMLA kernel source files (compiled from third_party)
         let flashmla_kernel_sources = [
+            // Dense decode
             "third_party/FlashMLA/csrc/sm90/decode/dense/instantiations/bf16.cu",
             "third_party/FlashMLA/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
             "third_party/FlashMLA/csrc/smxx/decode/combine/combine.cu",
+            // Sparse prefill (NSA) — d_qk=576 for V3.2
+            "third_party/FlashMLA/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+            "third_party/FlashMLA/csrc/sm90/prefill/sparse/fwd.cu",
         ];
 
         let flashmla_nvcc_base_args = [
@@ -721,7 +725,9 @@ fn main() {
             obj_files.push(obj_file);
         }
 
-        println!("cargo:warning=FlashMLA dense decode compiled for SM90a");
+        println!(
+            "cargo:warning=FlashMLA dense decode + sparse prefill (NSA k576) compiled for SM90a"
+        );
 
         // DeepEP intranode kernels — SM90a + C++17 + DISABLE_NVSHMEM
         let deepep_kernel_sources = [

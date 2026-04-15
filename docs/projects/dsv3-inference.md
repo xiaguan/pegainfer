@@ -126,10 +126,15 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 - [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
 - [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV3Executor::forward` 8 rank 并行 dispatch）
 - [x] **DeepEP combine timeout** — 修复 4 个参数错误后 combine 通过，详见下方调试记录
-- [ ] 全模型 output logits 与 Python reference 对齐（当前 top-5 overlap = 0/5，数值正确性待调查）
+- [ ] **切换到真正 prefill path** — 当前 `forward_prefill` 逐 token 跑 decode kernel，需要：
+  - 编译 FlashMLA SM90 sparse prefill kernel（`d_qk=576, d_v=512`，NSA）
+  - batch embedding + batch GEMM（seq_len > 1）
+  - FlashMLA sparse prefill attention 替换逐 token FlashMLA decode
+  - MoE DeepEP dispatch/combine 支持 batch tokens
+- [ ] 全模型 output logits 与 Python reference 对齐
 - [ ] （可选）Grouped GEMM（DeepGEMM `GroupedContiguous`）替代 per-expert sequential
 
-验收：给定 prompt，8 卡 token-by-token forward output logits 与 reference 一致。
+验收：给定 prompt，8 卡 prefill forward output logits 与 reference 一致。
 
 #### DeepEP Combine Timeout 调试记录
 

@@ -695,6 +695,29 @@ unsafe extern "C" {
     );
 
     // ========================================================================
+    // FlashMLA sparse prefill — NSA (csrc/flash_mla_prefill.cu)
+    // ========================================================================
+
+    pub(crate) fn flash_mla_sparse_prefill(
+        q: *const std::ffi::c_void,  // [s_q, h_q, d_qk] bf16
+        kv: *const std::ffi::c_void, // [s_kv, h_kv, d_qk] bf16
+        indices: *const i32,         // [s_q, h_kv, topk] i32
+        out: *mut std::ffi::c_void,  // [s_q, h_q, d_v] bf16
+        max_logits: *mut f32,        // [s_q, h_q] f32
+        lse: *mut f32,               // [s_q, h_q] f32
+        s_q: i32,
+        s_kv: i32,
+        h_q: i32,
+        h_kv: i32,
+        d_qk: i32,
+        d_v: i32,
+        topk: i32,
+        sm_scale: f32,
+        num_sm: i32,
+        stream: CUstream,
+    );
+
+    // ========================================================================
     // MoE routing + helpers (csrc/moe.cu)
     // ========================================================================
 
