@@ -13,6 +13,7 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
+use log::info;
 
 use super::config::DsV3Config;
 use super::mla_kv::{MlaKvPool, MlaKvState};
@@ -110,8 +111,8 @@ pub(crate) struct MlaForwardBuffers {
     ep_recv_topk_idx: CudaSlice<i64>,
     /// recv_topk_weights: [max_recv_tokens * topk] f32
     ep_recv_topk_weights: CudaSlice<f32>,
-    /// recv_channel_offset: [num_ranks * num_channels] i32
-    ep_recv_channel_offset: CudaSlice<i32>,
+    /// recv_channel_prefix_matrix: [num_ranks * num_channels] i32 — recv-side channel prefix matrix from dispatch
+    ep_recv_channel_prefix_matrix: CudaSlice<i32>,
     /// send_head: [max_tokens * num_ranks] i32
     ep_send_head: CudaSlice<i32>,
     /// combined_x output: [bs * hidden_size] bf16
@@ -208,7 +209,7 @@ impl MlaForwardBuffers {
         let ep_recv_topk_idx: CudaSlice<i64> = ctx.stream.alloc_zeros(max_recv_tokens * topk)?;
         let ep_recv_topk_weights: CudaSlice<f32> =
             ctx.stream.alloc_zeros(max_recv_tokens * topk)?;
-        let ep_recv_channel_offset: CudaSlice<i32> =
+        let ep_recv_channel_prefix_matrix: CudaSlice<i32> =
             ctx.stream.alloc_zeros(num_ranks * num_channels)?;
         let ep_send_head: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * num_ranks)?;
         let ep_combined_x: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_bs * hidden)?;
@@ -260,7 +261,7 @@ impl MlaForwardBuffers {
             ep_recv_src_idx,
             ep_recv_topk_idx,
             ep_recv_topk_weights,
-            ep_recv_channel_offset,
+            ep_recv_channel_prefix_matrix,
             ep_send_head,
             ep_combined_x,
             ep_combined_topk_weights,
@@ -1239,7 +1240,9 @@ impl DsV3Model {
             let (recv_si_ptr, _grs) = bufs.ep_recv_src_idx.device_ptr_mut(&ctx.stream);
             let (recv_ti_ptr, _grt) = bufs.ep_recv_topk_idx.device_ptr_mut(&ctx.stream);
             let (recv_tw_ptr, _grw) = bufs.ep_recv_topk_weights.device_ptr_mut(&ctx.stream);
-            let (recv_co_ptr, _grc) = bufs.ep_recv_channel_offset.device_ptr_mut(&ctx.stream);
+            let (recv_co_ptr, _grc) = bufs
+                .ep_recv_channel_prefix_matrix
+                .device_ptr_mut(&ctx.stream);
             let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
 
             unsafe {
@@ -1274,6 +1277,44 @@ impl DsV3Model {
                     ep_config.num_max_nvl_chunked_recv_tokens,
                 );
             }
+        }
+
+        // Debug: dump dispatch outputs before expert FFN
+        ctx.sync()?;
+        {
+            let rpm_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.rank_prefix_matrix_copy)?;
+            let cpm_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.channel_prefix_matrix)?;
+            let recv_co_host: Vec<i32> =
+                ctx.stream.clone_dtoh(&bufs.ep_recv_channel_prefix_matrix)?;
+            let sh_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.ep_send_head)?;
+            info!(
+                "[rank {}] dispatch done: num_recv_tokens={}, bs={}",
+                rank, num_recv_tokens, bs
+            );
+            info!(
+                "[rank {}] rank_prefix_matrix_copy ({} ints): {:?}",
+                rank,
+                rpm_host.len(),
+                &rpm_host[..rpm_host.len().min(64)]
+            );
+            info!(
+                "[rank {}] channel_prefix_matrix ({} ints): {:?}",
+                rank,
+                cpm_host.len(),
+                &cpm_host[..cpm_host.len().min(64)]
+            );
+            info!(
+                "[rank {}] recv_channel_prefix_matrix ({} ints): {:?}",
+                rank,
+                recv_co_host.len(),
+                &recv_co_host[..recv_co_host.len().min(64)]
+            );
+            info!(
+                "[rank {}] send_head ({} ints, first 64): {:?}",
+                rank,
+                sh_host.len(),
+                &sh_host[..sh_host.len().min(64)]
+            );
         }
 
         // ==================================================================
@@ -1410,6 +1451,9 @@ impl DsV3Model {
         // After dispatch, the buffer beginning contains the rank_prefix_matrix
         // which overlaps combine's channel_head_idx. We must zero the combine
         // channel control area (head_idx + tail_idx) and preprocess send_head.
+        //
+        // num_recv_tokens here = send_head.size(0) = original bs (combine output tokens),
+        // NOT the dispatch recv count. See deep_ep.cpp:798,839.
         {
             let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
             // combine channel control: 2 arrays of (num_channels * num_ranks) ints
@@ -1419,7 +1463,7 @@ impl DsV3Model {
                     ep_buf.buffer_ptrs_gpu(),
                     sh_ptr as *mut i32,
                     num_channels,
-                    num_recv_tokens,
+                    bs as i32,
                     combine_memset_int,
                     ep_buf.barrier_signal_ptrs_gpu(),
                     rank,
@@ -1432,16 +1476,40 @@ impl DsV3Model {
         // ==================================================================
         // Step 6: combine — gather expert outputs back to source ranks
         // ==================================================================
+        // Python handle from dispatch: (rank_prefix_matrix, channel_prefix_matrix,
+        //   recv_channel_prefix_matrix, recv_src_idx, is_recv_token_in_rank, send_head)
+        // Combine unpacks: rank_prefix_matrix, _, channel_prefix_matrix(=recv_channel_prefix_matrix),
+        //   src_idx, ..., send_head
+        // So combine uses:
+        //   topk_weights = ep_recv_topk_weights (dispatch recv space)
+        //   channel_prefix_matrix = ep_recv_channel_prefix_matrix (handle[2], recv-side matrix)
+        //   num_tokens = dispatch recv count (x.size(0) in Python, deep_ep.cpp:797)
+        //   num_recv_tokens = original bs (send_head.size(0) in Python, deep_ep.cpp:798)
         {
+            let dispatch_recv_tokens = num_recv_tokens; // from dispatch: tokens this rank received
+            let combine_output_tokens = bs as i32; // original batch size: tokens to reconstruct
+
             let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
-            let (wt_ptr, _gw) = bufs.topk_weights.device_ptr(&ctx.stream);
+            let (wt_ptr, _gw) = bufs.ep_recv_topk_weights.device_ptr(&ctx.stream);
             let (si_ptr, _gs) = bufs.ep_recv_src_idx.device_ptr(&ctx.stream);
             let (rpm_ptr, _g5) = bufs.rank_prefix_matrix_copy.device_ptr(&ctx.stream);
-            let (cpm_ptr, _g4) = bufs.channel_prefix_matrix.device_ptr(&ctx.stream);
+            let (cpm_ptr, _g4) = bufs.ep_recv_channel_prefix_matrix.device_ptr(&ctx.stream);
             let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
 
             let (combined_ptr, _gc) = bufs.ep_combined_x.device_ptr_mut(&ctx.stream);
             let (combined_wt_ptr, _gcw) = bufs.ep_combined_topk_weights.device_ptr_mut(&ctx.stream);
+
+            info!(
+                "[rank {}] combine: dispatch_recv_tokens={}, combine_output_tokens(bs)={}, hidden={}, topk={}, num_sms={}, max_send={}, max_recv_buf={}",
+                rank,
+                dispatch_recv_tokens,
+                combine_output_tokens,
+                hidden_size,
+                topk,
+                ep_config.num_sms,
+                ep_config.combine_max_send_tokens,
+                ep_config.num_max_nvl_chunked_recv_tokens,
+            );
 
             unsafe {
                 ffi::deep_ep_intranode_combine(
@@ -1453,8 +1521,8 @@ impl DsV3Model {
                     rpm_ptr as *const i32,
                     cpm_ptr as *const i32,
                     sh_ptr as *mut i32,
-                    bs as i32,
-                    num_recv_tokens,
+                    dispatch_recv_tokens, // num_tokens: combine input x dimension
+                    combine_output_tokens, // num_recv_tokens: combine output dimension (original bs)
                     hidden_size as i32,
                     topk as i32,
                     ep_buf.buffer_ptrs_gpu(),

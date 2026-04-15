@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 2d DeepEP combine timeout 调试中
+> **Status**: Phase 2d — 61 层 forward 跑通，logits 对齐待修
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
-> **Next action**: Phase 2d — 修复 DeepEP combine kernel timeout，然后验证 8 卡全模型 logits 对齐。
+> **Next action**: Phase 2d — 修复 output logits 与 vLLM reference 不匹配（top-5 overlap = 0/5）。
 
 ---
 
@@ -125,8 +125,8 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 - [x] `forward_moe` 接入 DeepEP dispatch/combine（`forward_moe_ep`，替代 EP1 local-only 路径）
 - [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
 - [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV3Executor::forward` 8 rank 并行 dispatch）
-- [ ] **DeepEP combine timeout** — dispatch/combine 跨卡通信 kernel hang，详见下方调试记录
-- [ ] 全模型 output logits 与 Python reference 对齐（`gen_logits_ref.py` 生成 reference，`dsv3_forward_full_ep8` 测试比对）
+- [x] **DeepEP combine timeout** — 修复 4 个参数错误后 combine 通过，详见下方调试记录
+- [ ] 全模型 output logits 与 Python reference 对齐（当前 top-5 overlap = 0/5，数值正确性待调查）
 - [ ] （可选）Grouped GEMM（DeepGEMM `GroupedContiguous`）替代 per-expert sequential
 
 验收：给定 prompt，8 卡 token-by-token forward output logits 与 reference 一致。
@@ -162,12 +162,20 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
    - 已添加到 `build.rs` 的 `deepep_nvcc_base_args`
    - 但单独加此标志**仍然 timeout**
 
-**当前分析方向**:
+5. **缺失 `cached_notify_combine` 调用**（`forward.rs`）
+   - dispatch 和 combine 的 NVL buffer layout 不同：dispatch 从 `buffer + kNumRanks² ints` 开始，combine 从 `buffer + 0` 开始
+   - dispatch 写入的 `rank_prefix_matrix` 覆盖了 combine 的 `channel_head_idx` 区域
+   - 需在 dispatch 和 combine 之间调 `cached_notify_combine` 做 barrier + zero + send_head 预处理
+   - 添加 C wrapper (`deep_ep.cu`) + FFI binding (`ffi.rs`) + 调用 (`forward.rs`)
 
-- combine receiver 看到的 `channel_tail_idx` 始终为 -1 或 0，说明 dispatch 数据从未到达远端 buffer
-- DeepEP 设计为 IPC buffer（`cudaIpcOpenMemHandle` 映射到本进程地址空间），我们改为 peer access（`cudaDeviceEnablePeerAccess` + 直接指针）
-- 关键疑问：DeepEP 的 ring buffer 协议（`st_release_sys_global` 信号 + `ld_acquire_sys_global` 等待）在 peer access 下是否与 IPC 行为一致？SM90 cooperative kernel launch (`cudaLaunchKernelEx` with cluster dims) 在 peer access 下是否正常？
-- `num_memset_int` 计算可能有偏差（包含不该 memset 的 `prefix_matrix_ints`），但多清零不应导致 hang
+6. **combine 参数错误**（`forward.rs`，root cause of timeout）
+   - `channel_prefix_matrix`：传了发送侧 `bufs.channel_prefix_matrix` → 应传接收侧 `bufs.ep_recv_channel_prefix_matrix`（handle 第 3 项）
+   - `cached_notify_combine` 的 `num_recv_tokens`：传了 dispatch recv 数 → 应传原始 `bs`（= `send_head.size(0)`，见 `deep_ep.cpp:798,839`）
+   - `num_tokens` / `num_recv_tokens` 两个计数参数对调：`num_tokens` = dispatch recv 数（combine 输入 x），`num_recv_tokens` = 原始 bs（combine 输出）
+   - `topk_weights`：传了原始 `bufs.topk_weights`（bs 空间） → 应传 `bufs.ep_recv_topk_weights`（dispatch recv 空间）
+   - 修复后 61 层 forward 全部跑通（67s），combine 不再 timeout
+
+**已关闭**：combine timeout 问题解决。下一步是 logits 对齐。
 
 ### Phase 3 — 生成循环 + 服务化
 
