@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 struct TritonKernelSpec {
     artifact_dir: &'static str,
@@ -11,6 +12,70 @@ struct TritonKernelSpec {
     out_name: &'static str,
     num_warps: u32,
     num_stages: u32,
+}
+
+struct CommandJob {
+    program: String,
+    args: Vec<String>,
+    display: String,
+    failure_context: String,
+}
+
+fn build_parallelism() -> usize {
+    std::env::var("PEGAINFER_BUILD_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .or_else(|| {
+            std::env::var("NUM_JOBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .or_else(|| thread::available_parallelism().ok().map(|v| v.get()))
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn run_command_job(job: CommandJob) -> Result<(), String> {
+    let output = Command::new(&job.program)
+        .args(&job.args)
+        .output()
+        .map_err(|err| format!("Failed to run {}: {err}", job.display))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{}\nstdout: {}\nstderr: {}",
+        job.failure_context,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    ))
+}
+
+fn run_command_jobs_in_parallel(jobs: Vec<CommandJob>) {
+    let max_jobs = build_parallelism();
+    let mut pending = jobs.into_iter();
+
+    loop {
+        let batch: Vec<_> = pending.by_ref().take(max_jobs).collect();
+        if batch.is_empty() {
+            break;
+        }
+
+        let handles: Vec<_> = batch
+            .into_iter()
+            .map(|job| thread::spawn(move || run_command_job(job)))
+            .collect();
+
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => panic!("{message}"),
+                Err(_) => panic!("parallel build worker panicked"),
+            }
+        }
+    }
 }
 
 fn parse_sm_token(raw: &str) -> Option<String> {
@@ -541,6 +606,7 @@ fn main() {
     );
 
     let mut obj_files = Vec::new();
+    let mut nvcc_jobs = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
         let obj_file = out_dir.join(format!("{}_cuda.o", stem));
@@ -568,19 +634,15 @@ fn main() {
             ]);
         }
 
-        let status = Command::new(&nvcc)
-            .args(&nvcc_args)
-            .status()
-            .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-        assert!(
-            status.success(),
-            "nvcc compilation failed for {}",
-            cu_file.display()
-        );
-
         obj_files.push(obj_file);
+        nvcc_jobs.push(CommandJob {
+            program: nvcc.clone(),
+            args: nvcc_args,
+            display: format!("nvcc for {}", cu_file.display()),
+            failure_context: format!("nvcc compilation failed for {}", cu_file.display()),
+        });
     }
+    run_command_jobs_in_parallel(nvcc_jobs);
 
     // DeepGEMM FP8 GEMM — SM90a only (requires TMA + WGMMA)
     let has_sm90 = sm_targets
@@ -593,6 +655,7 @@ fn main() {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(132);
 
+        let mut deepgemm_jobs = Vec::new();
         for file_name in &deepgemm_cuda_files {
             let cu_file = csrc_dir.join(file_name);
             if !cu_file.exists() {
@@ -601,36 +664,35 @@ fn main() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args([
-                    "-c",
-                    &cu_file.to_string_lossy(),
-                    "-o",
-                    &obj_file.to_string_lossy(),
-                    "-O3",
-                    "-gencode=arch=compute_90a,code=sm_90a",
-                    "--std=c++20",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--compiler-options",
-                    "-fPIC",
-                    "-I",
-                    "third_party/DeepGEMM/deep_gemm/include",
-                    "-I",
-                    "third_party/DeepGEMM/third-party/cutlass/include",
-                    &format!("-DDG_NUM_SMS={}", dg_num_sms),
-                ])
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (DeepGEMM SM90a)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            deepgemm_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    cu_file.to_string_lossy().to_string(),
+                    "-o".to_string(),
+                    obj_file.to_string_lossy().to_string(),
+                    "-O3".to_string(),
+                    "-gencode=arch=compute_90a,code=sm_90a".to_string(),
+                    "--std=c++20".to_string(),
+                    "--expt-relaxed-constexpr".to_string(),
+                    "--expt-extended-lambda".to_string(),
+                    "--compiler-options".to_string(),
+                    "-fPIC".to_string(),
+                    "-I".to_string(),
+                    "third_party/DeepGEMM/deep_gemm/include".to_string(),
+                    "-I".to_string(),
+                    "third_party/DeepGEMM/third-party/cutlass/include".to_string(),
+                    format!("-DDG_NUM_SMS={}", dg_num_sms),
+                ],
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (DeepGEMM SM90a)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(deepgemm_jobs);
 
         println!(
             "cargo:warning=DeepGEMM FP8 GEMM compiled for SM90a (DG_NUM_SMS={})",
@@ -677,28 +739,35 @@ fn main() {
             "-fPIC",
         ];
 
+        let mut flashmla_jobs = Vec::new();
         for source in &flashmla_kernel_sources {
             let cu_file = Path::new(source);
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("flashmla_{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args(["-c", source, "-o", &obj_file.to_string_lossy()])
-                .args(&flashmla_nvcc_base_args)
-                .args(&flashmla_include_args)
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (FlashMLA SM90a)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            let mut args = vec![
+                "-c".to_string(),
+                source.to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+            ];
+            args.extend(flashmla_nvcc_base_args.iter().map(|s| s.to_string()));
+            args.extend(flashmla_include_args.iter().map(|s| s.to_string()));
+            flashmla_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args,
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (FlashMLA SM90a)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(flashmla_jobs);
 
         // FlashMLA C wrapper (csrc/flash_mla.cu)
+        let mut flashmla_wrapper_jobs = Vec::new();
         for file_name in &flashmla_cuda_files {
             let cu_file = csrc_dir.join(file_name);
             if !cu_file.exists() {
@@ -707,26 +776,26 @@ fn main() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args([
-                    "-c",
-                    &cu_file.to_string_lossy(),
-                    "-o",
-                    &obj_file.to_string_lossy(),
-                ])
-                .args(&flashmla_nvcc_base_args)
-                .args(&flashmla_include_args)
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (FlashMLA SM90a)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            let mut args = vec![
+                "-c".to_string(),
+                cu_file.to_string_lossy().to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+            ];
+            args.extend(flashmla_nvcc_base_args.iter().map(|s| s.to_string()));
+            args.extend(flashmla_include_args.iter().map(|s| s.to_string()));
+            flashmla_wrapper_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args,
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (FlashMLA SM90a)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(flashmla_wrapper_jobs);
 
         println!(
             "cargo:warning=FlashMLA dense decode + sparse prefill (NSA k576) compiled for SM90a"
@@ -754,28 +823,35 @@ fn main() {
             "-DTOPK_IDX_BITS=64",
         ];
 
+        let mut deepep_jobs = Vec::new();
         for source in &deepep_kernel_sources {
             let cu_file = Path::new(source);
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("deepep_{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args(["-c", source, "-o", &obj_file.to_string_lossy()])
-                .args(&deepep_nvcc_base_args)
-                .args(&deepep_include_args)
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (DeepEP SM90a)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            let mut args = vec![
+                "-c".to_string(),
+                source.to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+            ];
+            args.extend(deepep_nvcc_base_args.iter().map(|s| s.to_string()));
+            args.extend(deepep_include_args.iter().map(|s| s.to_string()));
+            deepep_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args,
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (DeepEP SM90a)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(deepep_jobs);
 
         // DeepEP C wrapper (csrc/deep_ep.cu)
+        let mut deepep_wrapper_jobs = Vec::new();
         for file_name in &deepep_cuda_files {
             let cu_file = csrc_dir.join(file_name);
             if !cu_file.exists() {
@@ -784,30 +860,31 @@ fn main() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args([
-                    "-c",
-                    &cu_file.to_string_lossy(),
-                    "-o",
-                    &obj_file.to_string_lossy(),
-                ])
-                .args(&deepep_nvcc_base_args)
-                .args(&deepep_include_args)
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (DeepEP SM90a)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            let mut args = vec![
+                "-c".to_string(),
+                cu_file.to_string_lossy().to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+            ];
+            args.extend(deepep_nvcc_base_args.iter().map(|s| s.to_string()));
+            args.extend(deepep_include_args.iter().map(|s| s.to_string()));
+            deepep_wrapper_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args,
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (DeepEP SM90a)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(deepep_wrapper_jobs);
 
         println!("cargo:warning=DeepEP intranode kernels compiled for SM90a");
 
         // SM90a files that only need FP8 intrinsics (no DeepGEMM/CUTLASS headers)
+        let mut sm90_jobs = Vec::new();
         for file_name in &sm90_cuda_files {
             let cu_file = csrc_dir.join(file_name);
             if !cu_file.exists() {
@@ -816,30 +893,29 @@ fn main() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let obj_file = out_dir.join(format!("{}_cuda.o", stem));
 
-            let status = Command::new(&nvcc)
-                .args([
-                    "-c",
-                    &cu_file.to_string_lossy(),
-                    "-o",
-                    &obj_file.to_string_lossy(),
-                    "-O3",
-                    "-gencode=arch=compute_90a,code=sm_90a",
-                    "--std=c++17",
-                    "--expt-relaxed-constexpr",
-                    "--compiler-options",
-                    "-fPIC",
-                ])
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-            assert!(
-                status.success(),
-                "nvcc compilation failed for {} (SM90a FP8)",
-                cu_file.display()
-            );
-
-            obj_files.push(obj_file);
+            obj_files.push(obj_file.clone());
+            sm90_jobs.push(CommandJob {
+                program: nvcc.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    cu_file.to_string_lossy().to_string(),
+                    "-o".to_string(),
+                    obj_file.to_string_lossy().to_string(),
+                    "-O3".to_string(),
+                    "-gencode=arch=compute_90a,code=sm_90a".to_string(),
+                    "--std=c++17".to_string(),
+                    "--expt-relaxed-constexpr".to_string(),
+                    "--compiler-options".to_string(),
+                    "-fPIC".to_string(),
+                ],
+                display: format!("nvcc for {}", cu_file.display()),
+                failure_context: format!(
+                    "nvcc compilation failed for {} (SM90a FP8)",
+                    cu_file.display()
+                ),
+            });
         }
+        run_command_jobs_in_parallel(sm90_jobs);
     } else {
         println!("cargo:warning=Skipping DeepGEMM FP8 GEMM (no SM90+ target detected)");
     }

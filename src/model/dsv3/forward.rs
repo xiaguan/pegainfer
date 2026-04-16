@@ -108,6 +108,8 @@ pub(crate) struct MlaForwardBuffers {
     /// recv_src_idx: [max_recv_tokens] i32
     ep_recv_src_idx: CudaSlice<i32>,
     /// recv_topk_idx: [max_recv_tokens * topk] i64
+    /// DeepEP rewrites these into rank-local expert ids for the receiving rank;
+    /// entries with no local expert are set to -1.
     ep_recv_topk_idx: CudaSlice<i64>,
     /// recv_topk_weights: [max_recv_tokens * topk] f32
     ep_recv_topk_weights: CudaSlice<f32>,
@@ -1783,7 +1785,7 @@ impl DsV3Model {
         let rank = ep_buf.rank();
         let num_ranks = ep_buf.num_ranks();
         let num_channels = ep_config.num_channels();
-        let (ep_start, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
+        let (_, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
 
         // hidden_int4 = hidden_size * sizeof(bf16) / sizeof(int4) = hidden_size * 2 / 16
         let hidden_int4 = (hidden_size * 2 / 16) as i32;
@@ -1985,9 +1987,9 @@ impl DsV3Model {
             )?;
             ctx.sync()?;
 
-            // Process each received token through its designated local expert.
-            // Each recv'd token has topk expert indices, but only the ones in
-            // our local range [ep_start, ep_start + ep_count) should be computed.
+            // Process each received token through its designated local experts.
+            // DeepEP dispatch rewrites recv_topk_idx into rank-local expert ids
+            // for this receiving rank and fills non-local entries with -1.
             for tok in 0..num_recv_tokens as usize {
                 // Create a view of this token in recv_x (row-major from dispatch).
                 // DeepEP dispatch outputs recv_x in row-major: [num_recv_tokens, hidden].
@@ -2003,15 +2005,34 @@ impl DsV3Model {
                 };
                 fp8_quantize_into(ctx, &token_view, &mut bufs.fp8_hidden);
 
+                // This recv slot is the accumulation buffer for local expert outputs.
+                // Zero it once up front so the first valid local expert does not
+                // depend on its original top-k position or on stale input activations.
+                let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
+                let recv_tok_ptr =
+                    (recv_x_ptr + (offset * std::mem::size_of::<bf16>()) as u64) as *mut ffi::Half;
+                unsafe {
+                    ffi::cudaMemsetAsync(
+                        recv_tok_ptr as *mut std::ffi::c_void,
+                        0,
+                        hidden_size * std::mem::size_of::<bf16>(),
+                        ctx.stream.cu_stream(),
+                    );
+                }
+
                 for k in 0..topk {
-                    let expert_idx = recv_topk_idx_host[tok * topk + k] as usize;
+                    let expert_idx = recv_topk_idx_host[tok * topk + k];
                     let weight = recv_topk_wt_host[tok * topk + k];
 
-                    // Skip experts not in our local range
-                    if expert_idx < ep_start || expert_idx >= ep_start + ep_count {
+                    // DeepEP recv_topk_idx is rank-local expert space on the
+                    // receiving rank. Non-local experts are encoded as -1.
+                    if expert_idx < 0 {
                         continue;
                     }
-                    let local_idx = expert_idx - ep_start;
+                    let local_idx = expert_idx as usize;
+                    if local_idx >= ep_count {
+                        continue;
+                    }
                     let expert = &moe.experts[local_idx];
 
                     bufs.moe_gate.seq_len = 1;
@@ -2046,44 +2067,17 @@ impl DsV3Model {
                         &mut bufs.moe_down,
                     );
 
-                    // Write expert output back to recv_x buffer (in-place, weighted).
-                    // For the combine step, we need the expert output in recv_x position.
-                    // Accumulate weighted output into the recv_x slot for this token.
-                    let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
-                    let recv_tok_ptr = (recv_x_ptr + (offset * std::mem::size_of::<bf16>()) as u64)
-                        as *mut ffi::Half;
+                    // Accumulate weighted expert output into the recv_x slot
+                    // for this token; combine will reduce across ranks later.
                     let (e_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
-
-                    if k == 0 {
-                        // First expert for this token: overwrite (not add)
-                        // scale * expert_output → recv_x slot
-                        // We need a fused scale+copy. Use weighted_add with a zeroed destination.
-                        // Simpler: memset the slot to 0, then weighted_add.
-                        unsafe {
-                            ffi::cudaMemsetAsync(
-                                recv_tok_ptr as *mut std::ffi::c_void,
-                                0,
-                                hidden_size * std::mem::size_of::<bf16>(),
-                                ctx.stream.cu_stream(),
-                            );
-                            ffi::moe_weighted_add_cuda(
-                                recv_tok_ptr,
-                                e_ptr as *const ffi::Half,
-                                weight,
-                                hidden_size as i32,
-                                ctx.stream.cu_stream(),
-                            );
-                        }
-                    } else {
-                        unsafe {
-                            ffi::moe_weighted_add_cuda(
-                                recv_tok_ptr,
-                                e_ptr as *const ffi::Half,
-                                weight,
-                                hidden_size as i32,
-                                ctx.stream.cu_stream(),
-                            );
-                        }
+                    unsafe {
+                        ffi::moe_weighted_add_cuda(
+                            recv_tok_ptr,
+                            e_ptr as *const ffi::Half,
+                            weight,
+                            hidden_size as i32,
+                            ctx.stream.cu_stream(),
+                        );
                     }
                 }
             }

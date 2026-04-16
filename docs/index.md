@@ -2,6 +2,7 @@
 
 | Path | TL;DR |
 | --- | --- |
+| `projects/dsv3-offline-accuracy-audit.md` | Active DSV3 offline audit. Latest DeepEP / MoE slice found the highest-risk contract gaps in post-dispatch semantics: local-vs-global `recv_topk_idx`, recv-slot zeroing, pre-weighted combine assumptions, and manual buffer/config reconstruction |
 | `projects/dsv3-inference.md` | DSV3-0324 671B on 8xH20-3e: Phase 2d combine timeout 已修，61 层 forward 跑通。Next: logits 对齐 |
 | `projects/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |
 | `projects/continuous-batching.md` | Phase 1-2 done. Scheduler thread with prefill-priority, batch decode, channel-based streaming. Next: multi-request throughput testing |

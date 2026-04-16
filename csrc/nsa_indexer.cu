@@ -163,9 +163,10 @@ __global__ void indexer_fused_score_topk_kernel(
             logits[best_idx] = -FLT_MAX;
         }
 
-        // Pad with 0 (valid causal position) to avoid OOB reads in sparse prefill
+        // Pad with -1 so FlashMLA sparse prefill treats these entries as invalid.
+        // Padding with 0 would incorrectly re-attend the first token.
         for (int i = k_actual; i < topk; i++) {
-            out[i] = 0;
+            out[i] = -1;
         }
     }
 }
