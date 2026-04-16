@@ -260,15 +260,12 @@ impl DsV3Config {
             yarn_original_max_position_embeddings,
         ) = match &raw.rope_scaling {
             Some(rs) => {
-                let mscale = yarn_get_mscale(rs.factor, rs.mscale);
-                let mscale_all_dim = yarn_get_mscale(rs.factor, rs.mscale_all_dim);
-                let attention_factor = if mscale_all_dim > 0.0 {
-                    mscale / mscale_all_dim
-                } else {
-                    mscale
-                };
+                // DSV3 formula: softmax_scale = q_head_dim^{-0.5} * yarn_mscale²
+                // where yarn_mscale = yarn_get_mscale(factor, mscale_all_dim)
+                let yarn_mscale = yarn_get_mscale(rs.factor, rs.mscale_all_dim);
+                let softmax_mscale_val = yarn_mscale * yarn_mscale;
                 (
-                    attention_factor,
+                    softmax_mscale_val,
                     rs.beta_fast as f32,
                     rs.beta_slow as f32,
                     rs.factor as f32,

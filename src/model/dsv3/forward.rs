@@ -893,19 +893,26 @@ impl DsV3Model {
             &mut bufs.q_compressed,
         );
 
-        let mut q_normed = HiddenStates::zeros(ctx, config.q_lora_rank, bs)?;
-        ops::rms_norm_batch_into(
-            ctx,
-            &bufs.q_compressed,
-            &layer.mla.q_a_layernorm,
-            config.rms_norm_eps,
-            &mut q_normed,
-        );
+        // q_a_layernorm: norm in-place into q_compressed so forward_indexer
+        // reads the post-norm value (same tensor used for q_b_proj below).
+        {
+            let mut q_normed = HiddenStates::zeros(ctx, config.q_lora_rank, bs)?;
+            ops::rms_norm_batch_into(
+                ctx,
+                &bufs.q_compressed,
+                &layer.mla.q_a_layernorm,
+                config.rms_norm_eps,
+                &mut q_normed,
+            );
+            // Copy normed result back to q_compressed for indexer access.
+            ctx.stream
+                .memcpy_dtod(&q_normed.data, &mut bufs.q_compressed.data)?;
+        }
 
         bufs.q_full.seq_len = bs;
         fp8_linear_into(
             ctx,
-            &q_normed,
+            &bufs.q_compressed,
             &layer.mla.q_b_proj,
             &mut bufs.fp8_q_compressed,
             &mut bufs.q_full,

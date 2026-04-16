@@ -118,7 +118,7 @@ void flash_mla_decode(
     params.q_head_stride  = (int64_t)d_k;
 
     // kcache: [num_blocks, 64, h_k, d_k] — contiguous row-major
-    params.k_batch_stride = 0; // not used for paged KV
+    params.k_batch_stride = (int64_t)64 * h_k * d_k; // stride between pages in kcache
     params.k_row_stride   = (int64_t)h_k * d_k;
     params.k_head_stride  = (int64_t)d_k;
 

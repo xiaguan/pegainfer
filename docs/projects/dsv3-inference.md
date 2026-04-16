@@ -1,8 +1,8 @@
 # DeepSeek-V3 推理复现
 
-> **Status**: Phase 2d — 61 层 forward 跑通，logits 对齐待修
+> **Status**: Phase 2d — logits 对齐调试中，已修 3 个确认 bug，仍 0/5
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
-> **Next action**: Phase 2d — 修复 output logits 与 vLLM reference 不匹配（top-5 overlap = 0/5）。
+> **Next action**: 排查 MoE routed expert 路径（疑似 DeepEP combine 与 pre-weighting 双重计权）。
 
 ---
 

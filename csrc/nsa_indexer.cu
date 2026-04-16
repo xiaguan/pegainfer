@@ -163,9 +163,9 @@ __global__ void indexer_fused_score_topk_kernel(
             logits[best_idx] = -FLT_MAX;
         }
 
-        // Pad with -1
+        // Pad with 0 (valid causal position) to avoid OOB reads in sparse prefill
         for (int i = k_actual; i < topk; i++) {
-            out[i] = -1;
+            out[i] = 0;
         }
     }
 }

@@ -350,7 +350,10 @@ impl RankHandle {
                                         };
                                         state.reset();
 
-                                        let logits = if model.config().has_indexer() {
+                                        // TODO: sparse prefill has topk_length issue for short
+                                        // sequences. Use decode path for now to validate logits.
+                                        #[allow(clippy::overly_complex_bool_expr)]
+                                        let logits = if false && model.config().has_indexer() {
                                             model.forward_prefill_sparse(
                                                 &token_ids,
                                                 &positions,
