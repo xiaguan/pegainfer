@@ -207,6 +207,14 @@ pub(crate) struct DsV3Config {
     pub(crate) yarn_factor: f32,
     pub(crate) yarn_original_max_position_embeddings: usize,
 
+    // === NSA Indexer ===
+    /// Indexer head dimension (e.g. 128). None if model has no indexer.
+    pub(crate) index_head_dim: Option<usize>,
+    /// Number of indexer heads (e.g. 64).
+    pub(crate) index_n_heads: Option<usize>,
+    /// Number of top-K KV positions selected per query token (e.g. 2048).
+    pub(crate) index_topk: Option<usize>,
+
     // === FP8 ===
     /// Weight block size for dequantization, e.g. [128, 128]
     pub(crate) weight_block_size: [usize; 2],
@@ -311,6 +319,10 @@ impl DsV3Config {
             yarn_factor,
             yarn_original_max_position_embeddings,
 
+            index_head_dim: raw.index_head_dim,
+            index_n_heads: raw.index_n_heads,
+            index_topk: raw.index_topk,
+
             weight_block_size,
 
             bos_token_id: raw.bos_token_id,
@@ -363,6 +375,11 @@ impl DsV3Config {
     /// Number of MoE layers.
     pub(crate) fn num_moe_layers(&self) -> usize {
         self.num_hidden_layers - self.first_k_dense_replace
+    }
+
+    /// Whether the model has NSA indexer weights.
+    pub(crate) fn has_indexer(&self) -> bool {
+        self.index_head_dim.is_some()
     }
 
     /// Base softmax scale (before YaRN mscale).

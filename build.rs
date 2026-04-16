@@ -657,8 +657,11 @@ fn main() {
             "third_party/FlashMLA/csrc/sm90/decode/dense/instantiations/bf16.cu",
             "third_party/FlashMLA/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
             "third_party/FlashMLA/csrc/smxx/decode/combine/combine.cu",
-            // Sparse prefill (NSA) — d_qk=576 for V3.2
+            // Sparse prefill (NSA) — all instantiations referenced by fwd.cu dispatcher
             "third_party/FlashMLA/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+            "third_party/FlashMLA/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+            "third_party/FlashMLA/csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+            "third_party/FlashMLA/csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
             "third_party/FlashMLA/csrc/sm90/prefill/sparse/fwd.cu",
         ];
 

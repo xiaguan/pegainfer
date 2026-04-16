@@ -695,6 +695,55 @@ unsafe extern "C" {
     );
 
     // ========================================================================
+    // NSA Indexer kernels (csrc/nsa_indexer.cu)
+    // ========================================================================
+
+    /// LayerNorm with bias (bf16). x: [dim, bs] col-major, out: [dim, bs].
+    pub(crate) fn nsa_layernorm_bias_cuda(
+        x: *const std::ffi::c_void,
+        weight: *const std::ffi::c_void,
+        bias: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        dim: i32,
+        bs: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    /// Fused indexer score + causal topk (no [H,T,T] intermediate).
+    /// q: [T, H, D] bf16, k: [T, D] bf16, weights: [T, H] bf16.
+    /// indices: [T, topk] i32 output.
+    /// weight_scale: D^{-0.5} * H^{-0.5}.
+    pub(crate) fn nsa_indexer_fused_score_topk_cuda(
+        q: *const std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        weights: *const std::ffi::c_void,
+        indices: *mut i32,
+        t: i32,
+        h: i32,
+        d: i32,
+        topk: i32,
+        weight_scale: f32,
+        stream: CUstream,
+    );
+
+    /// RoPE for indexer q/k. Applies to first rope_dim dims (indexer layout: rope+nope).
+    /// q: [T, n_heads, head_dim] bf16 in-place.
+    /// k: [T, head_dim] bf16 in-place.
+    pub(crate) fn nsa_indexer_rope_cuda(
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        cos_cache: *const std::ffi::c_void,
+        sin_cache: *const std::ffi::c_void,
+        positions: *const i32,
+        t: i32,
+        n_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        stream: CUstream,
+    );
+
+    // ========================================================================
     // FlashMLA sparse prefill — NSA (csrc/flash_mla_prefill.cu)
     // ========================================================================
 

@@ -60,6 +60,33 @@ pub(super) struct MlaWeights {
 }
 
 // ---------------------------------------------------------------------------
+// NSA Indexer weights (per layer)
+// ---------------------------------------------------------------------------
+
+/// Native Sparse Attention (NSA) indexer weights for one layer.
+///
+/// The indexer computes per-query relevance scores over KV positions:
+///   index_q = wq_b(q_compressed)              → [T, n_heads, head_dim]
+///   index_k = k_norm(wk(hidden))              → [T, head_dim]
+///   weights = weights_proj(hidden)            → [T, n_heads]
+///   score   = sum_h relu(q_h · k) * weights_h → [T, T]
+///   indices = causal_topk(score, topk)         → [T, topk]
+///
+/// Layout: rope(64) + nope(64), NOT the main MLA's nope+rope ordering.
+pub(super) struct IndexerWeights {
+    /// Q projection from q_compressed: FP8 [n_heads * head_dim, q_lora_rank]
+    pub(super) wq_b: Fp8Matrix,
+    /// K projection from hidden: FP8 [head_dim, hidden_size]
+    pub(super) wk: Fp8Matrix,
+    /// LayerNorm weight for k (with bias, NOT RMSNorm): bf16 [head_dim]
+    pub(super) k_norm_weight: DeviceVec,
+    /// LayerNorm bias for k: bf16 [head_dim]
+    pub(super) k_norm_bias: DeviceVec,
+    /// Head-mixing weight projection: bf16 [n_heads, hidden_size]
+    pub(super) weights_proj: DeviceMatrix,
+}
+
+// ---------------------------------------------------------------------------
 // Dense FFN weights (layers 0..first_k_dense_replace)
 // ---------------------------------------------------------------------------
 
@@ -109,6 +136,8 @@ pub(super) struct TransformerBlock {
     pub(super) mla: MlaWeights,
     /// Pre-computed absorbed MLA weights (W_UK, W_UV from kv_b_proj dequant).
     pub(super) absorbed: AbsorbedMlaWeights,
+    /// NSA indexer weights (None if model has no indexer config).
+    pub(super) indexer: Option<IndexerWeights>,
     pub(super) post_attention_layernorm: DeviceVec,
     pub(super) ffn: FfnWeights,
 }
@@ -701,6 +730,47 @@ impl DsV3Model {
                 config.weight_block_size,
             )?;
 
+            // NSA indexer weights (if model has indexer config)
+            let indexer = if config.index_head_dim.is_some() {
+                let idx_prefix = format!("{}.indexer", attn_prefix);
+                Some(IndexerWeights {
+                    wq_b: load_fp8_matrix(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.wq_b.weight", idx_prefix),
+                        &format!("{}.wq_b.weight_scale_inv", idx_prefix),
+                    )?,
+                    wk: load_fp8_matrix(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.wk.weight", idx_prefix),
+                        &format!("{}.wk.weight_scale_inv", idx_prefix),
+                    )?,
+                    k_norm_weight: load_1d_f32_as_bf16(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.k_norm.weight", idx_prefix),
+                    )?,
+                    k_norm_bias: load_1d_f32_as_bf16(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.k_norm.bias", idx_prefix),
+                    )?,
+                    weights_proj: load_tensor_2d(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.weights_proj.weight", idx_prefix),
+                    )?,
+                })
+            } else {
+                None
+            };
+
             let block = TransformerBlock {
                 input_layernorm: load_1d_f32_as_bf16(
                     &ctx,
@@ -710,6 +780,7 @@ impl DsV3Model {
                 )?,
                 mla,
                 absorbed,
+                indexer,
                 post_attention_layernorm: load_1d_f32_as_bf16(
                     &ctx,
                     &shards,

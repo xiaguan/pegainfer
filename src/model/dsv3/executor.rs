@@ -350,13 +350,21 @@ impl RankHandle {
                                         };
                                         state.reset();
 
-                                        let logits = model.forward_prefill(
-                                            &token_ids,
-                                            &positions,
-                                            &mut state.kv_state,
-                                            &mut state.bufs,
-                                            &state.kv_pool,
-                                        )?;
+                                        let logits = if model.config().has_indexer() {
+                                            model.forward_prefill_sparse(
+                                                &token_ids,
+                                                &positions,
+                                                &mut state.bufs,
+                                            )?
+                                        } else {
+                                            model.forward_prefill(
+                                                &token_ids,
+                                                &positions,
+                                                &mut state.kv_state,
+                                                &mut state.bufs,
+                                                &state.kv_pool,
+                                            )?
+                                        };
 
                                         // Copy logits to host
                                         let ctx = model.device_ctx();
