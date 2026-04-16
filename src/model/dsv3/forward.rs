@@ -2068,7 +2068,8 @@ impl DsV3Model {
                     );
 
                     // Accumulate weighted expert output into the recv_x slot
-                    // for this token; combine will reduce across ranks later.
+                    // for this token. Normal DeepEP combine only sums activations
+                    // across ranks, so routed weights must not be passed in again.
                     let (e_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
                     unsafe {
                         ffi::moe_weighted_add_cuda(
@@ -2122,7 +2123,8 @@ impl DsV3Model {
         // Combine unpacks: rank_prefix_matrix, _, channel_prefix_matrix(=recv_channel_prefix_matrix),
         //   src_idx, ..., send_head
         // So combine uses:
-        //   topk_weights = ep_recv_topk_weights (dispatch recv space)
+        //   topk_weights = nullptr because this path has already applied routed
+        //     weights locally into recv_x; normal DeepEP combine only reduces x.
         //   channel_prefix_matrix = ep_recv_channel_prefix_matrix (handle[2], recv-side matrix)
         //   num_tokens = dispatch recv count (x.size(0) in Python, deep_ep.cpp:797)
         //   num_recv_tokens = original bs (send_head.size(0) in Python, deep_ep.cpp:798)
@@ -2131,14 +2133,12 @@ impl DsV3Model {
             let combine_output_tokens = bs as i32; // original batch size: tokens to reconstruct
 
             let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
-            let (wt_ptr, _gw) = bufs.ep_recv_topk_weights.device_ptr(&ctx.stream);
             let (si_ptr, _gs) = bufs.ep_recv_src_idx.device_ptr(&ctx.stream);
             let (rpm_ptr, _g5) = bufs.rank_prefix_matrix_copy.device_ptr(&ctx.stream);
             let (cpm_ptr, _g4) = bufs.ep_recv_channel_prefix_matrix.device_ptr(&ctx.stream);
             let (sh_ptr, _gsh) = bufs.ep_send_head.device_ptr_mut(&ctx.stream);
 
             let (combined_ptr, _gc) = bufs.ep_combined_x.device_ptr_mut(&ctx.stream);
-            let (combined_wt_ptr, _gcw) = bufs.ep_combined_topk_weights.device_ptr_mut(&ctx.stream);
 
             info!(
                 "[rank {}] combine: dispatch_recv_tokens={}, combine_output_tokens(bs)={}, hidden={}, topk={}, num_sms={}, max_send={}, max_recv_buf={}",
@@ -2155,9 +2155,9 @@ impl DsV3Model {
             unsafe {
                 ffi::deep_ep_intranode_combine(
                     combined_ptr as *mut std::ffi::c_void,
-                    combined_wt_ptr as *mut f32,
+                    std::ptr::null_mut(),
                     recv_x_ptr as *const std::ffi::c_void,
-                    wt_ptr as *const f32,
+                    std::ptr::null(),
                     si_ptr as *const i32,
                     rpm_ptr as *const i32,
                     cpm_ptr as *const i32,
@@ -2165,7 +2165,7 @@ impl DsV3Model {
                     dispatch_recv_tokens, // num_tokens: combine input x dimension
                     combine_output_tokens, // num_recv_tokens: combine output dimension (original bs)
                     hidden_size as i32,
-                    topk as i32,
+                    0,
                     ep_buf.buffer_ptrs_gpu(),
                     rank,
                     num_ranks,

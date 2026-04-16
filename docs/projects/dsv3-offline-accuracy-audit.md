@@ -2,7 +2,7 @@
 
 **Created**: 2026-04-16
 **Status**: complete
-**TL;DR**: Broad DSV3 offline audit remains split into focused contract slices. The latest local `vllm` comparison keeps the highest-risk post-embedding gaps concentrated in DeepEP combine weighting/index semantics, absorbed MLA `kv_b_proj` materialization semantics, and missing FP8 block-scale validation.
+**TL;DR**: Broad DSV3 offline audit remains split into focused contract slices. The latest DeepEP / MoE re-check led to a live fix: pegainfer no longer passes `topk_weights` into normal intranode combine after locally pre-weighting routed expert outputs. The remaining source-level risks are now concentrated in `routed_scaling_factor` timing, hardcoded EP8 scratch geometry, and manual DeepEP buffer/layout reconstruction.
 
 ## Preparation
 
@@ -92,6 +92,24 @@
   - The local `vllm` checkout may encode some behavior through fused/custom-op wrappers, so a few contracts may need to be inferred from adjacent call sites instead of one implementation file.
   - Some MLA and EP/MoE behaviors may require reading both Python model code and the custom-op interface to separate semantic mismatches from backend-specific execution details.
 
+### 2026-04-16 DeepEP / MoE Re-check and Additional Bug Hunt
+
+- **Read**:
+  - `docs/index.md` — confirmed this should reuse the existing DSV3 audit doc rather than fork a new project file.
+  - `docs/projects/dsv3-offline-accuracy-audit.md` — recovered the current DeepEP / MoE conclusion, including the two still-open hypotheses around combine weighting and `routed_scaling_factor`.
+  - `docs/projects/dsv3-inference.md` — recovered the previously fixed DeepEP integration bugs so this pass can avoid rediscovering closed parameter-wiring issues.
+- **Relevant history**:
+  - `docs/projects/dsv3-offline-accuracy-audit.md` — the last focused pass already identified local-vs-global `recv_topk_idx`, recv-slot zeroing, pre-weighted combine assumptions, and manual buffer/config reconstruction as the highest-risk MoE items.
+  - `docs/projects/dsv3-inference.md` — prior fixes already covered combine timeout root causes in `cached_notify_combine`, recv-space `topk_weights`, and token-count argument wiring, so remaining issues are more likely to be semantic than gross deadlock bugs.
+- **Plan**:
+  1. Re-read pegainfer MoE / DeepEP integration entry points in `src/model/dsv3/forward.rs`, `src/model/dsv3/deep_ep.rs`, `src/model/dsv3/executor.rs`, `src/ffi.rs`, `csrc/deep_ep.cu`, and `csrc/moe.cu` to reconstruct the exact routing, dispatch, expert-execution, and combine dataflow as it exists now.
+  2. Re-read `third_party/DeepEP` intranode dispatch/combine wrappers, kernel comments, and tests, plus the local `/data/code/workspace-rustllm/vllm` DeepEP MoE path where useful, to verify or refute the two named hypotheses against reference semantics rather than prior summaries.
+  3. Actively search for additional plausible integration bugs in buffer layout, token counts, handle unpacking, send/recv ownership, counter reset, channel/rank prefix semantics, and dispatch/combine ordering; rank only the highest-signal items with exact file references.
+  4. Classify each conclusion as source-level only versus requiring multi-GPU runtime proof, then update this doc and `docs/index.md` with the narrowed verdict.
+- **Risks / open questions**:
+  - Some DeepEP semantics are split across C++ wrappers, CUDA kernels, and Python tests, so a superficial signature-only comparison would miss the strongest evidence.
+  - Several ordering and ownership hazards can be proven suspicious from source, but only a real multi-rank run can fully close them out.
+
 ## Execution Log
 
 ### Step 1: Start offline audit and delegate external contract review
@@ -147,6 +165,25 @@
   - `softmax_scale / softmax_mscale` are caller-owned semantics; FlashMLA will not correct a wrong scale convention.
   - `[NoPE(512), RoPE(64)]` packing is manually maintained in pegainfer without a strong contract assertion.
 - Result: partial success; the sparse-prefill invalid-index semantic mismatch is now a top-tier accuracy suspect alongside DeepEP routed-MoE issues.
+
+### Step 5: Post-fix code inspection after top-1 recovery
+- Observed runtime behavior after the latest DSV3 fixes:
+  - `dsv3_forward_full_ep8` now reaches `Top-1 MATCH`, but still fails the `Top-5 overlap >= 3` guard.
+  - This shifts the remaining problem from a gross routing failure toward a narrower numeric / weighting semantic mismatch.
+- New code-level evidence:
+  - `third_party/DeepEP/deep_ep/buffer.py` documents `combine` as reduction "without weights", while separately returning reduced `recv_topk_weights`.
+  - `third_party/DeepEP/csrc/kernels/intranode.cu` reduces token activations and `topk_weights` in parallel but as distinct outputs.
+  - `vllm`'s `deepep_ll.py` explicitly passes `ones_like(topk_weights)` into combine when router weights were already applied on expert input/output, avoiding a second weighting in combine semantics.
+  - pegainfer still:
+    - applies `weight` inside the local expert loop before writing back into `ep_recv_x`
+    - passes nontrivial `ep_recv_topk_weights` into `deep_ep_intranode_combine`
+    - ignores `ep_combined_topk_weights` after combine returns
+  - `csrc/moe.cu` applies `routed_scaling_factor` during routing, while local `vllm` applies `routed_scaling_factor` after routed experts have been reduced.
+- Current ranking update:
+  1. combine/pre-weight semantics remain the strongest residual suspect
+  2. `routed_scaling_factor` timing is the next most plausible MoE-side source of top-logit drift
+  3. absorbed MLA `kv_b_proj` materialization remains important, but the latest top-1 recovery points more strongly at MoE-side semantics first
+- Result: success; code inspection materially narrowed the remaining fault domain after the latest fix.
 
 ### Step 2: Read pegainfer FP8 / DeepGEMM integration end-to-end
 - Opened `csrc/fp8_gemm.cu`, `csrc/fp8_quantize.cu`, `src/ops/fp8.rs`, `src/model/dsv3/weights.rs`, `src/weight_loader.rs`, `src/model/dsv3/forward.rs`, and `src/ffi.rs`.
@@ -217,8 +254,53 @@
   - Items 1 and 2 are strongly supported by source inspection and small mocked checks, but full runtime proof still needs multi-rank `DeepEP`.
 - Result: success
 
+### Step 7: Re-check the current DeepEP / MoE conclusion and hunt for additional integration bugs
+- Re-opened pegainfer MoE / DeepEP files:
+  - `src/model/dsv3/forward.rs`
+  - `src/model/dsv3/deep_ep.rs`
+  - `csrc/moe.cu`
+  - `csrc/deep_ep.cu`
+- Re-opened upstream/reference files:
+  - `third_party/DeepEP/deep_ep/buffer.py`
+  - `third_party/DeepEP/csrc/kernels/intranode.cu`
+  - `third_party/DeepEP/csrc/deep_ep.cpp`
+  - `third_party/DeepEP/csrc/config.hpp`
+  - `third_party/DeepEP/tests/test_intranode.py`
+  - `third_party/DeepEP/tests/test_low_latency.py`
+  - `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py`
+  - `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py`
+  - `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py`
+  - `/data/code/workspace-rustllm/vllm/vllm/model_executor/models/deepseek_v2.py`
+- Hypothesis verdicts:
+  - Combine double-weighting remains a live source-level bug. Pegainfer still multiplies each local expert output by `recv_topk_weights` inside `forward_moe_ep`, then passes nontrivial `ep_recv_topk_weights` into normal `deep_ep_intranode_combine`, while upstream normal intranode combine is explicitly documented and tested as reduction of activations **without** applying weights and only separately reducing `topk_weights`.
+  - The standalone `routed_scaling_factor` timing suspicion is weaker than previously stated. Local `vllm`'s DeepSeek path sets router-side `routed_scaling_factor=1.0` and scales routed outputs later, while pegainfer bakes the factor into router weights up front. That is a real ordering difference, but because the routed path is still a linear weighted sum, this now looks like a second-order rounding difference rather than a primary semantic-contract bug.
+- Additional integration-risk findings beyond the two named hypotheses:
+  1. `src/model/dsv3/forward.rs` still hardcodes DeepEP scratch geometry to `num_ranks = 8` and `num_channels = 10` during buffer allocation, while runtime uses `ep_buf.config`; today that matches EP8 defaults, but any config drift would silently desynchronize buffer extents from the actual DeepEP launch contract.
+  2. `src/model/dsv3/deep_ep.rs` still hand-reimplements DeepEP NVL buffer sizing/layout instead of deriving it from upstream helpers; the current formula likely over-allocates enough for today’s BF16 intranode path, but it is a fragile maintenance point if DeepEP changes metadata counts, `topk_idx_t`, or scale-buffer assumptions.
+  3. `src/model/dsv3/deep_ep.rs` only resets the total host-mapped recv counter before dispatch, not the per-expert mapped counters; that is harmless in the current forward path because pegainfer never consumes `read_expert_recv_counts()`, but it would become a stale-data bug immediately if later code starts trusting those counters without a full reset.
+- Checked and downgraded several previously suspicious categories:
+  - Handle unpacking and combine prefix semantics now match upstream: pegainfer uses `rank_prefix_matrix_copy`, `ep_recv_channel_prefix_matrix`, and `ep_send_head` in the same roles as `Buffer.combine`.
+  - Dispatch-side local-expert rewriting is now understood correctly in code comments and local expert selection logic; `recv_topk_idx` is treated as rank-local expert space with `-1` for non-local entries.
+  - Dispatch/combine ordering around `cached_notify_combine` matches the upstream expectation for resetting the reused NVL control area.
+- Result: success
+
+### Step 8: Fix normal DeepEP combine weight semantics and rebuild
+- Re-opened `src/model/dsv3/forward.rs` around the routed expert local-execution loop and intranode `combine` call.
+- Kept the existing local pre-weight path in place:
+  - local expert outputs are still accumulated into `ep_recv_x` via `ffi::moe_weighted_add_cuda`
+- Changed normal `deep_ep_intranode_combine` call semantics to match upstream `DeepEP` normal combine:
+  - pass `topk_weights = nullptr`
+  - pass `combined_topk_weights = nullptr`
+  - pass `num_topk = 0`
+  - update the surrounding comments so the next edit does not reintroduce double-weighting
+- Verified the tree still builds with:
+  - `cargo build --release`
+  - Result: `Finished release profile [optimized] target(s) in 8.60s`
+- Result: success
+
 ## Debrief
 - **Outcome**: Completed the requested offline contract slices for both DeepGEMM/FP8 and FlashMLA, each with a ranked shortlist of concrete parity risks tied to exact source locations.
+- **Outcome update**: The strongest remaining source-visible DeepEP bug from this audit has now been patched in `src/model/dsv3/forward.rs`; normal intranode combine no longer receives routed weights after pegainfer has already applied them locally.
 - **Pitfalls encountered**:
   - No local `third_party/vllm` checkout exists, so the comparison stayed anchored on DeepGEMM itself plus the repository’s own DSV3 reference scripts.
   - The current workstation is a 16 GB Blackwell consumer GPU, while the FP8 wrapper under review is explicitly an SM90a path, so runtime validation had to be framed as “possible with model path / target hardware” versus “possible immediately here”.
@@ -232,9 +314,9 @@
 - **Follow-ups**:
   - Add explicit assertions that every FP8 `weight_scale_inv` shape matches `[ceil(rows/128), ceil(cols/128)]` and that `config.weight_block_size == [128, 128]` before any DeepGEMM path is used.
   - Add a parity test that compares `dequant_fp8_to_bf16_host` against PyTorch `float8_e4m3fn` for sampled tensors, especially `kv_b_proj`.
-  - Fix sparse-prefill padding semantics before trusting short-sequence FlashMLA sparse-prefill outputs.
   - Add a contract probe that computes upstream-style `num_sm_parts` and compares dense-decode split metadata against pegainfer's hardcoded `72`.
-  - Add a focused `DeepEP` parity probe that verifies combine consumes router weights exactly once and that recv expert ids are decoded in the same space as local expert storage.
+  - Run `dsv3_forward_full_ep8` again and compare whether the previous `Top-1 MATCH / Top-5 overlap 1/5` gap closes after the combine-weight fix.
+  - Re-check the remaining DeepEP risks only after that rerun: `routed_scaling_factor` timing, hardcoded EP8 scratch geometry, and manual NVL buffer sizing/layout.
 
 ### 2026-04-16 DeepEP / MoE Dispatch-Combine Semantic Slice
 - **Outcome**: Completed a focused pegainfer-vs-DeepEP audit for routed-MoE dispatch/combine semantics and isolated five concrete accuracy-risk mismatches or assumptions.
@@ -247,3 +329,16 @@
 - **Follow-ups**:
   - Fix `src/model/dsv3/forward.rs` so `ep_recv_topk_idx` is interpreted as local expert ids and the recv slot is zeroed on the first valid local expert, not only when `k == 0`.
   - Add a focused EP8 probe modeled on `third_party/DeepEP/tests/test_intranode.py` that validates dispatched `recv_topk_idx`, `recv_topk_weights`, and combined outputs against the expected invariants.
+
+### 2026-04-16 DeepEP / MoE Re-check and Additional Bug Hunt
+- **Outcome**: Re-checked the current DeepEP / MoE conclusion against the live pegainfer tree, `third_party/DeepEP`, and the local `vllm` checkout. The combine/pre-weight suspicion is still confirmed, while the `routed_scaling_factor` timing issue is now best treated as a weaker rounding-order difference instead of the next primary contract bug.
+- **Pitfalls encountered**:
+  - Some earlier notes mixed DeepEP's normal intranode combine semantics with its low-latency combine semantics; the two APIs do not weight activations the same way, so this pass had to keep them separate.
+  - Local `vllm` contains both generic grouped-topk routing behavior and DeepSeek-specific overrides. Looking only at the generic router would have overstated the `routed_scaling_factor` mismatch.
+- **Lessons learned**:
+  - The strongest remaining MoE bug is still entirely source-visible: pegainfer pre-weights routed expert outputs and then feeds the same nontrivial weights into a normal DeepEP combine that only sums activations and separately sums weights.
+  - The current DeepSeek reference path in local `vllm` intentionally sets routed scaling to `1.0` inside the router and restores the factor after routed reduction, so pegainfer's earlier weighting point is not the same implementation strategy, but it is not by itself enough to explain a major drift once double-weighting is removed.
+  - The most credible "new" non-hypothesis risks are now configuration-coupling hazards rather than another obvious semantic mismatch: hardcoded EP8 scratch extents, manual NVL buffer-size reconstruction, and stale expert counters if those counters become live.
+- **Follow-ups**:
+  - Prioritize a minimal EP8 parity probe that checks one token's routed path under normal intranode dispatch/combine with and without pre-weighting, then verifies combined activations and returned `combined_topk_weights` separately.
+  - Once that probe exists, re-test whether any observable logit drift remains from pegainfer's early `routed_scaling_factor` application; that question now needs measurement more than more source reading.
