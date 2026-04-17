@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_precompute_yarn_rope_against_transformers() {
-        // DSV3-like params
+        // DSV3.2-like params
         let head_dim = 64;
         let theta = 10000.0f32;
         let beta_fast = 32.0f32;

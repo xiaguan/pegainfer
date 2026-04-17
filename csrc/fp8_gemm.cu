@@ -12,7 +12,8 @@
 //   - Output is bf16 (not fp32) — the kernel does dequant + accumulation + bf16 cast
 //   - SFB (weight scales) loaded via global memory reads, not TMA
 //   - D (output) TMA descriptor uses bf16 dtype with 128B swizzle
-//   - Template adds kMajorSFB, kSwizzleDMode, kNumLastStages; uses EpilogueIdentity
+//   - Template adds kMajorSFB and kSwizzleDMode; epilogue type lives in
+//     `deep_gemm::epilogue::transform`
 //
 // Kernel header: deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh
 // Compiled with: --std=c++20 -arch=sm_90a
@@ -213,11 +214,8 @@ static int compute_smem_size(
 // num_tma_threads = 128
 // num_multicast = 1 (no multicast for simplicity)
 //
-// kMajorSFB = Major::K — DSV3 checkpoint stores weight scales as
+// kMajorSFB = Major::K — DSV3.2 checkpoint stores weight scales as
 //   [ceil(N/128), ceil(K/128)] with K-chunk as inner/contiguous dimension.
-//
-// kNumLastStages = 0 — not used in the SM90 1D2D kernel body (template param
-//   exists for SM100 compatibility); safe to leave at 0 for AOT.
 //
 // Config 1: BLOCK_M=64,  BLOCK_N=128, 8 stages, 128+128 threads (decode/small M)
 // Config 2: BLOCK_M=128, BLOCK_N=128, 5 stages, 128+256 threads (prefill/large M)
@@ -236,12 +234,12 @@ namespace {
             1,                          // kNumGroups (Normal GEMM)
             64, 128, 128,              // BLOCK_M, BLOCK_N, BLOCK_K
             128, 128, 128,             // kSwizzleAMode, kSwizzleBMode, kSwizzleDMode
-            8, 0,                      // kNumStages, kNumLastStages
+            8,                         // kNumStages
             128, 128,                  // kNumTMAThreads, kNumMathThreads
             1, false,                  // kNumTMAMulticast, kIsTMAMulticastOnA
             DG_NUM_SMS,                // kNumSMs
             GemmType::Normal,          // kGemmType
-            EpilogueIdentity           // epilogue_type_t (identity — no head splits)
+            epilogue::transform::EpilogueIdentity  // identity epilogue
         >);
 
     // Config 2: block_m=128, block_n=128, 5 stages
@@ -252,12 +250,12 @@ namespace {
             1,
             128, 128, 128,
             128, 128, 128,
-            5, 0,
+            5,
             128, 256,                  // block_m > 64 → 2 warpgroups → 256 math threads
             1, false,
             DG_NUM_SMS,
             GemmType::Normal,
-            EpilogueIdentity
+            epilogue::transform::EpilogueIdentity
         >);
 }
 

@@ -214,8 +214,8 @@ extern "C" void deep_ep_intranode_combine(
         combined_topk_weights,
         x,
         topk_weights,
-        nullptr,          // bias_0 — not used for DSV3
-        nullptr,          // bias_1 — not used for DSV3
+        nullptr,          // bias_0 — not used for DSV3.2
+        nullptr,          // bias_1 — not used for DSV3.2
         src_idx,
         rank_prefix_matrix,
         channel_prefix_matrix,

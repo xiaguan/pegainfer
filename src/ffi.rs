@@ -770,7 +770,7 @@ unsafe extern "C" {
     // MoE routing + helpers (csrc/moe.cu)
     // ========================================================================
 
-    // DSV3 MoE routing: sigmoid + bias + group-limited TopK + normalize + scale.
+    // DSV3.2 MoE routing: sigmoid + bias + group-limited TopK + normalize + scale.
     // logits:    bf16 [num_experts, bs] (gate_weight @ normed output)
     // bias:      f32  [num_experts] (e_score_correction_bias)
     // topk_idx:  i32  [bs * topk] output

@@ -3,7 +3,7 @@
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::model::dsv3::Fp8Matrix;
+use crate::model::dsv32::Fp8Matrix;
 use crate::tensor::{DeviceContext, HiddenStates};
 
 /// Scratch buffers for FP8 linear operations.

@@ -8,6 +8,6 @@ pub(crate) mod mla_kv;
 pub(crate) mod weights;
 
 pub use config::ParallelConfig;
-pub use executor::DsV3Executor;
-pub use weights::DsV3Model;
+pub use executor::DsV32Executor;
+pub use weights::DsV32Model;
 pub(crate) use weights::{AbsorbedMlaWeights, Fp8Matrix};

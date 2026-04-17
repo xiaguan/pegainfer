@@ -13,7 +13,7 @@ pub(crate) enum FfnType {
 // Parallel configuration (TP + EP)
 // ---------------------------------------------------------------------------
 
-/// Parallelism configuration for DSV3 multi-GPU inference.
+/// Parallelism configuration for DSV3.2 multi-GPU inference.
 ///
 /// TP (Tensor Parallel): shards attention/dense-FFN weights across ranks,
 ///   requires AllReduce after o_proj and down_proj.
@@ -165,7 +165,7 @@ enum EosTokenIds {
 
 /// DeepSeek-V3.2 model configuration.
 #[derive(Debug)]
-pub(crate) struct DsV3Config {
+pub(crate) struct DsV32Config {
     // === Dimensions ===
     pub(crate) hidden_size: usize,
     /// Dense FFN intermediate size (layers 0..first_k_dense_replace)
@@ -228,7 +228,7 @@ pub(crate) struct DsV3Config {
     pub(crate) layer_types: Vec<FfnType>,
 }
 
-impl DsV3Config {
+impl DsV32Config {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
@@ -260,7 +260,7 @@ impl DsV3Config {
             yarn_original_max_position_embeddings,
         ) = match &raw.rope_scaling {
             Some(rs) => {
-                // DSV3 formula: softmax_scale = q_head_dim^{-0.5} * yarn_mscale²
+                // DSV3.2 formula: softmax_scale = q_head_dim^{-0.5} * yarn_mscale²
                 // where yarn_mscale = yarn_get_mscale(factor, mscale_all_dim)
                 let yarn_mscale = yarn_get_mscale(rs.factor, rs.mscale_all_dim);
                 let softmax_mscale_val = yarn_mscale * yarn_mscale;

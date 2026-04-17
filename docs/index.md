@@ -2,8 +2,8 @@
 
 | Path | TL;DR |
 | --- | --- |
-| `projects/dsv3-offline-accuracy-audit.md` | Complete DSV3 offline audit. Latest DeepEP / MoE re-check led to a live fix: normal intranode combine no longer receives `topk_weights` after local pre-weighting. Remaining source-level risks center on `routed_scaling_factor` timing, hardcoded EP8 geometry, and manual DeepEP buffer/layout reconstruction |
-| `projects/dsv3-inference.md` | DSV3-0324 671B on 8xH20-3e: Phase 2d combine timeout 已修，61 层 forward 跑通。Next: logits 对齐 |
+| `projects/dsv32-offline-accuracy-audit.md` | DSV3.2 离线精度审计摘要（已清理执行日志与中间产物，仅保留关键结论）。 |
+| `projects/dsv32-inference.md` | DeepSeek-V3.2-0324 671B on 8xH20-3e: Phase 2d combine timeout 已修，61 层 forward 跑通。Next: logits 对齐 |
 | `projects/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |
 | `projects/continuous-batching.md` | Phase 1-2 done. Scheduler thread with prefill-priority, batch decode, channel-based streaming. Next: multi-request throughput testing |
 | `projects/q2-2026-plan.md` | Q2 plan: W1 harden batching, W2 PegaInfer+PegaFlow native, W3 differentiation. Competitive intel: Qwen3.5 is both competitors' Achilles' heel, startup time 215s vs seconds, observability as product moat. MTP deferred to Q3 |

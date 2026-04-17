@@ -12,7 +12,7 @@
 //!   layer L:  [page_0 | page_1 | ... | page_{N-1}]
 //!
 //! Each page:  [page_size × kv_dim]  bf16
-//!             = [64 × 576]  for DSV3 (c_KV 512 + k_R 64)
+//!             = [64 × 576]  for DSV3.2 (c_KV 512 + k_R 64)
 //! ```
 
 use std::sync::Arc;
@@ -29,9 +29,9 @@ use crate::tensor::DeviceContext;
 pub(crate) struct MlaKvLayout {
     pub(crate) page_size: usize,
     pub(crate) num_layers: usize,
-    /// kv_lora_rank + qk_rope_head_dim (512 + 64 = 576 for DSV3).
+    /// kv_lora_rank + qk_rope_head_dim (512 + 64 = 576 for DSV3.2).
     pub(crate) kv_dim: usize,
-    /// kv_lora_rank — also FlashMLA's head_size_v (512 for DSV3).
+    /// kv_lora_rank — also FlashMLA's head_size_v (512 for DSV3.2).
     pub(crate) kv_lora_rank: usize,
     /// Elements per page per layer: page_size × kv_dim.
     pub(crate) page_kv_len: usize,
@@ -277,12 +277,12 @@ mod tests {
 
     fn test_pool(page_size: usize, num_pages: usize) -> MlaKvPool {
         let ctx = DeviceContext::new().expect("GPU required for mla_kv tests");
-        // DSV3 dims: kv_lora_rank=512, qk_rope_head_dim=64, 61 layers
+        // DSV3.2 dims: kv_lora_rank=512, qk_rope_head_dim=64, 61 layers
         MlaKvPool::new(&ctx, 61, 512, 64, page_size, num_pages).expect("MlaKvPool::new failed")
     }
 
     #[test]
-    fn layout_geometry_dsv3() {
+    fn layout_geometry_dsv32() {
         let l = MlaKvLayout::new(61, 512, 64, 64);
 
         assert_eq!(l.kv_dim, 576);

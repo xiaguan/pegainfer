@@ -1,4 +1,4 @@
-# DeepSeek-V3 推理复现
+# DeepSeek-V3.2 推理复现
 
 > **Status**: Phase 2d — logits 对齐调试中，已修 3 个确认 bug，仍 0/5
 > **TL;DR**: 在 pegainfer 上复现 DSV3.2 (671B MoE) 8x H20-3e 推理。FP8 权重，MLA + MoE + TP1/EP8。
@@ -10,14 +10,14 @@
 
 8x NVIDIA H20-3e, 每卡 141GB HBM3, 总计 ~1.1TB。NVLink 互联。
 
-- DSV3 FP8 权重 ~671GB → 放完剩 ~460GB 给 KV cache + activation，宽裕
+- DSV3.2 FP8 权重 ~671GB → 放完剩 ~460GB 给 KV cache + activation，宽裕
 - BF16 (~1.34TB) 放不下，**FP8 是必需项**
 - H20 bandwidth-bound (4TB/s HBM)，对 MLA decode 友好
 
 ## 本地环境速查
 
 - **Python (transformers / 验证脚本)**: `/root/develop/xingming/vllm_test/.venv/bin/python`
-- **模型权重目录**: `/data/models/DeepSeek-V3.2`（通过环境变量 `PEGAINFER_DSV3_MODEL_PATH` 传入）
+- **模型权重目录**: `/data/models/DeepSeek-V3.2`（通过环境变量 `PEGAINFER_DSV32_MODEL_PATH` 传入）
 
 ## 并行策略
 
@@ -36,7 +36,7 @@
 - [x] safetensors FP8 权重加载（`Fp8Matrix` 类型：raw e4m3 + block-wise scale_inv）
 - [x] 单卡 partial load 验证（embedding + 4 层，含 1 MoE w/ 256 experts，~15GB VRAM）
 - [ ] cudarc 多 GPU context 管理 — Qwen3 TP 已有蓝本：`DeviceContext::new_with_device(ordinal)` per-rank context, `Qwen3Executor::from_runtime` 多卡初始化流程 (`model_executor.rs:493-559`)
-- [ ] NCCL 通信初始化（8 卡 NVLink 拓扑）— Qwen3 TP 已用 `Comm::from_devices()` + `attach_tp_comm()` 做 AllReduce；DSV3 额外需要 All-to-All (EP)，需确认 cudarc NCCL bindings 是否封装了 `ncclSend`/`ncclRecv`
+- [ ] NCCL 通信初始化（8 卡 NVLink 拓扑）— Qwen3 TP 已用 `Comm::from_devices()` + `attach_tp_comm()` 做 AllReduce；DSV3.2 额外需要 All-to-All (EP)，需确认 cudarc NCCL bindings 是否封装了 `ncclSend`/`ncclRecv`
 - [ ] 权重分发：attention TP8 切分（仿 Qwen3 `load_tensor_2d_row_shard`）, MoE EP8 分配（每卡 32 experts）, shared expert 复制
 
 验收：权重全部上卡，显存占用符合预期。
@@ -69,7 +69,7 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 - [x] Rust FFI 暴露 `fp8_gemm_cuda(a, scale_a, b, scale_b, d, m, n, k, stream)`（d 为 bf16）
 - [x] 在线 activation FP8 量化 kernel（bf16 → fp8 e4m3 + per-token 1×128 block scale）— 从 TRT-LLM `scale_1x128_kernel` 抽取到 `csrc/fp8_quantize.cu`，零外部依赖
 - [x] 单卡 partial load 上验证：embedding → RMSNorm → FP8 quantize → q_a_proj GEMM → 对比 HF reference（max err 1.56e-2, mean err 1.22e-3）
-- [x] 修复 norm 权重加载：DSV3 checkpoint 中 norm 权重为 f32，新增 `load_1d_f32_as_bf16` 做正确转换
+- [x] 修复 norm 权重加载：DSV3.2 checkpoint 中 norm 权重为 f32，新增 `load_1d_f32_as_bf16` 做正确转换
 
 验收：FP8 GEMM 输出与 HF fp8 dequant + matmul 对齐（误差 < 1e-2）。✅ 已通过。
 
@@ -84,11 +84,11 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 - [x] cuBLAS strided batched GEMM（`csrc/linear.cu`）用于 Q absorption / V de-absorption
 - [x] MLA CUDA kernels（`csrc/mla.cu`）：partial RMSNorm、k_rope RoPE、q_rope extract+RoPE+copy、KV cache write
 - [x] MLA forward 全流程（`forward.rs`）：Q/KV path + absorption + FlashMLA 3-phase + de-absorption + o_proj + Dense FFN
-- [x] YaRN RoPE cos/sin cache 预计算并挂到 DsV3Model
+- [x] YaRN RoPE cos/sin cache 预计算并挂到 DsV32Model
 - [x] 端到端验证：前 3 层 hidden states 与 unabsorbed reference 对齐（Layer 0: mean_err=0.026, Layer 1: 0.093, Layer 2: 0.089）
 - [ ] Prefill path（当前 decode only，bs=1 per request）
 
-验收：前 3 层 hidden states 与 reference 对齐。✅ 已通过（`dsv3_forward_3_layers` 测试，reference 由 `tools/dsv3_ref/verify_phase1.py` 生成）。
+验收：前 3 层 hidden states 与 reference 对齐。✅ 已通过（`dsv32_forward_3_layers` 测试；历史离线校验脚本与中间产物已清理）。
 
 ### Phase 2 — MoE Forward + 多卡（8x H20 prefill）
 
@@ -96,7 +96,7 @@ torch 在 DeepGEMM 中仅用于两件事（均可平替）：
 
 #### Phase 2a — 多卡 Executor ✅
 
-- [x] DSV3 多卡 executor（per-rank DeviceContext + 8 线程并行加载，56s）
+- [x] DSV3.2 多卡 executor（per-rank DeviceContext + 8 线程并行加载，56s）
 - [x] EP8 权重分配加载：每卡 32 routed experts + shared expert 全卡复制
 - [x] Embedding/norm/attention 权重全卡复制（TP1：不切分 attention）
 
@@ -108,7 +108,7 @@ EP8 跨卡通信，端到端的唯一硬卡点。
 - [x] C wrapper（`csrc/deep_ep.cu`）：5 个 extern "C" 函数（layout, barrier, notify_dispatch, dispatch, combine）
 - [x] Rust FFI（`ffi.rs`）：DeepEP 5 函数 + CUDA IPC/HostAlloc/Memcpy helpers + i32→i64 cast kernel
 - [x] Buffer 管理（`deep_ep.rs`）：NVLink buffer alloc + IPC handle exchange (Arc<Barrier> + Arc<Mutex<>>) + host-mapped recv counters
-- [x] Executor 集成（`executor.rs`）：EP>1 时并行初始化 DeepEP buffers，挂到 DsV3Model
+- [x] Executor 集成（`executor.rs`）：EP>1 时并行初始化 DeepEP buffers，挂到 DsV32Model
 - [x] Forward 集成（`forward.rs`）：`forward_moe_ep` 实现完整 dispatch→compute→combine pipeline
 
 #### Phase 2c — MoE Forward ✅
@@ -124,7 +124,7 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 - [x] `forward_moe` 接入 DeepEP dispatch/combine（`forward_moe_ep`，替代 EP1 local-only 路径）
 - [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
-- [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV3Executor::forward` 8 rank 并行 dispatch）
+- [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV32Executor::forward` 8 rank 并行 dispatch）
 - [x] **DeepEP combine timeout** — 修复 4 个参数错误后 combine 通过，详见下方调试记录
 - [ ] **切换到真正 prefill path** — 当前 `forward_prefill` 逐 token 跑 decode kernel，需要：
   - 编译 FlashMLA SM90 sparse prefill kernel（`d_qk=576, d_v=512`，NSA）
@@ -136,51 +136,10 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 验收：给定 prompt，8 卡 prefill forward output logits 与 reference 一致。
 
-#### DeepEP Combine Timeout 调试记录
+#### DeepEP 记录（精简）
 
-**症状**: `dsv3_forward_full_ep8` 在第一个 MoE 层（layer 3）的 combine 阶段 hang ~100s 后 `trap()`，报
-`DeepEP timeout for combine receivers, rank N, responsible_channel = M, expect = -1`。
-随后 `CUDA_ERROR_LAUNCH_FAILED`。每次复现 timeout 的 rank 和 channel 不同。
-
-**已修复的 bug**:
-
-1. **CUDA IPC → Peer Access**（`deep_ep.rs`）
-   - 原实现用 `cudaIpcGetMemHandle` + `cudaIpcOpenMemHandle` 交换 NVLink buffer 指针
-   - 单进程多 GPU 下 IPC 报 error 201 (`cudaErrorDeviceUninitialized`) — IPC 设计给跨进程，跨设备同进程不行
-   - 改为 `cudaDeviceEnablePeerAccess` + 直接共享指针（`IntraProcessExchange`）
-   - 结果：DeepEP init 成功，8 rank 各连 7 peers
-
-2. **notify_dispatch num_channels vs num_sms**（`forward.rs:1219`）
-   - `deep_ep_notify_dispatch` 的 `num_sms` 参数传给 intranode kernel，kernel 直接当 `num_channels` 用
-   - 原代码传 `num_sms=20`，应传 `num_channels=10` (= num_sms/2)
-   - 导致 `channel_prefix_matrix` 越界写（20 channels × 8 ranks = 160 ints，实际只有 10 channels = 80 ints）
-   - 修复后 timeout 从 "rank 0 ch 3" 变为其他 rank/ch，确认修复相关但不充分
-
-3. **dispatch/combine max_send_tokens 混用**（`forward.rs`）
-   - dispatch 和 combine 的 `max_send_tokens` 不同：dispatch=6, combine=4（EP8 intranode config）
-   - 原代码两处都用同一个值 6
-   - 拆分为 `DeepEpConfig { dispatch_max_send_tokens: 6, combine_max_send_tokens: 4 }`
-
-4. **DISABLE_AGGRESSIVE_PTX_INSTRS 编译标志**（`build.rs`）
-   - DeepEP `setup.py` 默认 `-DDISABLE_AGGRESSIVE_PTX_INSTRS`，我们编译时漏了
-   - 没有此标志时 `st_na_global` 用 `st.global.L1::no_allocate`，`ld_nc_global` 用 `ld.global.nc` — 非一致性指令
-   - 已添加到 `build.rs` 的 `deepep_nvcc_base_args`
-   - 但单独加此标志**仍然 timeout**
-
-5. **缺失 `cached_notify_combine` 调用**（`forward.rs`）
-   - dispatch 和 combine 的 NVL buffer layout 不同：dispatch 从 `buffer + kNumRanks² ints` 开始，combine 从 `buffer + 0` 开始
-   - dispatch 写入的 `rank_prefix_matrix` 覆盖了 combine 的 `channel_head_idx` 区域
-   - 需在 dispatch 和 combine 之间调 `cached_notify_combine` 做 barrier + zero + send_head 预处理
-   - 添加 C wrapper (`deep_ep.cu`) + FFI binding (`ffi.rs`) + 调用 (`forward.rs`)
-
-6. **combine 参数错误**（`forward.rs`，root cause of timeout）
-   - `channel_prefix_matrix`：传了发送侧 `bufs.channel_prefix_matrix` → 应传接收侧 `bufs.ep_recv_channel_prefix_matrix`（handle 第 3 项）
-   - `cached_notify_combine` 的 `num_recv_tokens`：传了 dispatch recv 数 → 应传原始 `bs`（= `send_head.size(0)`，见 `deep_ep.cpp:798,839`）
-   - `num_tokens` / `num_recv_tokens` 两个计数参数对调：`num_tokens` = dispatch recv 数（combine 输入 x），`num_recv_tokens` = 原始 bs（combine 输出）
-   - `topk_weights`：传了原始 `bufs.topk_weights`（bs 空间） → 应传 `bufs.ep_recv_topk_weights`（dispatch recv 空间）
-   - 修复后 61 层 forward 全部跑通（67s），combine 不再 timeout
-
-**已关闭**：combine timeout 问题解决。下一步是 logits 对齐。
+- combine timeout 相关排查已完成并关闭，当前阶段关注点已转为 logits 对齐。
+- 详细逐步调试日志已从项目文档中清理，仅保留状态与结论。
 
 ### Phase 3 — 生成循环 + 服务化
 
@@ -203,21 +162,21 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 ## 已有基础设施（可复用/参考）
 
-Qwen3 TP 已跑通多卡推理，DSV3 多卡部分可直接参考：
+Qwen3 TP 已跑通多卡推理，DSV3.2 多卡部分可直接参考：
 
-| 组件 | 位置 | DSV3 可复用程度 |
+| 组件 | 位置 | DSV3.2 可复用程度 |
 |------|------|----------------|
 | 多 GPU context 管理 | `DeviceContext::new_with_device()` (`tensor.rs`) | 直接复用 |
 | NCCL comm 初始化 | `Comm::from_devices()` (`model_executor.rs:536`) | 直接复用 AllReduce；All-to-All 需新增 |
-| per-rank worker 线程 | `RankWorker` + `WorkerCommand` (`model_executor.rs:831-923`) | 架构可复用，内部 Lane 换成 DSV3 |
+| per-rank worker 线程 | `RankWorker` + `WorkerCommand` (`model_executor.rs:831-923`) | 架构可复用，内部 Lane 换成 DSV3.2 |
 | TP 权重切分加载 | `load_tensor_2d_row_shard` (`weight_loader.rs:131`) | bf16 column/row shard 可复用；FP8 shard 需新增 |
 | NCCL AllReduce bench | `benches/nccl_bench.rs` | 已有 TP2 PCIe 数据，需补 8 卡 NVLink 数据 |
-| `ModelExecutor` trait | `model_executor.rs:455-464` | DSV3 executor 实现同一 trait |
+| `ModelExecutor` trait | `model_executor.rs:455-464` | DSV3.2 executor 实现同一 trait |
 | `attach_tp_comm` 模式 | `qwen3/weights.rs:392` | 同一模式：load → attach comm → run |
 | DeepGEMM FP8 kernel | `third_party/DeepGEMM/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh` | kernel 直接用；host 侧 TMA setup 已重写（`csrc/fp8_gemm.cu`），bf16 输出 |
 | DeepGEMM grouped GEMM | 同上，`GemmType::GroupedContiguous` / `GroupedMasked` | MoE expert 计算直接可用 |
 | FlashMLA dense decode | `third_party/FlashMLA/csrc/sm90/decode/dense/` | SM90 MLA decode kernel；host 侧 torch 胶水已重写（`csrc/flash_mla.cu`），3-phase: metadata → decode → combine |
-| MLA paged KV cache | `src/model/dsv3/mla_kv.rs` | per-layer paged buffer (page_size=64)，`MlaKvPool`/`MlaKvState`，天然匹配 FlashMLA kcache 格式 |
+| MLA paged KV cache | `src/model/dsv32/mla_kv.rs` | per-layer paged buffer (page_size=64)，`MlaKvPool`/`MlaKvState`，天然匹配 FlashMLA kcache 格式 |
 
 ## DeepGEMM 1D2D 集成要点
 
@@ -235,14 +194,14 @@ Qwen3 TP 已跑通多卡推理，DSV3 多卡部分可直接参考：
 
 **用哪个？** Hopper block-scale FP8 主路径全走 1D2D。SGLang（`deep_gemm_wrapper/entrypoint.py:84`）和 vLLM（`deep_gemm.py:120`）均如此。DeepGEMM 默认 recipe `(1, 128, 128)` 在 `gran_n != 1` 时分派到 1D2D（`gemm.hpp:87`）。1D1D 仅用于 `gran_n==1` (per-channel) 和 k_grouped GEMM — 不是我们的场景。
 
-DSV3 checkpoint 权重 scale 本身就是 2D block-scale `[ceil(N/128), ceil(K/128)]`，天然匹配 1D2D 的 `kMajorSFB = Major::K`。
+DSV3.2 checkpoint 权重 scale 本身就是 2D block-scale `[ceil(N/128), ceil(K/128)]`，天然匹配 1D2D 的 `kMajorSFB = Major::K`。
 
 ### Kernel 模板参数（对比 1D1D）
 
 1D2D 比 1D1D 多三个模板参数：
 
 ```
-kMajorSFB        — cute::UMMA::Major::K (DSV3 权重 scale K-major) 或 Major::MN
+kMajorSFB        — cute::UMMA::Major::K (DSV3.2 权重 scale K-major) 或 Major::MN
 kSwizzleDMode    — BF16 输出的 TMA swizzle: 128 (block_n=128 时)
 kNumLastStages   — SM90 kernel body 不使用，保留给 SM100，AOT 设 0 即可
 epilogue_type_t  — EpilogueIdentity（普通 GEMM）或 EpilogueHeadSplits（MHA 分头）
@@ -433,7 +392,7 @@ V de-absorption: C_h = W_UV_h @ attn_out_h
 
 **为什么用 cuBLAS 不用 DeepGEMM einsum？** Absorption 是标准 bf16 batched GEMM，不涉及 FP8 block-scale 或 TMA descriptor。cuBLAS 已经 init 且对这些尺寸性能好。DeepGEMM einsum 的 JIT 基础设施搬过来工程量大、收益不大。
 
-### FlashMLA 调用参数（DSV3 具体值）
+### FlashMLA 调用参数（DSV3.2 具体值）
 
 ```
 flash_mla_decode(
@@ -477,7 +436,7 @@ MLA 的 RoPE 只作用于 rope 维度（64d），不影响 nope 维度：
 - q_rope: q_full 中每头的 [h*192+128 : h*192+192]（交替排列）
 - k_rope: kv_a 输出的 [512:576]（连续 64d）
 
-DSV3 使用 YaRN RoPE，参数在 config 中。softmax_scale 需要乘 `mscale²`。
+DSV3.2 使用 YaRN RoPE，参数在 config 中。softmax_scale 需要乘 `mscale²`。
 
 ### Dense FFN Forward（前 3 层）
 
@@ -508,7 +467,7 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | MLA RoPE (q_rope extract+copy) | `ffi::mla_rope_q_copy_cuda` | ✅ 已新增 |
 | Partial RMSNorm (c_kv only) | `ffi::rms_norm_partial_cuda` | ✅ 已新增 |
 | KV cache write (scatter) | `ffi::mla_kv_cache_write_cuda` | ✅ 已新增 |
-| YaRN RoPE cos/sin precompute | `precompute_yarn_rope` (`weight_loader.rs`) | ✅ 已实现，挂到 `DsV3Model.cos_cache/sin_cache` |
+| YaRN RoPE cos/sin precompute | `precompute_yarn_rope` (`weight_loader.rs`) | ✅ 已实现，挂到 `DsV32Model.cos_cache/sin_cache` |
 
 ## 探索方向
 
@@ -518,29 +477,29 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 
 | 日期 | 决策 | 理由 |
 |------|------|------|
-| 2026-04-14 | 直接上 DSV3-0324，跳过 DSV2-Lite | 8x H20-3e 141GB 够用，不浪费时间在小模型 |
+| 2026-04-14 | 直接上 DSV3.2-0324，跳过 DSV2-Lite | 8x H20-3e 141GB 够用，不浪费时间在小模型 |
 | 2026-04-14 | FP8 为必需项 | BF16 1.34TB 超过 8 卡 1.1TB 总容量 |
 | 2026-04-14 | TP8 + EP8 | 8 卡环境的自然切分：attention 全卡 TP，MoE 每卡 32 experts |
 | 2026-04-14 | 新增 `Fp8Matrix` 类型 | 现有 `DeviceMatrix` 是 bf16，FP8 需要 raw bytes + block-wise scale_inv 分开存 |
 | 2026-04-14 | partial load 支持 | 671GB 单卡放不下，测试用 `from_safetensors_partial` 只加载前 N 层 |
 | 2026-04-14 | FP8 GEMM 用 DeepGEMM | DeepSeek 自研，专为 128×128 block-scale FP8 优化，SM90 TMA+WGMMA，自带 grouped GEMM (MoE)。kernel header-only 无 torch 依赖，host 侧 torch 胶水可用 CUDA driver API 平替。TRT-LLM fp8_blockscale 底层也是 DeepGEMM，直接依赖源头更干净 |
-| 2026-04-14 | DeepGEMM AOT 编译 | DSV3 矩阵尺寸已知，build.rs nvcc 预编译固定 tile config，不需要运行时 JIT |
+| 2026-04-14 | DeepGEMM AOT 编译 | DSV3.2 矩阵尺寸已知，build.rs nvcc 预编译固定 tile config，不需要运行时 JIT |
 | 2026-04-14 | DeepGEMM 编译选项 | SM90a (`-gencode=arch=compute_90a,code=sm_90a`) + C++20 + `--expt-relaxed-constexpr --expt-extended-lambda`，需要 DeepGEMM 自带 CUTLASS v2.1.1 (不可与 flashinfer 的 v4.4.2 混用) |
 | 2026-04-14 | 两组 tile config | block_m=64/block_n=128/7stages (decode小M) + block_m=128/block_n=128/4stages (prefill大M)，kNumSMs 默认 132 可通过 `PEGAINFER_DG_NUM_SMS` 覆盖 |
-| 2026-04-14 | activation 量化从 TRT-LLM 抽取 | flashinfer 的 `mxfp8_quantize` 是 SM100/SF_VEC=32 格式，不匹配 DeepGEMM 的 1×128 block-scale。flashinfer 自己支持 DSV3 也是靠 TRT-LLM 内嵌的 `scale_1x128_kernel`（`fp8_blockscale_gemm_kernel.cuh`）。直接抽取该 kernel 到 `csrc/fp8_quantize.cu`，去掉所有 TRT-LLM 依赖 |
+| 2026-04-14 | activation 量化从 TRT-LLM 抽取 | flashinfer 的 `mxfp8_quantize` 是 SM100/SF_VEC=32 格式，不匹配 DeepGEMM 的 1×128 block-scale。flashinfer 自己支持 DSV3.2 也是靠 TRT-LLM 内嵌的 `scale_1x128_kernel`（`fp8_blockscale_gemm_kernel.cuh`）。直接抽取该 kernel 到 `csrc/fp8_quantize.cu`，去掉所有 TRT-LLM 依赖 |
 | 2026-04-14 | Scale 布局 K-chunk-major | TRT-LLM `scale_1x128_kernel` 输出 dequant scale 为 `[ceil(K/128), padded(M, 4)]`（K-chunk 维在前，M 维在内），与 DeepGEMM TMA scale descriptor 期望一致。注意不是 `[M, ceil(K/128)]` |
 | 2026-04-14 | GEMM 切 1D2D | SGLang（`deep_gemm_wrapper/entrypoint.py:84`）和 vLLM（`deep_gemm.py:120`）在 Hopper block-scale 主路径均走 1D2D。DeepGEMM 默认 recipe `(1, 128, 128)` 在 `gran_n != 1` 时分派到 `sm90_fp8_gemm_1d2d`（`gemm.hpp:87`），grouped/masked GEMM 在 SM90 写死 1D2D（`gemm.hpp:194,258`）。1D1D 仅用于 `gran_n==1` per-channel 和 k_grouped，不是我们的 case |
-| 2026-04-14 | 1D2D AOT config: 64×128/8stages + 128×128/5stages | 依据 DeepGEMM heuristics (`sm90.hpp`)：block_m<=64 用 1 warpgroup (128 math threads)，否则 2 warpgroups (256)。stages 取 SM90 smem 容量 232448 下的最大值。kMajorSFB=K 匹配 DSV3 checkpoint scale layout，kSwizzleDMode=128 匹配 bf16 block_n=128，kNumLastStages=0 因 SM90 kernel 不使用该参数 |
-| 2026-04-14 | 1D2D 输出 bf16 (非 fp32) | DeepGEMM 1D2D API 强制 `d.scalar_type() == torch::kBFloat16`。kernel 内部 fp32 accumulator → bf16 cast 后经 TMA store 写回。DSV3 forward 后续层本就需要 bf16 输入，省去显式 cast |
-| 2026-04-14 | norm 权重 f32→bf16 转换 | DSV3 checkpoint 中 layernorm 权重存为 f32，而 Qwen3 系列为 bf16。`load_tensor_1d` 直接按 bf16 读会长度翻倍。新增 `load_1d_f32_as_bf16` 做显式转换 |
-| 2026-04-14 | MLA attention 用 FlashMLA | DeepSeek 自研 MLA kernel（`third_party/FlashMLA`），SM90 dense decode 达 3000 GB/s / 660 TFLOPS (H800)。kernel 天然适配 DSV3 MLA 维度：`head_size_k=576` (c_KV 512 + k_R 64)，`head_size_v=512`，MQA 模式 (`h_kv=1`)。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
+| 2026-04-14 | 1D2D AOT config: 64×128/8stages + 128×128/5stages | 依据 DeepGEMM heuristics (`sm90.hpp`)：block_m<=64 用 1 warpgroup (128 math threads)，否则 2 warpgroups (256)。stages 取 SM90 smem 容量 232448 下的最大值。kMajorSFB=K 匹配 DSV3.2 checkpoint scale layout，kSwizzleDMode=128 匹配 bf16 block_n=128，kNumLastStages=0 因 SM90 kernel 不使用该参数 |
+| 2026-04-14 | 1D2D 输出 bf16 (非 fp32) | DeepGEMM 1D2D API 强制 `d.scalar_type() == torch::kBFloat16`。kernel 内部 fp32 accumulator → bf16 cast 后经 TMA store 写回。DSV3.2 forward 后续层本就需要 bf16 输入，省去显式 cast |
+| 2026-04-14 | norm 权重 f32→bf16 转换 | DSV3.2 checkpoint 中 layernorm 权重存为 f32，而 Qwen3 系列为 bf16。`load_tensor_1d` 直接按 bf16 读会长度翻倍。新增 `load_1d_f32_as_bf16` 做显式转换 |
+| 2026-04-14 | MLA attention 用 FlashMLA | DeepSeek 自研 MLA kernel（`third_party/FlashMLA`），SM90 dense decode 达 3000 GB/s / 660 TFLOPS (H800)。kernel 天然适配 DSV3.2 MLA 维度：`head_size_k=576` (c_KV 512 + k_R 64)，`head_size_v=512`，MQA 模式 (`h_kv=1`)。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
 | 2026-04-14 | KV cache 切 per-layer paged，page_size=64 | FlashMLA dense decode 硬性要求 `page_block_size=64`（`dense_decode.h:67`），且 kcache 为 per-layer 独立 buffer `[num_blocks, page_block_size, num_heads_k, head_size_k]`。现有 `KvPool` all-layers-in-one-page 布局（`kv_pool.rs`）改为 per-layer paged buffer，`PagePool`/`KvState` 分配逻辑不变，`KvLayout` 几何调整即可 |
 | 2026-04-14 | Absorption 用 cuBLAS strided batched GEMM，不用 DeepGEMM einsum | Absorption/de-absorption 是标准 bf16 batched GEMM（非 FP8 block-scale），无需 TMA descriptor。cuBLAS `cublasGemmStridedBatchedEx` 已 init 且对 [128,512]×[128,bs] 这类尺寸性能好。DeepGEMM einsum 虽有现成 `bhr,hdr->bhd` kernel，但 JIT 基础设施（`compiler->build`、torch tensor 胶水）搬过来工程量大且 bf16 场景收益不大 |
 | 2026-04-14 | W_UK/W_UV CPU dequant | kv_b_proj FP8 [32768, 512] 在加载时一次性 CPU dequant 到 bf16，拆成 W_UK/W_UV 上传 GPU。32 MB/layer × 61 ≈ 2 GB 可接受。CPU dequant 避免写 GPU dequant kernel，加载是一次性开销 |
 | 2026-04-14 | Partial RMSNorm kernel | kv_a_layernorm 只 norm c_kv 前 512d，保留 k_rope 后 64d。标准 `rms_norm_batch_into` 会 norm 整个 576d。新增 `rms_norm_partial_cuda`（`csrc/mla.cu`）做 sub-range norm |
-| 2026-04-14 | MLA RoPE 用 half-split 格式 | DSV3 用 transformers 标准 `rotate_half`：pairs 是 (x[i], x[i+half_dim])，与 Qwen3 `precompute_rope` 的 cos/sin cache 布局一致。不是 interleaved pairs |
-| 2026-04-14 | Dense FFN 分离 gate/up | Qwen3 gate_up fused 为一个投影 → `silu_mul_fused_batch_into`。DSV3 gate_proj 和 up_proj 是独立 FP8 权重 → 用 `silu_mul_batch_into`（分离 gate/up 输入）。共享 FP8 量化（normed 只量化一次供两个投影） |
-| 2026-04-15 | Phase 1 验证用 unabsorbed reference | transformers 不支持 DSV3.2，无法用 HF model 做 reference。改为 `tools/dsv3_ref/verify_phase1.py` 手动加载 safetensors + FP8 dequant，走 **unabsorbed** MLA 路径（标准 QKV + attention）做 f32 reference。数学上等价于 absorbed 路径（证明见 doc「Absorption 原理」节）。单 token decode (pos=0) 下 attention 是 trivial 的（softmax=1.0），但验证了全部投影、norm、RoPE、absorption/de-absorption、FFN 残差 |
+| 2026-04-14 | MLA RoPE 用 half-split 格式 | DSV3.2 用 transformers 标准 `rotate_half`：pairs 是 (x[i], x[i+half_dim])，与 Qwen3 `precompute_rope` 的 cos/sin cache 布局一致。不是 interleaved pairs |
+| 2026-04-14 | Dense FFN 分离 gate/up | Qwen3 gate_up fused 为一个投影 → `silu_mul_fused_batch_into`。DSV3.2 gate_proj 和 up_proj 是独立 FP8 权重 → 用 `silu_mul_batch_into`（分离 gate/up 输入）。共享 FP8 量化（normed 只量化一次供两个投影） |
+| 2026-04-15 | Phase 1 验证用 unabsorbed reference | transformers 不支持 DSV3.2，无法用 HF model 做 reference。历史上使用离线脚本手动加载 safetensors + FP8 dequant，走 **unabsorbed** MLA 路径（标准 QKV + attention）做 f32 reference。数学上等价于 absorbed 路径（证明见 doc「Absorption 原理」节）。单 token decode (pos=0) 下 attention 是 trivial 的（softmax=1.0），验证覆盖了投影、norm、RoPE、absorption/de-absorption、FFN 残差。 |
 | 2026-04-15 | Phase 1 精度阈值 | 3 层 forward mean_err < 0.1，max_err < 5×layer_count。FP8 量化误差在 mean 维度控制良好（0.026 → 0.093），max 维度个别 outlier 达 2.8–3.7（7168 维中 < 0.1% 维度），属于 FP8 block-scale 正常范围 |
 | 2026-04-15 | DeepEP 做 EP8 All-to-All | DeepSeek 自研 MoE 通信库（`third_party/DeepEP`，MIT 协议）。intranode kernel 通过 NVLink IPC buffer 实现 All-to-All，达 153-158 GB/s（H800 NVLink）。集成模式同 DeepGEMM：只取 kernel 层，host 侧 torch 胶水用 CUDA driver API 重写 |
 | 2026-04-15 | DeepEP 只用 intranode | 8x H20 单机场景只需 intranode normal kernels（NVLink），编译时 `-DDISABLE_NVSHMEM` 去掉 RDMA 依赖。Low-latency kernels 留给后续 decode 优化 |
@@ -616,7 +575,7 @@ DeepEP Buffer 构造过程（`deep_ep.cpp` 构造函数）：
 
 ```
 -DDISABLE_NVSHMEM          # 去掉 RDMA 依赖
--DTOPK_IDX_BITS=64         # DSV3 用 int64 topk indices（与 Python 端一致）
+-DTOPK_IDX_BITS=64         # DSV3.2 用 int64 topk indices（与 Python 端一致）
 SM90a                       # H20 = SM90
 ```
 
@@ -635,7 +594,7 @@ NVLink buffer 大小估算（`get_nvl_buffer_size_hint`）：
 channels = num_sms / 2 = 10
 per_channel = 8 ranks × (2*1+3) ints + 8 × 256 × hidden_bytes + ...
 ```
-DSV3 hidden=7168 bf16 → hidden_bytes=14336 → 约 300 MB/卡 NVLink buffer。
+DSV3.2 hidden=7168 bf16 → hidden_bytes=14336 → 约 300 MB/卡 NVLink buffer。
 
 ### 与 DeepGEMM/FlashMLA 集成对比
 

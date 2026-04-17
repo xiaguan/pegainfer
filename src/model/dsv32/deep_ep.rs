@@ -7,7 +7,7 @@ use std::ptr;
 use std::sync::{Arc, Barrier, Mutex};
 
 use anyhow::{Result, ensure};
-use log::info;
+use log::debug;
 
 use crate::ffi;
 
@@ -242,7 +242,7 @@ impl DeepEpBuffer {
         let mut barrier_ptrs: [*mut i32; NUM_MAX_NVL_PEERS] = [ptr::null_mut(); NUM_MAX_NVL_PEERS];
         barrier_ptrs[rank] = bar_ptr as *mut i32;
 
-        info!(
+        debug!(
             "Rank {}: DeepEP buffer allocated (nvl={:.1}MB, barrier={}B, workspace=32MB)",
             rank,
             nvl_size as f64 / (1024.0 * 1024.0),
@@ -365,7 +365,7 @@ impl DeepEpBuffer {
         // Step 5: Wait for all ranks to finish
         barrier.wait();
 
-        info!(
+        debug!(
             "Rank {}: DeepEP peer access enabled, {} peers connected",
             self.rank,
             self.num_ranks - 1

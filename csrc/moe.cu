@@ -1,6 +1,6 @@
 // MoE routing kernel for DeepSeek-V3.
 //
-// DSV3 routing algorithm:
+// DSV3.2 routing algorithm:
 //   1. sigmoid(gate_weight @ hidden) → scores [num_experts]
 //   2. scores + e_score_correction_bias → biased scores (selection only)
 //   3. Group-limited selection: top-2 per group → group scores → top topk_group groups
@@ -17,7 +17,7 @@
 // MoE routing kernel
 // ---------------------------------------------------------------------------
 
-// One block per token, blockDim.x >= num_experts (256 for DSV3).
+// One block per token, blockDim.x >= num_experts (256 for DSV3.2).
 // Each thread handles one expert.
 //
 // logits:    [num_experts, bs] bf16, column-major (stride = num_experts between tokens)
@@ -41,9 +41,9 @@ __global__ void moe_routing_kernel(
     if (token >= bs) return;
 
     const int tid = threadIdx.x;
-    const int experts_per_group = num_experts / n_group; // 32 for DSV3
+    const int experts_per_group = num_experts / n_group; // 32 for DSV3.2
 
-    // Shared memory layout (DSV3: num_experts=256, n_group=8)
+    // Shared memory layout (DSV3.2: num_experts=256, n_group=8)
     extern __shared__ char smem[];
     float* s_scores        = (float*)smem;                    // [256] original sigmoid
     float* s_scores_biased = s_scores + num_experts;          // [256] sigmoid + bias
@@ -219,7 +219,7 @@ void moe_routing_cuda(
                + topk * (sizeof(int) + sizeof(float));
 
     dim3 grid(bs);
-    dim3 block(num_experts); // 256 threads for DSV3
+    dim3 block(num_experts); // 256 threads for DSV3.2
     moe_routing_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)logits,
         bias,

@@ -13,11 +13,11 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
-use log::info;
+use log::debug;
 
-use super::config::DsV3Config;
+use super::config::DsV32Config;
 use super::mla_kv::{MlaKvPool, MlaKvState};
-use super::weights::{DsV3Model, FfnWeights, MoeFfnWeights};
+use super::weights::{DsV32Model, FfnWeights, MoeFfnWeights};
 use crate::ffi;
 use crate::ops;
 use crate::ops::fp8::{Fp8Scratch, fp8_gemm_into, fp8_linear_into, fp8_quantize_into};
@@ -160,7 +160,7 @@ pub(crate) struct MlaForwardBuffers {
 const FLASH_MLA_NUM_SM_PARTS: i32 = 72;
 
 impl MlaForwardBuffers {
-    pub(crate) fn new(ctx: &DeviceContext, config: &DsV3Config, max_bs: usize) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &DsV32Config, max_bs: usize) -> Result<Self> {
         let hidden = config.hidden_size;
         let q_lora = config.q_lora_rank;
         let q_b_dim = config.q_b_proj_dim();
@@ -329,7 +329,7 @@ impl MlaForwardBuffers {
     }
 }
 
-impl DsV3Model {
+impl DsV32Model {
     /// Full forward pass: embedding → all layers → final norm + lm_head.
     ///
     /// Processes tokens sequentially (token-by-token decode) since `forward_layer`
@@ -1928,43 +1928,10 @@ impl DsV3Model {
             }
         }
 
-        // Debug: dump dispatch outputs before expert FFN
-        ctx.sync()?;
-        {
-            let rpm_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.rank_prefix_matrix_copy)?;
-            let cpm_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.channel_prefix_matrix)?;
-            let recv_co_host: Vec<i32> =
-                ctx.stream.clone_dtoh(&bufs.ep_recv_channel_prefix_matrix)?;
-            let sh_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.ep_send_head)?;
-            info!(
-                "[rank {}] dispatch done: num_recv_tokens={}, bs={}",
-                rank, num_recv_tokens, bs
-            );
-            info!(
-                "[rank {}] rank_prefix_matrix_copy ({} ints): {:?}",
-                rank,
-                rpm_host.len(),
-                &rpm_host[..rpm_host.len().min(64)]
-            );
-            info!(
-                "[rank {}] channel_prefix_matrix ({} ints): {:?}",
-                rank,
-                cpm_host.len(),
-                &cpm_host[..cpm_host.len().min(64)]
-            );
-            info!(
-                "[rank {}] recv_channel_prefix_matrix ({} ints): {:?}",
-                rank,
-                recv_co_host.len(),
-                &recv_co_host[..recv_co_host.len().min(64)]
-            );
-            info!(
-                "[rank {}] send_head ({} ints, first 64): {:?}",
-                rank,
-                sh_host.len(),
-                &sh_host[..sh_host.len().min(64)]
-            );
-        }
+        debug!(
+            "[rank {}] dispatch done: num_recv_tokens={}, bs={}",
+            rank, num_recv_tokens, bs
+        );
 
         // ==================================================================
         // Step 5: Run local expert FFN on received tokens
@@ -2140,7 +2107,7 @@ impl DsV3Model {
 
             let (combined_ptr, _gc) = bufs.ep_combined_x.device_ptr_mut(&ctx.stream);
 
-            info!(
+            debug!(
                 "[rank {}] combine: dispatch_recv_tokens={}, combine_output_tokens(bs)={}, hidden={}, topk={}, num_sms={}, max_send={}, max_recv_buf={}",
                 rank,
                 dispatch_recv_tokens,
