@@ -10,4 +10,4 @@ pub(crate) mod weights;
 pub use config::ParallelConfig;
 pub use executor::DsV32Executor;
 pub use weights::DsV32Model;
-pub(crate) use weights::{AbsorbedMlaWeights, Fp8Matrix};
+pub(crate) use weights::Fp8Matrix;

@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::runtime::{result as cuda_runtime, sys as cuda_runtime_sys};
 use half::bf16;
 use log::debug;
 
@@ -156,11 +157,34 @@ pub(crate) struct MlaForwardBuffers {
     logits: HiddenStates,
 }
 
-// Number of SM partitions for FlashMLA.
-const FLASH_MLA_NUM_SM_PARTS: i32 = 72;
+fn flash_mla_num_sm_parts(
+    ctx: &DeviceContext,
+    config: &DsV32Config,
+    seqlen_q: usize,
+) -> Result<i32> {
+    let num_sms = unsafe {
+        cuda_runtime::device::get_attribute(
+            ctx.device_ordinal as i32,
+            cuda_runtime_sys::cudaDeviceAttr::cudaDevAttrMultiProcessorCount,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("failed to query CUDA multiprocessor count: {e}"))?;
+
+    let q_seq_per_hk = seqlen_q
+        .saturating_mul(config.num_attention_heads)
+        .div_ceil(1);
+    let q_blocks = q_seq_per_hk.div_ceil(64).max(1);
+    Ok((num_sms / q_blocks as i32).max(1))
+}
 
 impl MlaForwardBuffers {
-    pub(crate) fn new(ctx: &DeviceContext, config: &DsV32Config, max_bs: usize) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DsV32Config,
+        max_bs: usize,
+        num_ranks: usize,
+        num_channels: usize,
+    ) -> Result<Self> {
         let hidden = config.hidden_size;
         let q_lora = config.q_lora_rank;
         let q_b_dim = config.q_b_proj_dim();
@@ -168,6 +192,8 @@ impl MlaForwardBuffers {
         let num_heads = config.num_attention_heads;
         let kv_lora = config.kv_lora_rank;
         let o_proj_in = config.o_proj_input_dim();
+        let num_sm_parts = flash_mla_num_sm_parts(ctx, config, 1)? as usize;
+        let max_total_num_splits = max_bs + num_sm_parts;
         let intermediate = config.intermediate_size;
         let moe_intermediate = config.moe_intermediate_size;
         let n_routed_experts = config.n_routed_experts;
@@ -192,17 +218,13 @@ impl MlaForwardBuffers {
         let ffn_out = HiddenStates::zeros(ctx, hidden, max_bs)?;
 
         // FlashMLA metadata
-        let tile_scheduler_metadata: CudaSlice<i32> = ctx
-            .stream
-            .alloc_zeros(FLASH_MLA_NUM_SM_PARTS as usize * 8)?;
+        let tile_scheduler_metadata: CudaSlice<i32> = ctx.stream.alloc_zeros(num_sm_parts * 8)?;
         let num_splits: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs + 1)?;
         let lse: CudaSlice<f32> = ctx.stream.alloc_zeros(max_bs * num_heads)?;
-        let lse_accum: CudaSlice<f32> = ctx
-            .stream
-            .alloc_zeros(FLASH_MLA_NUM_SM_PARTS as usize * num_heads * max_bs)?;
+        let lse_accum: CudaSlice<f32> = ctx.stream.alloc_zeros(max_total_num_splits * num_heads)?;
         let o_accum: CudaSlice<f32> = ctx
             .stream
-            .alloc_zeros(FLASH_MLA_NUM_SM_PARTS as usize * max_bs * num_heads * kv_lora)?;
+            .alloc_zeros(max_total_num_splits * num_heads * kv_lora)?;
 
         let positions_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs)?;
         let seqlens_k_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs)?;
@@ -224,8 +246,6 @@ impl MlaForwardBuffers {
         // DeepEP dispatch/combine buffers
         // Max recv tokens: conservative upper bound — each rank can receive up to
         // max_bs * topk tokens in the worst case (all tokens route to one rank).
-        let num_ranks = 8usize; // EP8
-        let num_channels = 10usize; // num_sms/2 default
         let max_recv_tokens = max_bs * topk * num_ranks; // generous upper bound
         let topk_indices_i64: CudaSlice<i64> = ctx.stream.alloc_zeros(max_bs * topk)?;
         let num_tokens_per_rank: CudaSlice<i32> = ctx.stream.alloc_zeros(num_ranks)?;
@@ -357,6 +377,12 @@ impl DsV32Model {
         // Process each token sequentially through all layers (token-by-token).
         // This avoids the need for a prefill attention kernel.
         for t in 0..seq_len {
+            // `MlaKvState::seq_len` is request-level metadata (shared across all
+            // layers), so it must be advanced once per token — not once per layer.
+            // FlashMLA decode uses this value as `seqlen_k`.
+            kv_state.ensure_capacity(t + 1)?;
+            kv_state.advance(1);
+
             // Embedding for this single token
             let token_ids_gpu = ctx.stream.clone_htod(&[token_ids[t]])?;
             let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, 1)?;
@@ -555,6 +581,14 @@ impl DsV32Model {
         // ====================================================================
         for (req_idx, kv) in kv_states.iter_mut().enumerate() {
             let token_pos = positions[req_idx] as usize;
+            assert_eq!(
+                kv.seq_len(),
+                token_pos + 1,
+                "dense decode KV position mismatch at layer {layer_idx}, req {req_idx}: kv.seq_len()={} but token_pos={} (expected {})",
+                kv.seq_len(),
+                token_pos,
+                token_pos + 1
+            );
             kv.ensure_capacity(token_pos + 1)?;
 
             let page_indices = kv.page_indices_i32();
@@ -582,8 +616,6 @@ impl DsV32Model {
                     ctx.stream.cu_stream(),
                 );
             }
-
-            kv.advance(1);
         }
 
         // ====================================================================
@@ -1426,7 +1458,7 @@ impl DsV32Model {
         let seqlens_k_d = ctx.stream.clone_htod(&seqlens_k)?;
         let block_table_d = ctx.stream.clone_htod(&block_table_rect)?;
 
-        let num_sm_parts = FLASH_MLA_NUM_SM_PARTS;
+        let num_sm_parts = flash_mla_num_sm_parts(ctx, config, 1)?;
 
         // Phase 1: get metadata
         {
@@ -1447,10 +1479,7 @@ impl DsV32Model {
             }
         }
 
-        // Read total_num_splits from GPU
-        let num_splits_host: Vec<i32> = ctx.stream.clone_dtoh(&bufs.num_splits.slice(..bs + 1))?;
-        ctx.sync()?;
-        let total_num_splits = num_splits_host[bs];
+        let total_num_splits = bs as i32 + num_sm_parts;
 
         // Phase 2: decode attention
         let layer_offset = kv_pool.layer_offset(layer_idx);
@@ -1597,45 +1626,45 @@ impl DsV32Model {
         // ==================================================================
         // 3. Shared expert FFN (runs on all tokens, same as dense FFN)
         // ==================================================================
+        let expert = &moe.shared_expert;
+
+        // Shared FP8 quantize normed (reuse fp8_hidden from attention path)
+        fp8_quantize_into(ctx, &bufs.normed, &mut bufs.fp8_hidden);
+
+        bufs.moe_gate.seq_len = bs;
+        fp8_gemm_into(
+            ctx,
+            bs,
+            config.hidden_size,
+            &expert.gate_proj,
+            &bufs.fp8_hidden,
+            &mut bufs.moe_gate,
+        );
+
+        bufs.moe_up.seq_len = bs;
+        fp8_gemm_into(
+            ctx,
+            bs,
+            config.hidden_size,
+            &expert.up_proj,
+            &bufs.fp8_hidden,
+            &mut bufs.moe_up,
+        );
+
+        bufs.moe_act.seq_len = bs;
+        ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+        bufs.moe_down.seq_len = bs;
+        fp8_linear_into(
+            ctx,
+            &bufs.moe_act,
+            &expert.down_proj,
+            &mut bufs.fp8_moe_intermediate,
+            &mut bufs.moe_down,
+        );
+
+        // hidden += shared_expert_output
         {
-            let expert = &moe.shared_expert;
-
-            // Shared FP8 quantize normed (reuse fp8_hidden from attention path)
-            fp8_quantize_into(ctx, &bufs.normed, &mut bufs.fp8_hidden);
-
-            bufs.moe_gate.seq_len = bs;
-            fp8_gemm_into(
-                ctx,
-                bs,
-                config.hidden_size,
-                &expert.gate_proj,
-                &bufs.fp8_hidden,
-                &mut bufs.moe_gate,
-            );
-
-            bufs.moe_up.seq_len = bs;
-            fp8_gemm_into(
-                ctx,
-                bs,
-                config.hidden_size,
-                &expert.up_proj,
-                &bufs.fp8_hidden,
-                &mut bufs.moe_up,
-            );
-
-            bufs.moe_act.seq_len = bs;
-            ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
-
-            bufs.moe_down.seq_len = bs;
-            fp8_linear_into(
-                ctx,
-                &bufs.moe_act,
-                &expert.down_proj,
-                &mut bufs.fp8_moe_intermediate,
-                &mut bufs.moe_down,
-            );
-
-            // hidden += shared_expert_output
             let n = (config.hidden_size * bs) as i32;
             let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
             let (s_ptr, _gs) = bufs.moe_down.data.device_ptr(&ctx.stream);
@@ -1834,12 +1863,9 @@ impl DsV32Model {
         // ==================================================================
         ep_buf.reset_recv_counters();
         let num_memset_int = {
-            // Number of ints to memset in NVLink buffer for this dispatch.
-            // This covers the rank prefix matrix + channel metadata.
-            let prefix_matrix_ints = num_ranks * num_ranks;
-            let expert_prefix_ints = num_ranks * (config.n_routed_experts as i32 / num_ranks);
-            let channel_ints = num_channels * num_ranks * 5; // 5 control arrays
-            (prefix_matrix_ints + expert_prefix_ints + channel_ints) as i32
+            // Match upstream DeepEP intranode notify_dispatch semantics:
+            // clear dispatch queue control area only.
+            4 * num_channels * num_ranks
         };
 
         {
@@ -2050,7 +2076,6 @@ impl DsV32Model {
                 }
             }
         }
-
         // ==================================================================
         // Step 5.5: cached_notify_combine — barrier + zero NVL buffer for combine
         // ==================================================================
@@ -2143,7 +2168,6 @@ impl DsV32Model {
                 );
             }
         }
-
         // ==================================================================
         // Step 7: Add combined routed expert output to hidden
         // ==================================================================

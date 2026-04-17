@@ -852,7 +852,7 @@ unsafe extern "C" {
         barrier_signal_ptrs_gpu: *mut *mut i32,
         rank: i32,
         stream: CUstream,
-        num_sms: i32,
+        num_channels: i32,
     );
 
     // Dispatch tokens to target ranks via NVLink.

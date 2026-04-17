@@ -17,6 +17,9 @@ pub(crate) struct Fp8Scratch {
     pub(crate) scale_a: CudaSlice<f32>,
     max_m: usize,
     max_k: usize,
+    last_quantized_m: usize,
+    last_quantized_k: usize,
+    has_quantized_shape: bool,
 }
 
 impl Fp8Scratch {
@@ -39,6 +42,9 @@ impl Fp8Scratch {
             scale_a,
             max_m,
             max_k,
+            last_quantized_m: 0,
+            last_quantized_k: 0,
+            has_quantized_shape: false,
         }
     }
 }
@@ -112,6 +118,10 @@ pub(crate) fn fp8_linear_into(
             ctx.stream.cu_stream(),
         );
 
+        scratch.last_quantized_m = m;
+        scratch.last_quantized_k = k;
+        scratch.has_quantized_shape = true;
+
         // Step 2: FP8 GEMM — D[M,N] = A[M,K] @ B[N,K]^T
         ffi::fp8_gemm_cuda(
             fp8_ptr as *const u8,
@@ -154,6 +164,10 @@ pub(crate) fn fp8_quantize_into(
             ctx.stream.cu_stream(),
         );
     }
+
+    scratch.last_quantized_m = m;
+    scratch.last_quantized_k = k;
+    scratch.has_quantized_shape = true;
 }
 
 /// FP8 GEMM only (uses pre-quantized activation from scratch).
@@ -172,6 +186,20 @@ pub(crate) fn fp8_gemm_into(
     assert_eq!(weight.cols, k);
     assert_eq!(output.hidden_dim, n);
     assert_eq!(output.seq_len, m);
+    assert!(
+        scratch.has_quantized_shape,
+        "fp8_gemm_into called before fp8_quantize_into populated scratch"
+    );
+    assert_eq!(
+        scratch.last_quantized_m, m,
+        "fp8_gemm_into shape mismatch: scratch m={} but requested m={}",
+        scratch.last_quantized_m, m
+    );
+    assert_eq!(
+        scratch.last_quantized_k, k,
+        "fp8_gemm_into shape mismatch: scratch k={} but requested k={}",
+        scratch.last_quantized_k, k
+    );
 
     let (fp8_ptr, _gf) = scratch.fp8_act.device_ptr(&ctx.stream);
     let (scale_a_ptr, _gs) = scratch.scale_a.device_ptr(&ctx.stream);

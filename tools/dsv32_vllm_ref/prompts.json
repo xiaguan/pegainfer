@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "short_en_fact",
+      "prompt": "The capital of France is"
+    },
+    {
+      "name": "short_math",
+      "prompt": "What is 17 + 25?"
+    },
+    {
+      "name": "code_prompt",
+      "prompt": "Write a Python function that checks whether a number is prime."
+    },
+    {
+      "name": "reasoning_short",
+      "prompt": "Give two reasons why clean logging is important in production systems."
+    },
+    {
+      "name": "long_context_mix",
+      "prompt": "Summarize this sentence in one line: A distributed MoE model needs both numerical correctness and communication correctness to produce stable logits."
+    }
+  ]
+}

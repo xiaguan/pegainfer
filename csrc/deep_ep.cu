@@ -68,7 +68,7 @@ extern "C" void deep_ep_notify_dispatch(
     int** barrier_signal_ptrs_gpu,
     int rank,
     cudaStream_t stream,
-    int num_sms)
+    int num_channels)
 {
     intranode::notify_dispatch(
         num_tokens_per_rank,
@@ -87,7 +87,7 @@ extern "C" void deep_ep_notify_dispatch(
         barrier_signal_ptrs_gpu,
         rank,
         stream,
-        num_sms);
+        num_channels);
 }
 
 // ============================================================================

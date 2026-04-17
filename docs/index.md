@@ -2,6 +2,7 @@
 
 | Path | TL;DR |
 | --- | --- |
+| `projects/dsv32-vllm-accuracy-it.md` | DSV3.2 的 vLLM 精度回归入口：truth 生成脚本 + 8 卡 IT 已落地，精度排查阶段已暂停，下一主线转向生成与服务化。 |
 | `projects/dsv32-offline-accuracy-audit.md` | DSV3.2 离线精度审计摘要（已清理执行日志与中间产物，仅保留关键结论）。 |
 | `projects/dsv32-inference.md` | DeepSeek-V3.2-0324 671B on 8xH20-3e: Phase 2d combine timeout 已修，61 层 forward 跑通。Next: logits 对齐 |
 | `projects/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |

@@ -211,6 +211,7 @@ fn load_fp8_matrix(
     weight_map: &HashMap<String, usize>,
     weight_name: &str,
     scale_name: &str,
+    block_size: [usize; 2],
 ) -> Result<Fp8Matrix> {
     // Load raw FP8 data (1 byte per element)
     let weight_tensor = find_tensor(shards, weight_map, weight_name)?;
@@ -247,11 +248,26 @@ fn load_fp8_matrix(
     );
     let scale_rows = scale_shape[0];
     let scale_cols = scale_shape[1];
+    let expected_scale_rows = rows.div_ceil(block_size[0]);
+    let expected_scale_cols = cols.div_ceil(block_size[1]);
     let scale_bytes = scale_tensor.data();
     anyhow::ensure!(
         scale_bytes.len() == scale_rows * scale_cols * 4,
         "Scale '{}' size mismatch",
         scale_name
+    );
+    anyhow::ensure!(
+        scale_rows == expected_scale_rows && scale_cols == expected_scale_cols,
+        "Scale '{}' shape mismatch: expected [{}, {}] for weight '{}' with shape [{}, {}] and block_size {:?}, got [{}, {}]",
+        scale_name,
+        expected_scale_rows,
+        expected_scale_cols,
+        weight_name,
+        rows,
+        cols,
+        block_size,
+        scale_rows,
+        scale_cols
     );
     let scale_f32: &[f32] = unsafe {
         std::slice::from_raw_parts(scale_bytes.as_ptr().cast::<f32>(), scale_rows * scale_cols)
@@ -278,8 +294,22 @@ fn load_1d_f32_as_bf16(
     shards: &[safetensors::SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
+    expected_len: usize,
 ) -> Result<DeviceVec> {
     let tensor = find_tensor(shards, weight_map, name)?;
+    anyhow::ensure!(
+        tensor.shape().len() == 1,
+        "tensor '{}' expected 1D, got {:?}",
+        name,
+        tensor.shape()
+    );
+    anyhow::ensure!(
+        tensor.shape()[0] == expected_len,
+        "tensor '{}' length mismatch: expected {}, got {}",
+        name,
+        expected_len,
+        tensor.shape()[0]
+    );
     let data = tensor.data();
     anyhow::ensure!(
         data.len() % 4 == 0,
@@ -573,12 +603,14 @@ impl DsV32Model {
                     &weight_map,
                     &format!("{}.q_a_proj.weight", attn_prefix),
                     &format!("{}.q_a_proj.weight_scale_inv", attn_prefix),
+                    config.weight_block_size,
                 )?,
                 q_a_layernorm: load_1d_f32_as_bf16(
                     &ctx,
                     &shards,
                     &weight_map,
                     &format!("{}.q_a_layernorm.weight", attn_prefix),
+                    config.q_lora_rank,
                 )?,
                 q_b_proj: load_fp8_matrix(
                     &ctx,
@@ -586,6 +618,7 @@ impl DsV32Model {
                     &weight_map,
                     &format!("{}.q_b_proj.weight", attn_prefix),
                     &format!("{}.q_b_proj.weight_scale_inv", attn_prefix),
+                    config.weight_block_size,
                 )?,
                 kv_a_proj_with_mqa: load_fp8_matrix(
                     &ctx,
@@ -593,12 +626,14 @@ impl DsV32Model {
                     &weight_map,
                     &format!("{}.kv_a_proj_with_mqa.weight", attn_prefix),
                     &format!("{}.kv_a_proj_with_mqa.weight_scale_inv", attn_prefix),
+                    config.weight_block_size,
                 )?,
                 kv_a_layernorm: load_1d_f32_as_bf16(
                     &ctx,
                     &shards,
                     &weight_map,
                     &format!("{}.kv_a_layernorm.weight", attn_prefix),
+                    config.kv_lora_rank,
                 )?,
                 kv_b_proj: load_fp8_matrix(
                     &ctx,
@@ -606,6 +641,7 @@ impl DsV32Model {
                     &weight_map,
                     &format!("{}.kv_b_proj.weight", attn_prefix),
                     &format!("{}.kv_b_proj.weight_scale_inv", attn_prefix),
+                    config.weight_block_size,
                 )?,
                 o_proj: load_fp8_matrix(
                     &ctx,
@@ -613,6 +649,7 @@ impl DsV32Model {
                     &weight_map,
                     &format!("{}.o_proj.weight", attn_prefix),
                     &format!("{}.o_proj.weight_scale_inv", attn_prefix),
+                    config.weight_block_size,
                 )?,
             };
 
@@ -627,6 +664,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.gate_proj.weight", mlp_prefix),
                             &format!("{}.gate_proj.weight_scale_inv", mlp_prefix),
+                            config.weight_block_size,
                         )?,
                         up_proj: load_fp8_matrix(
                             &ctx,
@@ -634,6 +672,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.up_proj.weight", mlp_prefix),
                             &format!("{}.up_proj.weight_scale_inv", mlp_prefix),
+                            config.weight_block_size,
                         )?,
                         down_proj: load_fp8_matrix(
                             &ctx,
@@ -641,6 +680,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.down_proj.weight", mlp_prefix),
                             &format!("{}.down_proj.weight_scale_inv", mlp_prefix),
+                            config.weight_block_size,
                         )?,
                     })
                 }
@@ -676,6 +716,7 @@ impl DsV32Model {
                                 &weight_map,
                                 &format!("{}.gate_proj.weight", ep),
                                 &format!("{}.gate_proj.weight_scale_inv", ep),
+                                config.weight_block_size,
                             )?,
                             up_proj: load_fp8_matrix(
                                 &ctx,
@@ -683,6 +724,7 @@ impl DsV32Model {
                                 &weight_map,
                                 &format!("{}.up_proj.weight", ep),
                                 &format!("{}.up_proj.weight_scale_inv", ep),
+                                config.weight_block_size,
                             )?,
                             down_proj: load_fp8_matrix(
                                 &ctx,
@@ -690,6 +732,7 @@ impl DsV32Model {
                                 &weight_map,
                                 &format!("{}.down_proj.weight", ep),
                                 &format!("{}.down_proj.weight_scale_inv", ep),
+                                config.weight_block_size,
                             )?,
                         });
                     }
@@ -703,6 +746,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.gate_proj.weight", sep),
                             &format!("{}.gate_proj.weight_scale_inv", sep),
+                            config.weight_block_size,
                         )?,
                         up_proj: load_fp8_matrix(
                             &ctx,
@@ -710,6 +754,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.up_proj.weight", sep),
                             &format!("{}.up_proj.weight_scale_inv", sep),
+                            config.weight_block_size,
                         )?,
                         down_proj: load_fp8_matrix(
                             &ctx,
@@ -717,6 +762,7 @@ impl DsV32Model {
                             &weight_map,
                             &format!("{}.down_proj.weight", sep),
                             &format!("{}.down_proj.weight_scale_inv", sep),
+                            config.weight_block_size,
                         )?,
                     };
 
@@ -749,6 +795,7 @@ impl DsV32Model {
                         &weight_map,
                         &format!("{}.wq_b.weight", idx_prefix),
                         &format!("{}.wq_b.weight_scale_inv", idx_prefix),
+                        config.weight_block_size,
                     )?,
                     wk: load_fp8_matrix(
                         &ctx,
@@ -756,18 +803,21 @@ impl DsV32Model {
                         &weight_map,
                         &format!("{}.wk.weight", idx_prefix),
                         &format!("{}.wk.weight_scale_inv", idx_prefix),
+                        config.weight_block_size,
                     )?,
                     k_norm_weight: load_1d_f32_as_bf16(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.k_norm.weight", idx_prefix),
+                        config.index_head_dim.expect("index_head_dim"),
                     )?,
                     k_norm_bias: load_1d_f32_as_bf16(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.k_norm.bias", idx_prefix),
+                        config.index_head_dim.expect("index_head_dim"),
                     )?,
                     weights_proj: load_tensor_2d(
                         &ctx,
@@ -786,6 +836,7 @@ impl DsV32Model {
                     &shards,
                     &weight_map,
                     &format!("{}.input_layernorm.weight", prefix),
+                    config.hidden_size,
                 )?,
                 mla,
                 absorbed,
@@ -795,6 +846,7 @@ impl DsV32Model {
                     &shards,
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
+                    config.hidden_size,
                 )?,
                 ffn,
             };
@@ -826,7 +878,13 @@ impl DsV32Model {
             debug!("Partial load: using zeros for final norm");
             DeviceVec::zeros(&ctx, config.hidden_size)?
         } else {
-            load_1d_f32_as_bf16(&ctx, &shards, &weight_map, "model.norm.weight")?
+            load_1d_f32_as_bf16(
+                &ctx,
+                &shards,
+                &weight_map,
+                "model.norm.weight",
+                config.hidden_size,
+            )?
         };
 
         // Precompute YaRN RoPE cos/sin cache

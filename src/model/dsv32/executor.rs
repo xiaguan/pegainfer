@@ -289,8 +289,14 @@ impl RankForwardState {
         let ctx = model.device_ctx();
         let config = model.config();
         let num_layers = model.layers.len();
+        let num_ranks = model.parallel().ep_size.max(1);
+        let num_channels = model
+            .deep_ep_buffer
+            .as_ref()
+            .map(|buf| buf.config.num_channels().max(1) as usize)
+            .unwrap_or(1);
 
-        let bufs = MlaForwardBuffers::new(ctx, config, max_bs)?;
+        let bufs = MlaForwardBuffers::new(ctx, config, max_bs, num_ranks, num_channels)?;
         let kv_pool = MlaKvPool::new(
             ctx,
             num_layers,
