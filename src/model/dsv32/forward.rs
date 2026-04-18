@@ -350,69 +350,42 @@ impl MlaForwardBuffers {
 }
 
 impl DsV32Model {
-    /// Full forward pass: embedding → all layers → final norm + lm_head.
-    ///
-    /// Processes tokens sequentially (token-by-token decode) since `forward_layer`
-    /// is decode-only. Each token is processed as bs=1 through all 61 layers,
-    /// building up the KV cache. Logits are returned for the last token only.
-    ///
-    /// `token_ids`: token IDs for this request (len = seq_len).
-    /// `positions`: absolute positions for each token (len = seq_len).
-    /// Returns a reference to the logits buffer `[vocab_size, 1]` inside `bufs`.
-    pub(crate) fn forward_prefill<'a>(
+    fn write_kv_a_to_cache(
         &self,
-        token_ids: &[u32],
-        positions: &[i32],
+        layer_idx: usize,
+        start_pos: usize,
+        num_tokens: usize,
         kv_state: &mut MlaKvState,
-        bufs: &'a mut MlaForwardBuffers,
         kv_pool: &MlaKvPool,
-    ) -> Result<&'a HiddenStates> {
+        bufs: &mut MlaForwardBuffers,
+    ) -> Result<()> {
         let ctx = &self.ctx;
         let config = &self.config;
-        let seq_len = token_ids.len();
-        assert_eq!(seq_len, positions.len());
 
-        let num_layers = self.layers.len();
+        kv_state.ensure_capacity(start_pos + num_tokens)?;
+        let page_indices = kv_state.page_indices_i32();
+        let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
 
-        // Process each token sequentially through all layers (token-by-token).
-        // This avoids the need for a prefill attention kernel.
-        for t in 0..seq_len {
-            // `MlaKvState::seq_len` is request-level metadata (shared across all
-            // layers), so it must be advanced once per token — not once per layer.
-            // FlashMLA decode uses this value as `seqlen_k`.
-            kv_state.ensure_capacity(t + 1)?;
-            kv_state.advance(1);
+        let (kv_a_ptr, _g) = bufs.kv_a.data.device_ptr(&ctx.stream);
+        let layer_offset = kv_pool.layer_offset(layer_idx);
+        let (buf_ptr, _gb) = kv_pool.buffer().device_ptr(&ctx.stream);
+        let kv_buf_ptr = buf_ptr + (layer_offset * std::mem::size_of::<bf16>()) as u64;
+        let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
 
-            // Embedding for this single token
-            let token_ids_gpu = ctx.stream.clone_htod(&[token_ids[t]])?;
-            let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, 1)?;
-            hidden.seq_len = 1;
-            crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
-
-            let pos = [positions[t]];
-
-            // Forward through all layers for this token
-            let mut kv_refs: Vec<&mut MlaKvState> = vec![kv_state];
-            for layer_idx in 0..num_layers {
-                self.forward_layer(
-                    layer_idx,
-                    &mut hidden,
-                    &mut kv_refs,
-                    &pos,
-                    bufs,
-                    &self.cos_cache,
-                    &self.sin_cache,
-                    kv_pool,
-                )?;
-            }
-
-            // Only compute logits for the last token
-            if t == seq_len - 1 {
-                return Ok(self.forward_final(&hidden, bufs));
-            }
+        unsafe {
+            ffi::mla_kv_cache_write_cuda(
+                kv_a_ptr as *const ffi::Half,
+                kv_buf_ptr as *mut ffi::Half,
+                pi_ptr as *const i32,
+                config.kv_a_proj_dim() as i32,
+                kv_pool.layout().page_size as i32,
+                start_pos as i32,
+                num_tokens as i32,
+                ctx.stream.cu_stream(),
+            );
         }
 
-        unreachable!("seq_len must be > 0")
+        Ok(())
     }
 
     /// Final projection: RMSNorm → lm_head GEMM → logits.
@@ -880,6 +853,92 @@ impl DsV32Model {
         };
 
         Ok(self.forward_final(&last_hidden, bufs))
+    }
+
+    /// Sparse prefill that also materializes MLA KV into the paged decode cache.
+    pub(crate) fn forward_prefill_sparse_into_cache<'a>(
+        &self,
+        token_ids: &[u32],
+        positions: &[i32],
+        kv_state: &mut MlaKvState,
+        bufs: &'a mut MlaForwardBuffers,
+        kv_pool: &MlaKvPool,
+    ) -> Result<&'a HiddenStates> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let seq_len = token_ids.len();
+        assert_eq!(seq_len, positions.len());
+        assert!(config.has_indexer(), "sparse prefill requires NSA indexer");
+
+        let num_layers = self.layers.len();
+
+        let token_ids_gpu = ctx
+            .stream
+            .clone_htod(&token_ids.iter().map(|&t| t).collect::<Vec<u32>>())?;
+        let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, seq_len)?;
+        hidden.seq_len = seq_len;
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+
+        let positions_d = ctx.stream.clone_htod(positions)?;
+        ctx.stream
+            .memcpy_dtod(&positions_d, &mut bufs.positions_d.slice_mut(..seq_len))?;
+
+        for layer_idx in 0..num_layers {
+            self.forward_layer_prefill_sparse(layer_idx, &mut hidden, seq_len, bufs)?;
+            self.write_kv_a_to_cache(layer_idx, 0, seq_len, kv_state, kv_pool, bufs)?;
+        }
+        kv_state.advance(seq_len);
+
+        let last_token_offset = (seq_len - 1) * config.hidden_size;
+        let last_hidden = HiddenStates {
+            data: ctx.stream.clone_dtod(
+                &hidden
+                    .data
+                    .slice(last_token_offset..last_token_offset + config.hidden_size),
+            )?,
+            hidden_dim: config.hidden_size,
+            seq_len: 1,
+        };
+
+        Ok(self.forward_final(&last_hidden, bufs))
+    }
+
+    /// True decode step: consume one token and append it to the paged MLA KV cache.
+    pub(crate) fn forward_decode<'a>(
+        &self,
+        token_id: u32,
+        kv_state: &mut MlaKvState,
+        bufs: &'a mut MlaForwardBuffers,
+        kv_pool: &MlaKvPool,
+    ) -> Result<&'a HiddenStates> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let position = kv_state.seq_len();
+
+        kv_state.ensure_capacity(position + 1)?;
+        kv_state.advance(1);
+
+        let token_ids_gpu = ctx.stream.clone_htod(&[token_id])?;
+        let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, 1)?;
+        hidden.seq_len = 1;
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+
+        let positions = [position as i32];
+        let mut kv_refs: Vec<&mut MlaKvState> = vec![kv_state];
+        for layer_idx in 0..self.layers.len() {
+            self.forward_layer(
+                layer_idx,
+                &mut hidden,
+                &mut kv_refs,
+                &positions,
+                bufs,
+                &self.cos_cache,
+                &self.sin_cache,
+                kv_pool,
+            )?;
+        }
+
+        Ok(self.forward_final(&hidden, bufs))
     }
 
     /// Single layer for sparse prefill: attention + FFN with all tokens batched.

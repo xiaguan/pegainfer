@@ -124,12 +124,12 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 - [x] `forward_moe` 接入 DeepEP dispatch/combine（`forward_moe_ep`，替代 EP1 local-only 路径）
 - [x] Final RMSNorm + lm_head GEMM（`forward_final`：RMSNorm → bf16 GEMM with `output_projection()`，`tie_word_embeddings` 复用 embedding 矩阵）
-- [x] Executor forward loop（`forward_prefill`：token-by-token 跑 decode 跑完全部 61 层 + `forward_final`，`DsV32Executor::forward` 8 rank 并行 dispatch）
+- [x] Executor forward loop（`forward_prefill_sparse` + `forward_final`，`DsV32Executor::forward` 8 rank 并行 dispatch）
 - [x] **DeepEP combine timeout** — 修复 4 个参数错误后 combine 通过，详见下方调试记录
-- [ ] **切换到真正 prefill path** — 当前 `forward_prefill` 逐 token 跑 decode kernel，需要：
-  - 编译 FlashMLA SM90 sparse prefill kernel（`d_qk=576, d_v=512`，NSA）
+- [x] **切换到真正 prefill path**
+  - FlashMLA SM90 sparse prefill kernel（`d_qk=576, d_v=512`，NSA）
   - batch embedding + batch GEMM（seq_len > 1）
-  - FlashMLA sparse prefill attention 替换逐 token FlashMLA decode
+  - FlashMLA sparse prefill attention 接入主执行路径
   - MoE DeepEP dispatch/combine 支持 batch tokens
 - [ ] 全模型 output logits 与 Python reference 对齐
 - [ ] （可选）Grouped GEMM（DeepGEMM `GroupedContiguous`）替代 per-expert sequential
@@ -145,11 +145,28 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 目标：完整 decode 生成，接入 `/v1/completions` API。
 
+- [x] `main.rs` 接入 DSV3.2 模型识别与 HTTP server 启动路径
+- [x] 最小 `scheduler_dsv32`：串行请求执行，`prefill` 后复用 MLA/KV 做单 token decode
+- [x] H20 smoke test：`/v1/completions` 可起服务并返回 `hello world` / `1+1=` / reasoning 风格请求
 - [ ] Decode path：单 token MLA + MoE forward
 - [ ] KV cache 管理（MLA 压缩格式的 append/管理）
 - [ ] CUDA Graph capture（decode path）
-- [ ] 接入 `GenericServerEngine<DeepSeekV3Model>`
-- [ ] E2E 生成验证
+- [ ] `bench_serving` 接入 DSV3.2
+- [ ] E2E 生成验证 / 输出质量回归
+
+当前边界（精简）：
+
+- 当前服务链路已打通，但生成质量仍明显不对；本阶段验证的是“能起服务、能收发请求”，不是“输出已正确”。
+- 当前生成主路径已经切到 `prefill + decode reuse`：
+  - prompt 先走 sparse prefill；
+  - 后续 token 走单 token decode，并复用 paged MLA KV。
+- H20 当前 smoke timing：
+  - `hello world`, `max_tokens=8`: `~1.78s`
+  - `1+1=`, `max_tokens=8`: `~1.81s`
+  - reasoning prompt, `max_tokens=16`: `~5.84s`
+- 当前并行形态是 `TP1 + EP8`，不是 `DP8`：
+  - attention / dense FFN 不做 TP 切分，每张卡各算一份；
+  - routed MoE 通过 DeepEP 在 8 卡之间分发与合并。
 
 验收：greedy decode 输出与 reference 一致，API 可用。
 
@@ -505,7 +522,7 @@ normed [7168, bs]  (post_attention_layernorm 输出)
 | 2026-04-15 | DeepEP 只用 intranode | 8x H20 单机场景只需 intranode normal kernels（NVLink），编译时 `-DDISABLE_NVSHMEM` 去掉 RDMA 依赖。Low-latency kernels 留给后续 decode 优化 |
 | 2026-04-15 | Prefill 优先 | Phase 2 先跑通 8 卡 prefill，decode 留 Phase 3。prefill 用 intranode normal kernels（支持大 batch），decode 后续视需要引入 low-latency kernels |
 | 2026-04-15 | MoE 不用 FlashInfer，用 DeepGEMM grouped GEMM + 自写 routing | FlashInfer MoE 深度绑定 TRT-LLM 基础设施（JIT 编译、CUTLASS extensions、TVM-FFI），剥离代价大于自写。routing kernel（sigmoid + group-limited TopK）逻辑确定，自写几十行 CUDA。grouped GEMM 直接用已集成的 DeepGEMM `GroupedContiguous`。FlashInfer MoE 核心竞争力在 Blackwell SM100+ CuTe DSL 融合 pipeline，SM90 (H20) 收益不大 |
-| 2026-04-15 | 路线 B：跳过单卡 MoE 验证，直推 8 卡端到端 | DeepEP 是 EP8 唯一跨卡通信，其余（final norm、lm_head、forward loop）都是一天内的活。先啃 DeepEP，然后一步到位全模型 logits 对齐。验证用 token-by-token decode 避开 prefill attention kernel |
+| 2026-04-15 | 路线 B：跳过单卡 MoE 验证，直推 8 卡端到端 | DeepEP 是 EP8 唯一跨卡通信，其余（final norm、lm_head、forward loop）都是一天内的活。先啃 DeepEP，然后一步到位全模型 logits 对齐。历史上曾临时用 token-by-token decode 验证 logits；该路径现已退场，prefill 只保留 sparse 实现 |
 
 ## DeepEP Intranode 集成要点
 

@@ -6,7 +6,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::http_server::build_app;
 use pegainfer::logging;
-use pegainfer::model::Qwen35Model;
+use pegainfer::model::{DsV32Executor, Qwen35Model};
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
@@ -14,7 +14,10 @@ use pegainfer::trace_reporter::FileReporter;
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
 #[derive(Parser)]
-#[command(name = "pegainfer", about = "Qwen3/3.5 GPU inference server")]
+#[command(
+    name = "pegainfer",
+    about = "Qwen3/Qwen3.5/DeepSeek-V3.2 GPU inference server"
+)]
 struct Args {
     /// Model directory containing config, tokenizer, and safetensor shards
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
@@ -32,7 +35,7 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
 
-    /// Tensor-parallel world size for Qwen3
+    /// Tensor-parallel world size for Qwen3 / DSV3.2
     #[arg(long, default_value_t = 1)]
     tp_size: usize,
 
@@ -105,6 +108,25 @@ async fn main() {
 
             let handle = pegainfer::scheduler_qwen35::start(model, 42)
                 .expect("Failed to start Qwen3.5 scheduler");
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+
+            build_app(handle, tokenizer, model_id)
+        }
+        ModelType::Dsv32 => {
+            let tokenizer =
+                Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
+            let model_id = pegainfer::server_engine::model_id_from_path(model_path);
+            let world_size = args.tp_size.max(1);
+            let device_ordinals: Vec<usize> = if world_size == 1 {
+                vec![args.device_ordinal]
+            } else {
+                (0..world_size).collect()
+            };
+            let executor = DsV32Executor::load(model_path, &device_ordinals, 1)
+                .expect("Failed to load DeepSeek-V3.2 executor");
+            let handle = pegainfer::scheduler_dsv32::start(executor, 42)
+                .expect("Failed to start DeepSeek-V3.2 scheduler");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 

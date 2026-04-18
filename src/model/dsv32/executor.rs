@@ -23,6 +23,7 @@ use crate::tensor::DeviceContext;
 pub struct DsV32Executor {
     /// Models indexed by rank (0..world_size). Each lives on its own GPU thread.
     ranks: Vec<RankHandle>,
+    stop_token_ids: Vec<u32>,
 }
 
 struct RankHandle {
@@ -32,9 +33,21 @@ struct RankHandle {
 }
 
 enum RankCommand {
+    Reset {
+        resp: channel::Sender<Result<()>>,
+    },
     /// Synchronize — wait for all prior GPU work on this rank to complete.
     Sync {
         resp: channel::Sender<Result<()>>,
+    },
+    Prefill {
+        token_ids: Arc<Vec<u32>>,
+        positions: Arc<Vec<i32>>,
+        resp: channel::Sender<Result<Vec<bf16>>>,
+    },
+    Decode {
+        token_id: u32,
+        resp: channel::Sender<Result<Vec<bf16>>>,
     },
     /// Run full forward pass (embedding → all layers → logits) and return
     /// the output logits as host bf16 vec.
@@ -168,6 +181,8 @@ impl DsV32Executor {
             info!("DeepEP intranode buffers initialized for EP{}", ep_size);
         }
 
+        let stop_token_ids = models[0].config().stop_token_ids.clone();
+
         // Spawn per-rank worker threads
         let mut ranks = Vec::with_capacity(world_size);
         for (rank, model) in models.into_iter().enumerate() {
@@ -175,7 +190,10 @@ impl DsV32Executor {
         }
 
         info!("DSV3.2 executor ready: {} ranks active", world_size);
-        Ok(Self { ranks })
+        Ok(Self {
+            ranks,
+            stop_token_ids,
+        })
     }
 
     /// Number of ranks (GPUs).
@@ -201,6 +219,80 @@ impl DsV32Executor {
                 .map_err(|_| anyhow::anyhow!("rank {} dropped sync response", rank))??;
         }
         Ok(())
+    }
+
+    pub fn reset_generation_state(&self) -> Result<()> {
+        let receivers: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|r| {
+                let (tx, rx) = channel::bounded(1);
+                r.tx.send(RankCommand::Reset { resp: tx })
+                    .map_err(|_| anyhow::anyhow!("rank {} channel closed", r.rank))
+                    .map(|_| rx)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (rank, rx) in receivers.into_iter().enumerate() {
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("rank {} dropped reset response", rank))??;
+        }
+        Ok(())
+    }
+
+    pub fn prefill(&self, token_ids: &[u32], positions: &[i32]) -> Result<Vec<bf16>> {
+        let token_ids = Arc::new(token_ids.to_vec());
+        let positions = Arc::new(positions.to_vec());
+
+        let receivers: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|r| {
+                let (tx, rx) = channel::bounded(1);
+                r.tx.send(RankCommand::Prefill {
+                    token_ids: Arc::clone(&token_ids),
+                    positions: Arc::clone(&positions),
+                    resp: tx,
+                })
+                .map_err(|_| anyhow::anyhow!("rank {} channel closed", r.rank))
+                .map(|_| rx)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut rank0_logits = None;
+        for (rank, rx) in receivers.into_iter().enumerate() {
+            let logits = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("rank {} dropped prefill response", rank))??;
+            if rank == 0 {
+                rank0_logits = Some(logits);
+            }
+        }
+        rank0_logits.ok_or_else(|| anyhow::anyhow!("no rank 0 logits"))
+    }
+
+    pub fn decode(&self, token_id: u32) -> Result<Vec<bf16>> {
+        let receivers: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|r| {
+                let (tx, rx) = channel::bounded(1);
+                r.tx.send(RankCommand::Decode { token_id, resp: tx })
+                    .map_err(|_| anyhow::anyhow!("rank {} channel closed", r.rank))
+                    .map(|_| rx)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut rank0_logits = None;
+        for (rank, rx) in receivers.into_iter().enumerate() {
+            let logits = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("rank {} dropped decode response", rank))??;
+            if rank == 0 {
+                rank0_logits = Some(logits);
+            }
+        }
+        rank0_logits.ok_or_else(|| anyhow::anyhow!("no rank 0 logits"))
     }
 
     /// Run full forward pass across all ranks and return logits from rank 0.
@@ -242,6 +334,10 @@ impl DsV32Executor {
 
     pub fn rank_count(&self) -> usize {
         self.ranks.len()
+    }
+
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token_ids.contains(&token_id)
     }
 }
 
@@ -334,8 +430,89 @@ impl RankHandle {
 
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
+                                RankCommand::Reset { resp } => {
+                                    let result = (|| -> Result<()> {
+                                        let state = match &mut fwd_state {
+                                            Some(s) => s,
+                                            None => {
+                                                let max_bs = 64;
+                                                fwd_state =
+                                                    Some(RankForwardState::init(&model, max_bs)?);
+                                                fwd_state.as_mut().unwrap()
+                                            }
+                                        };
+                                        state.reset();
+                                        Ok(())
+                                    })();
+                                    let _ = resp.send(result);
+                                }
                                 RankCommand::Sync { resp } => {
                                     let result = model.device_ctx().sync();
+                                    let _ = resp.send(result);
+                                }
+                                RankCommand::Prefill {
+                                    token_ids,
+                                    positions,
+                                    resp,
+                                } => {
+                                    let result = (|| -> Result<Vec<bf16>> {
+                                        let state = match &mut fwd_state {
+                                            Some(s) => s,
+                                            None => {
+                                                let max_bs = 64;
+                                                fwd_state =
+                                                    Some(RankForwardState::init(&model, max_bs)?);
+                                                fwd_state.as_mut().unwrap()
+                                            }
+                                        };
+                                        state.reset();
+
+                                        anyhow::ensure!(
+                                            model.config().has_indexer(),
+                                            "DSV3.2 requires sparse prefill; indexer weights/config missing"
+                                        );
+                                        let logits = model.forward_prefill_sparse_into_cache(
+                                            &token_ids,
+                                            &positions,
+                                            &mut state.kv_state,
+                                            &mut state.bufs,
+                                            &state.kv_pool,
+                                        )?;
+
+                                        let ctx = model.device_ctx();
+                                        let len = logits.hidden_dim * logits.seq_len;
+                                        let host: Vec<bf16> =
+                                            ctx.stream.clone_dtoh(&logits.data.slice(..len))?;
+                                        ctx.sync()?;
+                                        Ok(host)
+                                    })();
+                                    let _ = resp.send(result);
+                                }
+                                RankCommand::Decode { token_id, resp } => {
+                                    let result = (|| -> Result<Vec<bf16>> {
+                                        let state = match &mut fwd_state {
+                                            Some(s) => s,
+                                            None => {
+                                                let max_bs = 64;
+                                                fwd_state =
+                                                    Some(RankForwardState::init(&model, max_bs)?);
+                                                fwd_state.as_mut().unwrap()
+                                            }
+                                        };
+                                        let logits = model.forward_decode(
+                                            token_id,
+                                            &mut state.kv_state,
+                                            &mut state.bufs,
+                                            &state.kv_pool,
+                                        )?;
+
+                                        let ctx = model.device_ctx();
+                                        let len = logits.hidden_dim * logits.seq_len;
+                                        let host: Vec<bf16> =
+                                            ctx.stream.clone_dtoh(&logits.data.slice(..len))?;
+                                        ctx.sync()?;
+                                        Ok(host)
+                                    })();
                                     let _ = resp.send(result);
                                 }
                                 RankCommand::Forward {
@@ -356,24 +533,16 @@ impl RankHandle {
                                         };
                                         state.reset();
 
-                                        // TODO: sparse prefill has topk_length issue for short
-                                        // sequences. Use decode path for now to validate logits.
-                                        #[allow(clippy::overly_complex_bool_expr)]
-                                        let logits = if false && model.config().has_indexer() {
-                                            model.forward_prefill_sparse(
-                                                &token_ids,
-                                                &positions,
-                                                &mut state.bufs,
-                                            )?
-                                        } else {
-                                            model.forward_prefill(
-                                                &token_ids,
-                                                &positions,
-                                                &mut state.kv_state,
-                                                &mut state.bufs,
-                                                &state.kv_pool,
-                                            )?
-                                        };
+                                        anyhow::ensure!(
+                                            model.config().has_indexer(),
+                                            "DSV3.2 requires sparse prefill; indexer weights/config missing"
+                                        );
+                                        state.reset();
+                                        let logits = model.forward_prefill_sparse(
+                                            &token_ids,
+                                            &positions,
+                                            &mut state.bufs,
+                                        )?;
 
                                         // Copy logits to host
                                         let ctx = model.device_ctx();

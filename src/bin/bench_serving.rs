@@ -1657,5 +1657,8 @@ fn main() -> Result<()> {
             let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
         }
+        ModelType::Dsv32 => Err(anyhow::anyhow!(
+            "bench_serving does not support DeepSeek-V3.2 yet; use the HTTP server path first"
+        )),
     }
 }
