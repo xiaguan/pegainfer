@@ -15,19 +15,20 @@
 // kv_a: [kv_a_proj_dim, bs] bf16, token t at offset t * kv_a_proj_dim.
 //       k_rope is at [kv_lora_rank..kv_lora_rank+rope_dim] per token.
 //
-// cos_cache, sin_cache: [max_seq_len, rope_dim] bf16, precomputed.
-//   Half-split layout: cos[pos, i] == cos[pos, i + half_dim].
+// cos_cache, sin_cache: [max_seq_len, rope_dim] fp32, precomputed.
+//   Only the first half_rope entries per row are used (cos[pos, 2i] unused).
 // positions: [bs] i32, per-token positions.
 //
-// Applies rotate_half style RoPE:
-//   y[i]             = x[i] * cos[i] - x[i + half_dim] * sin[i]
-//   y[i + half_dim]  = x[i + half_dim] * cos[i] + x[i] * sin[i]
+// **Interleaved (GPT-J) pairing — matches HF DeepSeek-V3 `rope_interleave=True`
+// which is the default for DSv3 / DSv3.2**:
+//   y[2i]   = x[2i]   * cos[i] - x[2i+1] * sin[i]
+//   y[2i+1] = x[2i+1] * cos[i] + x[2i]   * sin[i]
 // ============================================================================
 
 __global__ void mla_rope_kv_kernel(
     __nv_bfloat16 *kv_a,           // [kv_a_proj_dim, bs]
-    const __nv_bfloat16 *cos_cache, // [max_seq_len, rope_dim]
-    const __nv_bfloat16 *sin_cache,
+    const float *cos_cache,         // [max_seq_len, rope_dim] fp32
+    const float *sin_cache,
     const int *positions,           // [bs]
     int kv_a_proj_dim,              // 576
     int kv_lora_rank,               // 512 (offset to k_rope)
@@ -38,20 +39,20 @@ __global__ void mla_rope_kv_kernel(
     int total = half_rope * bs;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += gridDim.x * blockDim.x) {
-        int i = idx % half_rope;  // pair index within half_dim
+        int i = idx % half_rope;  // pair index
         int token = idx / half_rope;
 
         int base = token * kv_a_proj_dim + kv_lora_rank;
         int pos = positions[token];
 
-        float x_lo = __bfloat162float(kv_a[base + i]);
-        float x_hi = __bfloat162float(kv_a[base + i + half_rope]);
+        float x_lo = __bfloat162float(kv_a[base + 2 * i]);
+        float x_hi = __bfloat162float(kv_a[base + 2 * i + 1]);
 
-        float c = __bfloat162float(cos_cache[pos * rope_dim + i]);
-        float s = __bfloat162float(sin_cache[pos * rope_dim + i]);
+        float c = cos_cache[pos * rope_dim + i];
+        float s = sin_cache[pos * rope_dim + i];
 
-        kv_a[base + i]             = __float2bfloat16(x_lo * c - x_hi * s);
-        kv_a[base + i + half_rope] = __float2bfloat16(x_hi * c + x_lo * s);
+        kv_a[base + 2 * i]     = __float2bfloat16(x_lo * c - x_hi * s);
+        kv_a[base + 2 * i + 1] = __float2bfloat16(x_hi * c + x_lo * s);
     }
 }
 
@@ -73,8 +74,8 @@ __global__ void mla_rope_kv_kernel(
 __global__ void mla_rope_q_copy_kernel(
     const __nv_bfloat16 *q_full,    // [q_b_proj_dim, bs]
     __nv_bfloat16 *q_mla,           // [bs, num_heads, kv_a_proj_dim]
-    const __nv_bfloat16 *cos_cache,
-    const __nv_bfloat16 *sin_cache,
+    const float *cos_cache,          // [max_seq_len, rope_dim] fp32
+    const float *sin_cache,
     const int *positions,
     int q_b_proj_dim,                // 24576
     int q_head_dim,                  // 192
@@ -89,25 +90,25 @@ __global__ void mla_rope_q_copy_kernel(
     int total = half_rope * num_heads * bs;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += gridDim.x * blockDim.x) {
-        int i = idx % half_rope;
+        int i = idx % half_rope;  // pair index
         int rem = idx / half_rope;
         int head = rem % num_heads;
         int token = rem / num_heads;
 
-        // Read from q_full — q_rope for head h at [h*q_head_dim + nope_dim .. + rope_dim]
+        // Read from q_full — q_rope for head h at [h*q_head_dim + nope_dim..+rope_dim]
         int src_base = token * q_b_proj_dim + head * q_head_dim + nope_dim;
-        float x_lo = __bfloat162float(q_full[src_base + i]);
-        float x_hi = __bfloat162float(q_full[src_base + i + half_rope]);
+        float x_lo = __bfloat162float(q_full[src_base + 2 * i]);
+        float x_hi = __bfloat162float(q_full[src_base + 2 * i + 1]);
 
-        // RoPE (half-split format)
+        // RoPE (interleaved / GPT-J format, DSv3 default rope_interleave=True)
         int pos = positions[token];
-        float c = __bfloat162float(cos_cache[pos * rope_dim + i]);
-        float s = __bfloat162float(sin_cache[pos * rope_dim + i]);
+        float c = cos_cache[pos * rope_dim + i];
+        float s = sin_cache[pos * rope_dim + i];
 
         // Write to FlashMLA Q buffer rope slot
         int dst_base = token * num_heads * kv_a_proj_dim + head * kv_a_proj_dim + kv_lora_rank;
-        q_mla[dst_base + i]             = __float2bfloat16(x_lo * c - x_hi * s);
-        q_mla[dst_base + i + half_rope] = __float2bfloat16(x_hi * c + x_lo * s);
+        q_mla[dst_base + 2 * i]     = __float2bfloat16(x_lo * c - x_hi * s);
+        q_mla[dst_base + 2 * i + 1] = __float2bfloat16(x_hi * c + x_lo * s);
     }
 }
 
@@ -231,8 +232,8 @@ void mla_rope_kv_cuda(
     int blocks = (total + threads - 1) / threads;
     mla_rope_kv_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16 *>(kv_a),
-        reinterpret_cast<const __nv_bfloat16 *>(cos_cache),
-        reinterpret_cast<const __nv_bfloat16 *>(sin_cache),
+        reinterpret_cast<const float *>(cos_cache),
+        reinterpret_cast<const float *>(sin_cache),
         positions,
         kv_a_proj_dim, kv_lora_rank, rope_dim, bs);
 }
@@ -260,8 +261,8 @@ void mla_rope_q_copy_cuda(
     mla_rope_q_copy_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16 *>(q_full),
         reinterpret_cast<__nv_bfloat16 *>(q_mla),
-        reinterpret_cast<const __nv_bfloat16 *>(cos_cache),
-        reinterpret_cast<const __nv_bfloat16 *>(sin_cache),
+        reinterpret_cast<const float *>(cos_cache),
+        reinterpret_cast<const float *>(sin_cache),
         positions,
         q_b_proj_dim, q_head_dim, nope_dim, rope_dim,
         num_heads, kv_a_proj_dim, kv_lora_rank, bs);

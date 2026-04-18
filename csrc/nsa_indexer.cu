@@ -189,8 +189,8 @@ __global__ void indexer_fused_score_topk_kernel(
 __global__ void indexer_rope_kernel(
     __nv_bfloat16 *__restrict__ q,
     __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ cos_cache,
-    const __nv_bfloat16 *__restrict__ sin_cache,
+    const float *__restrict__ cos_cache,
+    const float *__restrict__ sin_cache,
     const int *__restrict__ positions,
     int T,
     int n_heads,
@@ -202,8 +202,10 @@ __global__ void indexer_rope_kernel(
 
     int pos = positions[t];
     int half_rope = rope_dim / 2;
-    const __nv_bfloat16 *cos_ptr = cos_cache + pos * rope_dim;
-    const __nv_bfloat16 *sin_ptr = sin_cache + pos * rope_dim;
+    const float *cos_ptr = cos_cache + pos * rope_dim;
+    const float *sin_ptr = sin_cache + pos * rope_dim;
+
+    // Interleaved / GPT-J RoPE: pair (2i, 2i+1), cos/sin indexed by i.
 
     // RoPE on q: for each head h, apply to q[t, h, 0:rope_dim]
     for (int idx = threadIdx.x; idx < n_heads * half_rope; idx += blockDim.x) {
@@ -211,25 +213,25 @@ __global__ void indexer_rope_kernel(
         int i = idx % half_rope;
 
         int base = t * n_heads * head_dim + h * head_dim;
-        float x0 = __bfloat162float(q[base + i]);
-        float x1 = __bfloat162float(q[base + i + half_rope]);
-        float c = __bfloat162float(cos_ptr[i]);
-        float s = __bfloat162float(sin_ptr[i]);
+        float x0 = __bfloat162float(q[base + 2 * i]);
+        float x1 = __bfloat162float(q[base + 2 * i + 1]);
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
 
-        q[base + i]             = __float2bfloat16(x0 * c - x1 * s);
-        q[base + i + half_rope] = __float2bfloat16(x1 * c + x0 * s);
+        q[base + 2 * i]     = __float2bfloat16(x0 * c - x1 * s);
+        q[base + 2 * i + 1] = __float2bfloat16(x1 * c + x0 * s);
     }
 
     // RoPE on k: single head, apply to k[t, 0:rope_dim]
     for (int i = threadIdx.x; i < half_rope; i += blockDim.x) {
         int base = t * head_dim;
-        float x0 = __bfloat162float(k[base + i]);
-        float x1 = __bfloat162float(k[base + i + half_rope]);
-        float c = __bfloat162float(cos_ptr[i]);
-        float s = __bfloat162float(sin_ptr[i]);
+        float x0 = __bfloat162float(k[base + 2 * i]);
+        float x1 = __bfloat162float(k[base + 2 * i + 1]);
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
 
-        k[base + i]             = __float2bfloat16(x0 * c - x1 * s);
-        k[base + i + half_rope] = __float2bfloat16(x1 * c + x0 * s);
+        k[base + 2 * i]     = __float2bfloat16(x0 * c - x1 * s);
+        k[base + 2 * i + 1] = __float2bfloat16(x1 * c + x0 * s);
     }
 }
 
@@ -299,8 +301,8 @@ void nsa_indexer_rope_cuda(
     indexer_rope_kernel<<<T, threads, 0, stream>>>(
         (__nv_bfloat16 *)q,
         (__nv_bfloat16 *)k,
-        (const __nv_bfloat16 *)cos_cache,
-        (const __nv_bfloat16 *)sin_cache,
+        (const float *)cos_cache,
+        (const float *)sin_cache,
         positions,
         T, n_heads, head_dim, rope_dim);
 }

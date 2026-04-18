@@ -22,7 +22,7 @@ use super::weights::{DsV32Model, FfnWeights, MoeFfnWeights};
 use crate::ffi;
 use crate::ops;
 use crate::ops::fp8::{Fp8Scratch, fp8_gemm_into, fp8_linear_into, fp8_quantize_into};
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, HiddenStates};
 
 /// Pre-allocated scratch buffers for MLA forward.
 pub(crate) struct MlaForwardBuffers {
@@ -432,8 +432,8 @@ impl DsV32Model {
         kv_states: &mut [&mut MlaKvState],
         positions: &[i32],
         bufs: &mut MlaForwardBuffers,
-        cos_cache: &DeviceVec,
-        sin_cache: &DeviceVec,
+        cos_cache: &cudarc::driver::CudaSlice<f32>,
+        sin_cache: &cudarc::driver::CudaSlice<f32>,
         kv_pool: &MlaKvPool,
     ) -> Result<()> {
         let ctx = &self.ctx;
@@ -531,14 +531,14 @@ impl DsV32Model {
         // RoPE on k_rope (in-place on kv_a)
         {
             let (kv_a_ptr, _g) = bufs.kv_a.data.device_ptr_mut(&ctx.stream);
-            let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+            let (cos_ptr, _gc) = cos_cache.device_ptr(&ctx.stream);
+            let (sin_ptr, _gs) = sin_cache.device_ptr(&ctx.stream);
             let (pos_ptr, _gp) = bufs.positions_d.device_ptr(&ctx.stream);
             unsafe {
                 ffi::mla_rope_kv_cuda(
                     kv_a_ptr as *mut ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
+                    cos_ptr as *const f32,
+                    sin_ptr as *const f32,
                     pos_ptr as *const i32,
                     config.kv_a_proj_dim() as i32,
                     config.kv_lora_rank as i32,
@@ -639,16 +639,16 @@ impl DsV32Model {
         {
             let (q_full_ptr, _gq) = bufs.q_full.data.device_ptr(&ctx.stream);
             let (q_mla_ptr, _gm) = bufs.q_mla.device_ptr_mut(&ctx.stream);
-            let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+            let (cos_ptr, _gc) = cos_cache.device_ptr(&ctx.stream);
+            let (sin_ptr, _gs) = sin_cache.device_ptr(&ctx.stream);
             let (pos_ptr, _gp) = bufs.positions_d.device_ptr(&ctx.stream);
 
             unsafe {
                 ffi::mla_rope_q_copy_cuda(
                     q_full_ptr as *const ffi::Half,
                     q_mla_ptr as *mut ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
+                    cos_ptr as *const f32,
+                    sin_ptr as *const f32,
                     pos_ptr as *const i32,
                     config.q_b_proj_dim() as i32,
                     config.q_head_dim() as i32,
@@ -1045,14 +1045,14 @@ impl DsV32Model {
         // RoPE on k_rope (in-place on kv_a)
         {
             let (kv_a_ptr, _g) = bufs.kv_a.data.device_ptr_mut(&ctx.stream);
-            let (cos_ptr, _gc) = self.cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _gs) = self.sin_cache.data.device_ptr(&ctx.stream);
+            let (cos_ptr, _gc) = self.cos_cache.device_ptr(&ctx.stream);
+            let (sin_ptr, _gs) = self.sin_cache.device_ptr(&ctx.stream);
             let (pos_ptr, _gp) = bufs.positions_d.device_ptr(&ctx.stream);
             unsafe {
                 ffi::mla_rope_kv_cuda(
                     kv_a_ptr as *mut ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
+                    cos_ptr as *const f32,
+                    sin_ptr as *const f32,
                     pos_ptr as *const i32,
                     config.kv_a_proj_dim() as i32,
                     config.kv_lora_rank as i32,
@@ -1111,16 +1111,16 @@ impl DsV32Model {
         {
             let (q_full_ptr, _gq) = bufs.q_full.data.device_ptr(&ctx.stream);
             let (q_mla_ptr, _gm) = bufs.q_mla.device_ptr_mut(&ctx.stream);
-            let (cos_ptr, _gc) = self.cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _gs) = self.sin_cache.data.device_ptr(&ctx.stream);
+            let (cos_ptr, _gc) = self.cos_cache.device_ptr(&ctx.stream);
+            let (sin_ptr, _gs) = self.sin_cache.device_ptr(&ctx.stream);
             let (pos_ptr, _gp) = bufs.positions_d.device_ptr(&ctx.stream);
 
             unsafe {
                 ffi::mla_rope_q_copy_cuda(
                     q_full_ptr as *const ffi::Half,
                     q_mla_ptr as *mut ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
+                    cos_ptr as *const f32,
+                    sin_ptr as *const f32,
                     pos_ptr as *const i32,
                     config.q_b_proj_dim() as i32,
                     config.q_head_dim() as i32,
@@ -1430,8 +1430,8 @@ impl DsV32Model {
         {
             let (iq_ptr, _g) = bufs.indexer_q.device_ptr_mut(&ctx.stream);
             let (ik_ptr, _gk) = bufs.indexer_k.device_ptr_mut(&ctx.stream);
-            let (cos_ptr, _gc) = self.cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _gs) = self.sin_cache.data.device_ptr(&ctx.stream);
+            let (cos_ptr, _gc) = self.cos_cache.device_ptr(&ctx.stream);
+            let (sin_ptr, _gs) = self.sin_cache.device_ptr(&ctx.stream);
             let (pos_ptr, _gp) = bufs.positions_d.device_ptr(&ctx.stream);
             unsafe {
                 ffi::nsa_indexer_rope_cuda(

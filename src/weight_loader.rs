@@ -260,7 +260,7 @@ pub(crate) fn precompute_yarn_rope(
     beta_slow: f32,
     factor: f32,
     original_max_position_embeddings: usize,
-) -> Result<(DeviceVec, DeviceVec)> {
+) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
     let half_dim = head_dim / 2;
 
     // pos_freqs = theta ^ (arange(0, head_dim, 2) / head_dim)
@@ -299,17 +299,19 @@ pub(crate) fn precompute_yarn_rope(
         inv_freq[i] = inv_freq_interpolation[i] * ramp + inv_freq_extrapolation[i] * (1.0 - ramp);
     }
 
-    // Build cos/sin cache with half-split layout
+    // Build cos/sin cache with half-split layout. Keep fp32 on-device so
+    // kernels don't pay a precision tax on per-position rotations (bf16 cos/sin
+    // lose ~8 bits of mantissa, causing position-dependent attention drift).
     let total = max_seq_len * head_dim;
-    let mut cos_host = vec![bf16::ZERO; total];
-    let mut sin_host = vec![bf16::ZERO; total];
+    let mut cos_host = vec![0.0f32; total];
+    let mut sin_host = vec![0.0f32; total];
 
     for pos in 0..max_seq_len {
         let base = pos * head_dim;
         for i in 0..half_dim {
             let freq = pos as f32 * inv_freq[i];
-            let cos_val = bf16::from_f32(freq.cos());
-            let sin_val = bf16::from_f32(freq.sin());
+            let cos_val = freq.cos();
+            let sin_val = freq.sin();
             cos_host[base + i] = cos_val;
             cos_host[base + i + half_dim] = cos_val;
             sin_host[base + i] = sin_val;
@@ -317,8 +319,8 @@ pub(crate) fn precompute_yarn_rope(
         }
     }
 
-    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;
-    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?;
+    let cos_cache = ctx.stream.clone_htod(&cos_host)?;
+    let sin_cache = ctx.stream.clone_htod(&sin_host)?;
     Ok((cos_cache, sin_cache))
 }
 

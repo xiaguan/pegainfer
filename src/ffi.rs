@@ -541,11 +541,11 @@ unsafe extern "C" {
     // MLA kernels (csrc/mla.cu)
     // ========================================================================
 
-    // RoPE on k_rope portion of kv_a (in-place).
+    // RoPE on k_rope portion of kv_a (in-place). cos/sin caches are fp32.
     pub(crate) fn mla_rope_kv_cuda(
         kv_a: *mut Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
         positions: *const i32,
         kv_a_proj_dim: i32,
         kv_lora_rank: i32,
@@ -555,11 +555,12 @@ unsafe extern "C" {
     );
 
     // Copy q_rope from q_full interleaved layout → FlashMLA Q buffer, with RoPE.
+    // cos/sin caches are fp32.
     pub(crate) fn mla_rope_q_copy_cuda(
         q_full: *const Half,
         q_mla: *mut Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
         positions: *const i32,
         q_b_proj_dim: i32,
         q_head_dim: i32,

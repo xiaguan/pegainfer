@@ -155,9 +155,11 @@ pub struct DsV32Model {
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
-    /// Precomputed YaRN RoPE cos/sin cache: [max_seq_len, qk_rope_head_dim] bf16
-    pub(super) cos_cache: DeviceVec,
-    pub(super) sin_cache: DeviceVec,
+    /// Precomputed YaRN RoPE cos/sin cache: [max_seq_len, qk_rope_head_dim] fp32.
+    /// Kept in fp32 because bf16 rounding of cos/sin at non-zero positions
+    /// caused visible per-position attention drift.
+    pub(super) cos_cache: CudaSlice<f32>,
+    pub(super) sin_cache: CudaSlice<f32>,
     /// DeepEP intranode buffer for EP All-to-All (None if EP1).
     pub(super) deep_ep_buffer: Option<super::deep_ep::DeepEpBuffer>,
 }
