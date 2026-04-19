@@ -1,8 +1,8 @@
 # Qwen3 Tensor Parallelism Design
 
-> **TL;DR:** Add `TP=2` support for `Qwen3-4B` as the first model-parallel milestone. The goal is correctness and a clean architectural foundation for larger dense models and future MoE work, with the runtime moving toward a controller-plus-workers broadcast execution model instead of scheduler-owned cross-thread mutable state.
+> **TL;DR:** Archived design record for the `Qwen3-4B` tensor-parallel milestone. It captures the first-pass `TP=2`/`TP=8` design and runtime direction that established the model-parallel foundation.
 >
-> **Status:** Active. `Qwen3-4B` has now been brought up end-to-end with `TP=2` on a single machine. `TP=8` has also been smoke-tested on an 8x4090 host, but the implementation still carries first-pass runtime debt and has not yet gone through systematic correctness validation.
+> **Status:** Archived. `Qwen3-4B` tensor-parallel bring-up is recorded here as design history; any future TP follow-up should continue in a new active project doc.
 
 ## Goal
 

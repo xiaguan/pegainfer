@@ -1,7 +1,7 @@
 # Project: ModelForward Trait Extraction
 
-**Status**: Active
-**TL;DR**: Extract `ModelForward` trait from model forward semantics. Lift the generation loop out of two model files into shared code. Designed for future bs > 1: weights (`&self`) separated from per-request mutable `State`.
+**Status**: Archived
+**TL;DR**: Archived architecture record for the `ModelForward` trait extraction. The shared generation-loop abstraction landed, and this document is now preserved as design history rather than an active project tracker.
 
 ---
 

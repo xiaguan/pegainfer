@@ -1,8 +1,8 @@
 # Project: Continuous Batching
 
-> **TL;DR:** Serve N requests concurrently so each 7.67GB weight read produces N tokens instead of 1. Phase 1 starts with a generic RAII `PagePool` allocator, then layers paged KV layout and kernels on top. Phase 2: Scheduler + batch decode. Phase 3: Multi-request server engine.
+> **TL;DR:** Archived implementation record for continuous batching. The project introduced the shared page allocator, paged KV direction, batched forward path, scheduler, and batch decode infrastructure that enabled the current server-side batching baseline.
 >
-> **Status:** Active. Phase 1 done. Phase 2 Steps 1-4 done (batched forward + correctness + bucket CUDA Graphs + scheduler). Next: Phase 3 (multi-request throughput testing).
+> **Status:** Archived. The document is preserved as the design and rollout history for continuous batching; new batching work should continue in a fresh active project doc instead of extending this one indefinitely.
 
 ## Motivation
 

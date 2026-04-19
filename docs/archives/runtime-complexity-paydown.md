@@ -1,7 +1,7 @@
 # Project: Runtime Complexity Paydown
 
-**Status**: Active
-**TL;DR**: pegainfer now has enough model-specific runtime branching that complexity itself is becoming a delivery risk. The current paydown track starts with API-surface cleanup and dead-code removal so internal runtime details stop leaking outward before larger module splits begin; the latest pass kept deleting obsolete wrappers while also pulling logging, tokenizer streaming, weight-loading helpers, Qwen3/Qwen3.5 internals, and Qwen3.5 config back behind crate-local boundaries.
+**Status**: Archived
+**TL;DR**: Archived runtime-paydown record. It captures the phase where runtime branching cleanup, API-surface tightening, and module-boundary cleanup were treated as a dedicated delivery-risk reduction effort.
 
 ---
 

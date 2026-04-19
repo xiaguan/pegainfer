@@ -1,5 +1,8 @@
 # Accuracy Evaluation Results — Phase 1 (GSM8K)
 
+**Status**: Archived
+**TL;DR**: Archived evaluation snapshot for the Phase 1 GSM8K run. It records one passing Qwen3-4B comparison and one failing Qwen3.5-4B comparison, and is kept as historical benchmark evidence rather than an active work tracker.
+
 ## Summary
 
 | Model | Backend | GSM8K 8-shot (strict-match) | GSM8K 8-shot (flexible-extract) | Delta vs HF | Status |

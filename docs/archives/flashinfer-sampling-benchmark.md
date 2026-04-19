@@ -1,9 +1,9 @@
 # FlashInfer Sampling Benchmark
 
 **Created**: 2026-04-03
-**Status**: blocked
+**Status**: archived-blocked
 
-> **TL;DR:** Runtime token selection now stays on FlashInfer, greedy uses FlashInfer top-k selection (`k=1`) instead of abusing `top_k=1` sampling, and `bench_serving` is back to greedy-only. The remaining blocker is batched decode: `mini-sglang` and `vLLM` both keep batched greedy and batched per-row sampling metadata, while pegainfer currently falls back to per-request sampling inside batch decode.
+> **TL;DR:** Archived blocked workstream. Runtime token selection moved onto FlashInfer and greedy now uses FlashInfer top-k selection (`k=1`), but the remaining batched-decode sampling work was not carried forward and the doc is kept as a reference for what landed and where it stopped.
 
 ## Preparation
 

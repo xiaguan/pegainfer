@@ -1,7 +1,7 @@
 # Milestone: Non-Standard Attention Focus
 
-**Status**: Active
-**TL;DR**: pegainfer is focused on inference and serving for non-standard attention models, especially linear attention and sparse attention. This milestone prioritizes model-family readiness, service experience, framework debt repayment, and disciplined correctness/performance evaluation.
+**Status**: Archived
+**TL;DR**: Archived milestone-direction document for pegainfer's non-standard-attention focus. It is retained as historical framing for model-family readiness, service quality, and framework paydown.
 
 ---
 

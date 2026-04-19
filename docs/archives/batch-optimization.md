@@ -1,8 +1,8 @@
 # Batch Optimization
 
-> **TL;DR:** Realistic varied-length benchmark (in~1024–3072, out~64–192, Poisson QPS=2, n=500) shows pegainfer within 2% of vLLM throughput while beating it on TTFT (−16%), TPOT (−1.6%), and latency stability (std lower across the board). Fixed-length decode: TPOT 11.05ms vs vLLM 11.41ms (−3.2%). KV cache now dynamically sized (85% of free VRAM).
+> **TL;DR:** Archived optimization record for the single-GPU batching/perf push: realistic varied-length benchmark (in~1024–3072, out~64–192, Poisson QPS=2, n=500) showed pegainfer within 2% of vLLM throughput while beating it on TTFT (−16%), TPOT (−1.6%), and latency stability. Fixed-length decode reached TPOT 11.05ms vs vLLM 11.41ms (−3.2%). Dynamic KV cache landed.
 >
-> **Status:** Active. Fused projections + dynamic KV cache landed. RMSNorm migrated to FlashInfer (zero perf delta). Decode TPOT surpasses vLLM at all concurrencies. Remaining: ITL p99 tail (prefill stalls → chunked prefill, low priority). Next: Qwen3.5 paged KV, concurrent stress testing.
+> **Status:** Archived. This doc is kept as the historical record of the batching/performance push after the main outcomes landed; any future batching follow-up should live in a new active project doc.
 
 ## Baseline (2026-03-30, n=50)
 

@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `225ms`, TPOT `11.81ms` (+1%). After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
+> **TL;DR:** Archived Qwen3.5-4B optimization record. The single-request path reached near-parity with vLLM, and the post-refactor decode regression was recovered by restoring the dedicated GDR decode kernel.
 >
-> **Status:** Active. Updated 2026-03-28: post-accuracy-parity optimization pass. The prefill-as-decode refactor (#40) simplified the codebase but regressed TPOT from `11.78ms` to `12.28ms` (+4.2%). Root cause: 7 chunk-wise Triton kernels per linear layer vs the old fused decode kernel. Restoring the GDR decode kernel for single-token path recovered TPOT to `11.81ms`. TTFT unchanged at `225ms`.
+> **Status:** Archived. Updated 2026-03-28 snapshot preserved as historical optimization context rather than an active tuning tracker.
 
 ## Goal
 
