@@ -809,6 +809,29 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Gather selected token rows into a contiguous packed buffer.
+    // dst[row, col] = src[token_indices[row], col]
+    pub(crate) fn moe_gather_rows_cuda(
+        dst: *mut Half,
+        src: *const Half,
+        token_indices: *const i32,
+        hidden_size: i32,
+        num_rows: i32,
+        stream: CUstream,
+    );
+
+    // Scatter-add weighted rows back into the recv-token output buffer.
+    // dst[token_indices[row], col] += weights[row] * src[row, col]
+    pub(crate) fn moe_scatter_weighted_add_rows_cuda(
+        dst: *mut Half,
+        src: *const Half,
+        token_indices: *const i32,
+        weights: *const f32,
+        hidden_size: i32,
+        num_rows: i32,
+        stream: CUstream,
+    );
+
     // ========================================================================
     // DeepEP intranode All-to-All (csrc/deep_ep.cu)
     // ========================================================================

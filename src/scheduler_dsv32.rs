@@ -2,7 +2,8 @@
 //! multi-GPU executor.
 //!
 //! This keeps the serving path honest to the current sparse-prefill main path:
-//! each generation step re-runs `DsV32Executor::forward` on the full prefix.
+//! the prompt runs through sparse prefill once, then each generation step
+//! reuses MLA KV via `DsV32Executor::decode`.
 //! It is correctness-first and intentionally avoids reintroducing the retired
 //! dense-prefill prompt path.
 

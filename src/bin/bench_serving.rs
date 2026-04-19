@@ -23,10 +23,11 @@ use comfy_table::{Cell, CellAlignment, Table};
 use log::{debug, info};
 use pegainfer::logging;
 use pegainfer::model::{
-    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
+    DsV32Executor, GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
 };
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
+use pegainfer::scheduler_dsv32;
 use pegainfer::scheduler_qwen35;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::tokenizer::Tokenizer;
@@ -39,9 +40,31 @@ const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench_snapshots
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
 const SNAPSHOT_DECODE_OUTPUT_LEN: usize = 256;
+const DSV32_SNAPSHOT_PREFILL_PROMPT_LEN: usize = 2048;
+const DSV32_SNAPSHOT_DECODE_PROMPT_LEN: usize = 1;
+const DSV32_SNAPSHOT_DECODE_OUTPUT_LEN: usize = 128;
+const DEFAULT_DSV32_DEVICE_ORDINALS: &str = "0,1,2,3,4,5,6,7";
+const DEFAULT_DSV32_TP_SIZE: usize = 1;
 
-fn snapshot_prefill_prompt_len(_model_type: ModelType) -> usize {
-    10_000
+fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
+    match model_type {
+        ModelType::Dsv32 => DSV32_SNAPSHOT_PREFILL_PROMPT_LEN,
+        ModelType::Qwen3 | ModelType::Qwen35 => 10_000,
+    }
+}
+
+fn snapshot_decode_prompt_len(model_type: ModelType) -> usize {
+    match model_type {
+        ModelType::Dsv32 => DSV32_SNAPSHOT_DECODE_PROMPT_LEN,
+        ModelType::Qwen3 | ModelType::Qwen35 => SNAPSHOT_DECODE_PROMPT_LEN,
+    }
+}
+
+fn snapshot_decode_output_len(model_type: ModelType) -> usize {
+    match model_type {
+        ModelType::Dsv32 => DSV32_SNAPSHOT_DECODE_OUTPUT_LEN,
+        ModelType::Qwen3 | ModelType::Qwen35 => SNAPSHOT_DECODE_OUTPUT_LEN,
+    }
 }
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
@@ -55,6 +78,7 @@ Examples:
   cargo run -r --bin bench_serving -- request
   cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
   cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64
+  cargo run -r --bin bench_serving -- --model-path /data/models/DeepSeek-V3.2 --dsv32-device-ordinals 0,1,2,3,4,5,6,7 request --prompt-len 64 --output-len 64 --warmup 0 --iters 1
   cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
   cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
   cargo run -r --bin bench_serving -- --format json --out bench.json request --prompt-len 512 --output-len 64
@@ -65,6 +89,7 @@ Examples:
   cargo run -r --bin bench_serving -- request
   cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
   cargo run -r --bin bench_serving -- request --prompt-file prompts/story.txt --output-len 128
+  cargo run -r --bin bench_serving -- --model-path /data/models/DeepSeek-V3.2 --dsv32-device-ordinals 0,1,2,3,4,5,6,7 request --prompt-len 64 --output-len 64 --warmup 0 --iters 1
   cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64 --warmup 3 --iters 10";
 const MATRIX_EXAMPLES: &str = "\
 Examples:
@@ -120,6 +145,14 @@ struct Cli {
     /// Model directory (contains config.json, tokenizer, safetensors)
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
     model_path: String,
+
+    /// Tensor-parallel size for DeepSeek-V3.2 (`PEGAINFER_DSV32_TP_SIZE` fallback)
+    #[arg(long)]
+    dsv32_tp_size: Option<usize>,
+
+    /// CUDA device ordinals for DeepSeek-V3.2 (`PEGAINFER_DSV32_DEVICE_ORDINALS` fallback)
+    #[arg(long, value_delimiter = ',')]
+    dsv32_device_ordinals: Option<Vec<usize>>,
 
     /// Enable CUDA graph on decode path
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -937,6 +970,47 @@ fn command_seed(cli: &Cli) -> u64 {
     }
 }
 
+fn parse_usize_csv(raw: &str, flag: &str) -> Result<Vec<usize>> {
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<usize>()
+                .with_context(|| format!("invalid {flag} value `{s}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!values.is_empty(), "{flag} must not be empty");
+    Ok(values)
+}
+
+fn resolve_dsv32_tp_size(cli: &Cli) -> Result<usize> {
+    let tp_size = match cli.dsv32_tp_size {
+        Some(value) => value,
+        None => std::env::var("PEGAINFER_DSV32_TP_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_DSV32_TP_SIZE),
+    };
+    ensure!(tp_size > 0, "--dsv32-tp-size must be > 0");
+    Ok(tp_size)
+}
+
+fn resolve_dsv32_device_ordinals(cli: &Cli) -> Result<Vec<usize>> {
+    let values = if let Some(values) = &cli.dsv32_device_ordinals {
+        values.clone()
+    } else if let Ok(raw) = std::env::var("PEGAINFER_DSV32_DEVICE_ORDINALS") {
+        parse_usize_csv(&raw, "PEGAINFER_DSV32_DEVICE_ORDINALS")?
+    } else {
+        parse_usize_csv(DEFAULT_DSV32_DEVICE_ORDINALS, "--dsv32-device-ordinals")?
+    };
+    ensure!(
+        !values.is_empty(),
+        "--dsv32-device-ordinals must include at least one device"
+    );
+    Ok(values)
+}
+
 fn normalize_sizes(values: &[usize], flag: &str) -> Result<Vec<usize>> {
     ensure!(!values.is_empty(), "{flag} must not be empty");
     ensure!(values.iter().all(|v| *v > 0), "{flag} values must be > 0");
@@ -1346,6 +1420,8 @@ fn run_snapshot(
     args: &SnapshotArgs,
 ) -> Result<()> {
     let prefill_prompt_len = snapshot_prefill_prompt_len(model_type);
+    let decode_prompt_len = snapshot_decode_prompt_len(model_type);
+    let decode_output_len = snapshot_decode_output_len(model_type);
 
     info!("Running prefill-heavy ({prefill_prompt_len},{SNAPSHOT_PREFILL_OUTPUT_LEN})");
     let prefill_tokens = synthetic_prompt_tokens(prefill_prompt_len);
@@ -1357,10 +1433,9 @@ fn run_snapshot(
     )?;
     let prefill_metrics = build_request_metrics(&prefill_timings);
 
-    info!("Running decode-heavy ({SNAPSHOT_DECODE_PROMPT_LEN},{SNAPSHOT_DECODE_OUTPUT_LEN})");
-    let decode_tokens = synthetic_prompt_tokens(SNAPSHOT_DECODE_PROMPT_LEN);
-    let decode_timings =
-        measure_timings(model, &decode_tokens, SNAPSHOT_DECODE_OUTPUT_LEN, &args.run)?;
+    info!("Running decode-heavy ({decode_prompt_len},{decode_output_len})");
+    let decode_tokens = synthetic_prompt_tokens(decode_prompt_len);
+    let decode_timings = measure_timings(model, &decode_tokens, decode_output_len, &args.run)?;
     let decode_metrics = build_request_metrics(&decode_timings);
 
     let model_name = model_display_name(&cli.model_path);
@@ -1376,8 +1451,8 @@ fn run_snapshot(
             metrics: prefill_metrics,
         },
         decode_heavy: SnapshotProfile {
-            prompt_len: SNAPSHOT_DECODE_PROMPT_LEN,
-            output_len: SNAPSHOT_DECODE_OUTPUT_LEN,
+            prompt_len: decode_prompt_len,
+            output_len: decode_output_len,
             metrics: decode_metrics,
         },
     };
@@ -1657,8 +1732,24 @@ fn main() -> Result<()> {
             let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
         }
-        ModelType::Dsv32 => Err(anyhow::anyhow!(
-            "bench_serving does not support DeepSeek-V3.2 yet; use the HTTP server path first"
-        )),
+        ModelType::Dsv32 => {
+            let device_ordinals = resolve_dsv32_device_ordinals(&cli)?;
+            let tp_size = resolve_dsv32_tp_size(&cli)?;
+            ensure!(
+                device_ordinals.len() % tp_size == 0,
+                "invalid DSV3.2 parallel config: world_size={} tp_size={tp_size}",
+                device_ordinals.len()
+            );
+            info!(
+                "Loading DSV3.2 benchmark runtime: model_path={} device_ordinals={device_ordinals:?} tp_size={tp_size}",
+                cli.model_path
+            );
+            let executor = DsV32Executor::load(&cli.model_path, &device_ordinals, tp_size)?;
+            let handle = scheduler_dsv32::start(executor, command_seed(&cli))?;
+            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            let mut bench = SchedulerBenchModel { handle };
+            dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
+        }
     }
 }

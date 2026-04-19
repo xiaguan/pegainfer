@@ -151,7 +151,7 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 - [ ] Decode path：单 token MLA + MoE forward
 - [ ] KV cache 管理（MLA 压缩格式的 append/管理）
 - [ ] CUDA Graph capture（decode path）
-- [ ] `bench_serving` 接入 DSV3.2
+- [x] `bench_serving` 接入 DSV3.2
 - [ ] E2E 生成验证 / 输出质量回归
 
 当前边界（精简）：
@@ -172,6 +172,11 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 
 ### Phase 4 — 性能优化
 
+- [x] Prefill EP MoE：`forward_moe_ep()` 从逐 token local expert 执行改成按 expert 分组、按 `max_bs` 分块批处理
+- [x] H20 `64 -> 64` 回归：TTFT 从 `7.08-7.34s` 降到 `0.76-0.97s`，steady TPOT 从 `180-190ms/token` 降到 `64-76ms/token`
+- [x] EP local expert gather/scatter kernel 化：把逐 token `DtoD gather` / `moe_weighted_add` 改成 batched gather/scatter，原始版本把 `64 -> 64` 压到 `TTFT 0.28-0.43s`、`steady TPOT 54-58ms/token`，但 greedy correctness 回归
+- [x] 找到 regression 根因并修复：bug 不是 FFI/layout，而是 batched scatter 把同一 token 的 expert 累加顺序从 top-k-slot-major 改成 expert-major，在 bf16 read-modify-write 下触发 greedy 漂移；现已改成按 top-k slot 保序 batching，`e2e_dsv32_small` 恢复 `44/44` 通过，H20 `64 -> 64` accepted baseline 为 `TTFT 452.17ms`、`steady TPOT 53.46ms/token`
+- [x] 热点画像切换：`fp8_gemm` 已升到 `42.5%` kernel time，超过 `cached_notify_combine 33.5%`；`cuMemcpyDtoDAsync` 基本退出主路径，但 chunk metadata `H2D` 仍然很高
 - [ ] 通信与计算 overlap（双 micro-batch 流水线）
 - [ ] Decode 侧 SM 分区实验
 - [ ] MTP speculative decoding

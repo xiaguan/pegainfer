@@ -177,6 +177,7 @@ fn test_e2e_dsv32_small_generation() {
     info!("Engine loaded in {:.2?}", start.elapsed());
 
     info!("=== DSV3.2 greedy correctness ===");
+    let mut failures = Vec::new();
     for case in &cases {
         info!("--- [{}] {} ---", case.name, case.prompt);
         let start = Instant::now();
@@ -194,24 +195,31 @@ fn test_e2e_dsv32_small_generation() {
             finish_reason
         );
 
-        assert!(
-            !text.is_empty(),
-            "empty output for case {} ({:?})",
-            case.name,
-            case.prompt
-        );
-        if tokens.len() >= case.max_new_tokens {
-            assert_eq!(
-                finish_reason,
-                FinishReason::Length,
-                "case {} should finish by length when emitting max_new_tokens",
-                case.name
-            );
+        if text.is_empty() {
+            failures.push(format!(
+                "case {} produced empty output (prompt={:?})",
+                case.name, case.prompt
+            ));
+            continue;
         }
-        assert_eq!(
-            text, case.output,
-            "greedy output mismatch for case {}\n  prompt:    {:?}\n  got:      {:?}\n  expected: {:?}",
-            case.name, case.prompt, text, case.output
-        );
+        if tokens.len() >= case.max_new_tokens && finish_reason != FinishReason::Length {
+            failures.push(format!(
+                "case {} should finish by length when emitting max_new_tokens: got {:?}",
+                case.name, finish_reason
+            ));
+        }
+        if text != case.output {
+            failures.push(format!(
+                "greedy output mismatch for case {}\n  prompt:    {:?}\n  got:      {:?}\n  expected: {:?}",
+                case.name, case.prompt, text, case.output
+            ));
+        }
     }
+
+    assert!(
+        failures.is_empty(),
+        "DSV3.2 small E2E mismatches: {} case(s)\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }

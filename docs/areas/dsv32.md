@@ -185,8 +185,15 @@ Commands (**not yet run**):
 
 ```bash
 # pegainfer
-bench_serving request --prompt-len 2048 --output-len 1 --model dsv32
-bench_serving request --prompt-len 1   --output-len 128 --model dsv32
+cargo run -r --bin bench_serving -- \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 2048 --output-len 1
+
+cargo run -r --bin bench_serving -- \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 1 --output-len 128
 
 # vLLM baseline (on the same 8-card NVLink node)
 vllm bench serve --model /data/models/DeepSeek-V3.2 --input-len 2048 --output-len 1
@@ -215,6 +222,26 @@ Current smoke timings (single request, TP1+DP1+EP8, not a benchmark):
 | `hello world` | 8 | ~1.78 s |
 | `1+1=` | 8 | ~1.81 s |
 | reasoning-style prompt | 16 | ~5.84 s |
+
+Exploratory benchmark on H20 (single request, synthetic prompt, `prompt_len=64`, `output_len=64`):
+
+| Run | warmup / iters | load_ms | TTFT | first decode step | steady TPOT | E2E | decode tok/s |
+|-----|----------------|---------|------|-------------------|-------------|-----|--------------|
+| #0 baseline benchmark | `1 / 1` | `57738.68` | `7084.10 ms` | `192.15 ms` | `180.66 ms` | `18477.46 ms` | `5.53` |
+| #0 baseline + `nsys` | `0 / 1` | `58434.80` | `7343.73 ms` | `211.01 ms` | `189.83 ms` | `19323.90 ms` | `5.26` |
+| #1 grouped-local-expert benchmark | `1 / 1` | `60358.22` | `758.10 ms` | `65.37 ms` | `64.13 ms` | `4799.54 ms` | `15.59` |
+| #1 grouped-local-expert + `nsys` | `0 / 1` | `56093.27` | `968.26 ms` | `83.60 ms` | `75.51 ms` | `5733.46 ms` | `13.22` |
+| #2 batch gather/scatter benchmark | `1 / 1` | `57609.95` | `283.72 ms` | `57.61 ms` | `54.51 ms` | `3720.82 ms` | `18.33` |
+| #2 batch gather/scatter + `nsys` | `0 / 1` | `56648.36` | `426.08 ms` | `72.44 ms` | `58.12 ms` | `4101.88 ms` | `17.14` |
+| #3 order-preserving gather/scatter benchmark | `1 / 1` | `58647.12` | `452.17 ms` | `54.46 ms` | `53.46 ms` | `3821.30 ms` | `18.70` |
+
+Notes:
+- `load_ms` is reported separately by `bench_serving`; it is **not** part of TTFT/TPOT.
+- The benchmark prompt is synthetic (`token_id = 100 + (idx % 1000)`), so these numbers isolate runtime cost rather than tokenizer/prompt-content effects.
+- The #1 change keeps `recv_x` immutable, batches local expert GEMMs per expert in `max_bs`-sized chunks, and accumulates into a separate combine input buffer.
+- The #2 change replaces per-token `DtoD gather` and per-token `moe_weighted_add` in the EP local-expert path with batched gather/scatter kernels plus chunk metadata upload.
+- The raw #2 numbers are **not** the accepted baseline because that version regressed greedy correctness.
+- At this size, the current accepted headline after #3 is: **TTFT is now ~0.45 s for 64 tokens, and steady decode is ~53 ms/token, with `e2e_dsv32_small` back to `44/44` passing.**
 
 ### Generation alignment harness (teacher-forced top-K)
 
@@ -256,6 +283,7 @@ Notes:
 - `max_new_tokens` is intentionally high for thinking-style prompts; sglang still stops early on EOS/stop.
 - Local `pegainfer/.venv` must first install sglang: `uv pip install -p .venv/bin/python -e ../sglang/python`.
 - H20 result (2026-04-19): `44/44` cases, `6888` positions, `argmax_mismatches=209 (3.03%)`, `argmax_outside_topk=5`, `top-K overlap mean=18.59/20`, runtime `1368.02s`.
+- H20 greedy JSON regression result after the order-preserving EP fix (2026-04-19): `44/44` cases passed in `394.98s`.
 
 ---
 
@@ -263,9 +291,217 @@ Notes:
 
 Append-only. See `docs/resources/model-optimization-pipeline.md` for entry format.
 
-### #0 Baseline — TBD
+### #0 Baseline — H20 `64 -> 64` benchmark + `nsys` (2026-04-19)
 
-No kernel breakdown yet. Will record once `benches/dsv32_*` + nsys capture are in place.
+Command:
+
+```bash
+cargo run --release --bin bench_serving -- \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 64 --output-len 64 --warmup 1 --iters 1
+```
+
+Profile command:
+
+```bash
+/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx --cuda-graph-trace=node \
+  --force-overwrite=true --export=sqlite \
+  -o target/profiling/dsv32_64_64 \
+  target/release/bench_serving \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 64 --output-len 64 --warmup 0 --iters 1
+```
+
+Observed metrics:
+- TTFT: `7.08-7.34 s`
+- first decode step: `192-211 ms`
+- steady TPOT: `180.66-189.83 ms/token`
+- E2E: `18.48-19.32 s`
+- decode throughput: `5.26-5.53 tok/s`
+- model load: `57.7-58.4 s` (reported separately from TTFT)
+
+`nsys` kernel summary (`target/profiling/dsv32_64_64.sqlite`):
+- `deep_ep::intranode::cached_notify_combine`: `59.8%`
+- `deep_gemm::sm90_fp8_gemm_1d2d_impl`: `33.6%`
+- `scale_1x128_kernel`: `1.2%`
+- `deep_ep::intranode::combine`: `0.7%`
+- `deep_ep::intranode::notify_dispatch`: `0.6%`
+- `deep_ep::intranode::dispatch`: `0.5%`
+- `FlashMLA sparse prefill` kernel: `0.1%`
+- `indexer_fused_score_topk_kernel`: `0.2%`
+
+`nsys` CUDA API summary:
+- `cuMemcpyHtoDAsync_v2`: `49.3%`
+- `cuStreamSynchronize`: `30.1%`
+- `cuMemAllocAsync`: `8.0%`
+- `cudaLaunchKernel`: `7.5%`
+- `cuMemcpyDtoHAsync_v2`: `1.3%`
+
+Performance findings:
+- **TTFT at `prompt_len=64` is not attention-bound.** Sparse prefill attention (`flash_mla_sparse_prefill`) and NSA indexer top-k are present, but each is only a small fraction of total GPU time. The large wall time is not explained by FlashMLA itself.
+- **Prefill MoE is currently reusing the decode-oriented EP path.** In the sparse prefill layer path, `forward_layer_prefill_sparse()` ends up in `forward_moe()`, which for EP8 immediately calls `forward_moe_ep()` (`src/model/dsv32/forward.rs:1252`, `src/model/dsv32/forward.rs:1744`).
+- **`forward_moe_ep()` is structurally serialized for prefill.** The function does a host-visible sync to read `num_recv_tokens`, copies routing metadata back to host, then iterates `for tok in 0..num_recv_tokens` and runs expert FFN with `seq_len = 1` (`src/model/dsv32/forward.rs:1959`, `src/model/dsv32/forward.rs:2030`, `src/model/dsv32/forward.rs:2045`, `src/model/dsv32/forward.rs:2090`). The inline comment even says: “For decode (small num_recv_tokens), we process per-token sequentially.” The same function is used during prefill, so batched prefill MoE is effectively falling back to per-token expert execution.
+- **DeepEP overhead is paid on every MoE layer in both prefill and decode.** The `cached_notify_combine`/`notify_dispatch`/`dispatch`/`combine` kernels each appear `29,696` times in the `64 -> 64` trace. That count matches `58 MoE layers * (1 prefill + 63 decode steps) * 8 ranks`, i.e. the communication path is exercised for every MoE layer of the entire request.
+- **The current bottleneck hierarchy is therefore:**
+  1. EP8 communication/control (`cached_notify_combine` especially)
+  2. FP8 GEMM volume in MoE/dense projections
+  3. Host sync / DTOH control traffic in `forward_moe_ep`
+  4. Attention/indexer, which are not the first-order explanation for `TTFT ~7 s` at `64` tokens
+
+### #1 Grouped Local Experts In Prefill EP Path — H20 `64 -> 64` recheck (2026-04-19)
+
+Code change:
+- `forward_moe_ep()` no longer overwrites `recv_x` in-place while computing local experts.
+- The received activations stay immutable in `ep_recv_x`.
+- Local routed outputs accumulate into a separate `ep_local_out`.
+- Local experts are executed per expert in `max_bs`-sized chunks instead of `seq_len=1` per token.
+
+Command:
+
+```bash
+cargo run --release --bin bench_serving -- \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 64 --output-len 64 --warmup 1 --iters 1
+```
+
+Profile command:
+
+```bash
+/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx --cuda-graph-trace=node \
+  --force-overwrite=true --export=sqlite \
+  -o target/profiling/dsv32_64_64_grouped \
+  target/release/bench_serving \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 64 --output-len 64 --warmup 0 --iters 1
+```
+
+Observed metrics:
+- TTFT: `0.76-0.97 s`
+- first decode step: `65-84 ms`
+- steady TPOT: `64.13-75.51 ms/token`
+- E2E: `4.80-5.73 s`
+- decode throughput: `13.22-15.59 tok/s`
+- model load: `56.1-60.4 s` (reported separately from TTFT)
+
+Delta vs #0:
+- TTFT: `7.5x-9.3x` faster
+- steady TPOT: `2.5x-2.9x` faster
+- E2E: `3.4x-3.9x` faster
+
+`nsys` kernel summary (`target/profiling/dsv32_64_64_grouped.sqlite`):
+- `deep_ep::intranode::cached_notify_combine`: `45.9%`
+- `deep_gemm::sm90_fp8_gemm_1d2d_impl`: `32.5%`
+- `deep_ep::intranode::notify_dispatch`: `3.0%`
+- `deep_ep::intranode::combine`: `2.5%`
+- `moe_weighted_add_kernel`: `2.4%`
+- `deep_ep::intranode::dispatch`: `2.1%`
+- `FlashMLA dense decode`: `1.4%`
+- `FlashMLA sparse prefill`: `0.5%`
+- `indexer_fused_score_topk_kernel`: `0.7%`
+
+`nsys` CUDA API summary:
+- `cuMemcpyHtoDAsync_v2`: `76.8%`
+- `cuStreamSynchronize`: `8.9%`
+- `cuMemAllocAsync`: `4.3%`
+- `cudaLaunchKernel`: `3.1%`
+- `cuMemcpyDtoDAsync_v2`: `1.7%`
+- `cuMemcpyDtoHAsync_v2`: `1.5%`
+
+Performance findings:
+- **The first-order TTFT regression was prefill MoE structure, and this change removed most of it.** The old path ran routed experts token-by-token inside `forward_moe_ep()`. After switching to grouped per-expert batches, `64 -> 64` TTFT fell from `~7.1-7.3 s` to `~0.76-0.97 s`.
+- **DeepEP control/communication is still the top GPU cost.** `cached_notify_combine` remains the largest kernel at `45.9%`, with `notify_dispatch`/`dispatch`/`combine` still present on every MoE layer. The optimization improved compute structure, but it did not change the communication shape.
+- **FP8 GEMM is now a clearer steady-state compute hotspot.** `deep_gemm::sm90_fp8_gemm_1d2d_impl` still takes `32.5%` of GPU kernel time; this is now a more meaningful next compute target because the per-token prefill serialization is no longer dominating wall time.
+- **API-side H2D traffic is still too large.** `cuMemcpyHtoDAsync_v2` grows to `76.8%` in the profiled run, while `cuMemcpyDtoHAsync_v2` drops to `1.5%`. Directionally, the next likely wins are host-built metadata / per-step uploads rather than another round of MoE local batching.
+- **Attention remains secondary at this shape.** FlashMLA sparse prefill is still only `0.5%` of kernel time in the profiled `64 -> 64` run; this is not where the remaining seconds are hiding.
+
+### #2 Batch Gather/Scatter In EP Local Experts — H20 `64 -> 64` recheck (2026-04-19)
+
+Change:
+- Keep the host-side `tokens_per_expert` bucketing for now, but replace the per-token `memcpy_dtod()` gather loop and per-token `moe_weighted_add_cuda()` accumulation loop inside `run_grouped_local_experts_from_recv()` with batched CUDA helpers:
+  - `moe_gather_rows_cuda(dst, src, token_indices, hidden_size, num_rows)`
+  - `moe_scatter_weighted_add_rows_cuda(dst, src, token_indices, weights, hidden_size, num_rows)`
+- Chunk token indices and weights are uploaded once per expert chunk, then each chunk runs:
+  1. one batched gather
+  2. shared FP8 quantize + gate/up/down GEMMs
+  3. one batched weighted scatter-add
+
+Observed metrics:
+- benchmark (`warmup=1`, `iters=1`):
+  - TTFT: `283.72 ms`
+  - first decode step: `57.61 ms`
+  - steady TPOT: `54.51 ms/token`
+  - E2E: `3720.82 ms`
+  - decode throughput: `18.33 tok/s`
+- benchmark + `nsys` (`warmup=0`, `iters=1`):
+  - TTFT: `426.08 ms`
+  - first decode step: `72.44 ms`
+  - steady TPOT: `58.12 ms/token`
+  - E2E: `4101.88 ms`
+  - decode throughput: `17.14 tok/s`
+  - model load: `56.6-57.6 s` (reported separately from TTFT)
+
+Compared with #1:
+- TTFT: `2.3x-3.4x` faster
+- steady TPOT: `1.1x-1.3x` faster
+- decode throughput: `~1.2x-1.3x` higher
+
+`nsys` kernel summary (`target/profiling/dsv32_64_64_gather_scatter_real.sqlite`):
+- `deep_gemm::sm90_fp8_gemm_1d2d_impl`: `42.5%`
+- `deep_ep::intranode::cached_notify_combine`: `33.5%`
+- `deep_ep::intranode::combine`: `3.3%`
+- `deep_ep::intranode::notify_dispatch`: `2.6%`
+- `deep_ep::intranode::dispatch`: `2.3%`
+- `moe_scatter_weighted_add_rows_kernel`: `0.3%` (`36,989` instances)
+- `moe_gather_rows_kernel`: `0.3%` (`36,989` instances)
+- previous per-token `moe_weighted_add_kernel` is no longer part of the hot path for EP8 runs
+
+`nsys` CUDA API summary:
+- `cuMemcpyHtoDAsync_v2`: `82.4%` (`271,930` calls)
+- `cuStreamSynchronize`: `8.1%` (`45,669` calls)
+- `cuMemAllocAsync`: `3.7%` (`105,280` calls)
+- `cudaLaunchKernel`: `2.4%` (`1,011,544` calls)
+- `cuMemcpyDtoHAsync_v2`: `1.3%` (`31,418` calls)
+- `cuMemcpyDtoDAsync_v2`: effectively gone from the hot path (`8` calls total)
+
+What this means:
+- **This is the first `64 -> 64` profile where GEMM is clearly the top kernel family.** `fp8_gemm` moved ahead of `cached_notify_combine` (`42.5%` vs `33.5%`), which matches the expected direction for a healthier compute path.
+- **The local-expert batching overhead is now much smaller.** The old EP path paid hundreds of thousands of tiny `DtoD` copies plus per-token weighted-add kernels. After replacing them with batched gather/scatter, the EP local compute path stopped dominating both TTFT and TPOT.
+- **The next likely limiter is chunk metadata H2D, not DtoD anymore.** `cuMemcpyDtoDAsync_v2` collapsed to `8` calls, but `cuMemcpyHtoDAsync_v2` grew to `271,930` calls because every expert chunk now uploads token indices and weights. The wall-clock win is still strongly positive, but the next cleanup target is obvious.
+- **DeepEP combine is still substantial, but it is no longer the first-order blocker.** With GEMM already at the top, the remaining work is more about reducing chunk-control overhead and then revisiting deeper EP routing / grouped-GEMM integration.
+
+### #3 Preserve top-k accumulation order in EP local expert batching (2026-04-19)
+
+Root cause:
+- The first gather/scatter version changed routed-expert accumulation from legacy **token-major, top-k-slot-major** order to **expert-major** order.
+- In the old path, each recv token was updated as `k=0 -> k=1 -> ... -> k=topk-1`.
+- In the new expert-major path, the same token's contributions were revisited later as each expert bucket was processed.
+- The scatter kernel updates `dst` with a bf16 read-modify-write on every contribution (`moe_scatter_weighted_add_rows_kernel`), so this reordering is not numerically equivalent. The decisive line is `dst = bf16(dst + weight * src)` in [moe.cu](/data/code/workspace-rustllm/pegainfer/csrc/moe.cu:226).
+- Result: the raw #2 path was fast, but it caused widespread greedy drift (`40/44` mismatches in `e2e_dsv32_small`).
+
+Fix:
+- Keep batched gather/scatter, but rebuild the host bucketing loop to preserve the legacy accumulation order.
+- The accepted path now iterates **top-k slot first**, then batches all tokens for the local expert inside that slot.
+- This preserves per-token accumulation as `slot 0 -> slot 1 -> ...`, while still batching GEMMs and gather/scatter within each slot.
+
+Observed metrics:
+- benchmark (`warmup=1`, `iters=1`):
+  - TTFT: `452.17 ms`
+  - first decode step: `54.46 ms`
+  - steady TPOT: `53.46 ms/token`
+  - E2E: `3821.30 ms`
+  - decode throughput: `18.70 tok/s`
+- correctness:
+  - single-case A/B on `en_capital_fr`: `legacy` passed, raw expert-major `grouped` failed, order-preserving `grouped` passed
+  - full `e2e_dsv32_small`: `44/44` passing on H20 in `394.98s`
+
+What this means:
+- **The bug was accumulation-order drift, not an FFI or layout bug.**
+- **The final accepted batching path keeps almost all of the #2 speedup.** Compared with the broken raw #2 benchmark, TTFT rose from `283.72 ms` to `452.17 ms`, but steady TPOT stayed slightly better at `53.46 ms/token`.
+- **Correctness is back at the committed regression level.** The accepted baseline is now the #3 row above, not the raw #2 row.
 
 ---
 

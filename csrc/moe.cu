@@ -190,6 +190,44 @@ __global__ void moe_weighted_add_kernel(
     }
 }
 
+__global__ void moe_gather_rows_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    const int* __restrict__ token_indices,
+    int hidden_size,
+    int num_rows)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = hidden_size * num_rows;
+    if (i < n) {
+        int row = i / hidden_size;
+        int col = i - row * hidden_size;
+        int src_row = token_indices[row];
+        dst[i] = src[src_row * hidden_size + col];
+    }
+}
+
+__global__ void moe_scatter_weighted_add_rows_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    const int* __restrict__ token_indices,
+    const float* __restrict__ weights,
+    int hidden_size,
+    int num_rows)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = hidden_size * num_rows;
+    if (i < n) {
+        int row = i / hidden_size;
+        int col = i - row * hidden_size;
+        int dst_row = token_indices[row];
+        int dst_idx = dst_row * hidden_size + col;
+        int src_idx = row * hidden_size + col;
+        float val = __bfloat162float(dst[dst_idx]) + weights[row] * __bfloat162float(src[src_idx]);
+        dst[dst_idx] = __float2bfloat16(val);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
@@ -248,6 +286,46 @@ void moe_weighted_add_cuda(
         (const __nv_bfloat16*)x,
         scale,
         n);
+}
+
+void moe_gather_rows_cuda(
+    void* dst,                  // bf16 [num_rows, hidden_size]
+    const void* src,            // bf16 [num_tokens, hidden_size]
+    const int* token_indices,   // [num_rows]
+    int hidden_size,
+    int num_rows,
+    void* stream)
+{
+    const int threads = 256;
+    int n = hidden_size * num_rows;
+    int blocks = (n + threads - 1) / threads;
+    moe_gather_rows_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)dst,
+        (const __nv_bfloat16*)src,
+        token_indices,
+        hidden_size,
+        num_rows);
+}
+
+void moe_scatter_weighted_add_rows_cuda(
+    void* dst,                  // bf16 [num_tokens, hidden_size]
+    const void* src,            // bf16 [num_rows, hidden_size]
+    const int* token_indices,   // [num_rows]
+    const float* weights,       // [num_rows]
+    int hidden_size,
+    int num_rows,
+    void* stream)
+{
+    const int threads = 256;
+    int n = hidden_size * num_rows;
+    int blocks = (n + threads - 1) / threads;
+    moe_scatter_weighted_add_rows_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)dst,
+        (const __nv_bfloat16*)src,
+        token_indices,
+        weights,
+        hidden_size,
+        num_rows);
 }
 
 void cast_i32_to_i64_cuda(

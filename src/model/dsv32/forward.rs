@@ -15,6 +15,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::runtime::{result as cuda_runtime, sys as cuda_runtime_sys};
 use half::bf16;
 use log::debug;
+use std::sync::OnceLock;
 
 use super::config::DsV32Config;
 use super::mla_kv::{MlaKvPool, MlaKvState};
@@ -24,8 +25,38 @@ use crate::ops;
 use crate::ops::fp8::{Fp8Scratch, fp8_gemm_into, fp8_linear_into, fp8_quantize_into};
 use crate::tensor::{DeviceContext, HiddenStates};
 
+const FLASH_MLA_MAX_BLOCKS_PER_SEQ: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpLocalExpertsMode {
+    LegacyTokenSerial,
+    GroupedCuda,
+}
+
+fn ep_local_expert_mode() -> EpLocalExpertsMode {
+    static MODE: OnceLock<EpLocalExpertsMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("PEGAINFER_DSV32_EP_LOCAL_MODE") {
+        Ok(mode) if mode.eq_ignore_ascii_case("legacy") => EpLocalExpertsMode::LegacyTokenSerial,
+        Ok(mode)
+            if mode.eq_ignore_ascii_case("grouped")
+                || mode.eq_ignore_ascii_case("grouped_cuda") =>
+        {
+            EpLocalExpertsMode::GroupedCuda
+        }
+        Ok(mode) => {
+            log::warn!(
+                "unknown PEGAINFER_DSV32_EP_LOCAL_MODE={mode:?}, falling back to grouped_cuda"
+            );
+            EpLocalExpertsMode::GroupedCuda
+        }
+        Err(_) => EpLocalExpertsMode::GroupedCuda,
+    })
+}
+
 /// Pre-allocated scratch buffers for MLA forward.
 pub(crate) struct MlaForwardBuffers {
+    /// Maximum per-rank token batch size for normal forward scratch buffers.
+    max_bs: usize,
     /// FP8 scratch for hidden_size input projections (q_a, kv_a, shared quantize).
     fp8_hidden: Fp8Scratch,
     /// FP8 scratch for q_compressed (q_lora_rank) → q_b_proj.
@@ -34,6 +65,8 @@ pub(crate) struct MlaForwardBuffers {
     fp8_intermediate: Fp8Scratch,
     /// q_compressed: [q_lora_rank, bs]
     q_compressed: HiddenStates,
+    /// q_a_layernorm output: [q_lora_rank, bs]
+    q_normed: HiddenStates,
     /// q_full: [q_b_proj_dim, bs] = [24576, bs]
     q_full: HiddenStates,
     /// kv_a: [kv_a_proj_dim, bs] = [576, bs]
@@ -66,6 +99,8 @@ pub(crate) struct MlaForwardBuffers {
     o_accum: CudaSlice<f32>,
     /// Positions buffer for RoPE
     positions_d: CudaSlice<i32>,
+    /// Token ids buffer for batched embedding lookup: [max_bs]
+    token_ids_d: CudaSlice<u32>,
     /// seqlens_k for FlashMLA: [bs]
     seqlens_k_d: CudaSlice<i32>,
     /// Block table for FlashMLA: [bs, max_blocks_per_seq]
@@ -118,6 +153,12 @@ pub(crate) struct MlaForwardBuffers {
     ep_recv_channel_prefix_matrix: CudaSlice<i32>,
     /// send_head: [max_tokens * num_ranks] i32
     ep_send_head: CudaSlice<i32>,
+    /// Local expert output before DeepEP combine: [max_recv_tokens * hidden_size] bf16
+    ep_local_out: CudaSlice<bf16>,
+    /// Chunk token indices for batched local expert gather/scatter: [max_bs] i32
+    ep_chunk_token_idx: CudaSlice<i32>,
+    /// Chunk weights for batched local expert scatter-add: [max_bs] f32
+    ep_chunk_weight: CudaSlice<f32>,
     /// combined_x output: [bs * hidden_size] bf16
     ep_combined_x: CudaSlice<bf16>,
     /// combined_topk_weights: [bs * topk] f32
@@ -205,6 +246,7 @@ impl MlaForwardBuffers {
         let fp8_intermediate = Fp8Scratch::new(ctx, max_bs, intermediate.max(o_proj_in));
 
         let q_compressed = HiddenStates::zeros(ctx, q_lora, max_bs)?;
+        let q_normed = HiddenStates::zeros(ctx, q_lora, max_bs)?;
         let q_full = HiddenStates::zeros(ctx, q_b_dim, max_bs)?;
         let kv_a = HiddenStates::zeros(ctx, kv_a_dim, max_bs)?;
         let q_mla: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_bs * num_heads * kv_a_dim)?;
@@ -227,9 +269,10 @@ impl MlaForwardBuffers {
             .alloc_zeros(max_total_num_splits * num_heads * kv_lora)?;
 
         let positions_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs)?;
+        let token_ids_d: CudaSlice<u32> = ctx.stream.alloc_zeros(max_bs)?;
         let seqlens_k_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs)?;
         // Generous max blocks per seq
-        let max_blocks_per_seq = 1024;
+        let max_blocks_per_seq = FLASH_MLA_MAX_BLOCKS_PER_SEQ;
         let block_table_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * max_blocks_per_seq)?;
         let page_indices_d: CudaSlice<i32> = ctx.stream.alloc_zeros(max_blocks_per_seq)?;
 
@@ -263,6 +306,9 @@ impl MlaForwardBuffers {
         let ep_recv_channel_prefix_matrix: CudaSlice<i32> =
             ctx.stream.alloc_zeros(num_ranks * num_channels)?;
         let ep_send_head: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs * num_ranks)?;
+        let ep_local_out: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_recv_tokens * hidden)?;
+        let ep_chunk_token_idx: CudaSlice<i32> = ctx.stream.alloc_zeros(max_bs)?;
+        let ep_chunk_weight: CudaSlice<f32> = ctx.stream.alloc_zeros(max_bs)?;
         let ep_combined_x: CudaSlice<bf16> = ctx.stream.alloc_zeros(max_bs * hidden)?;
         let ep_combined_topk_weights: CudaSlice<f32> = ctx.stream.alloc_zeros(max_bs * topk)?;
 
@@ -288,10 +334,12 @@ impl MlaForwardBuffers {
         let logits = HiddenStates::zeros(ctx, config.vocab_size, max_bs)?;
 
         Ok(Self {
+            max_bs,
             fp8_hidden,
             fp8_q_compressed,
             fp8_intermediate,
             q_compressed,
+            q_normed,
             q_full,
             kv_a,
             q_mla,
@@ -309,6 +357,7 @@ impl MlaForwardBuffers {
             lse_accum,
             o_accum,
             positions_d,
+            token_ids_d,
             seqlens_k_d,
             block_table_d,
             page_indices_d,
@@ -332,6 +381,9 @@ impl MlaForwardBuffers {
             ep_recv_topk_weights,
             ep_recv_channel_prefix_matrix,
             ep_send_head,
+            ep_local_out,
+            ep_chunk_token_idx,
+            ep_chunk_weight,
             ep_combined_x,
             ep_combined_topk_weights,
             indexer_q,
@@ -364,13 +416,20 @@ impl DsV32Model {
 
         kv_state.ensure_capacity(start_pos + num_tokens)?;
         let page_indices = kv_state.page_indices_i32();
-        let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
+        anyhow::ensure!(
+            page_indices.len() <= FLASH_MLA_MAX_BLOCKS_PER_SEQ,
+            "page_indices len {} exceeds preallocated page_indices_d capacity {}",
+            page_indices.len(),
+            FLASH_MLA_MAX_BLOCKS_PER_SEQ
+        );
+        let mut page_indices_d = bufs.page_indices_d.slice_mut(..page_indices.len());
+        ctx.stream.memcpy_htod(&page_indices, &mut page_indices_d)?;
 
         let (kv_a_ptr, _g) = bufs.kv_a.data.device_ptr(&ctx.stream);
         let layer_offset = kv_pool.layer_offset(layer_idx);
         let (buf_ptr, _gb) = kv_pool.buffer().device_ptr(&ctx.stream);
         let kv_buf_ptr = buf_ptr + (layer_offset * std::mem::size_of::<bf16>()) as u64;
-        let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+        let (pi_ptr, _gpi) = bufs.page_indices_d.device_ptr(&ctx.stream);
 
         unsafe {
             ffi::mla_kv_cache_write_cuda(
@@ -430,7 +489,6 @@ impl DsV32Model {
         layer_idx: usize,
         hidden: &mut HiddenStates,
         kv_states: &mut [&mut MlaKvState],
-        positions: &[i32],
         bufs: &mut MlaForwardBuffers,
         cos_cache: &cudarc::driver::CudaSlice<f32>,
         sin_cache: &cudarc::driver::CudaSlice<f32>,
@@ -440,13 +498,6 @@ impl DsV32Model {
         let config = &self.config;
         let layer = &self.layers[layer_idx];
         let bs = hidden.seq_len;
-
-        // Upload positions
-        let positions_slice = ctx.stream.clone_htod(positions)?;
-        ctx.stream.memcpy_dtod(
-            &positions_slice,
-            &mut bufs.positions_d.slice_mut(..positions.len()),
-        )?;
 
         // ====================================================================
         // 1. Input LayerNorm
@@ -479,20 +530,20 @@ impl DsV32Model {
         );
 
         // q_a_layernorm on q_compressed
-        let mut q_normed = HiddenStates::zeros(ctx, config.q_lora_rank, bs)?;
+        bufs.q_normed.seq_len = bs;
         ops::rms_norm_batch_into(
             ctx,
             &bufs.q_compressed,
             &layer.mla.q_a_layernorm,
             config.rms_norm_eps,
-            &mut q_normed,
+            &mut bufs.q_normed,
         );
 
         // FP8 quantize q_normed → q_b_proj
         bufs.q_full.seq_len = bs;
         fp8_linear_into(
             ctx,
-            &q_normed,
+            &bufs.q_normed,
             &layer.mla.q_b_proj,
             &mut bufs.fp8_q_compressed,
             &mut bufs.q_full,
@@ -553,7 +604,9 @@ impl DsV32Model {
         // 5. Write KV to paged cache
         // ====================================================================
         for (req_idx, kv) in kv_states.iter_mut().enumerate() {
-            let token_pos = positions[req_idx] as usize;
+            let token_pos = kv.seq_len().checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!("decode KV state must contain the current token before cache write")
+            })?;
             assert_eq!(
                 kv.seq_len(),
                 token_pos + 1,
@@ -565,7 +618,14 @@ impl DsV32Model {
             kv.ensure_capacity(token_pos + 1)?;
 
             let page_indices = kv.page_indices_i32();
-            let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
+            anyhow::ensure!(
+                page_indices.len() <= FLASH_MLA_MAX_BLOCKS_PER_SEQ,
+                "page_indices len {} exceeds preallocated page_indices_d capacity {}",
+                page_indices.len(),
+                FLASH_MLA_MAX_BLOCKS_PER_SEQ
+            );
+            let mut page_indices_d = bufs.page_indices_d.slice_mut(..page_indices.len());
+            ctx.stream.memcpy_htod(&page_indices, &mut page_indices_d)?;
 
             let (kv_a_ptr, _g) = bufs.kv_a.data.device_ptr(&ctx.stream);
             let kv_a_token_ptr =
@@ -575,7 +635,7 @@ impl DsV32Model {
             let (buf_ptr, _gb) = kv_pool.buffer().device_ptr(&ctx.stream);
             let kv_buf_ptr = buf_ptr + (layer_offset * std::mem::size_of::<bf16>()) as u64;
 
-            let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+            let (pi_ptr, _gpi) = bufs.page_indices_d.device_ptr(&ctx.stream);
 
             unsafe {
                 ffi::mla_kv_cache_write_cuda(
@@ -822,17 +882,15 @@ impl DsV32Model {
         let num_layers = self.layers.len();
 
         // Batch embedding: all tokens at once → hidden [hidden_size, seq_len]
-        let token_ids_gpu = ctx
-            .stream
-            .clone_htod(&token_ids.iter().map(|&t| t).collect::<Vec<u32>>())?;
+        let mut token_ids_d = bufs.token_ids_d.slice_mut(..seq_len);
+        ctx.stream.memcpy_htod(token_ids, &mut token_ids_d)?;
         let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, seq_len)?;
         hidden.seq_len = seq_len;
-        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &bufs.token_ids_d, &mut hidden)?;
 
         // Upload positions for all tokens
-        let positions_d = ctx.stream.clone_htod(positions)?;
-        ctx.stream
-            .memcpy_dtod(&positions_d, &mut bufs.positions_d.slice_mut(..seq_len))?;
+        let mut positions_d = bufs.positions_d.slice_mut(..seq_len);
+        ctx.stream.memcpy_htod(positions, &mut positions_d)?;
 
         // Forward through all layers
         for layer_idx in 0..num_layers {
@@ -872,16 +930,14 @@ impl DsV32Model {
 
         let num_layers = self.layers.len();
 
-        let token_ids_gpu = ctx
-            .stream
-            .clone_htod(&token_ids.iter().map(|&t| t).collect::<Vec<u32>>())?;
+        let mut token_ids_d = bufs.token_ids_d.slice_mut(..seq_len);
+        ctx.stream.memcpy_htod(token_ids, &mut token_ids_d)?;
         let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, seq_len)?;
         hidden.seq_len = seq_len;
-        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &bufs.token_ids_d, &mut hidden)?;
 
-        let positions_d = ctx.stream.clone_htod(positions)?;
-        ctx.stream
-            .memcpy_dtod(&positions_d, &mut bufs.positions_d.slice_mut(..seq_len))?;
+        let mut positions_d = bufs.positions_d.slice_mut(..seq_len);
+        ctx.stream.memcpy_htod(positions, &mut positions_d)?;
 
         for layer_idx in 0..num_layers {
             self.forward_layer_prefill_sparse(layer_idx, &mut hidden, seq_len, bufs)?;
@@ -918,19 +974,21 @@ impl DsV32Model {
         kv_state.ensure_capacity(position + 1)?;
         kv_state.advance(1);
 
-        let token_ids_gpu = ctx.stream.clone_htod(&[token_id])?;
+        let mut token_ids_d = bufs.token_ids_d.slice_mut(..1);
+        ctx.stream.memcpy_htod(&[token_id], &mut token_ids_d)?;
         let mut hidden = HiddenStates::zeros(ctx, config.hidden_size, 1)?;
         hidden.seq_len = 1;
-        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &bufs.token_ids_d, &mut hidden)?;
 
         let positions = [position as i32];
+        let mut positions_d = bufs.positions_d.slice_mut(..1);
+        ctx.stream.memcpy_htod(&positions, &mut positions_d)?;
         let mut kv_refs: Vec<&mut MlaKvState> = vec![kv_state];
         for layer_idx in 0..self.layers.len() {
             self.forward_layer(
                 layer_idx,
                 &mut hidden,
                 &mut kv_refs,
-                &positions,
                 bufs,
                 &self.cos_cache,
                 &self.sin_cache,
@@ -986,26 +1044,20 @@ impl DsV32Model {
             &mut bufs.q_compressed,
         );
 
-        // q_a_layernorm: norm in-place into q_compressed so forward_indexer
-        // reads the post-norm value (same tensor used for q_b_proj below).
-        {
-            let mut q_normed = HiddenStates::zeros(ctx, config.q_lora_rank, bs)?;
-            ops::rms_norm_batch_into(
-                ctx,
-                &bufs.q_compressed,
-                &layer.mla.q_a_layernorm,
-                config.rms_norm_eps,
-                &mut q_normed,
-            );
-            // Copy normed result back to q_compressed for indexer access.
-            ctx.stream
-                .memcpy_dtod(&q_normed.data, &mut bufs.q_compressed.data)?;
-        }
+        // q_a_layernorm output feeds both the indexer path and q_b_proj.
+        bufs.q_normed.seq_len = bs;
+        ops::rms_norm_batch_into(
+            ctx,
+            &bufs.q_compressed,
+            &layer.mla.q_a_layernorm,
+            config.rms_norm_eps,
+            &mut bufs.q_normed,
+        );
 
         bufs.q_full.seq_len = bs;
         fp8_linear_into(
             ctx,
-            &bufs.q_compressed,
+            &bufs.q_normed,
             &layer.mla.q_b_proj,
             &mut bufs.fp8_q_compressed,
             &mut bufs.q_full,
@@ -1311,7 +1363,7 @@ impl DsV32Model {
 
     /// NSA indexer forward: compute sparse attention indices for one layer.
     ///
-    /// q_compressed, normed, and fp8_hidden must already be computed for this layer.
+    /// q_normed, normed, and fp8_hidden must already be computed for this layer.
     /// Reads bufs.normed for weights_proj GEMM and bufs.fp8_hidden for wk GEMM.
     ///
     /// Output: bufs.indexer_indices [T, topk] i32 — token-level KV positions.
@@ -1324,12 +1376,12 @@ impl DsV32Model {
         let idx_d = config.index_head_dim.unwrap();
         let idx_topk = config.index_topk.unwrap();
         let rope_dim = config.qk_rope_head_dim;
-        let bs = bufs.q_compressed.seq_len;
+        let bs = bufs.q_normed.seq_len;
 
-        // 1. wq_b: q_compressed [q_lora_rank, T] → indexer_q [idx_h * idx_d, T]
-        //    FP8 quantize q_compressed, then GEMM: wq_b @ q_compressed_fp8
+        // 1. wq_b: q_normed [q_lora_rank, T] → indexer_q [idx_h * idx_d, T]
+        //    FP8 quantize q_normed, then GEMM: wq_b @ q_normed_fp8
         {
-            let (q_ptr, _g) = bufs.q_compressed.data.device_ptr(&ctx.stream);
+            let (q_ptr, _g) = bufs.q_normed.data.device_ptr(&ctx.stream);
             let (fp8_ptr, _gf) = bufs.fp8_indexer_q.fp8_act.device_ptr_mut(&ctx.stream);
             let (scale_ptr, _gs) = bufs.fp8_indexer_q.scale_a.device_ptr_mut(&ctx.stream);
             unsafe {
@@ -1493,14 +1545,12 @@ impl DsV32Model {
 
         // Build FlashMLA metadata on CPU
         let mut seqlens_k = Vec::with_capacity(bs);
-        let mut block_table_flat = Vec::new();
         let mut max_blocks_per_seq = 0usize;
 
         for kv in kv_states.iter() {
             seqlens_k.push(kv.seq_len() as i32);
             let pages = kv.page_indices_i32();
             max_blocks_per_seq = max_blocks_per_seq.max(pages.len());
-            block_table_flat.extend_from_slice(&pages);
         }
 
         // Pad block_table to rectangular [bs, max_blocks_per_seq]
@@ -1514,14 +1564,23 @@ impl DsV32Model {
         }
 
         // Upload metadata
-        let seqlens_k_d = ctx.stream.clone_htod(&seqlens_k)?;
-        let block_table_d = ctx.stream.clone_htod(&block_table_rect)?;
+        anyhow::ensure!(
+            max_blocks_per_seq <= FLASH_MLA_MAX_BLOCKS_PER_SEQ,
+            "max_blocks_per_seq {} exceeds preallocated block_table_d capacity {}",
+            max_blocks_per_seq,
+            FLASH_MLA_MAX_BLOCKS_PER_SEQ
+        );
+        let mut seqlens_k_d = bufs.seqlens_k_d.slice_mut(..bs);
+        ctx.stream.memcpy_htod(&seqlens_k, &mut seqlens_k_d)?;
+        let mut block_table_d = bufs.block_table_d.slice_mut(..bs * max_blocks_per_seq);
+        ctx.stream
+            .memcpy_htod(&block_table_rect, &mut block_table_d)?;
 
         let num_sm_parts = flash_mla_num_sm_parts(ctx, config, 1)?;
 
         // Phase 1: get metadata
         {
-            let (seqlens_ptr, _gs) = seqlens_k_d.device_ptr(&ctx.stream);
+            let (seqlens_ptr, _gs) = bufs.seqlens_k_d.device_ptr(&ctx.stream);
             let (meta_ptr, _gm) = bufs.tile_scheduler_metadata.device_ptr_mut(&ctx.stream);
             let (splits_ptr, _gsp) = bufs.num_splits.device_ptr_mut(&ctx.stream);
 
@@ -1550,8 +1609,8 @@ impl DsV32Model {
             let (lse_ptr, _gl) = bufs.lse.device_ptr_mut(&ctx.stream);
             let (lse_acc_ptr, _gla) = bufs.lse_accum.device_ptr_mut(&ctx.stream);
             let (o_acc_ptr, _goa) = bufs.o_accum.device_ptr_mut(&ctx.stream);
-            let (bt_ptr, _gbt) = block_table_d.device_ptr(&ctx.stream);
-            let (seqlens_ptr, _gs) = seqlens_k_d.device_ptr(&ctx.stream);
+            let (bt_ptr, _gbt) = bufs.block_table_d.device_ptr(&ctx.stream);
+            let (seqlens_ptr, _gs) = bufs.seqlens_k_d.device_ptr(&ctx.stream);
             let (meta_ptr, _gm) = bufs.tile_scheduler_metadata.device_ptr(&ctx.stream);
             let (splits_ptr, _gsp) = bufs.num_splits.device_ptr(&ctx.stream);
 
@@ -1750,6 +1809,256 @@ impl DsV32Model {
         Ok(())
     }
 
+    fn run_grouped_local_experts_from_recv(
+        &self,
+        moe: &MoeFfnWeights,
+        bufs: &mut MlaForwardBuffers,
+        num_recv_tokens: usize,
+        recv_topk_idx_host: &[i64],
+        recv_topk_wt_host: &[f32],
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let hidden_size = config.hidden_size;
+        let topk = config.num_experts_per_tok;
+        let (_, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
+
+        if num_recv_tokens == 0 {
+            return Ok(());
+        }
+
+        {
+            let (local_out_ptr, _gl) = bufs.ep_local_out.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::cudaMemsetAsync(
+                    local_out_ptr as *mut std::ffi::c_void,
+                    0,
+                    num_recv_tokens * hidden_size * std::mem::size_of::<bf16>(),
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        let chunk_cap = bufs.max_bs;
+        let mut chunk_token_idx_host = Vec::with_capacity(chunk_cap);
+        let mut chunk_weight_host = Vec::with_capacity(chunk_cap);
+        let mut tokens_per_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ep_count];
+
+        // Preserve the legacy accumulation order for each recv token:
+        // contributions from slot k=0 must be added before k=1, etc.
+        // We still batch GEMMs by local expert within each slot.
+        for k in 0..topk {
+            for routed_tokens in tokens_per_expert.iter_mut() {
+                routed_tokens.clear();
+            }
+            for tok in 0..num_recv_tokens {
+                let slot = tok * topk + k;
+                let local_idx = recv_topk_idx_host[slot];
+                if local_idx < 0 {
+                    continue;
+                }
+                let local_idx = local_idx as usize;
+                if local_idx >= ep_count {
+                    continue;
+                }
+                tokens_per_expert[local_idx].push((tok, recv_topk_wt_host[slot]));
+            }
+
+            for (local_idx, routed_tokens) in tokens_per_expert.iter().enumerate() {
+                if routed_tokens.is_empty() {
+                    continue;
+                }
+                let expert = &moe.experts[local_idx];
+
+                for chunk in routed_tokens.chunks(chunk_cap) {
+                    let chunk_len = chunk.len();
+
+                    chunk_token_idx_host.clear();
+                    chunk_weight_host.clear();
+                    for (tok, weight) in chunk.iter() {
+                        chunk_token_idx_host.push(*tok as i32);
+                        chunk_weight_host.push(*weight);
+                    }
+                    let mut chunk_token_idx_d = bufs.ep_chunk_token_idx.slice_mut(..chunk_len);
+                    ctx.stream
+                        .memcpy_htod(&chunk_token_idx_host, &mut chunk_token_idx_d)?;
+                    let mut chunk_weight_d = bufs.ep_chunk_weight.slice_mut(..chunk_len);
+                    ctx.stream
+                        .memcpy_htod(&chunk_weight_host, &mut chunk_weight_d)?;
+
+                    {
+                        let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
+                        let (packed_x_ptr, _gpx) =
+                            bufs.attn_proj_out.data.device_ptr_mut(&ctx.stream);
+                        let (chunk_idx_ptr, _gci) = bufs.ep_chunk_token_idx.device_ptr(&ctx.stream);
+                        unsafe {
+                            ffi::moe_gather_rows_cuda(
+                                packed_x_ptr as *mut ffi::Half,
+                                recv_x_ptr as *const ffi::Half,
+                                chunk_idx_ptr as *const i32,
+                                hidden_size as i32,
+                                chunk_len as i32,
+                                ctx.stream.cu_stream(),
+                            );
+                        }
+                    }
+
+                    bufs.attn_proj_out.seq_len = chunk_len;
+                    fp8_quantize_into(ctx, &bufs.attn_proj_out, &mut bufs.fp8_hidden);
+
+                    bufs.moe_gate.seq_len = chunk_len;
+                    fp8_gemm_into(
+                        ctx,
+                        chunk_len,
+                        hidden_size,
+                        &expert.gate_proj,
+                        &bufs.fp8_hidden,
+                        &mut bufs.moe_gate,
+                    );
+
+                    bufs.moe_up.seq_len = chunk_len;
+                    fp8_gemm_into(
+                        ctx,
+                        chunk_len,
+                        hidden_size,
+                        &expert.up_proj,
+                        &bufs.fp8_hidden,
+                        &mut bufs.moe_up,
+                    );
+
+                    bufs.moe_act.seq_len = chunk_len;
+                    ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+                    bufs.moe_down.seq_len = chunk_len;
+                    fp8_linear_into(
+                        ctx,
+                        &bufs.moe_act,
+                        &expert.down_proj,
+                        &mut bufs.fp8_moe_intermediate,
+                        &mut bufs.moe_down,
+                    );
+
+                    {
+                        let (expert_out_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
+                        let (local_out_ptr, _gl) = bufs.ep_local_out.device_ptr_mut(&ctx.stream);
+                        let (chunk_idx_ptr, _gci) = bufs.ep_chunk_token_idx.device_ptr(&ctx.stream);
+                        let (chunk_wt_ptr, _gcw) = bufs.ep_chunk_weight.device_ptr(&ctx.stream);
+                        unsafe {
+                            ffi::moe_scatter_weighted_add_rows_cuda(
+                                local_out_ptr as *mut ffi::Half,
+                                expert_out_ptr as *const ffi::Half,
+                                chunk_idx_ptr as *const i32,
+                                chunk_wt_ptr as *const f32,
+                                hidden_size as i32,
+                                chunk_len as i32,
+                                ctx.stream.cu_stream(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_legacy_local_experts_from_recv(
+        &self,
+        moe: &MoeFfnWeights,
+        bufs: &mut MlaForwardBuffers,
+        num_recv_tokens: usize,
+        recv_topk_idx_host: &[i64],
+        recv_topk_wt_host: &[f32],
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let hidden_size = config.hidden_size;
+        let topk = config.num_experts_per_tok;
+        let (_, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
+
+        for tok in 0..num_recv_tokens {
+            let offset = tok * hidden_size;
+            let token_view = HiddenStates {
+                data: ctx
+                    .stream
+                    .clone_dtod(&bufs.ep_recv_x.slice(offset..offset + hidden_size))?,
+                hidden_dim: hidden_size,
+                seq_len: 1,
+            };
+            fp8_quantize_into(ctx, &token_view, &mut bufs.fp8_hidden);
+
+            let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
+            let recv_tok_ptr =
+                (recv_x_ptr + (offset * std::mem::size_of::<bf16>()) as u64) as *mut ffi::Half;
+            unsafe {
+                ffi::cudaMemsetAsync(
+                    recv_tok_ptr as *mut std::ffi::c_void,
+                    0,
+                    hidden_size * std::mem::size_of::<bf16>(),
+                    ctx.stream.cu_stream(),
+                );
+            }
+
+            for k in 0..topk {
+                let expert_idx = recv_topk_idx_host[tok * topk + k];
+                let weight = recv_topk_wt_host[tok * topk + k];
+                if expert_idx < 0 {
+                    continue;
+                }
+                let local_idx = expert_idx as usize;
+                if local_idx >= ep_count {
+                    continue;
+                }
+                let expert = &moe.experts[local_idx];
+
+                bufs.moe_gate.seq_len = 1;
+                fp8_gemm_into(
+                    ctx,
+                    1,
+                    hidden_size,
+                    &expert.gate_proj,
+                    &bufs.fp8_hidden,
+                    &mut bufs.moe_gate,
+                );
+
+                bufs.moe_up.seq_len = 1;
+                fp8_gemm_into(
+                    ctx,
+                    1,
+                    hidden_size,
+                    &expert.up_proj,
+                    &bufs.fp8_hidden,
+                    &mut bufs.moe_up,
+                );
+
+                bufs.moe_act.seq_len = 1;
+                ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
+
+                bufs.moe_down.seq_len = 1;
+                fp8_linear_into(
+                    ctx,
+                    &bufs.moe_act,
+                    &expert.down_proj,
+                    &mut bufs.fp8_moe_intermediate,
+                    &mut bufs.moe_down,
+                );
+
+                let (expert_out_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::moe_weighted_add_cuda(
+                        recv_tok_ptr,
+                        expert_out_ptr as *const ffi::Half,
+                        weight,
+                        hidden_size as i32,
+                        ctx.stream.cu_stream(),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// EP1 routed expert FFN: per-token, per-expert sequential.
     /// All experts are local — no cross-GPU communication needed.
     fn forward_moe_local(
@@ -1873,8 +2182,7 @@ impl DsV32Model {
         let rank = ep_buf.rank();
         let num_ranks = ep_buf.num_ranks();
         let num_channels = ep_config.num_channels();
-        let (_, ep_count) = self.parallel.local_expert_range(config.n_routed_experts);
-
+        let ep_local_mode = ep_local_expert_mode();
         // hidden_int4 = hidden_size * sizeof(bf16) / sizeof(int4) = hidden_size * 2 / 16
         let hidden_int4 = (hidden_size * 2 / 16) as i32;
 
@@ -2021,11 +2329,10 @@ impl DsV32Model {
         // ==================================================================
         // Step 5: Run local expert FFN on received tokens
         // ==================================================================
-        // recv_x: [num_recv_tokens, hidden_size] bf16 (row-major from dispatch)
-        // We need to transpose to column-major [hidden_size, num_recv_tokens] for our GEMM.
-        // For decode (small num_recv_tokens), we process per-token sequentially.
-        //
-        // Read recv_topk_idx to know which local expert each recv'd token goes to.
+        // recv_x: [num_recv_tokens, hidden_size] bf16 (row-major from dispatch).
+        // Keep it immutable as the expert input buffer, and accumulate routed
+        // outputs into ep_local_out so we can batch local expert GEMMs in
+        // max_bs-sized chunks without losing the original activations.
         if num_recv_tokens > 0 {
             let recv_topk_idx_host: Vec<i64> = ctx.stream.clone_dtoh(
                 &bufs
@@ -2038,101 +2345,21 @@ impl DsV32Model {
                     .slice(..num_recv_tokens as usize * topk),
             )?;
             ctx.sync()?;
-
-            // Process each received token through its designated local experts.
-            // DeepEP dispatch rewrites recv_topk_idx into rank-local expert ids
-            // for this receiving rank and fills non-local entries with -1.
-            for tok in 0..num_recv_tokens as usize {
-                // Create a view of this token in recv_x (row-major from dispatch).
-                // DeepEP dispatch outputs recv_x in row-major: [num_recv_tokens, hidden].
-                // Our GEMM expects column-major [hidden, bs].
-                // For bs=1 per token, row-major [1, hidden] == column-major [hidden, 1].
-                let offset = tok * hidden_size;
-                let token_view = HiddenStates {
-                    data: ctx
-                        .stream
-                        .clone_dtod(&bufs.ep_recv_x.slice(offset..offset + hidden_size))?,
-                    hidden_dim: hidden_size,
-                    seq_len: 1,
-                };
-                fp8_quantize_into(ctx, &token_view, &mut bufs.fp8_hidden);
-
-                // This recv slot is the accumulation buffer for local expert outputs.
-                // Zero it once up front so the first valid local expert does not
-                // depend on its original top-k position or on stale input activations.
-                let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr_mut(&ctx.stream);
-                let recv_tok_ptr =
-                    (recv_x_ptr + (offset * std::mem::size_of::<bf16>()) as u64) as *mut ffi::Half;
-                unsafe {
-                    ffi::cudaMemsetAsync(
-                        recv_tok_ptr as *mut std::ffi::c_void,
-                        0,
-                        hidden_size * std::mem::size_of::<bf16>(),
-                        ctx.stream.cu_stream(),
-                    );
-                }
-
-                for k in 0..topk {
-                    let expert_idx = recv_topk_idx_host[tok * topk + k];
-                    let weight = recv_topk_wt_host[tok * topk + k];
-
-                    // DeepEP recv_topk_idx is rank-local expert space on the
-                    // receiving rank. Non-local experts are encoded as -1.
-                    if expert_idx < 0 {
-                        continue;
-                    }
-                    let local_idx = expert_idx as usize;
-                    if local_idx >= ep_count {
-                        continue;
-                    }
-                    let expert = &moe.experts[local_idx];
-
-                    bufs.moe_gate.seq_len = 1;
-                    fp8_gemm_into(
-                        ctx,
-                        1,
-                        hidden_size,
-                        &expert.gate_proj,
-                        &bufs.fp8_hidden,
-                        &mut bufs.moe_gate,
-                    );
-
-                    bufs.moe_up.seq_len = 1;
-                    fp8_gemm_into(
-                        ctx,
-                        1,
-                        hidden_size,
-                        &expert.up_proj,
-                        &bufs.fp8_hidden,
-                        &mut bufs.moe_up,
-                    );
-
-                    bufs.moe_act.seq_len = 1;
-                    ops::silu_mul_batch_into(ctx, &bufs.moe_gate, &bufs.moe_up, &mut bufs.moe_act)?;
-
-                    bufs.moe_down.seq_len = 1;
-                    fp8_linear_into(
-                        ctx,
-                        &bufs.moe_act,
-                        &expert.down_proj,
-                        &mut bufs.fp8_moe_intermediate,
-                        &mut bufs.moe_down,
-                    );
-
-                    // Accumulate weighted expert output into the recv_x slot
-                    // for this token. Normal DeepEP combine only sums activations
-                    // across ranks, so routed weights must not be passed in again.
-                    let (e_ptr, _ge) = bufs.moe_down.data.device_ptr(&ctx.stream);
-                    unsafe {
-                        ffi::moe_weighted_add_cuda(
-                            recv_tok_ptr,
-                            e_ptr as *const ffi::Half,
-                            weight,
-                            hidden_size as i32,
-                            ctx.stream.cu_stream(),
-                        );
-                    }
-                }
+            match ep_local_mode {
+                EpLocalExpertsMode::LegacyTokenSerial => self.run_legacy_local_experts_from_recv(
+                    moe,
+                    bufs,
+                    num_recv_tokens as usize,
+                    &recv_topk_idx_host,
+                    &recv_topk_wt_host,
+                )?,
+                EpLocalExpertsMode::GroupedCuda => self.run_grouped_local_experts_from_recv(
+                    moe,
+                    bufs,
+                    num_recv_tokens as usize,
+                    &recv_topk_idx_host,
+                    &recv_topk_wt_host,
+                )?,
             }
         }
         // ==================================================================
@@ -2183,7 +2410,6 @@ impl DsV32Model {
             let dispatch_recv_tokens = num_recv_tokens; // from dispatch: tokens this rank received
             let combine_output_tokens = bs as i32; // original batch size: tokens to reconstruct
 
-            let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
             let (si_ptr, _gs) = bufs.ep_recv_src_idx.device_ptr(&ctx.stream);
             let (rpm_ptr, _g5) = bufs.rank_prefix_matrix_copy.device_ptr(&ctx.stream);
             let (cpm_ptr, _g4) = bufs.ep_recv_channel_prefix_matrix.device_ptr(&ctx.stream);
@@ -2203,28 +2429,59 @@ impl DsV32Model {
                 ep_config.num_max_nvl_chunked_recv_tokens,
             );
 
-            unsafe {
-                ffi::deep_ep_intranode_combine(
-                    combined_ptr as *mut std::ffi::c_void,
-                    std::ptr::null_mut(),
-                    recv_x_ptr as *const std::ffi::c_void,
-                    std::ptr::null(),
-                    si_ptr as *const i32,
-                    rpm_ptr as *const i32,
-                    cpm_ptr as *const i32,
-                    sh_ptr as *mut i32,
-                    dispatch_recv_tokens, // num_tokens: combine input x dimension
-                    combine_output_tokens, // num_recv_tokens: combine output dimension (original bs)
-                    hidden_size as i32,
-                    0,
-                    ep_buf.buffer_ptrs_gpu(),
-                    rank,
-                    num_ranks,
-                    ctx.stream.cu_stream(),
-                    ep_config.num_sms,
-                    ep_config.combine_max_send_tokens,
-                    ep_config.num_max_nvl_chunked_recv_tokens,
-                );
+            match ep_local_mode {
+                EpLocalExpertsMode::LegacyTokenSerial => {
+                    let (recv_x_ptr, _grx) = bufs.ep_recv_x.device_ptr(&ctx.stream);
+                    unsafe {
+                        ffi::deep_ep_intranode_combine(
+                            combined_ptr as *mut std::ffi::c_void,
+                            std::ptr::null_mut(),
+                            recv_x_ptr as *const std::ffi::c_void,
+                            std::ptr::null(),
+                            si_ptr as *const i32,
+                            rpm_ptr as *const i32,
+                            cpm_ptr as *const i32,
+                            sh_ptr as *mut i32,
+                            dispatch_recv_tokens, // num_tokens: combine input x dimension
+                            combine_output_tokens, // num_recv_tokens: combine output dimension (original bs)
+                            hidden_size as i32,
+                            0,
+                            ep_buf.buffer_ptrs_gpu(),
+                            rank,
+                            num_ranks,
+                            ctx.stream.cu_stream(),
+                            ep_config.num_sms,
+                            ep_config.combine_max_send_tokens,
+                            ep_config.num_max_nvl_chunked_recv_tokens,
+                        );
+                    }
+                }
+                EpLocalExpertsMode::GroupedCuda => {
+                    let (recv_x_ptr, _grx) = bufs.ep_local_out.device_ptr(&ctx.stream);
+                    unsafe {
+                        ffi::deep_ep_intranode_combine(
+                            combined_ptr as *mut std::ffi::c_void,
+                            std::ptr::null_mut(),
+                            recv_x_ptr as *const std::ffi::c_void,
+                            std::ptr::null(),
+                            si_ptr as *const i32,
+                            rpm_ptr as *const i32,
+                            cpm_ptr as *const i32,
+                            sh_ptr as *mut i32,
+                            dispatch_recv_tokens, // num_tokens: combine input x dimension
+                            combine_output_tokens, // num_recv_tokens: combine output dimension (original bs)
+                            hidden_size as i32,
+                            0,
+                            ep_buf.buffer_ptrs_gpu(),
+                            rank,
+                            num_ranks,
+                            ctx.stream.cu_stream(),
+                            ep_config.num_sms,
+                            ep_config.combine_max_send_tokens,
+                            ep_config.num_max_nvl_chunked_recv_tokens,
+                        );
+                    }
+                }
             }
         }
         // ==================================================================
