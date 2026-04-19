@@ -18,7 +18,7 @@
 | `archives/qwen3-4b-optimization.md` | Dense-attention Qwen3-4B optimization record; archived as reference material after pegainfer led the measured RTX 5070 Ti workloads |
 | `archives/qwen35-gdr-chunkwise-plan.md` | Qwen3.5 chunk-wise GDR plan and validation history; archived after the plan landed in the real runtime and rolled into the broader Qwen3.5 optimization record |
 | `areas/bench-regression.md` | Benchmark regression tracking: one snapshot per model, git-tracked history, TPOT >2% / TTFT >3% thresholds |
-| `areas/dsv32.md` | DeepSeek-V3.2 runtime map: prefill is NSA sparse, decode is currently dense FlashMLA (implementation gap), plus operator coverage and optimization backlog |
+| `areas/dsv32.md` | DeepSeek-V3.2 runtime map + 当前验证状态：提交版精度回归收敛到 small greedy JSON E2E；SGLang teacher-forced top-K harness 保留为本地/H20 深度回归 |
 | `resources/accuracy-parity-playbook.md` | Accuracy debugging playbook: truth-source rules, first-diff workflow, bf16 rounding traps, and verified Qwen3.5 parity commands |
 | `resources/developer-onboarding.md` | New-developer onboarding — toolchain, unified venv, build, tests, benchmark smoke test |
 | `resources/profiling-guide.md` | GPU profiling playbook: nsys pitfalls, diagnostic paths, measured kernel comparisons |

@@ -1,6 +1,6 @@
 # DeepSeek-V3.2 on pegainfer
 
-> **Status**: Prefill logits aligned with reference. Decode currently runs dense FlashMLA (implementation gap vs NSA sparse design), and generation quality is not verified end-to-end. Serving endpoint up.
+> **Status**: Prefill logits aligned with reference. Decode currently runs dense FlashMLA (implementation gap vs NSA sparse design). H20 baseline for the **teacher-forced top-K logprob harness against SGLang** has completed (`44/44` cases, `6888` positions, `3.03%` argmax mismatches, `5` argmax-outside-topk). The committed regression path is now the **small greedy JSON E2E** over the same 44 prompts; the larger SGLang manifest stays local/H20-only and is gitignored. The old vLLM accuracy path has been retired because its H20 reference runtime never initialized reliably.
 > **Last updated**: 2026-04-19
 >
 > Read this document to know: what's supported, how each operator is implemented, what the performance is, and what's next.
@@ -111,13 +111,16 @@ Same DAG as prefill except:
 
 Columns: **DAG node**, **Provider** (where the kernel comes from), **Source file**, **Status**, **Notes**.
 
+`flashinfer` accounting note: FlashInfer is header-only, but still counted as an external operator provider whenever our local `.cu` wrapper directly instantiates `flashinfer::...` templates. In the current DSV3.2 runtime, this applies to RMSNorm-family kernels.
+
 ### Attention path
 
 | DAG node | Provider | File | Status | Notes |
 |----------|----------|------|--------|-------|
 | FP8 activation quantize (1×128 block-scale) | Self-written (extracted from TRT-LLM) | `csrc/fp8_quantize.cu` | ✅ | |
 | FP8 block-scale GEMM (q_a/q_b/kv_a/o_proj) | DeepGEMM SM90 1D2D | `csrc/fp8_gemm.cu` + `third_party/DeepGEMM` | ✅ | AOT-compiled, 2 tile configs (64×128/8s, 128×128/5s) |
-| RMSNorm (full / partial c_kv-only / fused add) | Self-written | `csrc/mla.cu`, `src/ops.rs` | ✅ | |
+| RMSNorm (full + fused add, incl. final norm) | FlashInfer header-only templates + local C wrapper | `csrc/flashinfer_norm.cu`, `src/ops/norm.rs` | ✅ | `RMSNorm` / `FusedAddRMSNorm` / `GemmaRMSNorm` |
+| Partial RMSNorm (c_kv-only, in-place) | Self-written | `csrc/mla.cu` | ✅ | Only normalizes first `kv_lora_rank` dims in `kv_a` |
 | MLA RoPE (q_rope extract+apply+copy, k_rope) | Self-written | `csrc/mla.cu` | ✅ | YaRN cos/sin cache pre-computed at load |
 | Q absorption / V de-absorption (bf16 batched GEMM) | cuBLAS `cublasGemmStridedBatchedEx` | `csrc/linear.cu` | ✅ | W_UK/W_UV dequant CPU-side at load (~2 GB total) |
 | KV cache write (scatter to paged buffer) | Self-written | `csrc/mla.cu` | ✅ | Per-layer paged, page_size=64 |
@@ -140,11 +143,12 @@ Columns: **DAG node**, **Provider** (where the kernel comes from), **Source file
 | DAG node | Provider | File | Status | Notes |
 |----------|----------|------|--------|-------|
 | Embedding lookup (batched) | Self-written | `src/ops.rs` | ✅ | |
-| Final RMSNorm + lm_head (bf16) | Self-written + cuBLAS | `forward_final` | ✅ | `tie_word_embeddings` shares embedding matrix |
+| Final RMSNorm + lm_head (bf16) | FlashInfer (norm) + cuBLAS (lm_head) + local glue | `forward_final`, `csrc/flashinfer_norm.cu`, `csrc/linear.cu` | ✅ | `tie_word_embeddings` shares embedding matrix |
 | KV cache pool (paged, per-layer) | Self-written | `src/model/dsv32/mla_kv.rs` | ✅ | `MlaKvPool`, `MlaKvState` |
 | Weight loader (safetensors → FP8/bf16 sharded) | Self-written | `src/model/dsv32/weights.rs` | ✅ | Per-rank parallel load, 8 threads ~56 s |
 | Multi-GPU executor (per-rank ctx + NCCL + DeepEP) | Self-written | `src/model/dsv32/executor.rs` | ✅ | |
 | Scheduler (serial) | Self-written | `scheduler_dsv32` | ✅ | One request at a time, no continuous batching |
+| Token sampling (service path) | Self-written CPU sampler | `src/scheduler_dsv32.rs` | ✅ | Current DSV3.2 path samples on CPU; FlashInfer sampling kernels are in-tree but not wired into this scheduler yet |
 
 ### Parallelism & communication
 
@@ -195,7 +199,7 @@ Single concurrency. See `docs/resources/bench-vs-vllm.md` for vLLM setup specifi
 
 ## 8. E2E Dashboard
 
-GPU: 8-card NVLink node. Model: DeepSeek-V3.2 FP8. vLLM version: TBD.
+GPU: 8-card NVLink node. Model: DeepSeek-V3.2 FP8.
 
 | Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
@@ -211,6 +215,47 @@ Current smoke timings (single request, TP1+DP1+EP8, not a benchmark):
 | `hello world` | 8 | ~1.78 s |
 | `1+1=` | 8 | ~1.81 s |
 | reasoning-style prompt | 16 | ~5.84 s |
+
+### Generation alignment harness (teacher-forced top-K)
+
+Ground truth generation (SGLang, top-20 logprobs):
+
+```bash
+.venv/bin/python tools/dsv32_sglang_ref/gen_ref.py \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --output-dir test_data/dsv32_sglang_ref \
+  --prompts-file tools/dsv32_sglang_ref/prompts_generation.json \
+  --tensor-parallel-size 8 \
+  --top-k 20 \
+  --seed 42
+```
+
+Teacher-forced top-K regression (pegainfer):
+
+```bash
+PEGAINFER_DSV32_MODEL_PATH=/data/models/DeepSeek-V3.2 \
+PEGAINFER_DSV32_SGLANG_REF_MANIFEST=test_data/dsv32_sglang_ref/manifest.json \
+PEGAINFER_DSV32_DEVICE_ORDINALS=0,1,2,3,4,5,6,7 \
+cargo test --release --test e2e_dsv32 -- --ignored --nocapture
+```
+
+Small greedy JSON regression (pegainfer, string match only):
+
+```bash
+PEGAINFER_DSV32_MODEL_PATH=/data/models/DeepSeek-V3.2 \
+PEGAINFER_DSV32_DEVICE_ORDINALS=0,1,2,3,4,5,6,7 \
+cargo test --release --test e2e_dsv32_small -- --ignored --nocapture
+```
+
+Notes:
+- Manifest schema `dsv32_sglang_ref.v1` carries `prompt_token_ids`, `generated_token_ids`, and per-output-position top-20 `(token_id, logprob)` pairs; token-level regression is a strict corollary since `output_top_logprobs[i][0][0] == generated_token_ids[i]`.
+- `test_data/DeepSeek-V3.2.json` is the checked-in regression fixture. It is generated by running pegainfer greedy decoding over the committed 44-prompt corpus; regenerate it with `cargo test --release --test regen_test_data_dsv32 -- --ignored --nocapture` on H20.
+- `test_data/dsv32_sglang_ref/manifest.json` is intentionally **not** checked in. Regenerate it locally on H20 when deeper logprob alignment work is needed.
+- The teacher-forced test is report-only by default (prints argmax mismatches + |Δlogprob| stats). Thresholds `PEGAINFER_DSV32_LOGPROB_MAX_ABS` and `PEGAINFER_DSV32_ARGMAX_MISMATCHES` are opt-in.
+- Prompt set lives in `tools/dsv32_sglang_ref/prompts_generation.json` (44 cases, cross-domain + music/creative).
+- `max_new_tokens` is intentionally high for thinking-style prompts; sglang still stops early on EOS/stop.
+- Local `pegainfer/.venv` must first install sglang: `uv pip install -p .venv/bin/python -e ../sglang/python`.
+- H20 result (2026-04-19): `44/44` cases, `6888` positions, `argmax_mismatches=209 (3.03%)`, `argmax_outside_topk=5`, `top-K overlap mean=18.59/20`, runtime `1368.02s`.
 
 ---
 
@@ -371,7 +416,7 @@ num_max_nvl_chunked_recv_tokens = 256
 | Operation | Function | Location |
 |-----------|----------|----------|
 | Embedding lookup (batched) | `ops::embedding_batch` | `src/ops.rs` |
-| RMSNorm batched / fused-add | `ops::rms_norm_batch_into` / `fused_add_rms_norm_batch_into` | `src/ops.rs` |
+| RMSNorm batched / fused-add | `ops::rms_norm_batch_into` / `fused_add_rms_norm_batch_into` | `src/ops/norm.rs`, `csrc/flashinfer_norm.cu` |
 | SiLU × up | `ops::silu_mul_batch_into` | `src/ops.rs` |
 | BF16 GEMM | `ops::gemm_into` | `src/ops.rs` |
 | FP8 quantize + GEMM | `ops::fp8::fp8_linear_into` / `fp8_quantize_into` + `fp8_gemm_into` | `src/ops/fp8.rs` |
@@ -381,6 +426,7 @@ num_max_nvl_chunked_recv_tokens = 256
 | MLA RoPE (q_rope extract+copy, k_rope) | `ffi::mla_rope_q_copy_cuda` / `mla_rope_kv_cuda` | `csrc/mla.cu` |
 | Partial RMSNorm (c_kv only) | `ffi::rms_norm_partial_cuda` | `csrc/mla.cu` |
 | KV cache write (scatter) | `ffi::mla_kv_cache_write_cuda` | `csrc/mla.cu` |
+| Token sampling (DSV3.2 service path) | `sample_from_logits` | `src/scheduler_dsv32.rs` |
 | YaRN RoPE cos/sin precompute | `precompute_yarn_rope` | `src/model/dsv32/weights.rs` |
 | DeepEP 5 functions + IPC helpers | `ffi::deep_ep_*` | `src/ffi.rs`, `src/model/dsv32/deep_ep.rs` |
 
@@ -390,7 +436,8 @@ num_max_nvl_chunked_recv_tokens = 256
 
 - [ ] `benches/dsv32_*` — micro benchmarks (FP8 GEMM, FlashMLA, DeepEP).
 - [ ] `#0 Baseline` — nsys kernel breakdown for both profiles.
-- [ ] Decode generation quality sanity check (greedy vs Python reference, 128+ tokens).
+- [ ] Decide default pass/fail thresholds for `e2e_dsv32` from the current H20 baseline instead of leaving it report-only.
+- [ ] Cross-machine recheck: regenerate `dsv32_sglang_ref` on one H20 node and replay `e2e_dsv32` on a second node.
 - [ ] Grouped GEMM for routed experts (DeepGEMM `GroupedContiguous`) — replace per-expert sequential.
 - [ ] CUDA Graph capture for decode.
 - [ ] TP2 attention sharding.

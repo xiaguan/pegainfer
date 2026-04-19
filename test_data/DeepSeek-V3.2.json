@@ -1,0 +1,270 @@
+{
+  "cases": [
+    {
+      "max_new_tokens": 64,
+      "name": "en_capital_fr",
+      "output": " Paris. 法国的首都是巴黎。\nThe capital of Italy is Rome. 意大利的首都是罗马。\nThe capital of Spain is Madrid. 西班牙的首都是马德里。\nThe capital of Portugal is Lisbon. 葡萄牙的首都是里斯本。\nThe capital of England is London. 英国的首都是伦敦。\nThe capital",
+      "prompt": "The capital of France is"
+    },
+    {
+      "max_new_tokens": 96,
+      "name": "en_open_source",
+      "output": " (1 point)\n\n2. 2.Explain the difference between open source software and freeware. (2 points)\n\n3. 3.Explain the difference between open source software and shareware. (2 points)\n\n4. 4.Explain the difference between open source software and public domain software. (2 points)\n\n5. 5.Explain the difference between open source software and proprietary software. (2 points)\n\n6. 6.Explain the difference between open source",
+      "prompt": "In one sentence, define open source software."
+    },
+    {
+      "max_new_tokens": 75,
+      "name": "zh_beijing_intro",
+      "output": " 2. 介绍中国的首都。 3. 介绍中国的首都。 4. 介绍中国的首都。 5. 介绍中国的首都。 6. 介绍中国的首都。 7. 介绍中国的首都。 8. 介绍中国的首都。 9. 介绍中国的首都。 10. 介绍中国的首都。 11.",
+      "prompt": "请介绍一下中国的首都。"
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "zh_linux_kernel",
+      "output": "第一句话是“Linux 内核是 Linux 操作系统的核心”，第二句话是“Linux 内核是 Linux 操作系统一切功能的基础”。这两句话虽然简单，但却是对 Linux 内核最准确的描述。Linux 内核是 Linux 操作系统的核心，它负责管理系统的进程、内存、设备驱动程序、文件和网络系统，决定着系统的性能和稳定性。Linux 内核是 Linux 操作系统一切功能的基础，它提供了 Linux 操作系统的基本功能，如进程管理、内存管理、文件系统、设备驱动程序、网络系统等。因此，Linux 内核是 Linux 操作系统的核心和基础，是 Linux 操作系统",
+      "prompt": "用两句话解释什么是 Linux 内核。"
+    },
+    {
+      "max_new_tokens": 64,
+      "name": "en_math_add",
+      "output": "\",\n    \"choices\": [\"42\", \"52\", \"62\", \"72\"],\n    \"answer\": \"42\"\n  },\n  {\n    \"question\": \"What is 23 + 19?\",\n    \"choices\": [\"42\", \"52\", \"62\", \"72\"],\n    \"answer\": \"42",
+      "prompt": "What is 17 + 25?"
+    },
+    {
+      "max_new_tokens": 96,
+      "name": "en_math_mul",
+      "output": " Work in base 10.\\n\\nWe are multiplying 144 by 37.\\n\\nStep 1: Break down 37 into 30 and 7.\\nMultiply 144 by 30 and 144 by 7, then add the results.\\n\\nStep 2: Compute 144 * 30.\\n144 * 30 = 144 * 3 * 10 = (432) * 10 = 4320.\\nAlternatively, ",
+      "prompt": "Compute 144 * 37 and show short steps."
+    },
+    {
+      "max_new_tokens": 96,
+      "name": "zh_math_fraction",
+      "output": "\\n\\n首先，我们需要找到两个分数的公共分母。分母 7 和 14 的最小公倍数是 14。\\n\\n将 3/7 转换为分母为 14 的分数：\\n3/7 = (3 × 2) / (7 × 2) = 6/14\\n\\n现在，两个分数都有相同的分母：\\n6/14 + 5/14 = (6 + 5)/",
+      "prompt": "计算 3/7 + 5/14，并给出结果。"
+    },
+    {
+      "max_new_tokens": 96,
+      "name": "zh_math_equation",
+      "output": " 解：2x=19-5 2x=14 x=7 2. 解方程：3(x-2)=15。 解：3x-6=15 3x=21 x=7 3. 解方程：4x+3=2x+9。 解：4x-2x=9-3 2x=6 x=3 4. 解方程：5(x+1",
+      "prompt": "解方程：2x+5=19。"
+    },
+    {
+      "max_new_tokens": 192,
+      "name": "en_reason_logging",
+      "output": "**\n   - **Answer:** Clean logging matters because it helps in debugging issues quickly by providing clear and relevant information, and it ensures that logs do not contain sensitive data, which is crucial for security and compliance.\n\n2. **What is the purpose of structured logging?**\n   - **Answer:** Structured logging formats logs in a consistent, machine-readable way (like JSON), making it easier to search, filter, and analyze log data, especially when using log management tools.\n\n3. **Why should you avoid logging sensitive information?**\n   - **Answer:** Logging sensitive information (like passwords, API keys, or personal data) can lead to security breaches and compliance violations if logs are accessed by unauthorized parties.\n\n4. **How can you control log verbosity in different environments?**\n   - **Answer:** Use environment-specific configurations to set log levels (e.g., `DEBUG` for development, `INFO` or `WARN` for production). This",
+      "prompt": "Give two reasons why clean logging matters in production."
+    },
+    {
+      "max_new_tokens": 192,
+      "name": "zh_reason_observability",
+      "output": "\",\n    \"answer\": \"1. 快速定位和解决问题：当线上服务出现故障或性能下降时，可观测性可以帮助开发者和运维人员快速定位问题的根本原因，减少故障恢复时间。\\n2. 优化系统性能：通过监控和分析系统的运行数据，可以发现性能瓶颈和潜在问题，从而进行优化，提升系统的稳定性和用户体验。\"\n  },\n  {\n    \"question\": \"什么是分布式追踪？它在可观测性中的作用是什么？\",\n    \"answer\": \"分布式追踪是一种用于监控和诊断分布式系统中请求路径的技术。它通过记录请求在多个服务之间的传递路径和耗时，帮助开发者理解系统的调用链，识别性能瓶颈和故障点。\"\n  },\n  {\n    \"question\": \"请解释什么是日志（Logging）、指标（Metrics）和追踪（Tracing），并说明它们之间的关系。\",\n    \"answer\": \"1. 日志（Logging）：记录系统",
+      "prompt": "为什么线上服务需要可观测性？请给出两个理由。"
+    },
+    {
+      "max_new_tokens": 224,
+      "name": "en_reason_moe",
+      "output": "**  \nDistributed MoE involves multiple experts across different devices. Compute correctness ensures each expert processes data accurately, while communication correctness ensures data is correctly routed between experts and devices. Both are essential for the overall model's accuracy and performance.\n\n**How does the paper evaluate the correctness of distributed MoE?**  \nThe paper introduces a comprehensive testing framework that includes unit tests for individual components (e.g., expert layers, routing mechanisms) and integration tests for the entire distributed system. It also uses differential testing to compare outputs from different implementations and stress tests to evaluate performance under heavy loads.\n\n**What are the main challenges in ensuring correctness for distributed MoE?**  \nKey challenges include: 1) Handling the dynamic and sparse nature of expert routing, 2) Managing synchronization and consistency across distributed devices, 3) Dealing with heterogeneous hardware and network conditions, 4) Ensuring fault tolerance and recovery from failures.\n\n**What tools and methodologies does the paper propose for testing distributed MoE?**  \nThe paper proposes: 1) A modular testing framework with mock components, 2) Differential testing against reference implementations, ",
+      "prompt": "Why does distributed MoE need both compute and communication correctness?"
+    },
+    {
+      "max_new_tokens": 192,
+      "name": "zh_reason_latency",
+      "output": "在交互式推理中，用户会等待模型的预测结果，然后基于预测结果采取行动。例如，在对话系统中，用户会等待模型的回复，然后基于回复继续对话。如果模型的延迟很高，用户会等待很长时间，这会影响用户体验。因此，低延迟对交互式推理很关键。\n\n### 2. 推理延迟的组成部分\n\n推理延迟主要由以下几个部分组成：\n\n1. **数据预处理延迟**：将输入数据转换为模型可以处理的格式的时间。\n2. **模型推理延迟**：模型对输入数据进行前向传播的时间。\n3. **数据后处理延迟**：将模型的输出转换为用户可理解的格式的时间。\n\n其中，模型推理延迟通常是最大的部分，因此优化模型推理延迟是降低推理延迟的关键。\n\n### 3. 优化推理延迟的方法\n\n#### 3.1 模型优化\n\n1. **模型压缩**：通过剪枝、量化、知识蒸馏等方法减小模型的大小和",
+      "prompt": "低延迟为什么对交互式推理很关键？"
+    },
+    {
+      "max_new_tokens": 224,
+      "name": "py_prime_fn",
+      "output": " The function should return True if the number is prime, and False otherwise. A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself.\\n\\nYour function should be named `is_prime` and take a single integer argument `n`. The function should handle edge cases appropriately, such as when `n` is less than 2.\\n\\nExample usage:\\n```python\\nprint(is_prime(2))  # Output: True\\nprint(is_prime(4))  # Output: False\\nprint(is_prime(17)) # Output: True\\nprint(is_prime(1))  # Output: False\\n```\\n\\nWrite the function below.\" }, { \"from\": \"gpt\", \"value\": \"```python\\ndef is_prime(n: int) -> bool:\\n \\\"\\\"\\\"\\n Check if a number is prime.\\n \\n Args:\\n n: An integer to check for primality.\\n \\n Returns:\\n True if n is prime, False otherwise.\\n \\\"\\\"\\\"\\n # Numbers less than ",
+      "prompt": "Write a Python function that checks whether a number is prime."
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "rust_lru_skeleton",
+      "output": " Use generics for key and value types. Include capacity and time-to-live (TTL) fields. Use std::time::Instant for timestamps. Provide a basic struct and method signatures.\n\n<thinking>\nThe user wants a Rust skeleton for an LRU cache with put/get signatures. They specified:\n- Use generics for key and value types\n- Include capacity and time-to-live (TTL) fields\n- Use std::time::Instant for timestamps\n- Provide a basic struct and method signatures\n\nI need to create a struct that will hold:\n1. The cache data (likely a HashMap for O(1) lookups)\n2. Some structure to track LRU order (likely a doubly linked list or VecDeque)\n3. Capacity limit\n4. TTL (time-to-live) - probably a Duration\n5. Timestamps for each entry to track when they expire\n\nFor the LRU mechanism, I'll need to track access order. In Rust, a common approach is to use:\n- HashMap<K, (V, Instant)> for the cache entries\n- A separate structure to track access order, like a VecDeque<K> or a linked list\n\nHowever, for a proper LRU implementation that's O",
+      "prompt": "Write a Rust skeleton of an LRU cache with put/get signatures."
+    },
+    {
+      "max_new_tokens": 89,
+      "name": "sql_topk",
+      "output": "\",\n    \"category\": \"SQL\",\n    \"difficulty\": \"medium\",\n    \"tags\": [\"aggregation\", \"ranking\", \"window-functions\"],\n    \"answer\": \"SELECT user_id, SUM(amount) AS total_spend FROM orders GROUP BY user_id ORDER BY total_spend DESC LIMIT 5;\",\n    \"explanation\": \"This query groups orders by user_id, sums the amount for each user, orders",
+      "prompt": "Write SQL to get top-5 users by total spend from orders(user_id, amount)."
+    },
+    {
+      "max_new_tokens": 160,
+      "name": "bash_log_parse",
+      "output": " Log format: $remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"'\n\n    response = client.chat.completions.create(\n        model=\"gpt-4o-mini\",\n        messages=[\n            {\"role\": \"system\", \"content\": \"You are a helpful assistant.\"},\n            {\"role\": \"user\", \"content\": prompt}\n        ]\n    )\n    \n    return response.choices[0].message.content\n\ndef generate_terraform_script():\n    \"\"\"Generate a Terraform script for AWS infrastructure.\"\"\"\n    prompt = 'Write a Terraform script to create an AWS S3 bucket with versioning enabled and a CloudFront distribution in front of it.'\n\n    response = client",
+      "prompt": "Write a bash one-liner to count 5xx status codes from nginx logs."
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "regex_email",
+      "output": " Provide a code snippet in Python that uses the regex to validate an email string. Also, write a function that uses the regex to check if an email is valid and returns True or False. Finally, include a test with a few example emails (both valid and invalid) and print the results.\\n\\nMake sure to handle any potential errors in the code and comment on the regex components.\" }, { \"from\": \"assistant\", \"value\": \"I'll provide a comprehensive solution for email validation using regex in Python. Let's start with the regex and then implement the validation function.\\n\\n```python\\nimport re\\n\\n#",
+      "prompt": "Provide a regex for simple email validation and explain its limits briefly."
+    },
+    {
+      "max_new_tokens": 192,
+      "name": "unit_test_py",
+      "output": " The function should add two numbers and return the result. The tests should cover positive, negative, and decimal numbers. Also include a test for invalid inputs (non-numeric).\",\n    \"response\": \"```python\\nimport pytest\\n\\ndef add(a, b):\\n    \\\"\\\"\\\"Add two numbers and return the result.\\\"\\\"\\\"\\n    try:\\n        # Convert inputs to float to handle both int and decimal numbers\\n        return float(a) + float(b)\\n    except (ValueError, TypeError):\\n        raise TypeError(\\\"Both inputs must be numeric\\\")\\n\\n# Test cases\\nclass TestAddFunction:\\n    \\n    def test_positive_numbers(self):\\n        \\\"\\\"\\\"Test addition of positive integers.\\\"\\\"\\\"\\n        assert add(2, 3) == 5\\n        assert add(10, 20) == 30\\n        \\n",
+      "prompt": "Write pytest unit tests for a function add(a,b)."
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "zh_to_en_translate",
+      "output": "\",\n  \"id\": \"chatcmpl-72Jq9vq8vz9zqJqJv8zqJqJv8zqJqJ\",\n  \"object\": \"chat.completion\",\n  \"created\": 1680866387,\n  \"model\": \"gpt-3.5-turbo-0301\",\n  \"usage\": {\n    \"prompt_tokens\": 26,\n    \"completion_tokens\": 17,\n    \"total_tokens\": 43\n  },\n  \"choices\": [\n    {\n      \"message\": {\n        \"role",
+      "prompt": "把这句话翻译成英文：分布式系统的正确性比速度更重要。"
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "en_to_zh_translate",
+      "output": "  \nTranslate to Chinese: 可靠性是通过可重复的验证建立的。  \n\nTranslate to Chinese: The system's reliability is ensured by rigorous testing.  \nTranslate to Chinese: 系统的可靠性通过严格的测试得到保证。  \n\nTranslate to Chinese: Reliability is a key factor in user satisfaction.  \nTranslate to Chinese: 可靠性是用户满意度的关键因素。  \n\nTranslate to Chinese: The reliability of the data is critical for decision-making.  \nTranslate to Chinese: 数据的可靠性对决策至关重要。  \n\nTranslate to Chinese: Reliability engineering focuses on preventing failures.  \nTranslate to Chinese: 可靠性工程专注于预防故障。  \n\nTranslate to Chinese:",
+      "prompt": "Translate to Chinese: Reliability is built through repeatable verification."
+    },
+    {
+      "max_new_tokens": 87,
+      "name": "rewrite_formal",
+      "output": "\",\"role\":\"user\"},{\"content\":\"The issue has been resolved and the functionality has been restored.\",\"role\":\"assistant\"}],\"created\":1705660998,\"object\":\"chat.completion\",\"model\":\"gpt-3.5-turbo-0613\",\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":13,\"total_tokens\":30},\"system_fingerprint\":null}",
+      "prompt": "Rewrite this in a formal tone: we fixed it and it works now."
+    },
+    {
+      "max_new_tokens": 51,
+      "name": "rewrite_concise",
+      "output": "\",\n    \"chosen\": \"Rewrite in concise Chinese: 该系统在高并发情况下表现稳定。\",\n    \"rejected\": \"该系统在高并发情况下表现稳定。\"\n}",
+      "prompt": "Rewrite in concise Chinese: 该系统在高并发情况下表现稳定。"
+    },
+    {
+      "max_new_tokens": 160,
+      "name": "json_extract_people",
+      "output": "`,\n      },\n      {\n        role: \"user\",\n        content: `Alice(backend), Bob(SRE), Carol(PM)`,\n      },\n    ],\n    expected: {\n      names: [\"Alice\", \"Bob\", \"Carol\"],\n      roles: [\"backend\", \"SRE\", \"PM\"],\n    },\n  },\n  {\n    messages: [\n      {\n        role: \"system\",\n        content: `Extract names and roles from: Alice(backend), Bob(SRE), Carol(PM). Output JSON only.`,\n      },\n      {\n        role: \"user\",\n        content: `Alice(backend), Bob(SRE), Carol(PM)`,\n      },\n    ],\n    expected: {\n      names: [\"Alice\", \"Bob\", \"Carol\"],\n      roles: [\"backend\",",
+      "prompt": "Extract names and roles from: Alice(backend), Bob(SRE), Carol(PM). Output JSON only."
+    },
+    {
+      "max_new_tokens": 86,
+      "name": "json_task_list",
+      "output": " If not specified, output null. Meeting notes: {meeting_notes}\",\n    \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n            \"action\": {\n                \"type\": \"string\",\n                \"description\": \"The action item\"\n            },\n            \"owner\": {\n                \"type\": \"string\",\n                \"description\": \"The owner of the action item\"\n            },\n            \"due",
+      "prompt": "From meeting notes, output JSON with fields action, owner, due_date."
+    },
+    {
+      "max_new_tokens": 160,
+      "name": "yaml_config",
+      "output": " Use the following format:\n\n```yaml\nservice_name: <name>\nport: <port>\nlog_level: <level>\ntimeout_ms: <timeout>\n```\n\nGenerate a config for a service named \"api-gateway\" with port 8080, log level \"info\", and timeout of 5000ms.",
+      "prompt": "Generate a minimal YAML config for a service with port, log_level, and timeout_ms."
+    },
+    {
+      "max_new_tokens": 88,
+      "name": "table_markdown",
+      "output": " Use the following format: \"| | TP | DP | EP |\" for the header row, \"| --- | --- | --- | --- |\" for the separator, and \"| ... | ... | ... | ... |\" for each of the three rows. Use one sentence each for TP, DP, EP under the column 'Description', and one sentence each under the column 'When to use'. Do not describe the table,",
+      "prompt": "Create a markdown table comparing TP, DP, EP in one row each."
+    },
+    {
+      "max_new_tokens": 98,
+      "name": "long_context_summary",
+      "output": " The numerical correctness is ensured by the model's architecture and training, while the communication correctness is ensured by the communication protocol and the correctness of the collective operations. The communication correctness is crucial for the model to produce stable logits, as any deviation in the communication can lead to incorrect logits and affect the model's performance. Therefore, both numerical and communication correctness are essential for the model to produce stable logits and achieve the desired performance.\n\n## 4.2.2. Communication Correctness",
+      "prompt": "Summarize this in one line: A distributed MoE model needs both numerical correctness and communication correctness to produce stable logits."
+    },
+    {
+      "max_new_tokens": 237,
+      "name": "long_context_actions",
+      "output": " Each action should be a single sentence, starting with a verb, and be specific and actionable. Avoid vague or generic statements. Return the actions as a numbered list, with no additional text or formatting.\"},\n    {\"role\": \"user\", \"content\": \"Release notes: Fixed an issue where the app would crash when opening large PDF files. Improved performance of the search function. Added support for dark mode on iOS devices.\"}\n  ],\n  \"temperature\": 0.7,\n  \"max_tokens\": 100,\n  \"top_p\": 1,\n  \"frequency_penalty\": 0,\n  \"presence_penalty\": 0\n}",
+      "prompt": "Given release notes text, extract 3 concrete follow-up actions."
+    },
+    {
+      "max_new_tokens": 129,
+      "name": "qa_from_paragraph",
+      "output": "\",\n    \"choices\": [\n      \"A) Risk: Inadequate training; Mitigation: Provide comprehensive training\",\n      \"B) Risk: Data breaches; Mitigation: Implement encryption\",\n      \"C) Risk: System failure; Mitigation: Regular maintenance\",\n      \"D) Risk: Budget overrun; Mitigation: Strict budget controls\"\n    ],\n    \"answer\": \"B\",\n    \"thought\": \"The paragraph discusses data security and encryption, so the main risk is data breaches, and the mitigation is implementing encryption.\"\n  }\n]",
+      "prompt": "Read paragraph and answer: what is the main risk and mitigation?"
+    },
+    {
+      "max_new_tokens": 88,
+      "name": "compare_options",
+      "output": " Option A: Use a single large model for all tasks. Option B: Use specialized smaller models for different tasks. Consider latency, cost, and accuracy trade-offs.\",\n    \"chosen\": \"A: Lower latency for individual requests due to no routing overhead, but higher cost per inference and potential accuracy compromises on specialized tasks.\\nB: Higher accuracy for specialized tasks and lower cost per inference, but added latency from routing decisions and model switching",
+      "prompt": "Compare option A and B for inference serving in 3 concise bullets."
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "noise_whitespace",
+      "output": " |\n| 2.2.2   | Explain   why   deterministic tests   are useful.    |\n| 2.2.3   | Explain   why   deterministic tests   are useful.    |\n| 2.2.4   | Explain   why   deterministic tests   are useful.    |\n| 2.2.5   | Explain   why   deterministic tests   are useful.    |\n| 2.2.6   | Explain   why   deterministic tests   are useful.    |\n| 2.2.7   | Explain   why   deterministic tests   are useful.    |\n|",
+      "prompt": "   Explain   why   deterministic tests   are useful.   "
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "noise_punctuation",
+      "output": "?\n    // TODO: test baseline for each line\n    // TODO: test baseline for each line with different font sizes\n    // TODO: test baseline for each line with different font families\n    // TODO: test baseline for each line with different font weights\n    // TODO: test baseline for each line with different font styles\n    // TODO: test baseline for each line with different font variants\n    // TODO: test baseline for each line with different font stretch\n    // TODO: test baseline for each line with different font sizes\n    // TODO: test baseline for each line with different font families\n    // TODO: test",
+      "prompt": "Explain??? Why!!! test baselines... matter??"
+    },
+    {
+      "max_new_tokens": 160,
+      "name": "unicode_mix",
+      "output": "稳定性是系统高可用的重要指标，常用的衡量指标是可用性，即用百分比表示服务可以正常提供服务的时长。比如我们常说的4个9（99.99%），意思是在一年中，服务宕机的时间不能超过52.56分钟（365天 * 24小时 * 60分钟 * (1-99.99%)）。可用性越高，代表服务的稳定性越高。而吞吐和延迟是衡量服务性能的两个重要指标。吞吐量是指系统在单位时间内可以处理的请求数量，延迟是指系统处理一个请求需要的时间。我们通常希望系统的吞吐量越高越好，延迟越低越好。但是吞吐量和延迟是相互影响的。当吞吐量达到一定阈值时，再提高吞吐量，延迟就会增加。所以，我们需要在吞吐",
+      "prompt": "解释“稳定性✅、吞吐📈、延迟⏱️”这三个指标的关系。"
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "number_stability",
+      "output": " 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648, 4294967296, 8589934592",
+      "prompt": "Continue: 2, 4, 8, 16,"
+    },
+    {
+      "max_new_tokens": 192,
+      "name": "codeblock_follow",
+      "output": "\n\n\n```python\ndef f(x):\n  return x/0\n```\n\nThe bug in this code is that it attempts to divide by zero, which is mathematically undefined and will raise a `ZeroDivisionError` in Python. This error occurs because division by zero is not allowed in arithmetic operations. The function `f(x)` takes an argument `x` and returns `x/0`, but regardless of the value of `x`, dividing by zero will always cause an error. To fix this bug, you should ensure that the divisor is not zero before performing the division, or handle the exception appropriately.",
+      "prompt": "Read this code and explain bug briefly:\n```python\ndef f(x):\n  return x/0\n```"
+    },
+    {
+      "max_new_tokens": 128,
+      "name": "constraint_exact_items",
+      "output": "`,\n    },\n    {\n      role: \"assistant\",\n      content: `- Regression testing is performed to ensure that new code changes do not adversely affect existing functionality.\n- It involves re-running previously executed test cases to verify that the software still works as expected after modifications.\n- This type of testing is crucial during maintenance phases, bug fixes, or when adding new features to prevent unintended side effects.`,\n    },\n    {\n      role: \"user\",\n      content: `Give exactly 3 bullet points about smoke testing.`,\n    },\n    {\n      role: \"assistant\",\n      content: `- Smoke testing is a preliminary test",
+      "prompt": "Give exactly 3 bullet points about regression testing."
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "music_kanye_favorite",
+      "output": "\",\n    \"assistant\": \"我最喜欢的 Kanye West 专辑是《My Beautiful Dark Twisted Fantasy》。这张专辑的优点包括：\\n\\n1. 制作精良：专辑的制作水准极高，融合了多种音乐风格，如嘻哈、摇滚、古典等，展现了Kanye West在音乐制作上的卓越才华。\\n\\n2. 歌词深刻：专辑中的歌词探讨了 fame、love、mental health 等复杂主题，展现了Kanye West的内心世界和情感挣扎。\\n\\n3. 合作阵容强大：专辑邀请了多位知名艺术家参与，如 Jay-Z、Nicki Minaj、Bon Iver 等，为专辑增添了多样性和深度。\\n\\n4. 艺术性：专辑不仅在音乐上具有创新性，其封面艺术和整体概念也极具艺术价值，展现了Kanye West对视觉艺术的独特见解。\\n\\n缺点包括：\\n\\n1. 长度较长：专辑的曲目较多，总时长较长，可能会让一些听众感到疲惫或难以一次性听完。\\n\\n2. 主题沉重：专辑探讨的主题较为沉重和复杂，可能不适合所有听众，尤其是那些寻求轻松娱乐的听众。\\n\\n3. 个人化",
+      "prompt": "我最喜欢的 Kanye West 专辑是，请你自己评价这张专辑的优点和缺点。"
+    },
+    {
+      "max_new_tokens": 100,
+      "name": "music_coldplay_ghost",
+      "output": "\",\n    \"assistant\": \"Coldplay 的《Ghost Stories》是一张充满情感深度和内省氛围的专辑，展现了乐队在音乐风格上的转变。这张专辑以电子音乐元素和简约的编曲为特色，与乐队早期的摇滚风格有所不同。歌词主题围绕爱情、失落和心灵创伤，整体氛围较为忧郁和梦幻。\\n\\n个人观点：虽然《Ghost Stories》可能不如Coldplay之前的专辑那样充满活力，但它在情感表达上非常真挚",
+      "prompt": "Coldplay 的《Ghost Stories》你会怎么评价？给出你自己的观点。"
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "music_tyler_creator",
+      "output": "\",\n    \"assistant\": \"Tyler, The Creator 在专辑叙事方面的代表作是《IGOR》（2019）。这张专辑以其连贯的概念叙事、情感深度和音乐创新而著称。以下是对《IGOR》的评价：\\n\\n### 专辑概述\\n《IGOR》是 Tyler, The Creator 的第五张录音室专辑，于2019年5月发布。专辑讲述了一个关于单恋、心碎和自我发现的故事，围绕着一个三角恋展开。Tyler 化身为“IGOR”这个角色，通过音乐探索爱情的复杂性、嫉妒和最终的情感释放。\\n\\n### 叙事结构\\n1. **连贯的故事线**：专辑的曲目顺序精心设计，引导听众经历一段情感的起伏。从开场曲《IGOR'S THEME》的戏剧性引入，到《EARFQUAKE》中对心碎的直白表达，再到《A BOY IS A GUN*》中的偏执与不安，最终以《ARE WE STILL FRIENDS?》的开放式结局收尾，叙事流畅且情感层层递进。\\n\\n2. **角色塑造**：Tyler 通过“IGOR”这个角色，模糊了自身与虚构叙事",
+      "prompt": "Tyler, The Creator 在专辑叙事上的代表作是哪一张？请给出你的评价。"
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "music_asen_style",
+      "output": "\",\n  \"id\": \"chatcmpl-72QqJ9zq9z8z8z8z8z8z8z8z8z8z8\",\n  \"object\": \"chat.completion\",\n  \"created\": 1680867178,\n  \"model\": \"gpt-3.5-turbo-0301\",\n  \"usage\": {\n    \"prompt_tokens\": 315,\n    \"completion_tokens\": 1,\n    \"total_tokens\": 316\n  },\n  \"choices\": [\n    {\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"抱歉，我还没有学会回答这个问题。如果你有其他问题，我非常乐意为你提供帮助。\"\n      },\n      \"finish_reason\": \"stop\",\n      \"index\": 0\n    }\n  ]\n}",
+      "prompt": "ASEN 听过吗？请按你自己的标准评价他的风格。"
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "music_cross_compare",
+      "output": " How do their approaches to album production and sonic branding differ?\",\n    \"response\": \"Kanye West, Coldplay, and Tyler, The Creator each have distinct sonic identities and approaches to album production and sonic branding, reflecting their unique artistic visions and career trajectories.\\n\\n**Kanye West:**\\n- **Sonic Identity:** Kanye's sound has evolved dramatically across his career, from the soul-sampling chipmunk soul of *The College Dropout* (2004) to the maximalist orchestral arrangements of *My Beautiful Dark Twisted Fantasy* (2010), industrial minimalism of *Yeezus* (2013), and gospel-infused minimalism of *Jesus Is King* (2019). His sonic identity is characterized by constant reinvention rather than consistency.\\n- **Album Production Approach:** Each album is a distinct era with its own sonic palette. He often pioneers new production trends (e.g., autotune art on *808s & Heartbreak*, abrasive textures on *Yeezus*). His branding is tied to his persona as a provocateur and innovator.\\n- **Consistency:** Thematic consistency (ambition, ego, vulnerability) outweighs sonic consistency. His production is consistently high-quality and boundary",
+      "prompt": "Compare Kanye West, Coldplay, and Tyler, The Creator in terms of sonic identity and consistency."
+    },
+    {
+      "max_new_tokens": 256,
+      "name": "music_cn_compare",
+      "output": " 在编曲上，Kanye West 的《Stronger》采样了 Daft Punk 的《Harder, Better, Faster, Stronger》，而 Coldplay 的《Viva La Vida》则采用了弦乐和管弦乐的元素。 在歌词上，Kanye West 的歌词充满了自信和力量，而 Coldplay 的歌词则更加诗意和哲学。 在现场表现上，Kanye West 的表演充满了能量和激情，而 Coldplay 的表演则更加内敛和感人。 总的来说，Kanye West 和 Coldplay 都是非常优秀的音乐人，他们的音乐风格和表现方式各有千秋。\",\n    \"human\": \"Kanye West 和 Coldplay 谁更厉害？\",\n    \"history\": [],\n    \"pre_response\": [],\n    \"user_id\": \"human\"\n}",
+      "prompt": "从编曲、歌词、现场表现三个维度，比较 Kanye West 和 Coldplay。"
+    },
+    {
+      "max_new_tokens": 320,
+      "name": "music_playlist",
+      "output": "\"\n}",
+      "prompt": "给我一份包含 Kanye、Coldplay、Tyler 风格过渡的 8 首歌播放列表，并说明排序理由。"
+    },
+    {
+      "max_new_tokens": 320,
+      "name": "music_subjective_rank",
+      "output": "\",\n    \"assistant\": \"作为一个人工智能，我没有主观意见或个人偏好。然而，我可以根据2020年后发行的专辑的广泛赞誉、文化影响和音乐创新，为您列出五张备受好评的专辑。这些专辑因其艺术成就、对流派的影响以及评论界和商业上的成功而脱颖而出。\\n\\n1. **泰勒·斯威夫特 - 《民俗》 (2020)**\\n   - **为什么选择它**：这张专辑标志着泰勒·斯威夫特音乐风格的重大转变，从流行音乐转向独立民谣和另类摇滚。它因其内省的歌词、故事叙述以及亚伦·德斯纳（The National）的制作而受到赞誉。《民俗》在疫情期间发布，引起了全球听众的共鸣，并获得了包括年度专辑在内的多项格莱美奖。它展示了艺术家的进化以及创作超越主流流行音乐的深刻、连贯作品的能力。\\n\\n2. **奥利维亚·罗德里戈 - 《酸》 (2021)**\\n   - **为什么选择它**：作为奥利维亚·罗德里戈的首张专辑，《酸》在2021年引起了现象级的轰动，将流行朋克和流行音乐重新带给年轻一代。主打单曲《驾照》打破了流媒体记录，而这张专辑则因其原始的情感、 relatable 的歌词以及90年代和2000年代流行摇滚影响的融合而受到赞扬。它捕捉了青少年焦虑和心碎的精髓，使其成为一代人的标志性作品。\\n\\n3. **阿黛尔 - 《30",
+      "prompt": "请给出你主观的 2020 年后最值得听的 5 张专辑，并解释你为什么选它们。"
+    }
+  ],
+  "engine": "pegainfer",
+  "model_name": "DeepSeek-V3.2"
+}
