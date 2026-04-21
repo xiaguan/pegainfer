@@ -242,6 +242,9 @@ Notes:
 - The #2 change replaces per-token `DtoD gather` and per-token `moe_weighted_add` in the EP local-expert path with batched gather/scatter kernels plus chunk metadata upload.
 - The raw #2 numbers are **not** the accepted baseline because that version regressed greedy correctness.
 - At this size, the current accepted headline after #3 is: **TTFT is now ~0.45 s for 64 tokens, and steady decode is ~53 ms/token, with `e2e_dsv32_small` back to `44/44` passing.**
+- Two short-lived follow-ups did **not** move the accepted baseline:
+  - device-built slot-major EP metadata kept `64 -> 64` roughly flat at `TTFT ~448 ms`, `steady TPOT ~54 ms/token`
+  - GPU greedy sampling kept `64 -> 64` roughly flat at `TTFT ~447 ms`, `steady TPOT ~53 ms/token`, and regressed `e2e_dsv32_small`, so it was reverted
 
 ### Generation alignment harness (teacher-forced top-K)
 
@@ -502,6 +505,11 @@ What this means:
 - **The bug was accumulation-order drift, not an FFI or layout bug.**
 - **The final accepted batching path keeps almost all of the #2 speedup.** Compared with the broken raw #2 benchmark, TTFT rose from `283.72 ms` to `452.17 ms`, but steady TPOT stayed slightly better at `53.46 ms/token`.
 - **Correctness is back at the committed regression level.** The accepted baseline is now the #3 row above, not the raw #2 row.
+
+### #4 Short-lived follow-ups that did not help (2026-04-19)
+
+- **Device-built slot-major EP metadata:** replaced the full `recv_topk_idx/weights` host round-trip with GPU-side counting + packing, but `64 -> 64` stayed at roughly `TTFT 447.94 ms`, `steady TPOT 54.01 ms/token`. Conclusion: this metadata path is not the first-order bottleneck at the current accepted baseline.
+- **GPU greedy sampling fast path:** moved greedy argmax onto GPU and skipped rank0 host logits for the common `temperature=0` case, but `64 -> 64` stayed at roughly `TTFT 446.62 ms`, `steady TPOT 53.28 ms/token`, while `e2e_dsv32_small` regressed badly. Conclusion: this path had no meaningful latency upside and was reverted.
 
 ---
 

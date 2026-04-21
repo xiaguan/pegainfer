@@ -177,6 +177,7 @@ DeepEP 就绪后，补齐剩余胶水打通全模型。
 - [x] EP local expert gather/scatter kernel 化：把逐 token `DtoD gather` / `moe_weighted_add` 改成 batched gather/scatter，原始版本把 `64 -> 64` 压到 `TTFT 0.28-0.43s`、`steady TPOT 54-58ms/token`，但 greedy correctness 回归
 - [x] 找到 regression 根因并修复：bug 不是 FFI/layout，而是 batched scatter 把同一 token 的 expert 累加顺序从 top-k-slot-major 改成 expert-major，在 bf16 read-modify-write 下触发 greedy 漂移；现已改成按 top-k slot 保序 batching，`e2e_dsv32_small` 恢复 `44/44` 通过，H20 `64 -> 64` accepted baseline 为 `TTFT 452.17ms`、`steady TPOT 53.46ms/token`
 - [x] 热点画像切换：`fp8_gemm` 已升到 `42.5%` kernel time，超过 `cached_notify_combine 33.5%`；`cuMemcpyDtoDAsync` 基本退出主路径，但 chunk metadata `H2D` 仍然很高
+- [x] 失败经验已记录：device-built slot-major EP metadata 与 GPU greedy sampling 都没有把 `64 -> 64` benchmark 拉出 accepted baseline，其中后者还带来 correctness 回归，已撤回
 - [ ] 通信与计算 overlap（双 micro-batch 流水线）
 - [ ] Decode 侧 SM 分区实验
 - [ ] MTP speculative decoding
