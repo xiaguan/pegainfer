@@ -801,28 +801,46 @@ fn main() {
             "cargo:warning=FlashMLA dense decode + sparse prefill (NSA k576) compiled for SM90a"
         );
 
-        // DeepEP intranode kernels — SM90a + C++17 + DISABLE_NVSHMEM
+        // DeepEP kernels — SM90a + C++17 + NVSHMEM (intranode + internode + low-latency).
+        // D2: NVSHMEM is a hard dependency. Build machines must have a usable NVSHMEM
+        // install at NVSHMEM_HOME (default /usr/local/nvshmem); see
+        // docs/projects/dsv32-optimization-directions.md §D2-integration.
         let deepep_kernel_sources = [
             "third_party/DeepEP/csrc/kernels/intranode.cu",
+            "third_party/DeepEP/csrc/kernels/internode.cu",
+            "third_party/DeepEP/csrc/kernels/internode_ll.cu",
             "third_party/DeepEP/csrc/kernels/layout.cu",
             "third_party/DeepEP/csrc/kernels/runtime.cu",
         ];
 
-        let deepep_include_args = ["-I", "third_party/DeepEP/csrc/kernels"];
+        let nvshmem_home =
+            std::env::var("NVSHMEM_HOME").unwrap_or_else(|_| "/usr/local/nvshmem".to_string());
+        let nvshmem_include = format!("{}/include", nvshmem_home);
+        let nvshmem_lib = format!("{}/lib", nvshmem_home);
 
+        let deepep_include_args = [
+            "-I".to_string(),
+            "third_party/DeepEP/csrc/kernels".to_string(),
+            "-I".to_string(),
+            nvshmem_include,
+        ];
+
+        // -rdc=true is required because DeepEP device code calls NVSHMEM device
+        // functions (e.g. nvshmemi_ibgda_amo_nonfetch_add) across translation units.
         let deepep_nvcc_base_args = [
             "-O3",
             "-gencode=arch=compute_90a,code=sm_90a",
             "--std=c++17",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
+            "-rdc=true",
             "--compiler-options",
             "-fPIC",
-            "-DDISABLE_NVSHMEM",
             "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
             "-DTOPK_IDX_BITS=64",
         ];
 
+        let mut deepep_obj_files: Vec<PathBuf> = Vec::new();
         let mut deepep_jobs = Vec::new();
         for source in &deepep_kernel_sources {
             let cu_file = Path::new(source);
@@ -830,6 +848,7 @@ fn main() {
             let obj_file = out_dir.join(format!("deepep_{}_cuda.o", stem));
 
             obj_files.push(obj_file.clone());
+            deepep_obj_files.push(obj_file.clone());
             let mut args = vec![
                 "-c".to_string(),
                 source.to_string(),
@@ -850,7 +869,9 @@ fn main() {
         }
         run_command_jobs_in_parallel(deepep_jobs);
 
-        // DeepEP C wrapper (csrc/deep_ep.cu)
+        // DeepEP C wrapper (csrc/deep_ep.cu) — also -rdc=true so its device-side
+        // references (via api.cuh -> configs.cuh -> nvshmem.h) participate in the
+        // device link step below.
         let mut deepep_wrapper_jobs = Vec::new();
         for file_name in &deepep_cuda_files {
             let cu_file = csrc_dir.join(file_name);
@@ -861,6 +882,7 @@ fn main() {
             let obj_file = out_dir.join(format!("{}_cuda.o", stem));
 
             obj_files.push(obj_file.clone());
+            deepep_obj_files.push(obj_file.clone());
             let mut args = vec![
                 "-c".to_string(),
                 cu_file.to_string_lossy().to_string(),
@@ -881,7 +903,34 @@ fn main() {
         }
         run_command_jobs_in_parallel(deepep_wrapper_jobs);
 
-        println!("cargo:warning=DeepEP intranode kernels compiled for SM90a");
+        // Device link step: resolve DeepEP kernels' calls into NVSHMEM device APIs
+        // (e.g. nvshmemi_ibgda_amo_nonfetch_add) against libnvshmem_device.a.
+        // Produces a single fatbin-carrying .o to include in the archive.
+        let deepep_dlink_obj = out_dir.join("deepep_nvshmem_dlink.o");
+        let mut dlink_args = vec![
+            "-dlink".to_string(),
+            "-arch=sm_90a".to_string(),
+            "--compiler-options".to_string(),
+            "-fPIC".to_string(),
+            "-o".to_string(),
+            deepep_dlink_obj.to_string_lossy().to_string(),
+        ];
+        for obj in &deepep_obj_files {
+            dlink_args.push(obj.to_string_lossy().to_string());
+        }
+        dlink_args.push(format!("-L{}", nvshmem_lib));
+        dlink_args.push("-lnvshmem_device".to_string());
+        run_command_jobs_in_parallel(vec![CommandJob {
+            program: nvcc.clone(),
+            args: dlink_args,
+            display: "nvcc -dlink for DeepEP+NVSHMEM".to_string(),
+            failure_context: "nvcc device-link failed for DeepEP+NVSHMEM".to_string(),
+        }]);
+        obj_files.push(deepep_dlink_obj);
+
+        println!(
+            "cargo:warning=DeepEP intranode+internode+LL kernels compiled for SM90a with NVSHMEM"
+        );
 
         // SM90a files that only need FP8 intrinsics (no DeepGEMM/CUTLASS headers)
         let mut sm90_jobs = Vec::new();
@@ -947,11 +996,36 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
 
+    // NVSHMEM runtime (required for DeepEP internode / low-latency kernels).
+    //
+    // Both libraries must be on the final link line:
+    //   - libnvshmem_host.so   — host-side runtime (nvshmemi_init_thread etc.)
+    //   - libnvshmem_device.a  — also contains host-side CUDA fatbin registration
+    //     stubs referenced by our nvcc -dlink output (__fatbinwrap_*_device_cu_*).
+    //     The -dlink step resolves device code, but the host stubs it emits still
+    //     need the original archive's objects at the final link.
+    let nvshmem_home_link =
+        std::env::var("NVSHMEM_HOME").unwrap_or_else(|_| "/usr/local/nvshmem".to_string());
+    println!("cargo:rustc-link-search=native={}/lib", nvshmem_home_link);
+    println!("cargo:rustc-link-lib=nvshmem_host");
+    // Use whole-archive so CUDA fatbin registration ctors are preserved.
+    println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+    println!(
+        "cargo:rustc-link-arg={}/lib/libnvshmem_device.a",
+        nvshmem_home_link
+    );
+    println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+    println!("cargo:rustc-link-lib=ibverbs");
+    println!("cargo:rustc-link-lib=mlx5");
+    println!("cargo:rustc-link-lib=gdrapi");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}/lib", nvshmem_home_link);
+
     println!("cargo:rerun-if-changed=csrc/");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=third_party/DeepGEMM/deep_gemm/include/");
     println!("cargo:rerun-if-changed=third_party/FlashMLA/csrc/");
     println!("cargo:rerun-if-changed=third_party/DeepEP/csrc/kernels/");
+    println!("cargo:rerun-if-env-changed=NVSHMEM_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");

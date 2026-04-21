@@ -1,7 +1,10 @@
 # DeepSeek-V3.2 on pegainfer
 
 > **Status**: Prefill logits aligned with reference. Decode currently runs dense FlashMLA (implementation gap vs NSA sparse design). H20 baseline for the **teacher-forced top-K logprob harness against SGLang** has completed (`44/44` cases, `6888` positions, `3.03%` argmax mismatches, `5` argmax-outside-topk). The committed regression path is now the **small greedy JSON E2E** over the same 44 prompts; the larger SGLang manifest stays local/H20-only and is gitignored. The old vLLM accuracy path has been retired because its H20 reference runtime never initialized reliably.
-> **Last updated**: 2026-04-19
+>
+> **Current bottleneck understanding (as of #5 rebaseline, 2026-04-21)**: `cached_notify_combine` (`~35%` of GPU time in `64 -> 64` decode) is a **cross-rank barrier**, not a communication cost — all 8 ranks exit within `< 1us` of each other but arrive with p50 `391us` skew, so the kernel time is dominated by waiting for the slowest rank per MoE layer. Decode GPU duty cycle is already `~88%`; CUDA Graph is low-leverage. Next levers (in order): grouped GEMM for routed experts → diagnose CPU-side jitter causing cnc start-skew → fp32 accumulator to unlock expert-major batching. See `#5` in the Optimization Log.
+>
+> **Last updated**: 2026-04-21
 >
 > Read this document to know: what's supported, how each operator is implemented, what the performance is, and what's next.
 
@@ -511,6 +514,67 @@ What this means:
 - **Device-built slot-major EP metadata:** replaced the full `recv_topk_idx/weights` host round-trip with GPU-side counting + packing, but `64 -> 64` stayed at roughly `TTFT 447.94 ms`, `steady TPOT 54.01 ms/token`. Conclusion: this metadata path is not the first-order bottleneck at the current accepted baseline.
 - **GPU greedy sampling fast path:** moved greedy argmax onto GPU and skipped rank0 host logits for the common `temperature=0` case, but `64 -> 64` stayed at roughly `TTFT 446.62 ms`, `steady TPOT 53.28 ms/token`, while `e2e_dsv32_small` regressed badly. Conclusion: this path had no meaningful latency upside and was reverted.
 
+### #5 Rebaseline nsys profile + cross-rank sync diagnosis (2026-04-21)
+
+Intent:
+- After `#4` failed, revisit the `64 -> 64` profile against the current accepted baseline (post-revert, same code state as `#3`) and answer three questions before committing to another optimization direction:
+  1. How much of `cached_notify_combine` is real GPU work vs CPU busy-wait / cross-rank wait?
+  2. Is the MoE DAG (`dispatch → local experts → cnc → combine`) back-to-back, or are there launch-bound gaps?
+  3. Is the decode workload balanced across ranks?
+
+Command:
+
+```bash
+nsys profile --trace=cuda,nvtx --cuda-graph-trace=node \
+  --force-overwrite=true --export=sqlite \
+  -o target/profiling/dsv32_64_64_rebaseline \
+  target/release/bench_serving \
+  --model-path /data/models/DeepSeek-V3.2 \
+  --dsv32-device-ordinals 0,1,2,3,4,5,6,7 \
+  request --prompt-len 64 --output-len 64 --warmup 0 --iters 1
+```
+
+Observed metrics (bench_serving, under nsys overhead):
+- `decode_tok_s`: `17.50 tok/s` → per-token `~57 ms` (consistent with `#3` un-profiled `~53 ms/token` plus nsys overhead)
+
+Trace shape — **device 0 active window = `1329.25 ms`**, main compute stream (streamId=125):
+- `48,494` kernels in a `1179 ms` sub-window (trim `150 ms` from both edges)
+- Active time `1035 ms`, idle gap `147 ms` → **duty cycle `87.78%`**
+- Gap distribution: avg `3us`, only `20` gaps `> 100us`, max `5.3ms`
+
+`nsys` kernel summary (global, 8 ranks):
+- `sm90_fp8_gemm_1d2d_impl`: `42.58%` (`197,226` events, avg `33.8us`)
+- `cached_notify_combine`: `34.79%` (`14,818` events, avg `367us`)
+- `combine`: `2.88%`; `notify_dispatch`: `2.39%`; `dispatch`: `1.72%`
+- attention (FlashMLA decode + sparse prefill), indexer, scatter/gather, SiLU, RMSNorm: each `< 2%`
+
+Per-device symmetry inside device-0 window (previous `3x` skew was load-phase, not decode):
+- kernel count per rank: `47,999 - 52,271` (`~5%` spread)
+- `fp8_gemm` count per rank: `12,725 - 14,327`
+- `cached_notify_combine` count per rank: `746 - 789`
+- duty cycle per rank: `74.07 - 80.80%`
+- "last-to-finish" rank rotates diffusely: rank 6 is last `190/746`, rank 0 only `40/746` — no structural straggler
+
+Cross-rank barrier signature (aligned cnc events, `n = 746`):
+- start-time skew across 8 ranks: p50 `391us`, p90 `609us`, avg `786us`
+- end-time skew across 8 ranks: p50 **`0.57us`**, p90 **`0.66us`**, max **`0.73us`**
+- neighbors are back-to-back: avg gap before cnc `1.12us`, avg gap after `1.13us`
+
+Performance findings:
+- **`cached_notify_combine` is a barrier, not a communication kernel.** End-skew `< 1us` across all 8 ranks confirms collective-barrier semantics: every rank arrives when it is done with `dispatch + local experts`, waits for the slowest, then all exit in lockstep. The `367us` average duration is almost entirely wait time for the laggard rank, not useful work. This kernel cannot be "made faster"; it can only be merged, overlapped, or have its pre-barrier variance reduced.
+- **GPU is not launch-bound during decode.** Duty cycle `87.78%` with avg inter-kernel gap of `3us` means CUDA Graph can recover at most `~12-20%` of wall time, much of it at prefill/decode boundaries rather than inside the decode steady state. Graph capture is a lower-priority lever than previously assumed.
+- **Decode work is balanced across ranks.** Earlier worry about a heavy-rank straggler (device 3/4/5 having `3x` the kernel count globally) turned out to be a load-phase artifact; inside the `1329 ms` decode window all 8 ranks are within `5-10%` on every compute metric.
+- **Updated bottleneck hierarchy for `64 -> 64` decode:**
+  1. Cross-rank barrier jitter at every MoE layer (`~394 ms` of the `1329 ms` window, `~30%` of wall time; CPU-side thread scheduling is a plausible primary cause of the `391us` start-skew)
+  2. `fp8_gemm` volume across attention projections + MoE FFN (`~42%` of kernel-active time, `~440 ms` on device 0 — biggest single-family target)
+  3. Everything else is < `3%` each
+
+Consequence for the optimization ranking going forward:
+1. **Grouped GEMM for routed experts (DeepGEMM `GroupedContiguous`)** — directly attacks the `42.58%` fp8_gemm budget and shortens pre-barrier compute time on every rank, which indirectly shrinks cnc wait. Template already vendored in `third_party/DeepGEMM`.
+2. **Profile CPU-side jitter across ranks before writing more kernels** — if the `~391us` cnc start-skew is driven by allocator contention or unpinned CPU threads, a small fix is on the critical path. Needs `nsys --trace=osrt,nvtx,cuda` or perf-side profiling, not just kernel summaries.
+3. **fp32 accumulator to unlock expert-major batching** — cheap prerequisite that recovers the `#2` TTFT gain (~`170 ms`) and simplifies the follow-up grouped-GEMM integration.
+4. Deferred: CUDA Graph capture (low ceiling here), barrier merging across MoE layers (large rewrite), micro-batch pipelining to hide cnc (requires continuous batching / MTP first).
+
 ---
 
 ## 10. Key Design Decisions
@@ -682,6 +746,8 @@ num_max_nvl_chunked_recv_tokens = 256
 - [ ] `#0 Baseline` — nsys kernel breakdown for both profiles.
 - [ ] Decide default pass/fail thresholds for `e2e_dsv32` from the current H20 baseline instead of leaving it report-only.
 - [ ] Cross-machine recheck: regenerate `dsv32_sglang_ref` on one H20 node and replay `e2e_dsv32` on a second node.
-- [ ] Grouped GEMM for routed experts (DeepGEMM `GroupedContiguous`) — replace per-expert sequential.
-- [ ] CUDA Graph capture for decode.
+- [ ] **Grouped GEMM for routed experts** (DeepGEMM `GroupedContiguous`) — replace per-expert sequential; ranked `#1` after `#5` profile. Attacks `42.58%` fp8_gemm budget and shortens cnc wait on every rank.
+- [ ] **Diagnose CPU-side cnc start-skew** — `#5` showed p50 `391us` cross-rank arrival spread at every MoE barrier. Candidate causes: allocator contention in `forward_moe_ep`'s per-expert loop, un-pinned Rust worker threads, DeepEP IPC host-sync path. Run a `nsys --trace=osrt,nvtx,cuda` profile and inspect per-rank CPU timelines before kernel-side changes.
+- [ ] **fp32 accumulator for `ep_local_out` scatter** — unblocks expert-major batching (regains `~170 ms` TTFT from `#2`) and is a prerequisite for the grouped-GEMM rewrite.
+- [ ] CUDA Graph capture for decode — deferred; `#5` showed decode duty cycle is already `87.78%`, graph ceiling is low.
 - [ ] TP2 attention sharding.

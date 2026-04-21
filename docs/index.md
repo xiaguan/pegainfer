@@ -3,6 +3,7 @@
 | Path | TL;DR |
 | --- | --- |
 | `projects/dsv32-inference.md` | DeepSeek-V3.2-0324 671B on 8xH20-3e: Phase 2d combine timeout 已修，61 层 forward 跑通。Next: logits 对齐 |
+| `projects/dsv32-optimization-directions.md` | DSV3.2 post-`#5` optimization directions (D1-D5) vs SGLang/vLLM; D2 build-level NVSHMEM integration landed (2026-04-21), runtime wiring next |
 | `archives/batch-optimization.md` | Archived optimization record for the single-GPU batching/perf push: pegainfer reached within 2% of vLLM throughput while beating it on TTFT, TPOT, and latency stability, with dynamic KV cache landed |
 | `archives/continuous-batching.md` | Archived implementation record for continuous batching: page allocator, paged KV direction, scheduler, and batch decode infrastructure landed and now serve as historical rollout context |
 | `archives/q2-2026-plan.md` | Archived Q2 2026 planning snapshot for batching hardening, PegaFlow integration, and differentiation work; preserved as period roadmap context |
