@@ -1,14 +1,11 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
 use log::info;
-use pegainfer::http_server::build_app;
 use pegainfer::logging;
 use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
-use pegainfer::tokenizer::Tokenizer;
 use pegainfer::trace_reporter::FileReporter;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -73,11 +70,8 @@ async fn main() {
         args.tp_size
     );
 
-    let app = match model_type {
+    let handle = match model_type {
         ModelType::Qwen3 => {
-            let tokenizer =
-                Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
-            let model_id = pegainfer::server_engine::model_id_from_path(model_path);
             let device_ordinals: Vec<usize> = if args.tp_size == 1 {
                 vec![args.device_ordinal]
             } else {
@@ -91,50 +85,34 @@ async fn main() {
             )
             .expect("Failed to start Qwen3 scheduler");
 
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis(),);
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
-            build_app(handle, tokenizer, model_id)
+            handle
         }
         ModelType::Qwen35 => {
             let model = Qwen35Model::from_safetensors_with_options(model_path, args.cuda_graph)
                 .expect("Failed to load Qwen3.5 model");
-
-            let tokenizer =
-                Arc::new(Tokenizer::from_file(model_path).expect("Failed to load tokenizer"));
-            let model_id = pegainfer::server_engine::model_id_from_path(model_path);
 
             let handle = pegainfer::scheduler_qwen35::start(model, 42)
                 .expect("Failed to start Qwen3.5 scheduler");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
-            build_app(handle, tokenizer, model_id)
+            handle
         }
     };
 
-    let addr = format!("0.0.0.0:{}", args.port);
-    info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(
-        axum::serve::ListenerExt::tap_io(listener, |tcp_stream| {
-            let _ = tcp_stream.set_nodelay(true);
-        }),
-        app,
+    pegainfer::vllm_frontend::serve(
+        handle,
+        &args.model_path,
+        args.port,
+        pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
     )
-    .with_graceful_shutdown(shutdown_signal())
     .await
-    .unwrap();
+    .expect("vLLM frontend server failed");
 
     if args.trace_output_path.is_some() {
         info!("Flushing pending traces...");
         fastrace::flush();
     }
-}
-
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C handler");
-    info!("Shutdown signal received");
 }

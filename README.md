@@ -202,10 +202,12 @@ See `tools/triton/README.md` for setup and troubleshooting.
 
 ```
 src/
-├── main.rs                # CLI + HTTP server (axum)
-├── server_engine.rs       # GenericServerEngine<M>, model detection, generate loop
-├── http_server/
-│   └── openai_v1.rs       # /v1/completions (streaming + non-streaming)
+├── main.rs                # CLI + vLLM/OpenAI server startup
+├── vllm_frontend.rs       # vLLM engine-core bridge into pegainfer scheduler
+├── server_engine.rs       # Model detection and shared scheduler-facing types
+├── scheduler.rs           # Qwen3 continuous batching scheduler
+├── scheduler_qwen35.rs    # Qwen3.5 scheduler
+├── model_executor.rs      # Shared execution helpers for scheduler paths
 ├── model.rs               # ModelForward trait
 ├── model/
 │   ├── cuda_graph.rs      # CUDA Graph capture/replay
@@ -224,7 +226,6 @@ src/
 ├── tensor.rs              # GPU tensor types (DeviceVec, DeviceMatrix, HiddenStates)
 ├── ffi.rs                 # FFI bindings to CUDA/Triton kernels
 ├── weight_loader.rs       # Safetensors loading + RoPE precomputation
-├── tokenizer.rs           # HuggingFace tokenizers wrapper
 ├── sampler.rs             # Temperature, top-k, top-p sampling
 └── trace_reporter.rs      # Chrome Trace JSON profiling
 

@@ -6,8 +6,10 @@ use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
 use pegainfer::scheduler_qwen35;
-use pegainfer::tokenizer::Tokenizer;
 use tokio::sync::mpsc;
+use vllm_text::tokenizer::DynTokenizer;
+
+mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_QWEN35_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -112,11 +114,11 @@ fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
 /// Generate text via the scheduler (Qwen3 path).
 fn generate_text_scheduler(
     handle: &scheduler::SchedulerHandle,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> String {
-    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
@@ -140,7 +142,7 @@ fn generate_text_scheduler(
         }
     }
 
-    tokenizer.decode(&tokens).expect("decode failed")
+    tokenizer.decode(&tokens, true).expect("decode failed")
 }
 
 fn write_golden_json(output_path: &Path, model_name: &str, cases_json: &[serde_json::Value]) {
@@ -192,7 +194,7 @@ fn regen_test_data() {
         },
     )
     .expect("Failed to load model");
-    let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
+    let tokenizer = common::load_tokenizer(&model_path);
     let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
 
     let mut cases_json = Vec::new();
@@ -236,7 +238,7 @@ fn regen_test_data_qwen35() {
 
     let model = Qwen35Model::from_safetensors_with_options(&model_path, true)
         .expect("Failed to load model");
-    let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
+    let tokenizer = common::load_tokenizer(&model_path);
     let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
 
     let mut cases_json = Vec::new();

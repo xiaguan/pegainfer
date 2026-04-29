@@ -8,9 +8,11 @@ use log::info;
 use pegainfer::model::Qwen35Model;
 use pegainfer::scheduler::{SchedulerRequest, TokenEvent};
 use pegainfer::scheduler_qwen35;
-use pegainfer::tokenizer::Tokenizer;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use vllm_text::tokenizer::DynTokenizer;
+
+mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
@@ -55,11 +57,11 @@ fn load_test_cases(path: &Path) -> Vec<TestCase> {
 
 fn generate_text(
     handle: &pegainfer::scheduler::SchedulerHandle,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> String {
-    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
@@ -83,7 +85,7 @@ fn generate_text(
         }
     }
 
-    tokenizer.decode(&out).expect("decode failed")
+    tokenizer.decode(&out, true).expect("decode failed")
 }
 
 #[test]
@@ -98,7 +100,7 @@ fn test_e2e_qwen35_generation() {
     let model =
         Qwen35Model::from_safetensors_with_options(&model_path, /*enable_cuda_graph=*/ true)
             .expect("Failed to load model");
-    let tokenizer = Tokenizer::from_file(&model_path).expect("Failed to load tokenizer");
+    let tokenizer = common::load_tokenizer(&model_path);
     let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
     info!("Model loaded");
 

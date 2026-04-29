@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
@@ -12,7 +11,9 @@ use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
 use pegainfer::server_engine::FinishReason;
-use pegainfer::tokenizer::Tokenizer;
+use vllm_text::tokenizer::DynTokenizer;
+
+mod common;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -67,11 +68,11 @@ fn init_logging() {
 /// Submit a request and collect all generated tokens (blocking).
 fn generate_tokens(
     handle: &scheduler::SchedulerHandle,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> (Vec<u32>, FinishReason) {
-    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
@@ -118,7 +119,7 @@ fn test_e2e_generation() {
         },
     )
     .expect("Failed to load model");
-    let tokenizer = Arc::new(Tokenizer::from_file(&model_path).expect("Failed to load tokenizer"));
+    let tokenizer = common::load_tokenizer(&model_path);
     let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
@@ -144,7 +145,7 @@ fn test_e2e_generation() {
         let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, prompt, max_tokens);
         let elapsed = start.elapsed();
 
-        let text = tokenizer.decode(&tokens).expect("decode failed");
+        let text = tokenizer.decode(&tokens, true).expect("decode failed");
         let tok_s = tokens.len() as f64 / elapsed.as_secs_f64();
 
         info!(
@@ -176,7 +177,7 @@ fn test_e2e_generation() {
     info!("=== Phase 2: Multi-request ===");
     for &(prompt, max_tokens) in &cases {
         let (tokens, _) = generate_tokens(&handle, &tokenizer, prompt, max_tokens);
-        let text = tokenizer.decode(&tokens).expect("decode failed");
+        let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
             "empty output on second run for: {}",
@@ -189,7 +190,7 @@ fn test_e2e_generation() {
 
     info!("=== Phase 3: Consumer drop ===");
     {
-        let prompt_tokens = tokenizer.encode("Hello").expect("encode failed");
+        let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
         let (token_tx, rx) = mpsc::unbounded_channel();
         drop(rx); // drop receiver immediately
         // Submit should succeed — scheduler will notice send error and retire the request
@@ -210,7 +211,7 @@ fn test_e2e_generation() {
 
     // Verify scheduler is still alive after consumer drop
     let (tokens, _) = generate_tokens(&handle, &tokenizer, "Hello", 5);
-    let text = tokenizer.decode(&tokens).expect("decode failed");
+    let text = tokenizer.decode(&tokens, true).expect("decode failed");
     assert!(!text.is_empty(), "scheduler dead after consumer drop");
     info!("  PASS: scheduler survived consumer drop");
 }

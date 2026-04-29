@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -29,11 +30,11 @@ use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use pegainfer::scheduler_qwen35;
 use pegainfer::server_engine::{ModelType, detect_model_type};
-use pegainfer::tokenizer::Tokenizer;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use vllm_text::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench_snapshots");
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
@@ -724,6 +725,11 @@ fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
     (0..len).map(|i| ((i % 1000) + 100) as u32).collect()
 }
 
+fn load_vllm_tokenizer(model_path: &str) -> Result<DynTokenizer> {
+    let tokenizer_path = Path::new(model_path).join("tokenizer.json");
+    Ok(Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?))
+}
+
 #[derive(Debug, Clone)]
 struct PromptSpec {
     descriptor: PromptDescriptor,
@@ -732,7 +738,7 @@ struct PromptSpec {
 
 fn resolve_prompt_input(
     args: &PromptInputArgs,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     default_text: Option<&str>,
     default_prompt_len: Option<usize>,
 ) -> Result<PromptSpec> {
@@ -740,15 +746,15 @@ fn resolve_prompt_input(
         (Some(prompt), None, None) => Ok(PromptSpec {
             descriptor: PromptDescriptor {
                 source: "text".to_string(),
-                prompt_tokens: tokenizer.encode(prompt)?.len(),
+                prompt_tokens: tokenizer.encode(prompt, false)?.len(),
                 prompt_preview: Some(truncate_preview(prompt, 96)),
             },
-            tokens: tokenizer.encode(prompt)?,
+            tokens: tokenizer.encode(prompt, false)?,
         }),
         (None, Some(path), None) => {
             let prompt = fs::read_to_string(path)
                 .with_context(|| format!("failed to read prompt file: {path}"))?;
-            let tokens = tokenizer.encode(&prompt)?;
+            let tokens = tokenizer.encode(&prompt, false)?;
             Ok(PromptSpec {
                 descriptor: PromptDescriptor {
                     source: format!("file:{path}"),
@@ -771,7 +777,7 @@ fn resolve_prompt_input(
         }
         (None, None, None) => {
             if let Some(prompt) = default_text {
-                let tokens = tokenizer.encode(prompt)?;
+                let tokens = tokenizer.encode(prompt, false)?;
                 Ok(PromptSpec {
                     descriptor: PromptDescriptor {
                         source: "text".to_string(),
@@ -1019,7 +1025,7 @@ fn run_info(cli: &Cli, command: &'static str, model_type: ModelType, load_ms: f6
 
 fn bench_request(
     model: &mut dyn BenchModel,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
@@ -1108,7 +1114,7 @@ fn bench_matrix(
 
 fn bench_curve(
     model: &mut dyn BenchModel,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
@@ -1251,7 +1257,7 @@ fn run_command(
     model_type: ModelType,
     load_ms: f64,
     model: &mut dyn BenchModel,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
 ) -> Result<BenchReport> {
     match &cli.command {
         Command::Request(args) => bench_request(model, tokenizer, cli, model_type, load_ms, args),
@@ -1593,7 +1599,7 @@ fn dispatch(
     model_type: ModelType,
     load_ms: f64,
     model: &mut dyn BenchModel,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
 ) -> Result<()> {
     if let Command::Snapshot(args) = &cli.command {
         run_snapshot(model, cli, model_type, args)
@@ -1639,7 +1645,7 @@ fn main() -> Result<()> {
         ModelType::Qwen3 => {
             let model = Qwen3Model::from_safetensors_with_runtime(&cli.model_path, runtime)?;
             let state = model.create_state()?;
-            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
+            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = ModelWithState { model, state };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
@@ -1652,7 +1658,7 @@ fn main() -> Result<()> {
             // Bench runs one request at a time — use minimal batch capacity
             // to leave GPU memory for large prefill scratch buffers.
             let handle = scheduler_qwen35::start_with_capacity(model, command_seed(&cli), 4)?;
-            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
+            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)

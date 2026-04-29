@@ -4,7 +4,6 @@
 /// with greedy correctness, concurrent requests, and consumer drop safety.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
@@ -15,7 +14,9 @@ use pegainfer::model::Qwen35Model;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerRequest, TokenEvent};
 use pegainfer::server_engine::FinishReason;
-use pegainfer::tokenizer::Tokenizer;
+use vllm_text::tokenizer::DynTokenizer;
+
+mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
@@ -55,11 +56,11 @@ fn load_test_cases(path: &Path) -> Vec<TestCase> {
 
 fn generate_tokens(
     handle: &pegainfer::scheduler::SchedulerHandle,
-    tokenizer: &Tokenizer,
+    tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> (Vec<u32>, FinishReason) {
-    let prompt_tokens = tokenizer.encode(prompt).expect("encode failed");
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
@@ -98,7 +99,7 @@ fn test_e2e_qwen35_scheduler() {
     let start = Instant::now();
     let model = Qwen35Model::from_safetensors_with_options(&model_path, true)
         .expect("Failed to load model");
-    let tokenizer = Arc::new(Tokenizer::from_file(&model_path).expect("Failed to load tokenizer"));
+    let tokenizer = common::load_tokenizer(&model_path);
     // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
     let handle = pegainfer::scheduler_qwen35::start_with_capacity(model, 42, 8)
         .expect("Failed to start Qwen3.5 scheduler");
@@ -118,7 +119,7 @@ fn test_e2e_qwen35_scheduler() {
             generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
         let elapsed = start.elapsed();
 
-        let text = tokenizer.decode(&tokens).expect("decode failed");
+        let text = tokenizer.decode(&tokens, true).expect("decode failed");
         let tok_s = tokens.len() as f64 / elapsed.as_secs_f64();
 
         info!(
@@ -147,7 +148,7 @@ fn test_e2e_qwen35_scheduler() {
     info!("=== Phase 2: Multi-request ===");
     for case in &cases {
         let (tokens, _) = generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
-        let text = tokenizer.decode(&tokens).expect("decode failed");
+        let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
             "empty output on second run for: {:?}",
@@ -163,7 +164,9 @@ fn test_e2e_qwen35_scheduler() {
 
         // Submit all cases concurrently
         for case in &cases {
-            let prompt_tokens = tokenizer.encode(&case.prompt).expect("encode failed");
+            let prompt_tokens = tokenizer
+                .encode(&case.prompt, false)
+                .expect("encode failed");
             let (token_tx, token_rx) = mpsc::unbounded_channel();
             handle
                 .submit(SchedulerRequest {
@@ -189,7 +192,7 @@ fn test_e2e_qwen35_scheduler() {
                     None => panic!("channel closed for {:?}", name),
                 }
             }
-            let text = tokenizer.decode(&tokens).expect("decode failed");
+            let text = tokenizer.decode(&tokens, true).expect("decode failed");
             assert!(!text.is_empty(), "empty output for concurrent: {:?}", name);
             info!("  PASS: {:?} → {} tokens", name, tokens.len());
         }
@@ -198,7 +201,7 @@ fn test_e2e_qwen35_scheduler() {
     // ── 4. Consumer drop safety ─────────────────────────────────────────
     info!("=== Phase 4: Consumer drop ===");
     {
-        let prompt_tokens = tokenizer.encode("Hello").expect("encode failed");
+        let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
         let (token_tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         handle
@@ -217,7 +220,7 @@ fn test_e2e_qwen35_scheduler() {
 
     // Verify scheduler survives
     let (tokens, _) = generate_tokens(&handle, &tokenizer, "Hello", 5);
-    let text = tokenizer.decode(&tokens).expect("decode failed");
+    let text = tokenizer.decode(&tokens, true).expect("decode failed");
     assert!(!text.is_empty(), "scheduler dead after consumer drop");
     info!("  PASS: scheduler survived consumer drop");
 

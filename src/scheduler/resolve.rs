@@ -35,7 +35,7 @@ fn resolve_prefill_outputs(
     request_results: Vec<PrefillRequestResult>,
 ) -> StepEffects {
     let mut effects = StepEffects::empty();
-    for (req, result) in pending.into_iter().zip(request_results.into_iter()) {
+    for (req, result) in pending.into_iter().zip(request_results) {
         debug_assert_eq!(req.request_id, result.request_id);
         let prompt_len = req.prompt_tokens.len();
 

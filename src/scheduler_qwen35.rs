@@ -136,7 +136,7 @@ fn scheduler_loop(
         // 2. Nothing active and nothing pending → block until a request arrives
         if active.is_empty() && pending.is_empty() {
             if let Some(req) = submit_rx.blocking_recv() {
-                pending.push(req)
+                pending.push(req);
             } else {
                 info!("Qwen3.5 scheduler: all handles dropped, exiting");
                 return;
