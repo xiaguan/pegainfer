@@ -12,7 +12,7 @@ pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Res
 }
 
 /// Batched element-wise add into pre-allocated output buffer (zero allocation).
-pub(crate) fn add_batch_into(
+pub fn add_batch_into(
     ctx: &DeviceContext,
     a: &HiddenStates,
     b: &HiddenStates,
@@ -54,7 +54,7 @@ pub fn silu_mul_batch(
 }
 
 /// Batched SiLU+mul into pre-allocated output buffer (zero allocation).
-pub(crate) fn silu_mul_batch_into(
+pub fn silu_mul_batch_into(
     ctx: &DeviceContext,
     gate: &HiddenStates,
     up: &HiddenStates,
@@ -86,7 +86,7 @@ pub(crate) fn silu_mul_batch_into(
 
 /// Fused SiLU-mul from combined [2*I, bs] gate+up buffer → [I, bs] output.
 /// Reads gate and up from interleaved column-major layout, no deinterleave needed.
-pub(crate) fn silu_mul_fused_batch_into(
+pub fn silu_mul_fused_batch_into(
     ctx: &DeviceContext,
     gate_up: &HiddenStates,
     out: &mut HiddenStates,
@@ -117,7 +117,7 @@ pub(crate) fn silu_mul_fused_batch_into(
 }
 
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
-pub(crate) fn extract_vec(
+pub fn extract_vec(
     ctx: &DeviceContext,
     batch: &HiddenStates,
     token_idx: usize,
@@ -129,7 +129,7 @@ pub(crate) fn extract_vec(
 }
 
 /// Copy one column from `batch` into a pre-allocated `out`.
-pub(crate) fn extract_vec_into(
+pub fn extract_vec_into(
     ctx: &DeviceContext,
     batch: &HiddenStates,
     token_idx: usize,
@@ -147,7 +147,7 @@ pub(crate) fn extract_vec_into(
 
 #[allow(dead_code)]
 /// Copy `src` into one column of `batch`.
-pub(crate) fn write_vec_into(
+pub fn write_vec_into(
     ctx: &DeviceContext,
     src: &DeviceVec,
     batch: &mut HiddenStates,

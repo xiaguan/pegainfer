@@ -191,9 +191,9 @@ cargo test --release --test e2e_qwen35
 
 ### Triton AOT
 
-Triton compiles **16+ kernels** at build time (silu_mul, add, embedding variants, split-KV attention decode/reduce, FlashAttention prefill, chunk-wise GDR prefill). Runtime has no Python dependency — everything runs through generated C wrappers.
+Triton compiles the Qwen3.5 compatibility AOT kernels at build time. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
 
-See `tools/triton/README.md` for setup and troubleshooting.
+See `crates/pegainfer-kernels/tools/triton/README.md` for setup and troubleshooting.
 
 ### Source Layout
 
@@ -214,43 +214,22 @@ src/
 │   ├── kv_cache.rs        # KV cache
 │   ├── qwen3/             # Qwen3: config, weights, forward, prefill, decode
 │   └── qwen35/            # Qwen3.5: config, weights, forward, prefill, decode, recurrent_state
-├── ops.rs                 # GPU operator dispatch
+├── ops.rs                 # Root compatibility dispatch + Qwen3.5 recurrent wrapper
 ├── ops/
-│   ├── attention.rs       # Fused GQA attention, prefill attention
-│   ├── elementwise.rs     # Add, copy, softmax
-│   ├── embedding.rs       # Token embedding lookup
-│   ├── linear.rs          # GEMV, cuBLAS GEMM
-│   ├── norm.rs            # RMSNorm (+ fused Add+RMSNorm)
 │   ├── recurrent.rs       # Conv1d, Gated Delta Rule (Qwen3.5)
-│   └── sampling.rs        # GPU argmax, top-k/top-p
-├── tensor.rs              # GPU tensor types (DeviceVec, DeviceMatrix, HiddenStates)
-├── ffi.rs                 # FFI bindings to CUDA/Triton kernels
+│   └── tests.rs           # Operator tests
+├── tensor.rs              # Re-export of pegainfer-kernels tensor types
+├── ffi.rs                 # Re-export of pegainfer-kernels FFI bindings
 ├── weight_loader.rs       # Safetensors loading + RoPE precomputation
 ├── sampler.rs             # Temperature, top-k, top-p sampling
 └── trace_reporter.rs      # Chrome Trace JSON profiling
 
-csrc/                      # Hand-written CUDA kernels
-├── gemv.cu                # GEMV (BF16×2 vectorized)
-├── fused_attention.cu     # Fused GQA decode attention (head_dim=128)
-├── fused_mlp.cu           # Fused SwiGLU MLP (gate+up→SiLU→down)
-├── gated_delta_rule.cu    # GDR decode recurrence (Qwen3.5)
-├── norm.cu                # RMSNorm (+ fused Add+RMSNorm)
-├── pos_enc.cu             # RoPE
-├── prefill_attention.cu   # Batched prefill attention (head_dim=128)
-├── prefill_attention_hd256.cu  # Prefill attention (head_dim=256)
-├── conv1d.cu              # Conv1d (Qwen3.5)
-└── sampling.cu            # GPU argmax, top-k/top-p
-
-tools/triton/              # Triton AOT kernels (build-time compiled)
-├── gen_triton_aot.py      # AOT compilation driver
-├── silu_mul_kernel.py
-├── basic_kernels.py       # add, embedding variants
-├── attention_decode_kernel.py
-├── attention_reduce_kernel.py
-├── flash_attention_prefill_kernel.py
-├── flash_attention_prefill_hd256_kernel.py
-├── gated_delta_rule_chunkwise_kernels.py
-└── README.md
+crates/pegainfer-kernels/          # Shared GPU kernel/runtime crate
+├── KERNELS.md                     # LLM routing index for model op -> wrapper -> FFI -> source
+├── kernel_manifest/qwen3_4b.toml  # Machine-readable Qwen3-4B kernel index
+├── src/                           # GPU tensor types, FFI, paged KV layout, Rust ops
+├── csrc/                          # Hand-written CUDA / FlashInfer C++ wrappers
+└── tools/triton/                  # Triton AOT kernels (build-time compiled)
 ```
 
 </details>

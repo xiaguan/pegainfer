@@ -5,7 +5,7 @@ use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 /// GEMM on a row sub-range of a weight matrix: Y = W[row_offset..row_offset+M, :] @ X
-pub(crate) fn gemm_rows_into(
+pub fn gemm_rows_into(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     row_offset: usize,
@@ -73,11 +73,7 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
     Ok(())
 }
 /// Linear layer: y = weight @ x
-pub(crate) fn linear(
-    ctx: &DeviceContext,
-    x: &DeviceVec,
-    weight: &DeviceMatrix,
-) -> Result<DeviceVec> {
+pub fn linear(ctx: &DeviceContext, x: &DeviceVec, weight: &DeviceMatrix) -> Result<DeviceVec> {
     let mut y = DeviceVec::zeros(ctx, weight.rows)?;
     gemv(ctx, weight, x, &mut y)?;
     Ok(y)
@@ -94,7 +90,7 @@ pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Res
 /// GEMM into pre-allocated output buffer (zero allocation).
 /// For seq_len=1, uses the graph-safe cuBLAS handle (no workspace) for lower
 /// latency while preserving numerical parity with the prefill path.
-pub(crate) fn gemm_into(
+pub fn gemm_into(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,

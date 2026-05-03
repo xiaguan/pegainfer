@@ -44,6 +44,18 @@ impl KvLayout {
             page_stride,
         }
     }
+
+    pub(crate) fn kernel_layout(&self) -> pegainfer_kernels::paged_kv::PagedKvLayout {
+        pegainfer_kernels::paged_kv::PagedKvLayout {
+            page_size: self.page_size,
+            num_layers: self.num_layers,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            kv_block_len: self.kv_block_len,
+            layer_stride: self.layer_stride,
+            page_stride: self.page_stride,
+        }
+    }
 }
 
 struct KvPoolInner {

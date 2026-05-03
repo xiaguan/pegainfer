@@ -3006,7 +3006,6 @@ name = "pegainfer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "clap",
  "colored",
  "comfy-table",
@@ -3020,6 +3019,7 @@ dependencies = [
  "memmap2",
  "ndarray",
  "parking_lot",
+ "pegainfer-kernels",
  "rand 0.10.0",
  "rmp-serde",
  "rmpv",
@@ -3033,6 +3033,16 @@ dependencies = [
  "vllm-server",
  "vllm-text",
  "zeromq",
+]
+
+[[package]]
+name = "pegainfer-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc",
+ "half",
 ]
 
 [[package]]

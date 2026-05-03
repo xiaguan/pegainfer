@@ -16,9 +16,3 @@ impl Default for SamplingParams {
         }
     }
 }
-
-impl SamplingParams {
-    pub(crate) fn is_greedy(&self) -> bool {
-        (self.temperature <= 0.0 || self.top_k == 1) && self.top_p >= 1.0
-    }
-}

@@ -8,8 +8,9 @@
 | `projects/q2-2026-plan.md` | Q2 plan: W1 harden batching, W2 PegaInfer+PegaFlow native, W3 differentiation. Competitive intel: Qwen3.5 is both competitors' Achilles' heel, startup time 215s vs seconds, observability as product moat. MTP deferred to Q3 |
 | `projects/nonstandard-attention-milestone.md` | Milestone direction: pegainfer focuses on non-standard attention models, with emphasis on model-family readiness, service experience, framework debt repayment, and disciplined evaluation |
 | `projects/qwen3-tp-design.md` | Qwen3 tensor-parallel design merged into one doc: `TP=2` milestone scope plus the controller/worker broadcast execution model, request identity, and coarse-grained step protocol for future TP/MoE work |
+| `projects/qwen3-kernels-crate.md` | Phase 1 split implemented and 5090-verified: Qwen3-4B kernel surface lives in `crates/pegainfer-kernels`; release build, test-target compile, Qwen3 e2e, and bench snapshot pass |
 | `projects/flashinfer-sampling-benchmark.md` | FlashInfer runtime sampling and greedy top-1 path are in place, but the work is blocked on restoring batched decode token selection instead of per-request sampling inside batch decode |
-| `projects/pegainfer-kernels-boundary.md` | Define the extraction boundary for a standalone `pegainfer-kernels` layer: what is a reusable operator primitive, what remains runtime/model orchestration, and the smallest migration path |
+| `projects/pegainfer-kernels-boundary.md` | Architecture decision: pegainfer should use reusable frontend/runtime/data-plane layers plus per-model engines; kernels become first-class assets through a ledger, simulator, and request tracing |
 | `projects/qwen35-4b-accuracy.md` | Qwen3.5-4B HF parity work: major decode-state bugs are fixed, `conv1d` now matches HF's bf16 pre-`SiLU` rounding, exact HF matches improved to 11/13, and only two small-logit-drift cases remain |
 | `projects/qwen35-4b-optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 225ms, TPOT 11.81ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9) |
 | `projects/model-forward-trait.md` | ModelForward trait extraction: weights/state separation, shared generation loop, designed for bs > 1 |
@@ -25,4 +26,5 @@
 | `resources/model-optimization-pipeline.md` | Per-model optimization methodology: 2 standard profiles, vLLM baseline, e2e dashboard + append-only optimization log |
 | `resources/kernel-technology-reference.md` | Kernel tech reference: current stack, ecosystem survey (Triton/Gluon/CUTLASS/ThunderKittens/FlashAttention/FlashInfer), decision framework, source-level lessons, and operator policy |
 | `resources/flashinfer-reference.md` | FlashInfer map: official docs structure, operator families, major features, and which source areas matter beyond the docs index |
+| `resources/5090.md` | 5090 dev box workflow: SSH alias, repo/model paths, SM target, rsync workflow, temporary validation worktree, build/e2e/bench commands |
 | `areas/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches |

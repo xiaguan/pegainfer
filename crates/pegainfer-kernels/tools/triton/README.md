@@ -11,7 +11,7 @@ Qwen3.5 GDR chunkwise prefill kernels.
 - Generated C wrappers linked into the normal Rust build
 - Native CUDA now covers basic ops (`add`, `silu_mul`, `embedding`) and decode-critical paths
 
-`build.rs` now skips compiling the replaced legacy CUDA translation units `csrc/activation.cu`, `csrc/elementwise.cu`, and `csrc/embedding.cu`.
+`build.rs` now skips compiling retired legacy translation units that are no longer present in the active kernel set.
 
 ## Prerequisites
 
@@ -23,17 +23,17 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 Bootstrap a repo-local Triton Python once:
 
 ```bash
-uv venv tools/triton/.venv
-uv pip install -p tools/triton/.venv/bin/python triton
+uv venv .venv
+uv pip install -p .venv/bin/python triton
 ```
 
 Then either point the build to that interpreter explicitly:
 
 ```bash
-export PEGAINFER_TRITON_PYTHON=$PWD/tools/triton/.venv/bin/python
+export PEGAINFER_TRITON_PYTHON=$PWD/.venv/bin/python
 ```
 
-or let `build.rs` auto-probe `tools/triton/.venv/bin/python` before trying `python3` / `python`.
+or let `build.rs` auto-probe `.venv/bin/python` before trying `python3` / `python`.
 
 If `nvidia-smi` is unavailable where you build, also set the target SM manually.
 
@@ -65,7 +65,7 @@ cargo build --release
 Generated Triton artifacts are written to Cargo `OUT_DIR`, typically under:
 
 ```text
-target/release/build/pegainfer-*/out/triton_aot/
+target/release/build/pegainfer-kernels-*/out/triton_aot/
 ```
 
 ## Validation
@@ -80,7 +80,7 @@ PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release --test e2e_qw
 ## Common failures
 
 - `Could not find a Python interpreter with Triton installed`
-  - Set `PEGAINFER_TRITON_PYTHON`, or bootstrap `tools/triton/.venv` with `uv`.
+  - Set `PEGAINFER_TRITON_PYTHON`, or bootstrap `.venv` with `uv`.
 - `GPU detection failed`
   - Set `PEGAINFER_CUDA_SM` explicitly if `nvidia-smi` is not available during build.
 - `Triton AOT generator failed`

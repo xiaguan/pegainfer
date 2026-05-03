@@ -30,7 +30,7 @@ pub fn rms_norm_into(
 }
 
 /// RMSNorm (allocating)
-pub(crate) fn rms_norm(
+pub fn rms_norm(
     ctx: &DeviceContext,
     x: &DeviceVec,
     weight: &DeviceVec,
@@ -73,7 +73,7 @@ pub fn fused_add_rms_norm_into(
 
 /// Batched fused add + RMSNorm for HiddenStates.
 /// hidden[i] += residual[i]; out[i] = rms_norm(hidden[i], weight) for each batch element.
-pub(crate) fn fused_add_rms_norm_batch_into(
+pub fn fused_add_rms_norm_batch_into(
     ctx: &DeviceContext,
     hidden: &mut HiddenStates,
     residual: &HiddenStates,
@@ -105,7 +105,7 @@ pub(crate) fn fused_add_rms_norm_batch_into(
 }
 
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).
-pub(crate) fn rms_norm_batch_into(
+pub fn rms_norm_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &DeviceVec,
@@ -187,7 +187,7 @@ pub fn rms_norm_offset_into(
 /// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn rms_norm_gated_batch_into(
+pub fn rms_norm_gated_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &CudaSlice<f32>,
