@@ -9,8 +9,8 @@ mod sampling;
 
 pub use attention::{
     PrefillPagedPlan, paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
-    qk_norm_rope_batch_decode_into,
+    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
+    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
 };
 pub use elementwise::{
     add_batch, add_batch_into, extract_vec, extract_vec_into, silu_mul_batch, silu_mul_batch_into,

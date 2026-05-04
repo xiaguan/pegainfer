@@ -593,6 +593,128 @@ pub fn paged_attention_batch_decode_into(
     Ok(())
 }
 
+/// Batched paged attention decode using FlashInfer partition-KV/split-K.
+///
+/// This is intended for low-batch, long-context decode where the non-partition
+/// grid `(batch, kv_heads)` does not expose enough CTAs.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_split_kv_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    split_request_indices_d: &CudaSlice<i32>,
+    split_kv_tile_indices_d: &CudaSlice<i32>,
+    split_kv_chunk_size_d: &CudaSlice<i32>,
+    split_o_indptr_d: &CudaSlice<i32>,
+    split_block_valid_mask_d: &CudaSlice<u8>,
+    split_tmp_v: &mut CudaSlice<bf16>,
+    split_tmp_s: &mut CudaSlice<f32>,
+    split_padded_slots: usize,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    let page_size = layout.page_size;
+
+    let k_offset = (layer * layout.layer_stride) as i64;
+    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
+    let stride_page = layout.page_stride as i64;
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);
+    let (pos_ptr, _gpos) = positions_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = request_indices_d.device_ptr(&ctx.stream);
+    let (split_ri_ptr, _gsri) = split_request_indices_d.device_ptr(&ctx.stream);
+    let (split_kti_ptr, _gskti) = split_kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (split_kcs_ptr, _gskcs) = split_kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (split_o_indptr_ptr, _gsoi) = split_o_indptr_d.device_ptr(&ctx.stream);
+    let (split_valid_ptr, _gsv) = split_block_valid_mask_d.device_ptr(&ctx.stream);
+    let (split_tmp_v_ptr, _gstmpv) = split_tmp_v.device_ptr_mut(&ctx.stream);
+    let (split_tmp_s_ptr, _gstmps) = split_tmp_s.device_ptr_mut(&ctx.stream);
+
+    let stream = ctx.stream.cu_stream();
+
+    let src_stride_n = (num_kv_heads * head_dim) as i64;
+    let src_stride_h = head_dim as i64;
+    let result = unsafe {
+        ffi::paged_kv_scatter_cuda(
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            ri_ptr as *const i32,
+            pos_ptr as *const i32,
+            batch_size as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            stride_page,
+            src_stride_n,
+            src_stride_h,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("paged_kv_scatter_cuda (batch split-K decode) failed with error {result}");
+    }
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let result = unsafe {
+        ffi::paged_attention_decode_split_kv_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            split_ri_ptr as *const i32,
+            split_kti_ptr as *const i32,
+            split_kcs_ptr as *const i32,
+            split_o_indptr_ptr as *const i32,
+            split_valid_ptr as *const u8,
+            split_tmp_v_ptr as *mut ffi::Half,
+            split_tmp_s_ptr as *mut f32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            batch_size as i32,
+            split_padded_slots as i32,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("paged_attention_decode_split_kv_cuda (batch) failed with error {result}");
+    }
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_batch_decode_hd256_into(

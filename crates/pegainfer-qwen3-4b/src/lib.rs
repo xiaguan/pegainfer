@@ -4,6 +4,7 @@ mod batch_decode;
 mod batch_decode_buffers;
 mod config;
 mod executor;
+pub mod kernel_bench;
 mod prefill;
 mod scheduler;
 mod unified_forward;

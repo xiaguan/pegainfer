@@ -25,11 +25,11 @@ serde_json = "1.0.149"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+pegainfer-cupti = { path = "../pegainfer-cupti" }
 vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
 
 [[bench]]
-name = "qwen3_runtime"
+name = "qwen3_kernel_snapshot"
 harness = false
 
 [lints.clippy]

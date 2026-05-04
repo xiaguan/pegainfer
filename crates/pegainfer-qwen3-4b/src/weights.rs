@@ -428,6 +428,7 @@ impl Qwen3Model {
             max_batch_size,
             self.kv_pool.capacity_pages(),
             self.kv_pool.padding_page_id(),
+            self.local_num_attention_heads(),
         )
     }
 }

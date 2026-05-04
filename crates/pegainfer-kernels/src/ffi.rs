@@ -134,6 +134,8 @@ unsafe extern "C" {
     pub fn cublas_init();
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
+    pub fn cudaProfilerStart() -> i32;
+    pub fn cudaProfilerStop() -> i32;
 
     // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
     pub fn prefill_qk_norm_rope_only_cuda(
@@ -517,6 +519,34 @@ unsafe extern "C" {
         head_dim: i32,
         page_size: i32,
         batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode (FlashInfer BatchDecode, partition-KV / split-K).
+    pub fn paged_attention_decode_split_kv_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        o_indptr: *const i32,
+        block_valid_mask: *const u8,
+        tmp_v: *mut Half,
+        tmp_s: *mut f32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
         stride_page: i64,
         sm_scale: f32,
         stream: CUstream,

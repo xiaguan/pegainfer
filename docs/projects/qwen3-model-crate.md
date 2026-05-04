@@ -2,7 +2,7 @@
 
 **Created**: 2026-05-03
 **Status**: ready for diff review
-**TL;DR**: `crates/pegainfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. 5090 release build, workspace test-target compile, clippy, Qwen3 crate e2e, and root `bench_serving snapshot` pass. Qwen3 Criterion benches use the production `runtime::Qwen3Executor` phase API; the old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`.
+**TL;DR**: `crates/pegainfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode for `padded_bs<=2 && seq_len>=1024` and was retuned to `chunk_tokens=256,max_chunks=64`, cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
 
 ## Preparation
 
@@ -166,8 +166,378 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - 5090 `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
   - 5090 `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` passes.
 
+### Step 8: Decode Context-Length Sweep and Compile Audit
+- Added `crates/pegainfer-qwen3-4b/src/bin/qwen3_decode_context.rs` as a production-path fixed-context decode probe. It prefills a fresh request to a selected context length, then measures or profiles real `Qwen3Executor::execute_decode`; the optional `cudaProfilerStart/Stop` range only exists for profiler capture and does not run in normal serving.
+- 5090 fixed-context command:
+  - `PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context --model-path /data/Qwen3-4B --iters 10 --contexts 128,512,1024,2048,4096,8192,10000`
+- Result on RTX 5090:
+
+| Context | Decode p50 |
+| --- | ---: |
+| 128 | `6.1107ms` |
+| 512 | `6.7094ms` |
+| 1024 | `7.4256ms` |
+| 2048 | `8.8918ms` |
+| 4096 | `11.7912ms` |
+| 8192 | `17.5457ms` |
+| 10000 | `20.0653ms` |
+
+- Linear fit across the sweep: `TPOT ~= 5.9789ms + 1.411us/token * context`, `R^2=0.99997`.
+- `nsys` with `--cuda-graph-trace=node` shows the growth is almost entirely FlashInfer paged decode attention:
+
+| Context | Total kernel time / step | Attention / step | Non-attention / step |
+| --- | ---: | ---: | ---: |
+| 1024 | `7.3287ms` | `1.5390ms` | `5.7897ms` |
+| 10000 | `19.6907ms` | `13.8868ms` | `5.8039ms` |
+
+- H2D traffic in the profiled decode range was only about `20-23us/step`, so metadata dirty caching is good runtime hygiene but cannot explain a multi-ms TPOT gap.
+- Compile audit on the same 5090 worktree:
+  - GPU reports compute capability `12.0`; default toolkit is CUDA `12.9` (`nvcc V12.9.86`), driver `575.57.08`.
+  - `crates/pegainfer-kernels/build.rs` emits `-O3 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 --compiler-options -fPIC`; FlashInfer translation units add `--std=c++17` and the FlashInfer include path.
+  - `cuobjdump -lelf` confirms both `libkernels_cuda.a` and `target/release/pegainfer` contain `sm_120.cubin`. `compute_120` PTX fallback is also embedded, but the matching SASS is present, so this is not PTX-JIT-only execution.
+  - CUDA `13.1` is installed and can build the same code into `sm_120` cubins, but the current driver/runtime combination cannot run it (`cudaError=35` after linking `libcudart.so.13`). Until the driver is upgraded, CUDA `12.9` is the latest runnable toolkit on this box.
+- Interpretation: the compile target is correct. The `bs=1` long-context slope is the known non-partition FlashInfer paged decode issue: grid shape is effectively `(batch_size, num_kv_heads) = (1, 8)`, so only 8 CTAs scan the whole KV context. At `ctx=4096`, Qwen3-4B attention reads about `604MB` (`576MiB`) of K/V per token; the measured attention time is about `5.7ms`, or roughly `105GB/s` effective aggregate bandwidth, far below the 5090 memory system because the kernel under-fills the GPU. The next real fix is partition-KV/split-K decode for `bs=1` or low-batch, not build-flag tuning.
+
+### Step 9: Pure Paged Decode Attention Bench
+- Added `crates/pegainfer-qwen3-4b/benches/qwen3_attention.rs`.
+- The bench does not load Qwen3 weights. It constructs synthetic non-zero Q and paged KV buffers using Qwen3-4B attention shape: `num_qo_heads=32`, `num_kv_heads=8`, `head_dim=128`, `page_size=16`, one layer.
+- The bench calls the FlashInfer paged decode FFI directly and uses CUDA events around the kernel launches. It measures decode attention only; it excludes QKV projection, KV append, O projection, MLP, scheduler, tokenizer, and host-side serving overhead.
+- Added `paged_attention_decode_split_kv_cuda` as a reusable kernel entry for FlashInfer partition-KV/split-K decode. Runtime dispatch still uses the existing non-partition path; this step only exposes and benchmarks the candidate operator.
+- The split-K bench uses `chunk_size=512` and `max_chunks_per_request=64`. Active chunks are packed for `o_indptr`, and remaining graph-stability slots are masked with `block_valid_mask=0`.
+- Bench setup runs a non-timed D2H sanity check comparing split-K output with the non-partition output for every synthetic case. The 5090 run below passed that check.
+- Registered it as a model-crate Criterion bench instead of a kernels-crate bench because the shape, context sweep, and interpretation are Qwen3-specific; the implementation still directly indexes the reusable kernel entry point.
+- Local verification:
+  - `cargo fmt --all --check` passes.
+  - `cargo metadata --no-deps --format-version 1` passes.
+  - `git diff --check` passes.
+- 5090 compile:
+  - `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3-4b --bench qwen3_attention` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-qwen3-4b --all-targets -- -D warnings` passes.
+- 5090 run:
+  - `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_attention -- --noplot` passes.
+
+Single-layer `bs=1` context sweep on RTX 5090:
+
+| KV length | Non-partition | Split-K 512/padded64 | Speedup |
+| --- | ---: | ---: | ---: |
+| 128 | `6.56us` | `8.91us` | `0.74x` |
+| 512 | `18.70us` | `20.96us` | `0.89x` |
+| 1024 | `34.94us` | `21.17us` | `1.65x` |
+| 2048 | `65.78us` | `20.85us` | `3.16x` |
+| 4096 | `129.23us` | `21.59us` | `5.99x` |
+| 8192 | `254.98us` | `22.81us` | `11.18x` |
+| 10000 | `311.51us` | `23.31us` | `13.36x` |
+
+Batch sweep at `kv_len=1024`:
+
+| Batch size | Non-partition | Split-K 512/padded64 | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | `34.97us` | `20.89us` | `1.67x` |
+| 2 | `34.96us` | `27.07us` | `1.29x` |
+| 4 | `34.90us` | `38.44us` | `0.91x` |
+| 8 | `35.00us` | `45.95us` | `0.76x` |
+| 16 | `35.05us` | `51.11us` | `0.69x` |
+| 32 | `86.12us` | `92.51us` | `0.93x` |
+
+Interpretation: the pure operator data reproduces the same shape as the full decode profile. At `bs=1`, non-partition time grows almost linearly with KV length, while graph-stable split-K stays near `21-23us/layer` once context reaches 1k. Multiplying the synthetic ctx10000 split-K result by 36 layers gives about `0.84ms` attention-only time instead of about `11.2ms` from non-partition. That is the right order of magnitude for fixing the long-context TPOT slope. The batch sweep also shows the guard must be conservative: at `kv_len=1024`, split-K only wins for `bs<=2`, and non-partition is better once batch already provides enough request/head CTAs.
+
+### Step 10: Runtime Split-K Decode Gate
+- Integrated `paged_attention_decode_split_kv_cuda` into the Qwen3 decode runtime.
+- `BatchDecodeBuffers` now owns split-K metadata and workspace:
+  - `split_request_indices_d`
+  - `split_kv_tile_indices_d`
+  - `split_kv_chunk_size_d`
+  - `split_o_indptr_d`
+  - `split_block_valid_mask_d`
+  - `split_tmp_v`
+  - `split_tmp_s`
+- CUDA graph cache is now keyed by `(batch_bucket, attention_path)` instead of only `batch_bucket`. This matters because a request can first capture the `bs=1` non-partition graph at short context and later cross the split-K threshold; the split-K path needs its own graph capture.
+- Runtime gate:
+  - split-K when `padded_bs <= 2 && max_seq_len >= 1024`
+  - otherwise keep non-partition decode
+- Split-K metadata uses `chunk_size=max(512, ceil(max_seq_len / 64))` and `64` reserved chunk slots per request. Real chunk slots are packed for `o_indptr`; unused graph-stability slots are masked with `block_valid_mask=0`.
+- Padding batch slots get zero active split chunks. Their output is discarded, and the batch columns remain independent through GEMMs.
+
+5090 validation:
+
+| Check | Result |
+| --- | --- |
+| `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3-4b --all-targets` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` | pass |
+
+Fixed-context decode probe after runtime integration:
+
+| Prompt context | Decode KV len | p50 TPOT before | p50 TPOT after |
+| --- | ---: | ---: | ---: |
+| 1024 | 1025 | `7.43ms` | `6.74ms` |
+| 4096 | 4097 | `11.79ms` | `6.82ms` |
+| 10000 | 10001 | `20.07ms` | `7.06ms` |
+
+Command:
+
+```bash
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+  --model-path /data/Qwen3-4B \
+  --iters 10 \
+  --contexts 1024,4096,10000
+```
+
+Cross-threshold smoke:
+
+```bash
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+  --model-path /data/Qwen3-4B \
+  --iters 600 \
+  --contexts 512
+```
+
+Result: pass, `p50=6.7156ms`. This exercises a single request growing from non-partition territory into the split-K threshold with separate graph captures.
+
+Serving request check after rebuilding `bench_serving`:
+
+```bash
+RUST_LOG=warn PEGAINFER_CUDA_SM=120 target/release/bench_serving \
+  --model-path /data/Qwen3-4B \
+  request --prompt-len 4096 --output-len 64
+```
+
+Result:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| `first_decode_step_ms p50` | `11.74ms` | `6.82ms` |
+| `steady_tpot_ms p50` | `11.72ms` | `6.77ms` |
+| `e2e_ms p50` | `916.34ms` | `604.24ms` |
+
+Interpretation: split-K removes the long-context attention slope for the low-batch case. The remaining `~6.8-7.1ms` TPOT is now dominated by the non-attention decode body: GEMMs/GEMVs, MLP, norms, logits, sampling, and graph replay overhead. Next optimization work should not keep pushing paged attention first; it should re-profile the post-split decode step and pick the new largest kernel family.
+
+### Step 11: Attention Theoretical Bandwidth Estimate
+- Updated `crates/pegainfer-qwen3-4b/benches/qwen3_attention.rs` to print a one-time theoretical bandwidth report before Criterion runs.
+- The report queries CUDA Driver attributes:
+  - `CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE`
+  - `CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH`
+- On the 5090, CUDA reports `14001MHz` memory clock and a `512-bit` memory bus. Using `2` transfers per memory clock gives `1792.128GB/s`, matching the public RTX 5090 bandwidth figure.
+- The report uses Qwen3 KV read bytes only:
+  - `bs * kv_len * num_kv_heads * head_dim * 2(K,V) * sizeof(bf16)`
+  - This is a counter-free lower-bound estimate, not measured DRAM bytes.
+- Verification command:
+
+```bash
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \
+  --bench qwen3_attention -- --noplot
+```
+
+Key 5090 report rows:
+
+| Case | KV read | Time | Effective GB/s | Peak % |
+| --- | ---: | ---: | ---: | ---: |
+| `ctx bs1 non_partition 4096` | `16.777MB` | `129.285us` | `129.769` | `7.24%` |
+| `ctx bs1 non_partition 10000` | `40.960MB` | `309.744us` | `132.238` | `7.38%` |
+| `ctx bs1 split_k512_padded64 4096` | `16.777MB` | `21.494us` | `780.536` | `43.55%` |
+| `ctx bs1 split_k512_padded64 10000` | `40.960MB` | `23.294us` | `1758.386` | `98.12%` |
+
+Batch sweep sanity rows at `kv_len=1024`:
+
+| Case | KV read | Time | Effective GB/s | Peak % |
+| --- | ---: | ---: | ---: | ---: |
+| `batch non_partition bs8` | `33.554MB` | `34.935us` | `960.482` | `53.59%` |
+| `batch non_partition bs16` | `67.109MB` | `35.004us` | `1917.174` | `106.98%` |
+| `batch split_k512_padded64 bs32` | `134.218MB` | `92.533us` | `1450.489` | `80.94%` |
+
+Interpretation: the estimate is good enough to prove the original `bs=1` non-partition path was badly under-filling memory bandwidth. It is not good enough to make final hardware-utilization claims because single-layer KV working sets fit in the 5090's `96MiB` L2; the `bs16` non-partition row exceeding `100%` of DRAM peak is the warning sign. The next measurement step should use CUPTI Profiler or NCU counters for `dram__bytes_*`, `lts__t_bytes.*`, and `*_pct_of_peak_sustained_elapsed`.
+
+### Step 12: CUPTI Counters and Split-K Retune
+- Added `crates/pegainfer-cupti`, a small CUPTI Range Profiler wrapper used by the attention bench. It profiles only the attention launch range and lets the bench clear L2 before `cuptiRangeProfilerStart`, so cache-clear traffic is excluded from the measured range.
+- Extended `crates/pegainfer-qwen3-4b/benches/qwen3_attention.rs`:
+  - `PEGAINFER_QWEN3_ATTENTION_CUPTI=1` prints cold-L2 CUPTI rows for `gpu__time_duration.sum`, `dram__bytes.sum`, `dram__bytes_op_read.sum`, `dram__bytes_op_write.sum`, and `lts__t_bytes.sum`.
+  - `PEGAINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1` sweeps split-K chunk sizes and max chunk slots.
+  - `PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1` prints reports without running Criterion samples.
+- 5090 CUPTI command:
+
+```bash
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
+PEGAINFER_QWEN3_ATTENTION_CUPTI=1 \
+cargo bench -p pegainfer-qwen3-4b --bench qwen3_attention -- --noplot
+```
+
+Key cold-L2 CUPTI rows at `bs=1,ctx=10000`:
+
+| Path | GPU time | DRAM read | DRAM total | DRAM GB/s | Peak % | KV read / DRAM read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| non-partition | `425.920us` | `41.028MB` | `55.123MB` | `129.421` | `7.22%` | `99.83%` |
+| split-K 512/64 | `76.896us` | `41.019MB` | `54.431MB` | `707.849` | `39.50%` | `99.86%` |
+| split-K 256/64 | `66.976us` | `41.020MB` | `48.712MB` | `727.301` | `40.58%` | `99.85%` |
+
+Interpretation: FlashInfer is not rereading KV many times from DRAM. The non-partition path reads roughly the theoretical KV bytes but uses only about `7%` of peak DRAM bandwidth because `bs=1` launches too little work. Split-K increases parallelism and moves the same required KV read to roughly `40%` of peak DRAM bandwidth in the cold-L2 CUPTI range.
+
+Split-K sweep command:
+
+```bash
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
+PEGAINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1 \
+cargo bench -p pegainfer-qwen3-4b --bench qwen3_attention -- --noplot
+```
+
+Representative cold-L2 sweep rows:
+
+| Case | 256/64 | 512/64 | Result |
+| --- | ---: | ---: | --- |
+| `bs1 ctx1024` | `22.197us` | `30.823us` | 256/64 wins |
+| `bs1 ctx4096` | `26.703us` | `35.159us` | 256/64 wins |
+| `bs1 ctx10000` | `38.912us` | `46.824us` | 256/64 wins |
+| `bs2 ctx1024` | `23.713us` | `34.705us` | 256/64 wins |
+| `bs2 ctx8192` | `54.637us` | `55.200us` | tied, 256/64 slightly ahead |
+| `bs2 ctx10000` | `62.417us` | `63.620us` | tied, 256/64 slightly ahead |
+
+Runtime change: `BatchDecodeBuffers` now uses `SPLIT_KV_CHUNK_TOKENS=256` with `SPLIT_KV_MAX_CHUNKS_PER_REQUEST=64`. This keeps the same graph-stable padded slot budget as the original `512/64` integration, while doubling active chunks for low-batch long-context decode.
+
+Production decode probe after retune:
+
+```bash
+PEGAINFER_CUDA_SM=120 cargo build --release \
+  -p pegainfer-qwen3-4b --bin qwen3_decode_context
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+  --model-path /data/Qwen3-4B \
+  --iters 10 \
+  --contexts 1024,4096,10000
+```
+
+| Prompt context | Decode KV len | p50 TPOT |
+| --- | ---: | ---: |
+| 1024 | 1025 | `6.4002ms` |
+| 4096 | 4097 | `6.5327ms` |
+| 10000 | 10001 | `7.0436ms` |
+
+Serving check after syncing the root `src/` worktree on 5090:
+
+```bash
+RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release \
+  --bin bench_serving -- \
+  --model-path /data/Qwen3-4B \
+  request --prompt-len 4096 --output-len 64 --warmup 5 --iters 20
+```
+
+| Metric | p50 | p95 | Samples |
+| --- | ---: | ---: | ---: |
+| `ttft_ms` | `177.21ms` | `177.86ms` | 20 |
+| `first_decode_step_ms` | `6.51ms` | `6.52ms` | 20 |
+| `steady_tpot_ms` | `6.46ms` | `6.48ms` | 1240 |
+| `e2e_ms` | `584.79ms` | `585.25ms` | 20 |
+
+Verification:
+
+| Check | Result |
+| --- | --- |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3-4b --bench qwen3_attention -- -D warnings` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 cargo bench -p pegainfer-qwen3-4b --bench qwen3_attention -- --noplot` | pass |
+| `cargo fmt --all --check` | pass |
+| `cargo metadata --no-deps --format-version 1` | pass |
+| `git diff --check` | pass |
+
+Note: an initial remote e2e run failed because the remote `test_data/Qwen3-4B.json` was stale and expected the pre length-limit baseline. Syncing the tracked baseline fixed it; this was not a split-K numerical drift.
+
+### Step 13: Kernel Snapshot MVP
+- Extracted the Qwen3 paged decode attention case construction into `crates/pegainfer-qwen3-4b/src/kernel_bench.rs`.
+- Added `crates/pegainfer-qwen3-4b/benches/qwen3_kernel_snapshot.rs` as a deterministic `harness=false` runner.
+- Removed the temporary correctness envelope from the snapshot runner. We do not have a settled truth source for this layer yet, so correctness belongs in a separate design rather than a misleading "non-partition equals truth" field.
+- CUPTI is default-on in the snapshot runner. `--no-cupti` is available only for latency-only smoke runs.
+
+Snapshot command:
+
+```bash
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \
+  --bench qwen3_kernel_snapshot -- \
+  run \
+  --contexts 1024 \
+  --batch-sizes 1 \
+  --variants non_partition,split_kv_256x64 \
+  --iters 4 \
+  --out /tmp/qwen3_kernel_snapshot_smoke.json
+```
+
+Compare command:
+
+```bash
+cargo bench -p pegainfer-qwen3-4b \
+  --bench qwen3_kernel_snapshot -- \
+  compare \
+  --base /tmp/qwen3_kernel_snapshot_smoke.json \
+  --new /tmp/qwen3_kernel_snapshot_smoke.json
+```
+
+The JSON snapshot records:
+- model/op identity: `qwen3-4b`, `paged_decode_attention`
+- hardware: GPU name, compute capability, memory clock, memory bus width, theoretical peak bandwidth, L2 size, cache-clear size
+- measurement recipe: warm iters, cold-L2 iters, `INNER_LAUNCHES`
+- CUPTI recipe: enabled flag and metric list
+- per-case shape: batch, KV length, head shape, page size, dtype
+- per-case variant/params: non-partition or split-K `chunk_tokens/max_chunks`
+- warm and cold-L2 CUDA event latency
+- CUPTI counters: GPU time, DRAM read/write/total bytes, L2 bytes, SM throughput percentage, active-warp percentage, DRAM bandwidth, peak percentage, and theoretical KV-read over DRAM-read percentage
+- theoretical KV read bytes
+
+5090 smoke result for `bs=1,ctx=1024,iters=4`:
+
+| Variant | Warm | Cold-L2 | CUPTI GPU | CUPTI DRAM read | SM throughput | Active warps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `non_partition` | about `35us` | about `46us` | `75.776us` | `4.236MB` | `0.75%` | `8.27%` |
+| `split_kv_256x64` | about `13us` | about `21us` | `48.736us` | `4.249MB` | `1.31%` | `11.77%` |
+
+Snapshot compare result:
+
+```text
+kernel snapshot compare complete: warnings=0 failures=0
+```
+
+CUPTI note: the standalone snapshot runner originally crashed inside `libnvperf_host.so` at `NVPW_CUDA_Profiler_DecodeCounters`. The root cause was the verbose user range name, not the attention case or Rust callback trampoline. The fix is to use compact range names such as `qk/non_partition/b1/k1024` and keep full metadata in JSON fields. The first profiled launch also needs an unprofiled warmup launch; otherwise CUDA lazy initialization pollutes the first CUPTI GPU time. The rule is recorded in `docs/resources/cupti-range-profiler.md`.
+
+```bash
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \
+  --bench qwen3_kernel_snapshot -- \
+  run \
+  --contexts 1024 \
+  --batch-sizes 1 \
+  --variants non_partition,split_kv_256x64 \
+  --iters 4 \
+  --out /tmp/qwen3_kernel_snapshot_cupti_smoke.json
+```
+
+Verification:
+
+| Check | Result |
+| --- | --- |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- -D warnings` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_snapshot_cupti_smoke.json` | pass |
+
+The SM counters are intentionally minimal. `sm__throughput.avg.pct_of_peak_sustained_elapsed` shows whether SMs are busy over elapsed time; `smsp__warps_active.avg.pct_of_peak_sustained_active` shows active-warp residency while SM partitions are active. At `bs=1,ctx=10000`, non-partition measured `1.19%` SM throughput and `6.59%` DRAM peak, while split-K measured `8.74%` SM throughput and `41.06%` DRAM peak for nearly identical DRAM read bytes. That is the kernel snapshot evidence for low-batch underfill.
+
+### Step 14: Consolidate Bench Entry Points
+- Deleted the retired Criterion benches:
+  - `crates/pegainfer-qwen3-4b/benches/qwen3_runtime.rs`
+  - `crates/pegainfer-qwen3-4b/benches/qwen3_attention.rs`
+- Removed their `[[bench]]` entries and the Qwen3 crate-local `criterion` dev dependency.
+- Qwen3 now has exactly one model-crate bench entry: `qwen3_kernel_snapshot`.
+- Rationale: the human CSV report, split-K tuning sweep, and machine-readable JSON runner were duplicating case construction, metric selection, and interpretation. Kernel maintenance should have one durable artifact first; optional human views should be generated from snapshot data rather than maintained as separate benches.
+
+Verification after consolidation:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo metadata --no-deps --format-version 1` | pass |
+| `git diff --check` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot` on 5090 | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- -D warnings` on 5090 | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_snapshot_single_bench_smoke.json` on 5090 | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- compare --base /tmp/qwen3_kernel_snapshot_single_bench_smoke.json --new /tmp/qwen3_kernel_snapshot_single_bench_smoke.json` on 5090 | pass |
+
 ## Debrief
 
 The Qwen3 split now enforces the intended dependency direction: model execution code depends on `pegainfer-core` and `pegainfer-kernels`; root depends on the model crate only at registry/startup glue points. Root still has a `ModelType::Qwen3` enum and default Qwen3 model path because the product needs a loader choice, but it no longer sees Qwen3 layers, KV state, TP rank workers, or prefill/decode/unified plans.
 
-Next cleanup should be a generic model registry module so `main.rs` and `bench_serving.rs` stop matching model crate names directly. Qwen3.5 should then get the same crate treatment.
+Next cleanup should be a generic model registry module so `main.rs` and `bench_serving.rs` stop matching model crate names directly. Performance-wise, the next target is the post-split decode body: GEMM/GEMV, MLP, norms, logits, sampling, and graph replay overhead now dominate the remaining `~6.5-7.0ms` TPOT. Kernel DevOps-wise, the next target is defining a real correctness/truth source for kernel snapshots instead of treating one implementation path as the oracle.

@@ -10,6 +10,26 @@ use pegainfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+const DECODE_ATTENTION_PATH_COUNT: usize = 2;
+const SPLIT_KV_CHUNK_TOKENS: usize = 256;
+const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
+const SPLIT_KV_MAX_BATCH_SIZE: usize = 2;
+const SPLIT_KV_MIN_SEQ_LEN: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeAttentionPath {
+    NonPartition,
+    SplitKv,
+}
+
+impl DecodeAttentionPath {
+    fn graph_slot(self) -> usize {
+        match self {
+            Self::NonPartition => 0,
+            Self::SplitKv => 1,
+        }
+    }
+}
 
 /// Find the smallest bucket >= `bs`. Panics if bs > largest bucket.
 pub(crate) fn bucket_for(bs: usize) -> usize {
@@ -59,10 +79,21 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) kv_tile_indices_d: CudaSlice<i32>,
     pub(crate) kv_chunk_size_d: CudaSlice<i32>,
 
+    // Split-K paged attention metadata/workspace.
+    pub(crate) split_request_indices_d: CudaSlice<i32>,
+    pub(crate) split_kv_tile_indices_d: CudaSlice<i32>,
+    pub(crate) split_kv_chunk_size_d: CudaSlice<i32>,
+    pub(crate) split_o_indptr_d: CudaSlice<i32>,
+    pub(crate) split_block_valid_mask_d: CudaSlice<u8>,
+    pub(crate) split_tmp_v: CudaSlice<half::bf16>,
+    pub(crate) split_tmp_s: CudaSlice<f32>,
+    pub(crate) split_padded_slots: usize,
+    max_seq_len: usize,
+
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
-    /// One CudaGraphState per bucket (indexed by BATCH_BUCKETS position).
+    /// One CudaGraphState per `(bucket, attention_path)`.
     pub(crate) graphs: Vec<CudaGraphState>,
 }
 
@@ -77,8 +108,10 @@ impl BatchDecodeBuffers {
         max_batch_size: usize,
         max_total_pages: usize,
         padding_page_id: i32,
+        num_qo_heads: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
+        let max_split_slots = bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
 
         Ok(Self {
             max_batch_size: bs,
@@ -103,10 +136,19 @@ impl BatchDecodeBuffers {
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
+            split_request_indices_d: ctx.stream.alloc_zeros(max_split_slots)?,
+            split_kv_tile_indices_d: ctx.stream.alloc_zeros(max_split_slots)?,
+            split_kv_chunk_size_d: ctx.stream.alloc_zeros(1)?,
+            split_o_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
+            split_block_valid_mask_d: ctx.stream.alloc_zeros(max_split_slots)?,
+            split_tmp_v: ctx.stream.alloc_zeros(max_split_slots * q_dim)?,
+            split_tmp_s: ctx.stream.alloc_zeros(max_split_slots * num_qo_heads)?,
+            split_padded_slots: 0,
+            max_seq_len: 0,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()
-                .map(|_| CudaGraphState::new())
+                .flat_map(|_| (0..DECODE_ATTENTION_PATH_COUNT).map(|_| CudaGraphState::new()))
                 .collect(),
         })
     }
@@ -146,6 +188,7 @@ impl BatchDecodeBuffers {
         let mut indptr = vec![0i32];
         let mut last_page_lens = Vec::with_capacity(padded_bs);
         let mut chunk_sizes = Vec::with_capacity(padded_bs);
+        self.max_seq_len = 0;
 
         for kv in kv_states {
             let pages = kv.page_indices_i32();
@@ -153,6 +196,7 @@ impl BatchDecodeBuffers {
             indptr.push(all_page_indices.len() as i32);
             last_page_lens.push(kv.last_page_len() as i32);
             chunk_sizes.push(kv.seq_len() as i32);
+            self.max_seq_len = self.max_seq_len.max(kv.seq_len());
         }
 
         // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1
@@ -177,7 +221,72 @@ impl BatchDecodeBuffers {
             .memcpy_htod(&request_indices, &mut self.request_indices_d)?;
         ctx.stream
             .memcpy_htod(&kv_tile_indices, &mut self.kv_tile_indices_d)?;
+        self.sync_split_kv_meta(ctx, kv_states, padded_bs)?;
 
         Ok(())
+    }
+
+    fn sync_split_kv_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_states: &[&KvState],
+        padded_bs: usize,
+    ) -> Result<()> {
+        let split_chunk_size =
+            SPLIT_KV_CHUNK_TOKENS.max(self.max_seq_len.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST));
+        let split_padded_slots = padded_bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
+        let mut split_request_indices = Vec::with_capacity(split_padded_slots);
+        let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
+        let mut split_o_indptr = Vec::with_capacity(padded_bs + 1);
+        let mut split_block_valid_mask = Vec::with_capacity(split_padded_slots);
+        split_o_indptr.push(0);
+
+        for (request_idx, kv) in kv_states.iter().enumerate() {
+            let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
+            debug_assert!(chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST);
+            for chunk_idx in 0..chunks {
+                split_request_indices.push(request_idx as i32);
+                split_kv_tile_indices.push(chunk_idx as i32);
+                split_block_valid_mask.push(1);
+            }
+            split_o_indptr.push(split_request_indices.len() as i32);
+        }
+
+        for _ in kv_states.len()..padded_bs {
+            split_o_indptr.push(split_request_indices.len() as i32);
+        }
+
+        while split_request_indices.len() < split_padded_slots {
+            split_request_indices.push(0);
+            split_kv_tile_indices.push(0);
+            split_block_valid_mask.push(0);
+        }
+
+        let split_kv_chunk_size = [split_chunk_size as i32];
+        ctx.stream
+            .memcpy_htod(&split_request_indices, &mut self.split_request_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&split_kv_tile_indices, &mut self.split_kv_tile_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&split_kv_chunk_size, &mut self.split_kv_chunk_size_d)?;
+        ctx.stream
+            .memcpy_htod(&split_o_indptr, &mut self.split_o_indptr_d)?;
+        ctx.stream
+            .memcpy_htod(&split_block_valid_mask, &mut self.split_block_valid_mask_d)?;
+        self.split_padded_slots = split_padded_slots;
+
+        Ok(())
+    }
+
+    pub(crate) fn attention_path(&self, padded_bs: usize) -> DecodeAttentionPath {
+        if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE && self.max_seq_len >= SPLIT_KV_MIN_SEQ_LEN {
+            DecodeAttentionPath::SplitKv
+        } else {
+            DecodeAttentionPath::NonPartition
+        }
+    }
+
+    pub(crate) fn graph_index(bucket_idx: usize, path: DecodeAttentionPath) -> usize {
+        bucket_idx * DECODE_ATTENTION_PATH_COUNT + path.graph_slot()
     }
 }

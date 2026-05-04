@@ -6,7 +6,7 @@ mod sampling;
 
 pub use attention::{
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    prefill_attention_paged_into,
+    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
 };
 pub use paged_plan::PrefillPagedPlan;
 pub use pegainfer_kernels::ops::{

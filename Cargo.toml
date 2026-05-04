@@ -8,6 +8,7 @@ edition = "2024"
 [workspace]
 members = [
     "crates/pegainfer-core",
+    "crates/pegainfer-cupti",
     "crates/pegainfer-kernels",
     "crates/pegainfer-qwen3-4b",
 ]

@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 
-use super::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers, bucket_for};
+use super::batch_decode_buffers::{
+    BATCH_BUCKETS, BatchDecodeBuffers, DecodeAttentionPath, bucket_for,
+};
 use super::weights::{Qwen3Model, TransformerBlock};
 use pegainfer_core::kv_pool::{KvLayout, KvState};
 use pegainfer_core::ops;
@@ -55,21 +57,23 @@ impl Qwen3Model {
 
         let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
+        let attention_path = bufs.attention_path(padded_bs);
 
         // Forward pass — with or without CUDA Graph
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
         if self.enable_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
+            let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
             // Take graphs out of bufs to avoid split-borrow conflict with closure
             let mut graphs = std::mem::take(&mut bufs.graphs);
-            let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, bufs)
+            let result = graphs[graph_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
             });
             bufs.graphs = graphs;
             result?;
         } else {
-            self.batch_decode_kernels(kv_buffer, &layout, padded_bs, bufs)?;
+            self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)?;
         }
 
         Ok(())
@@ -80,6 +84,7 @@ impl Qwen3Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         bs: usize,
+        attention_path: DecodeAttentionPath,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -103,7 +108,15 @@ impl Qwen3Model {
         );
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.batch_decode_layer(layer_idx, layer, kv_buffer, layout, bs, bufs)?;
+            self.batch_decode_layer(
+                layer_idx,
+                layer,
+                kv_buffer,
+                layout,
+                bs,
+                attention_path,
+                bufs,
+            )?;
 
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
@@ -139,6 +152,7 @@ impl Qwen3Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         bs: usize,
+        attention_path: DecodeAttentionPath,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -191,25 +205,56 @@ impl Qwen3Model {
         );
 
         // KV append + paged attention decode (FlashInfer, batched)
-        ops::paged_attention_batch_decode_into(
-            &self.ctx,
-            &bufs.q,
-            &bufs.k,
-            &bufs.v,
-            kv_buffer,
-            layout,
-            layer_idx,
-            &bufs.page_indices_d,
-            &bufs.page_indptr_d,
-            &bufs.last_page_len_d,
-            &bufs.positions_d,
-            &bufs.request_indices_d,
-            &bufs.kv_tile_indices_d,
-            &bufs.kv_chunk_size_d,
-            &mut bufs.attn_out,
-            self.local_num_attention_heads(),
-            bs,
-        )?;
+        match attention_path {
+            DecodeAttentionPath::NonPartition => {
+                ops::paged_attention_batch_decode_into(
+                    &self.ctx,
+                    &bufs.q,
+                    &bufs.k,
+                    &bufs.v,
+                    kv_buffer,
+                    layout,
+                    layer_idx,
+                    &bufs.page_indices_d,
+                    &bufs.page_indptr_d,
+                    &bufs.last_page_len_d,
+                    &bufs.positions_d,
+                    &bufs.request_indices_d,
+                    &bufs.kv_tile_indices_d,
+                    &bufs.kv_chunk_size_d,
+                    &mut bufs.attn_out,
+                    self.local_num_attention_heads(),
+                    bs,
+                )?;
+            }
+            DecodeAttentionPath::SplitKv => {
+                ops::paged_attention_batch_decode_split_kv_into(
+                    &self.ctx,
+                    &bufs.q,
+                    &bufs.k,
+                    &bufs.v,
+                    kv_buffer,
+                    layout,
+                    layer_idx,
+                    &bufs.page_indices_d,
+                    &bufs.page_indptr_d,
+                    &bufs.last_page_len_d,
+                    &bufs.positions_d,
+                    &bufs.request_indices_d,
+                    &bufs.split_request_indices_d,
+                    &bufs.split_kv_tile_indices_d,
+                    &bufs.split_kv_chunk_size_d,
+                    &bufs.split_o_indptr_d,
+                    &bufs.split_block_valid_mask_d,
+                    &mut bufs.split_tmp_v,
+                    &mut bufs.split_tmp_s,
+                    bufs.split_padded_slots,
+                    &mut bufs.attn_out,
+                    self.local_num_attention_heads(),
+                    bs,
+                )?;
+            }
+        }
 
         // O projection (GEMM)
         ops::gemm_into(
@@ -379,6 +424,7 @@ mod tests {
             1,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),
+            model.local_num_attention_heads(),
         )
         .unwrap();
 
@@ -433,6 +479,7 @@ mod tests {
             max_bs,
             model.kv_pool.capacity_pages(),
             model.kv_pool.padding_page_id(),
+            model.local_num_attention_heads(),
         )
         .unwrap();
 
