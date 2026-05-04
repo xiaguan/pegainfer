@@ -6,8 +6,9 @@ use anyhow::{Result, anyhow, bail};
 use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut, sys};
 use half::bf16;
 use pegainfer_kernels::ffi;
+use pegainfer_kernels::ops::{PrefillPagedPlan, prefill_attention_paged_into};
 use pegainfer_kernels::paged_kv::PagedKvLayout;
-use pegainfer_kernels::tensor::{DeviceContext, HiddenStates};
+use pegainfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use serde::{Deserialize, Serialize};
 
 pub const NUM_LAYERS: usize = 1;
@@ -15,29 +16,12 @@ pub const NUM_QO_HEADS: usize = 32;
 pub const NUM_KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
 pub const PAGE_SIZE: usize = 16;
-pub const CONTEXT_LENGTHS: &[usize] = &[128, 512, 1024, 2048, 4096, 8192, 10_000];
-pub const BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32];
-pub const BATCH_SWEEP_CONTEXT_LEN: usize = 1024;
-pub const INNER_LAUNCHES: u64 = 16;
 pub const REPORT_ITERS: u64 = 128;
 pub const DEFAULT_SPLIT_KV_CHUNK_TOKENS: usize = 256;
 pub const DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
 pub const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
 pub const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
 pub const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
-pub const SPLITK_TUNING_CONTEXT_LENGTHS: &[usize] = &[1024, 2048, 4096, 8192, 10_000];
-pub const SPLITK_TUNING_BATCH_SIZES: &[usize] = &[1, 2];
-pub const SPLITK_TUNING_CONFIGS: &[SplitKvConfig] = &[
-    SplitKvConfig::new(256, 128),
-    SplitKvConfig::new(256, 64),
-    SplitKvConfig::new(384, 96),
-    SplitKvConfig::new(512, 128),
-    SplitKvConfig::new(512, 64),
-    SplitKvConfig::new(512, 32),
-    SplitKvConfig::new(768, 64),
-    SplitKvConfig::new(1024, 64),
-    SplitKvConfig::new(1024, 32),
-];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SplitKvConfig {
@@ -137,26 +121,82 @@ pub struct AttentionKernelSpec {
     pub variant: AttentionKernelVariant,
 }
 
-pub fn default_attention_kernel_specs() -> Vec<AttentionKernelSpec> {
-    let variants = [
-        AttentionKernelVariant::NonPartition,
-        AttentionKernelVariant::SplitKv(DEFAULT_SPLIT_KV_CONFIG),
-        AttentionKernelVariant::SplitKv(SplitKvConfig::new(512, 64)),
-    ];
-    BATCH_SIZES
-        .iter()
-        .copied()
-        .flat_map(|batch_size| {
-            CONTEXT_LENGTHS.iter().copied().flat_map(move |kv_len| {
-                variants
-                    .into_iter()
-                    .map(move |variant| AttentionKernelSpec {
-                        shape: AttentionKernelShape::new(batch_size, kv_len),
-                        variant,
-                    })
-            })
-        })
-        .collect()
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct PrefillAttentionShape {
+    pub batch_size: usize,
+    pub seq_len: usize,
+}
+
+impl PrefillAttentionShape {
+    pub const fn new(batch_size: usize, seq_len: usize) -> Self {
+        Self {
+            batch_size,
+            seq_len,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillAttentionSpec {
+    pub shape: PrefillAttentionShape,
+    pub variant: PrefillAttentionVariant,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrefillAttentionVariant {
+    Default,
+    CtaTileQ(usize),
+}
+
+impl PrefillAttentionVariant {
+    pub fn label(self) -> String {
+        match self {
+            Self::Default => "default".to_string(),
+            Self::CtaTileQ(tile_q) => format!("cta_q{tile_q}"),
+        }
+    }
+
+    pub fn range_label(self) -> String {
+        match self {
+            Self::Default => "auto".to_string(),
+            Self::CtaTileQ(tile_q) => format!("q{tile_q}"),
+        }
+    }
+
+    pub fn cta_tile_q_override(self) -> i32 {
+        match self {
+            Self::Default => 0,
+            Self::CtaTileQ(tile_q) => tile_q as i32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrefillStage {
+    Full,
+    QkNormRope,
+    KvScatter,
+    AttentionCore,
+}
+
+impl PrefillStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::QkNormRope => "qk_norm_rope",
+            Self::KvScatter => "kv_scatter",
+            Self::AttentionCore => "attention_core",
+        }
+    }
+
+    pub fn range_label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::QkNormRope => "qk",
+            Self::KvScatter => "kv",
+            Self::AttentionCore => "attn",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -218,6 +258,8 @@ impl L2CacheClear {
     }
 
     pub fn clear(&mut self, ctx: &DeviceContext) -> Result<()> {
+        // CUDA's reset-persisting-L2 APIs do not evict normal cache lines, so
+        // benchmarks use a large streaming kernel to push prior data out of L2.
         let (a_ptr, _a_guard) = self.a.device_ptr(&ctx.stream);
         let (b_ptr, _b_guard) = self.b.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = self.out.device_ptr_mut(&ctx.stream);
@@ -406,10 +448,6 @@ impl AttentionDecodeCase {
         self.split_config
     }
 
-    pub fn kv_read_bytes(&self) -> u64 {
-        (self.batch_size * self.kv_len * NUM_KV_HEADS * HEAD_DIM * 2 * size_of::<bf16>()) as u64
-    }
-
     pub fn split_chunk_size(&self) -> usize {
         self.split_config.actual_chunk_size(self.kv_len)
     }
@@ -528,29 +566,6 @@ impl AttentionDecodeCase {
         Ok(result)
     }
 
-    pub fn measure_decode_only(&mut self, criterion_iters: u64, path: DecodePath) -> Duration {
-        let mut elapsed_ms = 0.0f64;
-
-        for _ in 0..criterion_iters {
-            self.start
-                .record(&self.ctx.stream)
-                .expect("record start event failed");
-            for _ in 0..INNER_LAUNCHES {
-                self.launch_once(path).expect("paged attention failed");
-            }
-            self.end
-                .record(&self.ctx.stream)
-                .expect("record end event failed");
-            elapsed_ms += f64::from(
-                self.start
-                    .elapsed_ms(&self.end)
-                    .expect("cuda event elapsed failed"),
-            ) / INNER_LAUNCHES as f64;
-        }
-
-        Duration::from_secs_f64(elapsed_ms / 1_000.0)
-    }
-
     pub fn measure_decode_only_cold_l2(
         &mut self,
         criterion_iters: u64,
@@ -571,8 +586,546 @@ impl AttentionDecodeCase {
     }
 }
 
+pub struct AttentionPrefillCase {
+    pub ctx: DeviceContext,
+    layout: PagedKvLayout,
+    q: HiddenStates,
+    k: HiddenStates,
+    v: HiddenStates,
+    output: HiddenStates,
+    q_norm: DeviceVec,
+    k_norm: DeviceVec,
+    cos_cache: DeviceVec,
+    sin_cache: DeviceVec,
+    kv_buffer: CudaSlice<bf16>,
+    plan: PrefillPagedPlan,
+    start: CudaEvent,
+    end: CudaEvent,
+    batch_size: usize,
+    seq_len: usize,
+    variant: PrefillAttentionVariant,
+}
+
+impl AttentionPrefillCase {
+    pub fn for_spec(spec: PrefillAttentionSpec) -> Result<Self> {
+        Self::new(spec.shape.batch_size, spec.shape.seq_len, spec.variant)
+    }
+
+    pub fn new(
+        batch_size: usize,
+        seq_len: usize,
+        variant: PrefillAttentionVariant,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            batch_size > 0,
+            "prefill batch_size must be greater than zero"
+        );
+        anyhow::ensure!(seq_len > 0, "prefill seq_len must be greater than zero");
+
+        let ctx = DeviceContext::new()?;
+        let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE);
+        let q_dim = NUM_QO_HEADS * HEAD_DIM;
+        let kv_dim = NUM_KV_HEADS * HEAD_DIM;
+        let pages_per_request = seq_len.div_ceil(PAGE_SIZE);
+        let total_pages = pages_per_request * batch_size;
+
+        let q = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&patterned_bf16(q_dim * batch_size * seq_len, 0.01))?,
+            hidden_dim: q_dim,
+            seq_len: batch_size * seq_len,
+        };
+        let k = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&patterned_bf16(kv_dim * batch_size * seq_len, 0.001))?,
+            hidden_dim: kv_dim,
+            seq_len: batch_size * seq_len,
+        };
+        let v = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&patterned_bf16(kv_dim * batch_size * seq_len, 0.002))?,
+            hidden_dim: kv_dim,
+            seq_len: batch_size * seq_len,
+        };
+        let output = HiddenStates::zeros(&ctx, q_dim, batch_size * seq_len)?;
+        let q_norm = DeviceVec::from_host(&ctx, &vec![bf16::from_f32(1.0); HEAD_DIM])?;
+        let k_norm = DeviceVec::from_host(&ctx, &vec![bf16::from_f32(1.0); HEAD_DIM])?;
+        let cos_cache = DeviceVec::from_host(&ctx, &rope_cache_bf16(seq_len, true))?;
+        let sin_cache = DeviceVec::from_host(&ctx, &rope_cache_bf16(seq_len, false))?;
+        let kv_buffer = ctx
+            .stream
+            .clone_htod(&patterned_bf16(total_pages * layout.page_stride, 0.001))?;
+
+        let last_page_len = match seq_len % PAGE_SIZE {
+            0 => PAGE_SIZE,
+            rem => rem,
+        };
+        let page_indices: Vec<Vec<i32>> = (0..batch_size)
+            .map(|request_idx| {
+                (0..pages_per_request)
+                    .map(|page_offset| (request_idx * pages_per_request + page_offset) as i32)
+                    .collect()
+            })
+            .collect();
+        let last_page_lens = vec![last_page_len; batch_size];
+        let start_positions = vec![0usize; batch_size];
+        let seq_lens = vec![seq_len; batch_size];
+        let cta_tile_q_override = variant.cta_tile_q_override();
+        let plan = if batch_size == 1 {
+            PrefillPagedPlan::new_with_cta_tile_q(
+                &ctx,
+                &page_indices[0],
+                last_page_len,
+                0,
+                seq_len,
+                NUM_QO_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                cta_tile_q_override,
+            )?
+        } else {
+            PrefillPagedPlan::new_batch_with_cta_tile_q(
+                &ctx,
+                &page_indices,
+                &last_page_lens,
+                &start_positions,
+                &seq_lens,
+                NUM_QO_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                cta_tile_q_override,
+            )?
+        };
+
+        let start = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let end = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+
+        let case = Self {
+            ctx,
+            layout,
+            q,
+            k,
+            v,
+            output,
+            q_norm,
+            k_norm,
+            cos_cache,
+            sin_cache,
+            kv_buffer,
+            plan,
+            start,
+            end,
+            batch_size,
+            seq_len,
+            variant,
+        };
+        case.ctx.sync()?;
+        Ok(case)
+    }
+
+    pub fn shape(&self) -> PrefillAttentionShape {
+        PrefillAttentionShape::new(self.batch_size, self.seq_len)
+    }
+
+    fn total_tokens(&self) -> usize {
+        self.batch_size * self.seq_len
+    }
+
+    pub fn cu_context_ptr(&self) -> *mut c_void {
+        self.ctx.ctx.cu_ctx().cast::<c_void>()
+    }
+
+    pub fn launch_once(&mut self) -> Result<()> {
+        prefill_attention_paged_into(
+            &self.ctx,
+            &mut self.q,
+            &mut self.k,
+            &self.v,
+            &self.q_norm,
+            &self.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            &self.kv_buffer,
+            &self.layout,
+            0,
+            &self.plan,
+            &mut self.output,
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            0,
+            1.0e-6,
+        )
+    }
+
+    pub fn prepare_stage(&mut self, stage: PrefillStage) -> Result<()> {
+        match stage {
+            PrefillStage::Full | PrefillStage::QkNormRope => Ok(()),
+            PrefillStage::KvScatter => {
+                self.launch_qk_norm_rope();
+                Ok(())
+            }
+            PrefillStage::AttentionCore => {
+                self.launch_qk_norm_rope();
+                self.launch_kv_scatter()
+            }
+        }
+    }
+
+    pub fn pre_measure_stage(&mut self, stage: PrefillStage) -> Result<()> {
+        self.prepare_stage(stage)?;
+        self.launch_stage(stage)?;
+        self.ctx.sync()
+    }
+
+    pub fn launch_stage(&mut self, stage: PrefillStage) -> Result<()> {
+        match stage {
+            PrefillStage::Full => self.launch_once(),
+            PrefillStage::QkNormRope => {
+                self.launch_qk_norm_rope();
+                Ok(())
+            }
+            PrefillStage::KvScatter => self.launch_kv_scatter(),
+            PrefillStage::AttentionCore => self.launch_attention_core(),
+        }
+    }
+
+    fn launch_qk_norm_rope(&mut self) {
+        let total_tokens = self.total_tokens();
+        let (q_ptr, _q_guard) = self.q.data.device_ptr_mut(&self.ctx.stream);
+        let (k_ptr, _k_guard) = self.k.data.device_ptr_mut(&self.ctx.stream);
+        let (qn_ptr, _qn_guard) = self.q_norm.data.device_ptr(&self.ctx.stream);
+        let (kn_ptr, _kn_guard) = self.k_norm.data.device_ptr(&self.ctx.stream);
+        let (cos_ptr, _cos_guard) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+        let (sin_ptr, _sin_guard) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+
+        unsafe {
+            if self.plan.batch_size() == 1 {
+                ffi::prefill_qk_norm_rope_only_cuda(
+                    q_ptr as *mut ffi::Half,
+                    k_ptr as *mut ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    NUM_QO_HEADS as i32,
+                    NUM_KV_HEADS as i32,
+                    HEAD_DIM as i32,
+                    total_tokens as i32,
+                    0,
+                    1.0e-6,
+                    self.ctx.stream.cu_stream(),
+                );
+            } else {
+                let (positions_ptr, _positions_guard) =
+                    self.plan.positions_d().device_ptr(&self.ctx.stream);
+                ffi::qk_norm_rope_batched_decode_cuda(
+                    q_ptr as *mut ffi::Half,
+                    k_ptr as *mut ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    positions_ptr as *const i32,
+                    NUM_QO_HEADS as i32,
+                    NUM_KV_HEADS as i32,
+                    HEAD_DIM as i32,
+                    total_tokens as i32,
+                    1.0e-6,
+                    self.ctx.stream.cu_stream(),
+                );
+            }
+        }
+    }
+
+    fn launch_kv_scatter(&mut self) -> Result<()> {
+        let (kv_ptr, _kv_guard) = self.kv_buffer.device_ptr(&self.ctx.stream);
+        let (k_ptr, _k_guard) = self.k.data.device_ptr(&self.ctx.stream);
+        let (v_ptr, _v_guard) = self.v.data.device_ptr(&self.ctx.stream);
+        let (page_indices_ptr, _page_indices_guard) =
+            self.plan.page_indices_d().device_ptr(&self.ctx.stream);
+        let (page_indptr_ptr, _page_indptr_guard) =
+            self.plan.page_indptr_d().device_ptr(&self.ctx.stream);
+        let (last_page_len_ptr, _last_page_len_guard) =
+            self.plan.last_page_len_d().device_ptr(&self.ctx.stream);
+        let (batch_indices_ptr, _batch_indices_guard) =
+            self.plan.batch_indices_d().device_ptr(&self.ctx.stream);
+        let (positions_ptr, _positions_guard) =
+            self.plan.positions_d().device_ptr(&self.ctx.stream);
+
+        let kv_dim = NUM_KV_HEADS * HEAD_DIM;
+        let k_offset = 0i64;
+        let v_offset = self.layout.kv_block_len as i64;
+        let stride_page = self.layout.page_stride as i64;
+        let result = unsafe {
+            ffi::paged_kv_scatter_cuda(
+                kv_ptr as *const ffi::Half,
+                k_offset,
+                v_offset,
+                page_indices_ptr as *const i32,
+                page_indptr_ptr as *const i32,
+                last_page_len_ptr as *const i32,
+                k_ptr as *const ffi::Half,
+                v_ptr as *const ffi::Half,
+                batch_indices_ptr as *const i32,
+                positions_ptr as *const i32,
+                self.total_tokens() as i32,
+                NUM_KV_HEADS as i32,
+                HEAD_DIM as i32,
+                PAGE_SIZE as i32,
+                stride_page,
+                kv_dim as i64,
+                HEAD_DIM as i64,
+                self.ctx.stream.cu_stream(),
+            )
+        };
+        if result != 0 {
+            bail!("segmented paged_kv_scatter_cuda failed with error {result}");
+        }
+        Ok(())
+    }
+
+    fn launch_attention_core(&mut self) -> Result<()> {
+        let total_tokens = self.total_tokens();
+        let (q_ptr, _q_guard) = self.q.data.device_ptr(&self.ctx.stream);
+        let (out_ptr, _out_guard) = self.output.data.device_ptr_mut(&self.ctx.stream);
+        let (kv_ptr, _kv_guard) = self.kv_buffer.device_ptr(&self.ctx.stream);
+        let (page_indices_ptr, _page_indices_guard) =
+            self.plan.page_indices_d().device_ptr(&self.ctx.stream);
+        let (page_indptr_ptr, _page_indptr_guard) =
+            self.plan.page_indptr_d().device_ptr(&self.ctx.stream);
+        let (last_page_len_ptr, _last_page_len_guard) =
+            self.plan.last_page_len_d().device_ptr(&self.ctx.stream);
+        let (q_indptr_ptr, _q_indptr_guard) = self.plan.q_indptr_d().device_ptr(&self.ctx.stream);
+        let (request_indices_ptr, _request_indices_guard) =
+            self.plan.request_indices_d().device_ptr(&self.ctx.stream);
+        let (qo_tile_indices_ptr, _qo_tile_indices_guard) =
+            self.plan.qo_tile_indices_d().device_ptr(&self.ctx.stream);
+        let (kv_tile_indices_ptr, _kv_tile_indices_guard) =
+            self.plan.kv_tile_indices_d().device_ptr(&self.ctx.stream);
+        let (kv_chunk_size_ptr, _kv_chunk_size_guard) =
+            self.plan.kv_chunk_size_d().device_ptr(&self.ctx.stream);
+        let (total_num_rows_ptr, _total_num_rows_guard) =
+            self.plan.total_num_rows_d().device_ptr(&self.ctx.stream);
+
+        let k_offset = 0i64;
+        let v_offset = self.layout.kv_block_len as i64;
+        let stride_page = self.layout.page_stride as i64;
+        let sm_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let result = unsafe {
+            ffi::batch_prefill_paged_cuda_with_cta_tile_q(
+                q_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                kv_ptr as *const ffi::Half,
+                k_offset,
+                v_offset,
+                page_indices_ptr as *const i32,
+                page_indptr_ptr as *const i32,
+                last_page_len_ptr as *const i32,
+                q_indptr_ptr as *const i32,
+                request_indices_ptr as *const i32,
+                qo_tile_indices_ptr as *const i32,
+                kv_tile_indices_ptr as *const i32,
+                kv_chunk_size_ptr as *const i32,
+                total_num_rows_ptr as *const u32,
+                NUM_QO_HEADS as i32,
+                NUM_KV_HEADS as i32,
+                HEAD_DIM as i32,
+                PAGE_SIZE as i32,
+                total_tokens as i32,
+                self.plan.batch_size(),
+                self.plan.num_tiles(),
+                stride_page,
+                sm_scale,
+                self.variant.cta_tile_q_override(),
+                self.ctx.stream.cu_stream(),
+            )
+        };
+        if result != 0 {
+            bail!("segmented batch_prefill_paged_cuda failed with error {result}");
+        }
+        Ok(())
+    }
+
+    pub fn measure_cold_l2(
+        &mut self,
+        criterion_iters: u64,
+        cache_clear: &mut L2CacheClear,
+    ) -> Result<Duration> {
+        self.measure_stage_cold_l2(criterion_iters, PrefillStage::Full, cache_clear)
+    }
+
+    pub fn measure_stage_cold_l2(
+        &mut self,
+        criterion_iters: u64,
+        stage: PrefillStage,
+        cache_clear: &mut L2CacheClear,
+    ) -> Result<Duration> {
+        let mut elapsed_ms = 0.0f64;
+
+        for _ in 0..criterion_iters {
+            self.prepare_stage(stage)?;
+            cache_clear.clear(&self.ctx)?;
+            self.start.record(&self.ctx.stream)?;
+            self.launch_stage(stage)?;
+            self.end.record(&self.ctx.stream)?;
+            elapsed_ms += f64::from(self.start.elapsed_ms(&self.end)?);
+        }
+
+        Ok(Duration::from_secs_f64(elapsed_ms / 1_000.0))
+    }
+}
+
+pub struct SinglePrefillCase {
+    pub ctx: DeviceContext,
+    q: HiddenStates,
+    output: HiddenStates,
+    k_cache: CudaSlice<bf16>,
+    v_cache: CudaSlice<bf16>,
+    start: CudaEvent,
+    end: CudaEvent,
+    seq_len: usize,
+}
+
+impl SinglePrefillCase {
+    pub fn for_spec(spec: PrefillAttentionSpec) -> Result<Self> {
+        anyhow::ensure!(
+            spec.shape.batch_size == 1,
+            "single prefill bench only supports batch_size=1"
+        );
+        Self::new(spec.shape.seq_len)
+    }
+
+    pub fn new(seq_len: usize) -> Result<Self> {
+        anyhow::ensure!(
+            seq_len > 0,
+            "single prefill seq_len must be greater than zero"
+        );
+        let ctx = DeviceContext::new()?;
+        let q_dim = NUM_QO_HEADS * HEAD_DIM;
+        let kv_dim = NUM_KV_HEADS * HEAD_DIM;
+        let q = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&patterned_bf16(q_dim * seq_len, 0.01))?,
+            hidden_dim: q_dim,
+            seq_len,
+        };
+        let output = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
+        let k_cache = ctx
+            .stream
+            .clone_htod(&patterned_bf16(kv_dim * seq_len, 0.001))?;
+        let v_cache = ctx
+            .stream
+            .clone_htod(&patterned_bf16(kv_dim * seq_len, 0.002))?;
+        let start = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let end = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let case = Self {
+            ctx,
+            q,
+            output,
+            k_cache,
+            v_cache,
+            start,
+            end,
+            seq_len,
+        };
+        case.ctx.sync()?;
+        Ok(case)
+    }
+
+    pub fn shape(&self) -> PrefillAttentionShape {
+        PrefillAttentionShape::new(1, self.seq_len)
+    }
+
+    pub fn cu_context_ptr(&self) -> *mut c_void {
+        self.ctx.ctx.cu_ctx().cast::<c_void>()
+    }
+
+    pub fn pre_measure(&mut self) -> Result<()> {
+        self.launch_once()?;
+        self.ctx.sync()
+    }
+
+    pub fn launch_once(&mut self) -> Result<()> {
+        let (q_ptr, _q_guard) = self.q.data.device_ptr(&self.ctx.stream);
+        let (out_ptr, _out_guard) = self.output.data.device_ptr_mut(&self.ctx.stream);
+        let (k_ptr, _k_guard) = self.k_cache.device_ptr(&self.ctx.stream);
+        let (v_ptr, _v_guard) = self.v_cache.device_ptr(&self.ctx.stream);
+        let sm_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let result = unsafe {
+            ffi::single_prefill_cuda(
+                q_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                k_ptr as *const ffi::Half,
+                v_ptr as *const ffi::Half,
+                NUM_QO_HEADS as i32,
+                NUM_KV_HEADS as i32,
+                HEAD_DIM as i32,
+                self.seq_len as i32,
+                self.seq_len as i32,
+                self.seq_len as i32,
+                sm_scale,
+                self.ctx.stream.cu_stream(),
+            )
+        };
+        if result != 0 {
+            bail!("single_prefill_cuda failed with error {result}");
+        }
+        Ok(())
+    }
+
+    pub fn measure_cold_l2(
+        &mut self,
+        criterion_iters: u64,
+        cache_clear: &mut L2CacheClear,
+    ) -> Result<Duration> {
+        let mut elapsed_ms = 0.0f64;
+
+        for _ in 0..criterion_iters {
+            cache_clear.clear(&self.ctx)?;
+            self.start.record(&self.ctx.stream)?;
+            self.launch_once()?;
+            self.end.record(&self.ctx.stream)?;
+            elapsed_ms += f64::from(self.start.elapsed_ms(&self.end)?);
+        }
+
+        Ok(Duration::from_secs_f64(elapsed_ms / 1_000.0))
+    }
+}
+
 fn patterned_bf16(len: usize, scale: f32) -> Vec<bf16> {
     (0..len)
         .map(|i| bf16::from_f32((((i % 251) as f32) - 125.0) * scale))
         .collect()
+}
+
+fn rope_cache_bf16(seq_len: usize, cos: bool) -> Vec<bf16> {
+    let half_dim = HEAD_DIM / 2;
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / 1_000_000.0f32.powf(i as f32 * 2.0 / HEAD_DIM as f32))
+        .collect();
+    let mut out = vec![bf16::ZERO; seq_len * HEAD_DIM];
+    for pos in 0..seq_len {
+        let base = pos * HEAD_DIM;
+        for (i, inv_freq) in inv_freq.iter().copied().enumerate() {
+            let angle = pos as f32 * inv_freq;
+            let value = if cos { angle.cos() } else { angle.sin() };
+            let value = bf16::from_f32(value);
+            out[base + i] = value;
+            out[base + i + half_dim] = value;
+        }
+    }
+    out
 }

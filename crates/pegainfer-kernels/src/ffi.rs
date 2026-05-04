@@ -415,12 +415,28 @@ unsafe extern "C" {
         head_dim: i32,
     ) -> i32;
 
+    pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
+        seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        cta_tile_q_override: i32,
+    ) -> i32;
+
     // Return the CTA tile size for batch prefill planning.
     pub fn batch_prefill_cta_tile_q(
         total_seq_len: i32,
         num_qo_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
+    ) -> i32;
+
+    pub fn batch_prefill_cta_tile_q_with_override(
+        total_seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        cta_tile_q_override: i32,
     ) -> i32;
 
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
@@ -450,6 +466,51 @@ unsafe extern "C" {
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
+
+    pub fn batch_prefill_paged_cuda_with_cta_tile_q(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        cta_tile_q_override: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Single-request prefill with contiguous HND KV cache (FlashInfer SinglePrefill, causal).
+    pub fn single_prefill_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Paged attention decode for HEAD_DIM=256 (Qwen3.5-4B full-attention layers).
     pub fn paged_attention_decode_cuda_hd256(
         q: *const Half,

@@ -20,13 +20,36 @@ impl PrefillPagedPlan {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
+        Self::new_with_cta_tile_q(
+            ctx,
+            desc,
+            start_pos,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cta_tile_q(
+        ctx: &DeviceContext,
+        desc: &KvDesc<'_>,
+        start_pos: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<Self> {
         let page_indices: Vec<i32> = desc
             .page_indices()
             .iter()
             .map(|p| p.index() as i32)
             .collect();
         Ok(Self {
-            inner: pegainfer_kernels::ops::PrefillPagedPlan::new(
+            inner: pegainfer_kernels::ops::PrefillPagedPlan::new_with_cta_tile_q(
                 ctx,
                 &page_indices,
                 desc.last_page_len(),
@@ -35,6 +58,7 @@ impl PrefillPagedPlan {
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                cta_tile_q_override,
             )?,
         })
     }
@@ -48,6 +72,29 @@ impl PrefillPagedPlan {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
+        Self::new_batch_with_cta_tile_q(
+            ctx,
+            descs,
+            start_positions,
+            seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch_with_cta_tile_q(
+        ctx: &DeviceContext,
+        descs: &[KvDesc<'_>],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<Self> {
         let page_indices: Vec<Vec<i32>> = descs
             .iter()
             .map(|desc| {
@@ -59,7 +106,7 @@ impl PrefillPagedPlan {
             .collect();
         let last_page_lens: Vec<usize> = descs.iter().map(KvDesc::last_page_len).collect();
         Ok(Self {
-            inner: pegainfer_kernels::ops::PrefillPagedPlan::new_batch(
+            inner: pegainfer_kernels::ops::PrefillPagedPlan::new_batch_with_cta_tile_q(
                 ctx,
                 &page_indices,
                 &last_page_lens,
@@ -68,6 +115,7 @@ impl PrefillPagedPlan {
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                cta_tile_q_override,
             )?,
         })
     }

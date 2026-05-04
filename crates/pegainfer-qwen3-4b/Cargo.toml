@@ -6,8 +6,10 @@ autobenches = false
 
 [dependencies]
 pegainfer-core = { path = "../pegainfer-core" }
+pegainfer-cupti = { path = "../pegainfer-cupti", optional = true }
 pegainfer-kernels = { path = "../pegainfer-kernels" }
 anyhow = "1.0"
+clap = { version = "4.5.57", features = ["derive"], optional = true }
 crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
@@ -18,19 +20,25 @@ cudarc = { version = "0.19.4", features = [
 ] }
 fastrace = { version = "0.7.16", features = ["enable"] }
 half = { version = "2.4", features = ["num-traits"] }
+hex = { version = "0.4", optional = true }
 log = "0.4"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = { version = "0.10", optional = true }
 tokio = { version = "1", features = ["sync"] }
+toml = { version = "0.9", optional = true }
+
+[features]
+kernel-report = ["dep:clap", "dep:hex", "dep:pegainfer-cupti", "dep:sha2", "dep:toml"]
 
 [dev-dependencies]
-pegainfer-cupti = { path = "../pegainfer-cupti" }
 vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
 
-[[bench]]
-name = "qwen3_kernel_snapshot"
-harness = false
+[[bin]]
+name = "qwen3_kernel_report"
+path = "src/bin/qwen3_kernel_report.rs"
+required-features = ["kernel-report"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -2 }

@@ -1,0 +1,43 @@
+model = "qwen3-4b"
+
+[[ops]]
+name = "paged_decode_attention"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32]
+kv_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["non_partition", "split_kv_256x64", "split_kv_512x64"]
+
+[[ops]]
+name = "paged_prefill_attention"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default", "cta_q128", "cta_q64", "cta_q16"]
+
+[[ops]]
+name = "prefill_qk_norm_rope"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_kv_scatter"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_attention_core"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default", "cta_q128", "cta_q64", "cta_q16"]
+
+[[ops]]
+name = "single_prefill_attention_core"
+phase = "prefill"
+batch_size = [1]
+seq_len = [10000]
+variants = ["default"]

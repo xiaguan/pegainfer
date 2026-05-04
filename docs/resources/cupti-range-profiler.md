@@ -1,15 +1,15 @@
 # CUPTI Range Profiler Notes
 
 **Status**: Active
-**TL;DR**: CUPTI Range Profiler works for pegainfer kernel snapshots, but the NVPerf stack on the 5090/CUDA 12.9 box is sensitive to user range names. Keep range names short and treat them as profiler IDs only; store full model/op/shape metadata in the JSON snapshot. Run one unprofiled warmup launch before `cuptiRangeProfilerStart` so the first measured range does not include CUDA lazy initialization. The default Qwen3 attention snapshot records time, DRAM/L2 traffic, and two minimal SM counters; it is still a decode-attention kernel snapshot, not a full decode-step profile.
+**TL;DR**: CUPTI Range Profiler works for pegainfer kernel reports, but the NVPerf stack on the 5090/CUDA 12.9 box is sensitive to user range names. Keep range names short and treat them as profiler IDs only; store full model/op/shape metadata in the JSON report. Run one unprofiled pre-measure launch before `cuptiRangeProfilerStart` so the first measured range does not include CUDA lazy initialization. Qwen3 attention reports store raw CUPTI metric names and values, including tensor-pipe/BF16-HMMA peak percentages for attention-core questions.
 
 ## Current Use
 
 - Rust wrapper: `crates/pegainfer-cupti`
 - C++ Range Profiler bridge: `crates/pegainfer-cupti/csrc/range_profiler.cpp`
-- Qwen3 paged decode snapshot: `crates/pegainfer-qwen3-4b/benches/qwen3_kernel_snapshot.rs`
+- Qwen3 paged decode report tool: `crates/pegainfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`
 
-The snapshot runner should enable CUPTI by default. Use `--no-cupti` only for latency-only smoke runs or when the host profiler stack is unavailable.
+The report runner should enable CUPTI by default. Use `--no-cupti` only for latency-only local validation or when the host profiler stack is unavailable.
 
 ## 5090 Finding
 
@@ -34,53 +34,67 @@ The crash was not caused by the attention case, the Rust callback trampoline, co
 Observed bad range name:
 
 ```text
-qwen3_kernel_snapshot/paged_decode_attention/non_partition/bs1/kv128
+qwen3_kernel_report/paged_decode_attention/non_partition/bs1/kv128
 ```
 
 Observed stable range name pattern:
 
 ```text
 qk/non_partition/b1/k128
+qpf/qk/b1/s128
+qpf/kv/b1/s128
+qpf/attn/b1/s128
 ```
 
 Operational rule until we test more CUDA/NVPerf versions: keep CUPTI range names under roughly 48 ASCII bytes, avoid verbose path-like names, and put full semantics in structured output fields instead of the range name.
 
 ## Measurement Rules
 
-- Run one unprofiled `launch_once(path)` plus stream sync before the profiled range. Without this, the first profiled case can include lazy CUDA/module initialization. On 5090, `bs=1,ctx=1024,non_partition` reported about `3528us` before this warmup and `87us` after it.
+- Run one unprofiled `launch_once(path)` plus stream sync before the profiled range. Without this, the first profiled case can include lazy CUDA/module initialization. On 5090, `bs=1,ctx=1024,non_partition` reported about `3528us` before this pre-measure launch and `87us` after it.
 - Clear L2 in the prepare callback before `cuptiRangeProfilerStart`; synchronize after prepare and after the profiled launch.
+- Do not use `cudaCtxResetPersistingL2Cache` / `cuCtxResetPersistingL2Cache` as a general cache-clear primitive. Those APIs reset persisting L2 lines to normal status; they do not evict ordinary L2 contents. Use the benchmark sweep buffer for cache-cleared timing.
 - Profile one user range per call. Keep range names deterministic but compact.
-- Interpret `kv_read_over_dram_read_pct` as a sanity check for read amplification, not as a correctness oracle.
+- Do not write derived fields such as bandwidth percentages, utilization labels, or read-amplification ratios into the report JSON. Keep `case.cupti` as a raw metric-name map.
 
 ## Metric Set
 
-Use a small set that answers the first diagnostic question for decode attention: "is the kernel moving the required KV bytes, and is the GPU being fed enough work?"
+Use a small set that answers the first diagnostic question for decode/prefill attention: "is the kernel moving the required KV bytes, is the GPU being fed enough work, and is the attention core using the BF16 tensor path?"
 
 Default metrics:
 
 ```text
 gpu__time_duration.sum
+sm__cycles_elapsed.avg.per_second
 dram__bytes.sum
 dram__bytes_op_read.sum
 dram__bytes_op_write.sum
 lts__t_bytes.sum
 sm__throughput.avg.pct_of_peak_sustained_elapsed
 smsp__warps_active.avg.pct_of_peak_sustained_active
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed
+sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_second
 ```
 
-Why only these two SM counters:
+Why these SM/tensor counters:
 
 - `sm__throughput.avg.pct_of_peak_sustained_elapsed` is the coarse "are SMs busy over wall time?" signal. It catches low-batch underfill directly.
 - `smsp__warps_active.avg.pct_of_peak_sustained_active` says whether active SM partitions have enough resident warps while they are active. It helps separate global grid underfill from per-partition occupancy.
+- `sm__cycles_elapsed.avg.per_second` records the profiler-observed SM clock during the range, avoiding a stale external clock assumption.
+- `sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed` is the direct CUPTI/NVPerf answer for BF16 HMMA math ops versus peak sustained elapsed time. Prefer this over runner-owned MFU calculations when the question is kernel-level tensor utilization.
+- `sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_second` gives the same BF16 HMMA path as a raw operation-rate metric.
 
 Do not grow this into a full NCU replacement. If the question is stall reason, issue mix, tensor-core use, or scheduler detail, take an NCU profile.
 
-## Verified Smoke
+On the 5090 validation host, `ncu` is available at `/usr/local/cuda/bin/ncu`; non-interactive SSH shells may not have that directory in `PATH`.
 
-Verified on 5090 after switching to short range names and adding the unprofiled warmup launch:
+## Verified Minimal Run
+
+Verified on 5090 after switching to short range names and adding the unprofiled pre-measure launch:
 
 ```bash
-ssh 5090 'bash -ic "cd /root/develop/xingming/pegainfer && PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_snapshot_cupti_smoke.json"'
+ssh 5090 'bash -ic "cd /root/develop/xingming/pegainfer && PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_report_cupti_min.json"'
 ```
 
 Result:
@@ -89,19 +103,31 @@ Result:
 running 2 qwen3 paged decode attention kernel cases
 case variant=non_partition bs=1 ctx=1024
 case variant=split_kv_256x64 bs=1 ctx=1024
-wrote /tmp/qwen3_kernel_snapshot_cupti_smoke.json
+wrote /tmp/qwen3_kernel_report_cupti_min.json
 ```
 
-Representative verified snapshot summary:
+Representative verified snapshot shape:
 
 ```text
 cupti_enabled True
-non_partition 1 1024 True 75.776us 4.236MB_dram_read 0.75%_sm 8.27%_warps_active
-split_kv_256x64 1 1024 True 48.736us 4.249MB_dram_read 1.31%_sm 11.77%_warps_active
+schema 4
+case.cupti keys:
+  gpu__time_duration.sum
+  sm__cycles_elapsed.avg.per_second
+  dram__bytes.sum
+  dram__bytes_op_read.sum
+  dram__bytes_op_write.sum
+  lts__t_bytes.sum
+  sm__throughput.avg.pct_of_peak_sustained_elapsed
+  smsp__warps_active.avg.pct_of_peak_sustained_active
+  sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed
+  sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+  sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+  sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_second
 ```
 
-The same metric set showed the intended signal at `bs=1,ctx=10000`: non-partition used only `1.19%` SM throughput and `6.59%` DRAM peak, while split-K used `8.74%` SM throughput and `41.06%` DRAM peak for essentially the same KV read bytes. That confirms the long-context low-batch issue is underfill, not KV read amplification.
+Derived analysis of these values should happen in a separate report or notebook, not in `qwen3_kernel_report`.
 
 ## Next Step
 
-Keep CUPTI in the kernel snapshot path and add new metrics only when they answer a concrete kernel-maintenance question.
+Keep CUPTI in the kernel report path and add new metrics only when they answer a concrete kernel-maintenance question.

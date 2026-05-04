@@ -8,6 +8,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
+use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
 use pegainfer_core::ffi;
@@ -130,7 +131,7 @@ impl Qwen3Model {
 
         // Prefill plan (for prefill attention + KV scatter)
         let prefill_descs: Vec<_> = prefill_kv_states.iter().map(|kv| kv.desc()).collect();
-        let prefill_plan = PrefillPagedPlan::new_batch(
+        let prefill_plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
             &self.ctx,
             &prefill_descs,
             &prefill_start_positions,
@@ -138,6 +139,7 @@ impl Qwen3Model {
             self.local_num_attention_heads(),
             self.local_num_key_value_heads(),
             self.config.head_dim,
+            PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
         // Decode attention metadata (built AFTER advance so seq_lens reflect new state)

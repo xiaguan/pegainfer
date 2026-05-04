@@ -323,6 +323,22 @@ int paged_kv_scatter_cuda(
 // ---------------------------------------------------------------------------
 using BatchPrefillParamsT = BatchPrefillPagedParams<DType, DType, DType, IdType>;
 
+static uint32_t resolve_prefill_cta_tile_q(
+    int64_t packed_qo_len,
+    int32_t head_dim,
+    int32_t cta_tile_q_override)
+{
+    if (cta_tile_q_override == 0) {
+        return FA2DetermineCtaTileQ(packed_qo_len, head_dim);
+    }
+    if (cta_tile_q_override == 16 ||
+        cta_tile_q_override == 64 ||
+        cta_tile_q_override == 128) {
+        return static_cast<uint32_t>(cta_tile_q_override);
+    }
+    return 0;
+}
+
 // Return the number of Q tiles for given dimensions (needed to size plan arrays).
 int32_t batch_prefill_paged_num_tiles(
     int32_t  seq_len,
@@ -333,6 +349,23 @@ int32_t batch_prefill_paged_num_tiles(
     uint32_t group_size = num_qo_heads / num_kv_heads;
     int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
     uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
+    return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
+}
+
+int32_t batch_prefill_paged_num_tiles_with_cta_tile_q(
+    int32_t  seq_len,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  cta_tile_q_override)
+{
+    uint32_t group_size = num_qo_heads / num_kv_heads;
+    int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
+    uint32_t cta_tile_q = resolve_prefill_cta_tile_q(
+        packed_qo_len, head_dim, cta_tile_q_override);
+    if (cta_tile_q == 0) {
+        return -1;
+    }
     return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
 }
 
@@ -350,7 +383,20 @@ int32_t batch_prefill_cta_tile_q(
     return static_cast<int32_t>(FA2DetermineCtaTileQ(packed_qo_len, head_dim));
 }
 
-int batch_prefill_paged_cuda(
+int32_t batch_prefill_cta_tile_q_with_override(
+    int32_t  total_seq_len,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  cta_tile_q_override)
+{
+    uint32_t group_size = num_qo_heads / num_kv_heads;
+    int64_t packed_qo_len = static_cast<int64_t>(total_seq_len) * group_size;
+    return static_cast<int32_t>(resolve_prefill_cta_tile_q(
+        packed_qo_len, head_dim, cta_tile_q_override));
+}
+
+int batch_prefill_paged_cuda_with_cta_tile_q(
     // Q and output (HiddenStates col-major: [q_dim, total_seq_len])
     void*    q,
     void*    output,
@@ -379,6 +425,7 @@ int batch_prefill_paged_cuda(
     int32_t  padded_batch_size,    // = total num_tiles
     int64_t  stride_page,
     float    sm_scale,
+    int32_t  cta_tile_q_override,
     // Stream
     void*    stream)
 {
@@ -424,7 +471,11 @@ int batch_prefill_paged_cuda(
     // Determine CTA tile size and dispatch
     uint32_t group_size = num_qo_heads / num_kv_heads;
     int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
-    uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
+    uint32_t cta_tile_q = resolve_prefill_cta_tile_q(
+        packed_qo_len, head_dim, cta_tile_q_override);
+    if (cta_tile_q == 0) {
+        return -1;
+    }
 
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     int result = 0;
@@ -446,6 +497,41 @@ int batch_prefill_paged_cuda(
                 s));
     });
     return result;
+}
+
+int batch_prefill_paged_cuda(
+    void*    q,
+    void*    output,
+    void*    kv_data,
+    int64_t  k_offset_elems,
+    int64_t  v_offset_elems,
+    int32_t* page_indices,
+    int32_t* page_indptr,
+    int32_t* last_page_len_d,
+    int32_t* q_indptr,
+    int32_t* request_indices,
+    int32_t* qo_tile_indices,
+    int32_t* kv_tile_indices,
+    int32_t* kv_chunk_size_ptr,
+    uint32_t* total_num_rows,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  page_size,
+    int32_t  seq_len,
+    int32_t  batch_size,
+    int32_t  padded_batch_size,
+    int64_t  stride_page,
+    float    sm_scale,
+    void*    stream)
+{
+    return batch_prefill_paged_cuda_with_cta_tile_q(
+        q, output, kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indptr, last_page_len_d, q_indptr,
+        request_indices, qo_tile_indices, kv_tile_indices,
+        kv_chunk_size_ptr, total_num_rows, num_qo_heads, num_kv_heads,
+        head_dim, page_size, seq_len, batch_size, padded_batch_size,
+        stride_page, sm_scale, /*cta_tile_q_override=*/0, stream);
 }
 
 // ---------------------------------------------------------------------------

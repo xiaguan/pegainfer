@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
 
+pub(crate) const PREFILL_ATTENTION_CTA_TILE_Q: i32 = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TensorParallelConfig {
     pub(crate) rank: usize,
@@ -28,8 +30,6 @@ pub(crate) struct Config {
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
-    #[allow(dead_code)]
-    pub(crate) bos_token_id: u32,
     pub(crate) eos_token_id: u32,
     pub(crate) tie_word_embeddings: bool,
     #[serde(skip)]

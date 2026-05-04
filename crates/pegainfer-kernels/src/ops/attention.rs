@@ -29,6 +29,7 @@ pub struct PrefillPagedPlan {
     num_tiles: i32,
     batch_size: i32,
     total_tokens: usize,
+    cta_tile_q: i32,
 }
 
 impl PrefillPagedPlan {
@@ -71,6 +72,9 @@ impl PrefillPagedPlan {
     pub fn num_tiles(&self) -> i32 {
         self.num_tiles
     }
+    pub fn cta_tile_q(&self) -> i32 {
+        self.cta_tile_q
+    }
 
     pub fn new(
         ctx: &DeviceContext,
@@ -81,6 +85,31 @@ impl PrefillPagedPlan {
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+    ) -> Result<Self> {
+        Self::new_with_cta_tile_q(
+            ctx,
+            page_indices_i32,
+            last_page_len,
+            start_pos,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cta_tile_q(
+        ctx: &DeviceContext,
+        page_indices_i32: &[i32],
+        last_page_len: usize,
+        start_pos: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
     ) -> Result<Self> {
         let kv_len = start_pos + seq_len;
 
@@ -95,13 +124,31 @@ impl PrefillPagedPlan {
         let positions_d = ctx.stream.clone_htod(&positions)?;
 
         let num_tiles = unsafe {
-            ffi::batch_prefill_paged_num_tiles(
+            ffi::batch_prefill_paged_num_tiles_with_cta_tile_q(
                 seq_len as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,
+                cta_tile_q_override,
             )
         };
+        anyhow::ensure!(
+            num_tiles > 0,
+            "invalid prefill CTA tile override {cta_tile_q_override}"
+        );
+        let cta_tile_q = unsafe {
+            ffi::batch_prefill_cta_tile_q_with_override(
+                seq_len as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                cta_tile_q_override,
+            )
+        };
+        anyhow::ensure!(
+            cta_tile_q > 0,
+            "invalid prefill CTA tile override {cta_tile_q_override}"
+        );
 
         let q_indptr_d = ctx.stream.clone_htod(&[0i32, seq_len as i32])?;
         let request_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
@@ -126,6 +173,7 @@ impl PrefillPagedPlan {
             num_tiles,
             batch_size: 1,
             total_tokens: seq_len,
+            cta_tile_q,
         })
     }
 
@@ -142,6 +190,31 @@ impl PrefillPagedPlan {
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+    ) -> Result<Self> {
+        Self::new_batch_with_cta_tile_q(
+            ctx,
+            page_indices,
+            last_page_lens,
+            start_positions,
+            seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch_with_cta_tile_q(
+        ctx: &DeviceContext,
+        page_indices: &[Vec<i32>],
+        last_page_lens: &[usize],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
     ) -> Result<Self> {
         let batch_size = page_indices.len();
         assert_eq!(batch_size, last_page_lens.len());
@@ -181,13 +254,18 @@ impl PrefillPagedPlan {
 
         // Tile plan: use global cta_tile_q for consistent tiling
         let cta_tile_q = unsafe {
-            ffi::batch_prefill_cta_tile_q(
+            ffi::batch_prefill_cta_tile_q_with_override(
                 total_tokens as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,
+                cta_tile_q_override,
             )
         } as usize;
+        anyhow::ensure!(
+            cta_tile_q > 0,
+            "invalid prefill CTA tile override {cta_tile_q_override}"
+        );
 
         let mut request_indices_v = Vec::new();
         let mut qo_tile_indices_v = Vec::new();
@@ -219,6 +297,7 @@ impl PrefillPagedPlan {
             num_tiles,
             batch_size: batch_size as i32,
             total_tokens,
+            cta_tile_q: cta_tile_q as i32,
         })
     }
 }
@@ -343,7 +422,7 @@ pub fn prefill_attention_paged_into(
             anyhow::bail!("paged_kv_scatter_cuda failed for layer {layer} with error {result}");
         }
 
-        let result = ffi::batch_prefill_paged_cuda(
+        let result = ffi::batch_prefill_paged_cuda_with_cta_tile_q(
             q_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             buf_ptr as *const ffi::Half,
@@ -367,6 +446,7 @@ pub fn prefill_attention_paged_into(
             plan.num_tiles,
             stride_page,
             sm_scale,
+            plan.cta_tile_q(),
             stream,
         );
         if result != 0 {

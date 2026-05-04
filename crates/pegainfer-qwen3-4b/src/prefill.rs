@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
 use pegainfer_core::kv_pool::{KvLayout, KvState};
 use pegainfer_core::ops;
@@ -89,7 +90,7 @@ impl Qwen3Model {
 
         // Build paged prefill plan once — shared across all layers.
         let desc = kv_state.desc();
-        let plan = PrefillPagedPlan::new(
+        let plan = PrefillPagedPlan::new_with_cta_tile_q(
             &self.ctx,
             &desc,
             start_pos,
@@ -97,6 +98,7 @@ impl Qwen3Model {
             num_heads,
             num_kv_heads,
             head_dim,
+            PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
         // Allocate all intermediates once — eliminates ~11k cuMemAllocAsync calls.
@@ -308,7 +310,7 @@ impl Qwen3Model {
 
         // Build batch plan (all descs must reflect post-advance state)
         let descs: Vec<_> = kv_states.iter().map(|kv| kv.desc()).collect();
-        let plan = PrefillPagedPlan::new_batch(
+        let plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
             &self.ctx,
             &descs,
             &start_positions,
@@ -316,6 +318,7 @@ impl Qwen3Model {
             self.local_num_attention_heads(),
             self.local_num_key_value_heads(),
             self.config.head_dim,
+            PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
         // Forward through all layers
