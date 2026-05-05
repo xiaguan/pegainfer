@@ -8,14 +8,14 @@ use super::batch_decode_graph::{BATCH_BUCKETS, BatchDecodeGraphState, bucket_for
 use super::decode_buffers::BatchDecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::weights::{FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model};
-use crate::kv_pool::{KvLayout, KvState};
 use crate::ops;
+use pegainfer_core::kv_pool::{KvLayout, KvState};
 
 impl Qwen35Model {
     pub(crate) fn select_tokens_batch_varied(
         &self,
         bufs: &mut BatchDecodeBuffers35,
-        params: &[&crate::sampler::SamplingParams],
+        params: &[&pegainfer_core::sampler::SamplingParams],
         rng: &mut rand::rngs::StdRng,
     ) -> Result<Vec<u32>> {
         let batch_size = params.len();

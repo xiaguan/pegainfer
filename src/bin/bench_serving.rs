@@ -23,10 +23,8 @@ use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
 use log::{debug, info};
 use pegainfer::logging;
-use pegainfer::model::Qwen35Model;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
-use pegainfer::scheduler_qwen35;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer_core::engine::EngineLoadOptions;
 use rand::SeedableRng;
@@ -1623,11 +1621,15 @@ fn main() -> Result<()> {
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
         }
         ModelType::Qwen35 => {
-            let model =
-                Qwen35Model::from_safetensors_with_options(&cli.model_path, cli.cuda_graph)?;
-            // Bench runs one request at a time — use minimal batch capacity
-            // to leave GPU memory for large prefill scratch buffers.
-            let handle = scheduler_qwen35::start_with_capacity(model, command_seed(&cli), 4)?;
+            let handle = pegainfer_qwen35_4b::start_engine_with_capacity(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: cli.cuda_graph,
+                    device_ordinals: vec![0],
+                    seed: command_seed(&cli),
+                },
+                4,
+            )?;
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };

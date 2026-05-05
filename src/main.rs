@@ -4,7 +4,6 @@ use std::time::Instant;
 use clap::Parser;
 use log::info;
 use pegainfer::logging;
-use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer_core::engine::EngineLoadOptions;
 
@@ -79,11 +78,15 @@ async fn main() {
             handle
         }
         ModelType::Qwen35 => {
-            let model = Qwen35Model::from_safetensors_with_options(model_path, args.cuda_graph)
-                .expect("Failed to load Qwen3.5 model");
-
-            let handle = pegainfer::scheduler_qwen35::start(model, 42)
-                .expect("Failed to start Qwen3.5 scheduler");
+            let handle = pegainfer_qwen35_4b::start_engine(
+                &args.model_path,
+                EngineLoadOptions {
+                    enable_cuda_graph: args.cuda_graph,
+                    device_ordinals: vec![args.device_ordinal],
+                    seed: 42,
+                },
+            )
+            .expect("Failed to start Qwen3.5 engine");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 

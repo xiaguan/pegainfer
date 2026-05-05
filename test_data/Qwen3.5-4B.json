@@ -3,7 +3,7 @@
     {
       "max_new_tokens": 50,
       "name": "tell_story",
-      "output": " about a young man who discovers a mysterious portal in his backyard.\n\n<think>\nHere's a thinking process that could lead to the story above:\n\n1.  **Analyze the Request:**\n    *   **Protagonist:** A young",
+      "output": " about a young man who discovers a mysterious portal in his backyard.\n\n<think>\n\n</think>\n\nThe rain in Oakhaven didn't just fall; it seemed to hang in the air, a heavy, grey curtain that blurred the edges of the world. For",
       "prompt": "Tell me a story"
     },
     {
@@ -27,7 +27,7 @@
     {
       "max_new_tokens": 50,
       "name": "chinese_capital",
-      "output": "。\n\n<think>\nHere's a thinking process that leads to the introduction of China's capital:\n\n1.  **Analyze the Request:**\n    *   **Topic:** China's capital (中国的首都).\n    *   **Task",
+      "output": "。\n\n<think>\n\n</think>\n\n中国的首都是**北京**。\n\n北京位于中国北部，地处华北平原的西北端，背靠燕山，毗邻渤海湾。作为中国的政治、文化、国际交往和科技创新中心，北京拥有深厚的历史底蕴和",
       "prompt": "请介绍一下中国的首都"
     },
     {
@@ -51,7 +51,7 @@
     {
       "max_new_tokens": 50,
       "name": "oyster_riddle",
-      "output": "，生蚝没煮熟是生蚝，生蚝没煮熟吃下去会怎么样？\n\n<think>\n\n</think>\n\n生蚝没煮熟吃下去，最直接的后果通常是**食物中毒**，严重时甚至可能危及生命。\n\n生蚝属于贝类",
+      "output": "，生蚝没煮熟是生蚝，生蚝煮熟了是生蚝，生蚝没煮熟是生蚝，生蚝煮熟了是生蚝，生蚝没煮熟是生蚝，生蚝煮熟了是生蚝，生",
       "prompt": "生蚝煮熟了是熟蚝"
     },
     {

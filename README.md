@@ -170,7 +170,6 @@ HTTP / vLLM frontend → EngineHandle → per-model engine crate
 ### What's not (yet) implemented
 
 - Quantization (INT8/INT4)
-- Qwen3.5 extraction into a standalone model crate
 
 ## Development
 
@@ -182,7 +181,7 @@ cargo test --release
 
 # E2E greedy regression (needs GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
-cargo test --release --test e2e_qwen35
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e
 ```
 
 ### Triton AOT
@@ -200,21 +199,14 @@ See `crates/pegainfer-kernels/tools/triton/README.md` for setup and troubleshoot
 src/
 ├── main.rs                # CLI + vLLM/OpenAI server startup
 ├── vllm_frontend.rs       # vLLM engine-core bridge into a generic EngineHandle
-├── server_engine.rs       # Model detection and compatibility re-exports
+├── server_engine.rs       # Model detection and shared server helpers
 ├── scheduler.rs           # Compatibility re-export of core engine request/event types
-├── scheduler_qwen35.rs    # Qwen3.5 scheduler
-├── model.rs               # Root-local Qwen3.5 model
-├── model/
-│   └── qwen35/            # Qwen3.5: config, weights, forward, prefill, decode, recurrent_state
-├── ops.rs                 # Root compatibility dispatch + Qwen3.5 recurrent wrapper
+├── ops.rs                 # Compatibility re-export of shared GPU ops
 ├── ops/
-│   ├── recurrent.rs       # Conv1d, Gated Delta Rule (Qwen3.5)
-│   └── tests.rs           # Operator tests
+│   └── tests.rs           # Root operator smoke tests
 ├── tensor.rs              # Re-export of pegainfer-kernels tensor types
-├── ffi.rs                 # Re-export of pegainfer-kernels FFI bindings
-├── weight_loader.rs       # Safetensors loading + RoPE precomputation
 ├── sampler.rs             # Temperature, top-k, top-p sampling
-└── trace_reporter.rs      # Archived fastrace JSON reporter, not wired into CLI
+└── logging.rs             # Runtime logging setup
 
 crates/pegainfer-core/             # Shared runtime API for model crates
 ├── src/engine.rs                  # EngineHandle, GenerateRequest, TokenEvent
@@ -233,6 +225,11 @@ crates/pegainfer-qwen3-4b/         # Qwen3-4B model-owned engine crate
 ├── tests/                         # Qwen3 e2e, paged attention, regression data generation
 ├── benches/                       # Qwen3 model-level benchmarks
 └── src/kernel_plan.rs             # Model DAG phase -> kernel routing index
+
+crates/pegainfer-qwen35-4b/        # Qwen3.5-4B model-owned engine crate
+├── src/                           # Config, weights, prefill/decode/unified, recurrent state, scheduler
+├── tests/                         # Qwen3.5 exact e2e, scheduler e2e, regression data generation
+└── benches/                       # Qwen3.5 recurrent/norm operator benchmarks
 ```
 
 </details>

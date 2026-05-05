@@ -6,9 +6,9 @@
 
 use anyhow::Result;
 
-use crate::kv_pool::KvPool;
-use crate::model::cuda_graph::CudaGraphState;
-use crate::tensor::DeviceContext;
+use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
 use super::decode_buffers::BatchDecodeBuffers35;
@@ -18,7 +18,7 @@ use super::recurrent_state::RecurrentState;
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 /// Maximum supported batch size (= largest bucket).
-pub(crate) const MAX_BATCH: usize = 64;
+pub const MAX_BATCH: usize = 64;
 
 /// Find the smallest bucket >= `bs`. Panics if `bs` > MAX_BATCH.
 pub(crate) fn bucket_for(bs: usize) -> usize {

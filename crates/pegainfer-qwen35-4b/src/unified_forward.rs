@@ -13,10 +13,10 @@ use anyhow::Result;
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
-use crate::kv_pool::KvState;
-use crate::model::kv_cache::KVCache;
 use crate::ops;
-use crate::tensor::DeviceVec;
+use pegainfer_core::kv_cache::KVCache;
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::tensor::DeviceVec;
 
 impl Qwen35Model {
     /// Prefill `n` prompts sequentially, updating each request's KV and recurrent state.
@@ -112,8 +112,7 @@ mod tests {
     use rand::rngs::StdRng;
 
     use super::*;
-    use crate::kv_pool::KvState;
-    use crate::sampler::SamplingParams;
+    use pegainfer_core::kv_pool::KvState;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 
@@ -122,8 +121,8 @@ mod tests {
     }
 
     /// Sample a token from a DeviceVec logits using greedy (argmax).
-    fn greedy_sample(model: &Qwen35Model, logits: &DeviceVec, rng: &mut StdRng) -> u32 {
-        let params = SamplingParams::default();
+    fn greedy_sample(model: &Qwen35Model, logits: &DeviceVec, _rng: &mut StdRng) -> u32 {
+        let params = pegainfer_core::sampler::SamplingParams::default();
         let mut probs: cudarc::driver::CudaSlice<f32> = model
             .ctx
             .stream
@@ -138,7 +137,6 @@ mod tests {
             .unwrap();
         let mut valid: cudarc::driver::CudaSlice<u8> = model.ctx.stream.alloc_zeros(1).unwrap();
         let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
-        let random_val: f32 = rand::RngExt::random(rng);
         crate::ops::gpu_sample_into(
             &model.ctx,
             logits,
@@ -148,7 +146,7 @@ mod tests {
             &mut valid,
             &mut out,
             &params,
-            random_val,
+            0.0,
         )
         .unwrap()
     }

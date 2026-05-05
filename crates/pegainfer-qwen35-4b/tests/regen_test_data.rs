@@ -2,16 +2,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use pegainfer::model::Qwen35Model;
-use pegainfer::sampler::SamplingParams;
-use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
-use pegainfer::scheduler_qwen35;
+use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use pegainfer_core::sampler::SamplingParams;
 use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_QWEN35_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+const DEFAULT_QWEN35_MODEL_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3.5-4B");
 static GPU_REGEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -89,7 +88,7 @@ fn model_name(model_path: &str) -> String {
 
 fn test_data_path(model_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data")
+        .join("../../test_data")
         .join(format!("{model_name}.json"))
 }
 
@@ -112,7 +111,7 @@ fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
 
 /// Generate text via a scheduler handle.
 fn generate_text_scheduler(
-    handle: &scheduler::SchedulerHandle,
+    handle: &EngineHandle,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -121,7 +120,7 @@ fn generate_text_scheduler(
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
-        .submit(SchedulerRequest {
+        .submit(GenerateRequest {
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
@@ -169,7 +168,7 @@ fn lock_gpu_regen_test() -> MutexGuard<'static, ()> {
 #[ignore = "regenerates checked-in golden data; run manually when fixtures need refresh"]
 fn regen_test_data_qwen35() {
     let _guard = lock_gpu_regen_test();
-    pegainfer::logging::init_stderr("info");
+    // logging intentionally left to the test harness
 
     let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| DEFAULT_QWEN35_MODEL_PATH.to_string());
@@ -185,10 +184,16 @@ fn regen_test_data_qwen35() {
         output_path.display()
     );
 
-    let model = Qwen35Model::from_safetensors_with_options(&model_path, true)
-        .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
+    let handle = pegainfer_qwen35_4b::start_engine(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+        },
+    )
+    .expect("Failed to start engine");
 
     let mut cases_json = Vec::new();
     for case in CASES {

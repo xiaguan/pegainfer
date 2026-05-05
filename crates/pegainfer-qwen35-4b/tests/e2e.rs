@@ -5,16 +5,15 @@
 use std::path::{Path, PathBuf};
 
 use log::info;
-use pegainfer::model::Qwen35Model;
-use pegainfer::scheduler::{SchedulerRequest, TokenEvent};
-use pegainfer::scheduler_qwen35;
+use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use pegainfer_core::sampler::SamplingParams;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3.5-4B");
 
 fn get_model_path() -> String {
     let path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
@@ -29,7 +28,7 @@ fn get_test_data_path(model_path: &str) -> PathBuf {
         .and_then(|n| n.to_str())
         .unwrap_or(model_path);
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data")
+        .join("../../test_data")
         .join(format!("{name}.json"));
     info!("Using test data path: {}", p.display());
     p
@@ -56,7 +55,7 @@ fn load_test_cases(path: &Path) -> Vec<TestCase> {
 }
 
 fn generate_text(
-    handle: &pegainfer::scheduler::SchedulerHandle,
+    handle: &EngineHandle,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -65,9 +64,9 @@ fn generate_text(
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
-        .submit(SchedulerRequest {
+        .submit(GenerateRequest {
             prompt_tokens,
-            params: pegainfer::sampler::SamplingParams::default(),
+            params: SamplingParams::default(),
             max_tokens,
             token_tx,
             logprobs: 0,
@@ -90,18 +89,23 @@ fn generate_text(
 
 #[test]
 fn test_e2e_qwen35_generation() {
-    pegainfer::logging::init_stderr("info");
+    // logging intentionally left to the test harness
 
     let model_path = get_model_path();
     let test_data_path = get_test_data_path(&model_path);
     let cases = load_test_cases(&test_data_path);
 
     info!("Loading Qwen3.5 model...");
-    let model =
-        Qwen35Model::from_safetensors_with_options(&model_path, /*enable_cuda_graph=*/ true)
-            .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = scheduler_qwen35::start(model, 42).expect("Failed to start scheduler");
+    let handle = pegainfer_qwen35_4b::start_engine(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+        },
+    )
+    .expect("Failed to start engine");
     info!("Model loaded");
 
     info!("=== Qwen3.5-4B greedy correctness ===");

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
-use pegainfer::ops;
-use pegainfer::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_qwen35_4b::runtime_ops as ops;
 
 use super::common::{
     EPS, QWEN35_4B_HIDDEN, configure_group, device_vec, hidden_states, iter_sync,

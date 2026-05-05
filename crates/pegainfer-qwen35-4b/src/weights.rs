@@ -4,8 +4,8 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config35, LayerType};
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{
+use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use pegainfer_core::weight_loader::{
     deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
     mmap_shards, precompute_rope,
 };
@@ -80,7 +80,7 @@ pub struct Qwen35Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     /// Shared paged KV pool for full-attention layers.
-    pub(super) kv_pool: crate::kv_pool::KvPool,
+    pub(super) kv_pool: pegainfer_core::kv_pool::KvPool,
 }
 
 impl Qwen35Model {
@@ -88,9 +88,17 @@ impl Qwen35Model {
         model_path: &str,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
+        Self::from_safetensors_with_device_options(model_path, enable_cuda_graph, 0)
+    }
+
+    pub fn from_safetensors_with_device_options(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinal: usize,
+    ) -> Result<Self> {
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU");
-        let ctx = DeviceContext::new()?;
+        let ctx = DeviceContext::new_with_device(device_ordinal)?;
 
         let config = Config35::from_file(model_path)?;
         debug!(
@@ -303,7 +311,7 @@ impl Qwen35Model {
         // Paged KV pool for the 8 full-attention layers.
         let page_size = 16usize;
         let num_full_layers = config.num_full_attention_layers();
-        let layout = crate::kv_pool::KvLayout::new(
+        let layout = pegainfer_core::kv_pool::KvLayout::new(
             num_full_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -327,7 +335,7 @@ impl Qwen35Model {
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
-        let kv_pool = crate::kv_pool::KvPool::new(
+        let kv_pool = pegainfer_core::kv_pool::KvPool::new(
             &ctx,
             num_full_layers,
             config.num_key_value_heads,
@@ -356,11 +364,11 @@ impl Qwen35Model {
         &self.ctx
     }
 
-    pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
+    pub(crate) fn alloc_kv(&self) -> pegainfer_core::kv_pool::KvState {
         self.kv_pool.alloc()
     }
 
-    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
+    pub(crate) fn kv_pool(&self) -> &pegainfer_core::kv_pool::KvPool {
         &self.kv_pool
     }
     /// Create a CUDA Graph batch decode state with a custom slot capacity.

@@ -5,8 +5,8 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::kv_pool::KvState;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {

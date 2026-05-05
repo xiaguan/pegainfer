@@ -37,7 +37,7 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
             idx
         } else {
             let idx = shard_files.len();
-            shard_files.push(format!("{}/{}", model_path, &shard_file));
+            shard_files.push(format!("{model_path}/{shard_file}"));
             file_to_idx.insert(shard_file, idx);
             idx
         };

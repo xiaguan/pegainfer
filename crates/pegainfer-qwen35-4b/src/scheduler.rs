@@ -7,6 +7,7 @@
 //! Prefill allocates temporary `RecurrentState`s, then D2D-copies them into
 //! graph slots. On request retirement, swap-remove compaction keeps slots dense.
 
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use anyhow::Result;
@@ -15,14 +16,16 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::kv_pool::KvState;
-use crate::model::Qwen35Model;
-use crate::model::qwen35::batch_decode_graph::BatchDecodeGraphState;
-use crate::model::qwen35::recurrent_state::RecurrentState;
-use crate::sampler::SamplingParams;
-use crate::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
-use crate::server_engine::{FinishReason, TokenLogprob};
-use crate::tensor::DeviceVec;
+use crate::batch_decode_graph::BatchDecodeGraphState;
+use crate::recurrent_state::RecurrentState;
+use crate::weights::Qwen35Model;
+use pegainfer_core::engine::{
+    EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, TokenEvent,
+    TokenLogprob,
+};
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::sampler::SamplingParams;
+use pegainfer_core::tensor::DeviceVec;
 
 // ── Internal types ──────────────────────────────────────────────────────
 
@@ -71,11 +74,7 @@ impl SampleScratch {
 
 /// Start the Qwen3.5 scheduler thread with default max batch size (64).
 pub fn start(model: Qwen35Model, seed: u64) -> Result<SchedulerHandle> {
-    start_with_capacity(
-        model,
-        seed,
-        crate::model::qwen35::batch_decode_graph::MAX_BATCH,
-    )
+    start_with_capacity(model, seed, crate::batch_decode_graph::MAX_BATCH)
 }
 
 /// Start the Qwen3.5 scheduler thread with a custom max batch size.
@@ -91,22 +90,63 @@ pub fn start_with_capacity(
     let sample_scratch = SampleScratch::new(&model)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (startup_tx, startup_rx) = std_mpsc::channel();
 
     thread::Builder::new()
         .name("scheduler-qwen35".into())
-        .spawn(move || {
-            scheduler_loop(
-                model,
-                submit_rx,
-                graph_state,
-                sample_scratch,
-                seed,
-                max_batch,
-            );
+        .spawn(move || match bind_model_thread(&model) {
+            Ok(_guard) => {
+                let _ = startup_tx.send(Ok(()));
+                scheduler_loop(
+                    model,
+                    submit_rx,
+                    graph_state,
+                    sample_scratch,
+                    seed,
+                    max_batch,
+                );
+            }
+            Err(err) => {
+                let _ = startup_tx.send(Err(err));
+            }
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
+    startup_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Qwen3.5 scheduler exited during startup"))??;
     Ok(SchedulerHandle::new(submit_tx))
+}
+
+struct CublasThreadGuard;
+
+impl Drop for CublasThreadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            crate::ffi::cublas_destroy();
+        }
+    }
+}
+
+fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
+    let ctx = model.device_ctx();
+    unsafe {
+        let err = crate::ffi::cuda_set_device(ctx.device_ordinal as i32);
+        if err != 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to set CUDA device {} on Qwen3.5 scheduler thread: cudaError={}",
+                ctx.device_ordinal,
+                err
+            ));
+        }
+    }
+    ctx.ctx.bind_to_thread().map_err(|e| {
+        anyhow::anyhow!("Failed to bind CUDA context to Qwen3.5 scheduler thread: {e}")
+    })?;
+    unsafe {
+        crate::ffi::cublas_init();
+    }
+    Ok(CublasThreadGuard)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────

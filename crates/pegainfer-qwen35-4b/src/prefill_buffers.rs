@@ -5,7 +5,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::config::Config35;
-use crate::tensor::{DeviceContext, HiddenStates};
+use pegainfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
 ///

@@ -8,7 +8,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::tensor::{DeviceContext, DeviceVec};
+use pegainfer_core::tensor::{DeviceContext, DeviceVec};
 
 /// Per-layer recurrent state for a single linear attention layer.
 pub(crate) struct LayerRecurrentState {

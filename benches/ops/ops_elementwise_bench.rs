@@ -3,8 +3,8 @@ use pegainfer::ops;
 use pegainfer::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
-    EPS, OUT_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_VOCAB, VECTOR_DIM, configure_group, device_matrix,
-    device_vec, iter_sync, positive_device_vec,
+    EPS, OUT_DIM, VECTOR_DIM, configure_group, device_matrix, device_vec, iter_sync,
+    positive_device_vec,
 };
 
 pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
@@ -13,16 +13,9 @@ pub(crate) fn bench_elementwise_ops(c: &mut Criterion) {
 
     let gemv_shapes = [
         ("legacy_1024x1024", OUT_DIM, VECTOR_DIM),
-        ("qwen35_q_qkv_8192x2560", 8192, QWEN35_4B_HIDDEN),
-        ("qwen35_z_4096x2560", 4096, QWEN35_4B_HIDDEN),
-        ("qwen35_kv_1024x2560", 1024, QWEN35_4B_HIDDEN),
-        ("qwen35_ba_32x2560", 32, QWEN35_4B_HIDDEN),
-        ("qwen35_o_2560x4096", QWEN35_4B_HIDDEN, 4096),
-        (
-            "qwen35_lm_head_248320x2560",
-            QWEN35_4B_VOCAB,
-            QWEN35_4B_HIDDEN,
-        ),
+        ("wide_8192x2560", 8192, 2560),
+        ("proj_4096x2560", 4096, 2560),
+        ("small_32x2560", 32, 2560),
     ];
 
     for (label, rows, cols) in gemv_shapes {

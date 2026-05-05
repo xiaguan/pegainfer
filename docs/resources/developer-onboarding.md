@@ -109,11 +109,11 @@ Benchmark:
 cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B request
 ```
 
-E2E tests — Qwen3 and Qwen3.5 have separate test files:
+E2E tests - Qwen3 and Qwen3.5 live in separate model crates:
 
 ```bash
-cargo test -r --test e2e          # Qwen3-4B (greedy reference match)
-cargo test -r --test e2e_qwen35   # Qwen3.5-4B (streaming + consistency)
+cargo test -r -p pegainfer-qwen3-4b --test e2e     # Qwen3-4B exact greedy regression
+cargo test -r -p pegainfer-qwen35-4b --test e2e    # Qwen3.5-4B exact greedy regression
 ```
 
 ### Regenerating Test Data
@@ -121,8 +121,8 @@ cargo test -r --test e2e_qwen35   # Qwen3.5-4B (streaming + consistency)
 After kernel changes that affect numerical output, regenerate greedy reference data:
 
 ```bash
-cargo test -r --test regen_test_data          # writes test_data/Qwen3-4B.json
-cargo test -r --test gen_test_data_35         # writes test_data/Qwen3.5-4B.json
+cargo test -r -p pegainfer-qwen3-4b --test regen_test_data -- --ignored    # writes test_data/Qwen3-4B.json
+cargo test -r -p pegainfer-qwen35-4b --test regen_test_data -- --ignored   # writes test_data/Qwen3.5-4B.json
 ```
 
 Then re-run the e2e tests to confirm the new baselines pass.

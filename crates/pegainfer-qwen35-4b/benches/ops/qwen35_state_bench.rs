@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
-use pegainfer::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
-use pegainfer::ops;
-use pegainfer::tensor::DeviceContext;
+use pegainfer_core::tensor::DeviceContext;
+use pegainfer_qwen35_4b::prefill_buffers::GdrChunkwiseScratch35;
+use pegainfer_qwen35_4b::runtime_ops as ops;
 
 use super::common::{
     QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
@@ -40,7 +40,7 @@ pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
                     QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM,
                 )
                 .expect("failed to allocate recurrent state");
-                let mut recurrent_out = pegainfer::tensor::HiddenStates::zeros(
+                let mut recurrent_out = pegainfer_core::tensor::HiddenStates::zeros(
                     &ctx,
                     QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM,
                     seq_len,

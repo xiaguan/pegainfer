@@ -11,11 +11,11 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::ffi;
-use crate::kv_pool::KvState;
-use crate::model::kv_cache::KVCache;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
-use crate::tensor::{DeviceVec, HiddenStates};
+use pegainfer_core::kv_cache::KVCache;
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::tensor::{DeviceVec, HiddenStates};
 
 impl Qwen35Model {
     pub(super) fn prefill_forward(

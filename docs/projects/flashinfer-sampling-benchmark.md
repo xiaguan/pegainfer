@@ -98,7 +98,7 @@
 
 ### Step 9: Incorporate independent review findings
 - Spawned a sub-agent review and asked it to stress the current local diff from a hostile reviewer perspective.
-- The review identified one high-severity issue: `src/model/qwen3/batch_decode.rs` and `src/model/qwen35/batch_decode.rs` now sample each row separately, while the serving schedulers still call them on the hot path. That removes the old batched greedy behavior and turns all-greedy batch decode into `O(batch)` GPU launches plus one sync/D2H per row.
+- The review identified one high-severity issue: `crates/pegainfer-qwen3-4b/src/batch_decode.rs` and `crates/pegainfer-qwen35-4b/src/batch_decode.rs` now sample each row separately, while the serving schedulers still call them on the hot path. That removes the old batched greedy behavior and turns all-greedy batch decode into `O(batch)` GPU launches plus one sync/D2H per row.
 - The review also flagged a lower-confidence integration risk: `src/ops/sampling.rs` currently hard-codes a `1MB` FlashInfer row-state scratch allocation, which is a brittle dependency on upstream internal layout.
 - Result: blocked. Single-request greedy regressions are fixed, but the batch decode token-selection path still needs a real batched design before this work is ready to land.
 
@@ -113,5 +113,5 @@
   - "Using FlashInfer" is not specific enough for performance work. The exact primitive matters: `top_k=1` probability sampling regressed decode TPOT, while FlashInfer top-k selection (`k=1`) restored it.
   - Competing runtimes solve per-request sampling diversity with batched metadata, not with per-request sampling launches. `mini-sglang` and `vLLM` both preserve a batched greedy path and batch the random path around per-row tensors.
 - **Follow-ups**:
-  - Rework `src/model/qwen3/batch_decode.rs` and `src/model/qwen35/batch_decode.rs` so batch token selection stays batched instead of iterating row by row.
+  - Rework `crates/pegainfer-qwen3-4b/src/batch_decode.rs` and `crates/pegainfer-qwen35-4b/src/batch_decode.rs` so batch token selection stays batched instead of iterating row by row.
   - Replace the hard-coded FlashInfer row-state scratch size with a source-backed contract or a tighter wrapper that owns the sizing rule.

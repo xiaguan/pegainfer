@@ -2,7 +2,7 @@
 
 > **TL;DR:** Accuracy work is defined as matching Hugging Face Qwen3.5-4B, not matching pegainfer's self-generated JSON. The large decode-state bugs are fixed: the broken HD256 full-attention decode kernel is no longer used, `conv1d_prefill` handoff across repeated `seq_len=1` calls is corrected, argmax tie-break now matches host semantics, and `conv1d` now matches HF's bf16 pre-`SiLU` rounding behavior. HF exact-match coverage improved to `11/13`, but parity is still incomplete. The remaining gap is now concentrated in two late, small-logit-drift cases, and the correct truth source for generated tokens remains HF's real incremental path with `past_key_values`, not reconstructed full-prefill.
 >
-> **Status:** Active. Updated 2026-03-27: exact HF spot-check is now `11/13`, up from `2/13` before the decode-state fixes and `9/13` before the latest `conv1d` rounding fix. New production-path incremental layer dump tooling confirms that the real runtime path decodes by reusing `prefill_forward(&[token])`; an earlier manual dump path based on the retired decode kernels was misleading and is no longer the reference. On `python_prime`, the first layer now matches HF through `conv1d_out`; on the two remaining failures, the first divergent logits are down to `0.125` to `0.25` shifts rather than obvious structural breaks.
+> **Status:** Active. Updated 2026-05-05: Qwen3.5 runtime code moved from root into `crates/pegainfer-qwen35-4b`. Current regression commands are crate-local: `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture` and `... --test e2e_scheduler -- --nocapture`. The all-case gibberish failure seen during the split was traced to the older thread-local cuBLAS change and fixed in `docs/projects/qwen35-e2e-gibberish.md`; both crate-local Qwen3.5 e2e commands now pass on this machine. Historical command logs below retain the paths that were run at the time.
 
 ## Goal
 
@@ -14,8 +14,8 @@
 ## Current State
 
 - Reusable debugging method now lives in [../resources/accuracy-parity-playbook.md](../resources/accuracy-parity-playbook.md).
-- `tests/e2e_qwen35.rs` checks outputs against `test_data/Qwen3.5-4B.json`.
-- `tests/gen_test_data_35.rs` regenerates that JSON from pegainfer itself.
+- `crates/pegainfer-qwen35-4b/tests/e2e.rs` checks outputs against `test_data/Qwen3.5-4B.json`.
+- `crates/pegainfer-qwen35-4b/tests/regen_test_data.rs` regenerates that JSON from pegainfer itself.
 - That makes the current Qwen3.5 e2e useful as a regression guard after a baseline is accepted, but not as an HF accuracy check.
 - `docs/projects/qwen35-4b-optimization.md` records that the refreshed chunk-wise baseline changed `6/13` prompts. Once such a baseline is accepted, the current e2e no longer tells us where pegainfer differs from HF.
 - Existing low-level tests already narrow the search space:
@@ -26,7 +26,7 @@
   - `src/ops/tests.rs`: `test_conv1d_prefill_seq1_matches_decode`
   - `src/ops/tests.rs`: `test_argmax_tie_prefers_smallest_index`
   - `src/ops/tests.rs`: `test_argmax_tie_prefers_smallest_index_across_thread_strides`
-- New accuracy tooling now exists for layer `0` prefill:
+- Historical accuracy tooling was recorded for layer `0` prefill, but these paths are not present in the current tree after the model-crate split:
   - `src/bin/qwen35_dump_layer0.rs` dumps pegainfer layer-0 checkpoints to JSON
   - `tools/accuracy/hf_dump_qwen35_layer0.py` dumps matching HF checkpoints on GPU
   - `tools/accuracy/compare_qwen35_dump.py` reports `max_abs` / `mean_abs` per checkpoint

@@ -73,8 +73,8 @@ target/release/build/pegainfer-kernels-*/out/triton_aot/
 Run the focused GPU tests for the active Triton-backed paths:
 
 ```bash
-cargo test --release test_conv1d_prefill_handoff_matches_single_prefill -- --nocapture
-PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release --test e2e_qwen35_scheduler -- --nocapture
+cargo test --release -p pegainfer-qwen35-4b recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture
 ```
 
 ## Common failures

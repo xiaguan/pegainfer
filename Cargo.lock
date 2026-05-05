@@ -3051,6 +3051,7 @@ dependencies = [
  "logforth",
  "pegainfer-core",
  "pegainfer-qwen3-4b",
+ "pegainfer-qwen35-4b",
  "rand 0.10.1",
  "rmp-serde",
  "rmpv",
@@ -3119,6 +3120,26 @@ dependencies = [
  "sha2 0.11.0",
  "tokio",
  "toml",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-qwen35-4b"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokio",
  "vllm-text",
 ]
 
