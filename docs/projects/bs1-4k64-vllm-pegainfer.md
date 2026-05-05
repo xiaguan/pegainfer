@@ -7,17 +7,16 @@
 ## Preparation
 
 - **Read**:
-  - `docs/index.md` - located the comparative benchmark and 5090 workflow docs.
+  - `docs/index.md` - located the comparative benchmark docs.
   - `docs/resources/bench-vs-vllm.md` - confirmed both engines should be driven by `vllm bench serve`, with `--ignore-eos`, random dataset, `--temperature 0`, and sequential same-GPU runs.
-  - `docs/resources/5090.md` - confirmed model path `/data/Qwen3-4B`, vLLM environment, SM target, and remote workflow.
   - `docs/projects/batch-optimization.md` - confirmed previous fixed-length and realistic benchmark interpretation, especially vLLM cold-start and TTFT/TPOT reading.
 - **Relevant history**:
   - `docs/projects/batch-optimization.md` showed fixed-length single-concurrency results should be interpreted as latency probes rather than full serving saturation claims.
 - **Plan**:
-  1. Use `/root/develop/xingming/.venv/bin/vllm` as the client and vLLM server.
-  2. Use `/root/develop/xingming/pegainfer-kernels-crate-build/target/release/pegainfer` for the PegaInfer server.
+  1. Use `vllm` as the client and vLLM server.
+  2. Use the release `pegainfer` binary for the PegaInfer server.
   3. Run `input_len=4096`, `output_len=64`, `num_prompts=20`, `max_concurrency=1`, `request_rate=inf`, after a 3-request warmup for each engine.
-  4. Save JSON/log artifacts under a timestamped 5090 result directory and compare TTFT/TPOT/throughput.
+  4. Save JSON/log artifacts under a timestamped result directory and compare TTFT/TPOT/throughput.
 - **Risks / open questions**:
   - vLLM prefix caching must be disabled for a fair random-prompt prefill comparison.
   - PegaInfer's vLLM frontend may not report streaming usage with the exact same accounting as vLLM.
@@ -25,25 +24,25 @@
 ## Execution Log
 
 ### Step 1: Environment check
-- Confirmed vLLM on the 5090:
-  - `/root/develop/xingming/.venv/bin/vllm --version` returned `0.19.1`.
-  - `uv pip list --python /root/develop/xingming/.venv/bin/python` showed `vllm 0.19.1`, `torch 2.10.0`, `flashinfer-python 0.6.6`, and `flashinfer-cubin 0.6.6`.
+- Confirmed vLLM in the benchmark environment:
+  - `vllm --version` returned `0.19.1`.
+  - `uv pip list --python <python-venv>/bin/python` showed `vllm 0.19.1`, `torch 2.10.0`, `flashinfer-python 0.6.6`, and `flashinfer-cubin 0.6.6`.
 - Confirmed model path:
-  - `/data/Qwen3-4B`, size `7.6G`.
+  - `<model-path>`, size `7.6G`.
 - Built PegaInfer server binary in the validation worktree:
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/.venv/bin/python cargo build --release -p pegainfer --bin pegainfer`
-  - The remote SSH session hung after the build process ended, but `target/release/pegainfer` existed with timestamp `2026-05-04 21:11`.
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo build --release -p pegainfer --bin pegainfer`
+  - The validation shell session hung after the build process ended, but `target/release/pegainfer` existed with timestamp `2026-05-04 21:11`.
 
 ### Step 2: vLLM run
 - First vLLM run used default prefix-cache behavior and showed prefix cache hits in the server log, so it was not used for the final comparison.
 - Reran vLLM with explicit `--no-enable-prefix-caching`.
 - Result directory:
-  - `/root/develop/xingming/bench_results/20260504-220139-bs1-in4096-out64/`
+  - `<bench-results-dir>`
 - Measured JSON:
   - `vllm-noprefix-in4096-out64-c1-n20.json`
 - Command shape:
-  - server: `vllm serve /data/Qwen3-4B --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.9 --max-num-seqs 1 --no-enable-prefix-caching --served-model-name Qwen3-4B`
-  - client: `vllm bench serve --backend openai --model Qwen3-4B --dataset-name random --input-len 4096 --output-len 64 --num-prompts 20 --request-rate inf --max-concurrency 1 --ignore-eos --temperature 0 --tokenizer /data/Qwen3-4B`
+  - server: `vllm serve <model-path> --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.9 --max-num-seqs 1 --no-enable-prefix-caching --served-model-name Qwen3-4B`
+  - client: `vllm bench serve --backend openai --model Qwen3-4B --dataset-name random --input-len 4096 --output-len 64 --num-prompts 20 --request-rate inf --max-concurrency 1 --ignore-eos --temperature 0 --tokenizer <model-path>`
 - Results:
   - completed `20`, failed `0`.
   - duration `11.968s`.
@@ -54,12 +53,12 @@
   - ITL median `6.389ms`, p99 `6.638ms`.
 
 ### Step 3: PegaInfer run
-- PegaInfer served model ID was `/data/Qwen3-4B`, not `Qwen3-4B`, so the client model name was set to `/data/Qwen3-4B`.
+- PegaInfer served model ID was `<model-path>`, not `Qwen3-4B`, so the client model name was set to `<model-path>`.
 - Measured JSON:
   - `pegainfer-in4096-out64-c1-n20.json`
 - Command shape:
-  - server: `target/release/pegainfer --model-path /data/Qwen3-4B --port 8000`
-  - client: same `vllm bench serve` shape as vLLM, except `--model /data/Qwen3-4B`.
+  - server: `target/release/pegainfer --model-path <model-path> --port 8000`
+  - client: same `vllm bench serve` shape as vLLM, except `--model <model-path>`.
 - Raw results:
   - completed `20`, failed `0`.
   - duration `11.287s`.
@@ -87,7 +86,7 @@
 - **Outcome**: Completed the `bs=1`, `4k input`, `64 output` single-concurrency probe on RTX 5090. PegaInfer has better prefill/TTFT and slightly slower decode TPOT; wall-clock request throughput is higher because TTFT dominates this shape.
 - **Pitfalls encountered**:
   - The first vLLM measurement had prefix cache hits. It was rerun with `--no-enable-prefix-caching`.
-  - The remote SSH session can remain open after some long build/server scripts even when the remote work has finished; checking remote process state is necessary before assuming a command is still running.
+  - The validation shell session can remain open after some long build/server scripts even when the validation work has finished; checking validation process state is necessary before assuming a command is still running.
   - PegaInfer's vLLM frontend overreported streaming `completion_tokens` for this benchmark, so the raw output throughput field in `vllm bench` JSON is not reliable for PegaInfer here.
 - **Lessons learned**:
   - For fixed-output PegaInfer comparisons through `vllm bench serve`, trust TTFT/TPOT/ITL and recompute output throughput from requested output length until streaming usage accounting is fixed.

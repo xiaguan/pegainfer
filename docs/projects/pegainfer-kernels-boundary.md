@@ -11,7 +11,7 @@
   - `docs/projects/q2-2026-plan.md` - established the existing Q2 direction around batching hardening, PegaFlow integration, and observability.
   - `docs/resources/kernel-technology-reference.md` - captured the current three-tier operator stack and the policy for choosing kernel technologies.
   - `docs/resources/model-optimization-pipeline.md` - defined per-model optimization docs, DAG expansion, and profiling-driven optimization.
-  - Local source in `src/model_executor.rs`, `src/scheduler_qwen35.rs`, `src/model/qwen35/`, the DSV3 worktree, `vllm_frontend.rs`, and `/Users/mac/code/pegaflow` - confirmed that model execution, KV/state layout, communication, and kernel needs diverge materially by model family.
+  - Local source in `src/model_executor.rs`, `src/scheduler_qwen35.rs`, `src/model/qwen35/`, the DSV3 worktree, `vllm_frontend.rs`, and `../pegaflow` - confirmed that model execution, KV/state layout, communication, and kernel needs diverge materially by model family.
 - **Relevant history**:
   - `docs/projects/model-forward-trait.md` and `docs/projects/runtime-complexity-paydown.md` pursued shared model execution boundaries.
   - `docs/projects/qwen3-tp-design.md` moved Qwen3 toward a controller/worker executor model.

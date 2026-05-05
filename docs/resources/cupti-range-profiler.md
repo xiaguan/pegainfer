@@ -1,7 +1,7 @@
 # CUPTI Range Profiler Notes
 
 **Status**: Active
-**TL;DR**: CUPTI Range Profiler works for pegainfer kernel reports, but the NVPerf stack on the 5090/CUDA 12.9 box is sensitive to user range names. Keep range names short and treat them as profiler IDs only; store full model/op/shape metadata in the JSON report. Run one unprofiled pre-measure launch before `cuptiRangeProfilerStart` so the first measured range does not include CUDA lazy initialization. Qwen3 attention reports store raw CUPTI metric names and values, including tensor-pipe/BF16-HMMA peak percentages for attention-core questions.
+**TL;DR**: CUPTI Range Profiler works for pegainfer kernel reports, but the NVPerf stack on RTX 5090/CUDA 12.9 is sensitive to user range names. Keep range names short and treat them as profiler IDs only; store full model/op/shape metadata in the JSON report. Run one unprofiled pre-measure launch before `cuptiRangeProfilerStart` so the first measured range does not include CUDA lazy initialization. Qwen3 attention reports store raw CUPTI metric names and values, including tensor-pipe/BF16-HMMA peak percentages for attention-core questions.
 
 ## Current Use
 
@@ -11,7 +11,7 @@
 
 The report runner should enable CUPTI by default. Use `--no-cupti` only for latency-only local validation or when the host profiler stack is unavailable.
 
-## 5090 Finding
+## RTX 5090 Finding
 
 Environment:
 
@@ -50,7 +50,7 @@ Operational rule until we test more CUDA/NVPerf versions: keep CUPTI range names
 
 ## Measurement Rules
 
-- Run one unprofiled `launch_once(path)` plus stream sync before the profiled range. Without this, the first profiled case can include lazy CUDA/module initialization. On 5090, `bs=1,ctx=1024,non_partition` reported about `3528us` before this pre-measure launch and `87us` after it.
+- Run one unprofiled `launch_once(path)` plus stream sync before the profiled range. Without this, the first profiled case can include lazy CUDA/module initialization. On RTX 5090, `bs=1,ctx=1024,non_partition` reported about `3528us` before this pre-measure launch and `87us` after it.
 - Clear L2 in the prepare callback before `cuptiRangeProfilerStart`; synchronize after prepare and after the profiled launch.
 - Do not use `cudaCtxResetPersistingL2Cache` / `cuCtxResetPersistingL2Cache` as a general cache-clear primitive. Those APIs reset persisting L2 lines to normal status; they do not evict ordinary L2 contents. Use the benchmark sweep buffer for cache-cleared timing.
 - Profile one user range per call. Keep range names deterministic but compact.
@@ -87,14 +87,15 @@ Why these SM/tensor counters:
 
 Do not grow this into a full NCU replacement. If the question is stall reason, issue mix, tensor-core use, or scheduler detail, take an NCU profile.
 
-On the 5090 validation host, `ncu` is available at `/usr/local/cuda/bin/ncu`; non-interactive SSH shells may not have that directory in `PATH`.
+On the CUDA validation host, `ncu` is available at `/usr/local/cuda/bin/ncu`; non-interactive shells may not have that directory in `PATH`.
 
 ## Verified Minimal Run
 
-Verified on 5090 after switching to short range names and adding the unprofiled pre-measure launch:
+Verified on the CUDA validation host after switching to short range names and adding the unprofiled pre-measure launch:
 
 ```bash
-ssh 5090 'bash -ic "cd /root/develop/xingming/pegainfer && PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_report_cupti_min.json"'
+cd <validation-checkout>
+PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_report_cupti_min.json
 ```
 
 Result:

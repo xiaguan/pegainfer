@@ -2,7 +2,7 @@
 
 **Created**: 2026-05-03
 **Status**: complete
-**TL;DR**: Phase 1 now extracts the Qwen3-4B dense full-attention kernel surface into `crates/pegainfer-kernels`, with a compact kernel index so future LLM sessions can jump from model DAG nodes to Rust wrappers, FFI symbols, CUDA/Triton sources, and shape constraints. `KvPool`, `PagePool`, and `SamplingParams` stay in the root runtime. Local metadata/format checks pass; 5090 release build, release test-target compilation, release clippy, Qwen3-4B e2e, and `bench_serving snapshot` pass.
+**TL;DR**: Phase 1 now extracts the Qwen3-4B dense full-attention kernel surface into `crates/pegainfer-kernels`, with a compact kernel index so future LLM sessions can jump from model DAG nodes to Rust wrappers, FFI symbols, CUDA/Triton sources, and shape constraints. `KvPool`, `PagePool`, and `SamplingParams` stay in the root runtime. Local metadata/format checks pass; GPU release build, release test-target compilation, release clippy, Qwen3-4B e2e, and `bench_serving snapshot` pass.
 
 ## Preparation
 
@@ -11,7 +11,6 @@
   - `docs/projects/pegainfer-kernels-boundary.md` - recorded the per-model engine direction, but its near-term ordering needs to be corrected from ledger-first to crate-first.
   - `docs/resources/kernel-technology-reference.md` - confirmed the current production stack: cuBLAS for dense GEMM, CUDA for decode-critical kernels, and Triton AOT where appropriate.
   - `docs/projects/qwen3-tp-design.md` - confirmed Qwen3-4B TP constraints and runtime hazards around per-thread CUDA/cuBLAS state.
-  - `docs/resources/5090.md` - confirmed the remote build box path, SM target, venv, and release validation commands.
   - `src/model/qwen3/*`, `src/ops/*`, `src/ffi.rs`, `src/tensor.rs`, `src/kv_pool.rs`, `src/page_pool.rs`, and `build.rs` - mapped the current Qwen3-4B kernel calls, tensor/runtime dependencies, paged KV metadata, and CUDA/Triton build pipeline.
 - **Relevant history**:
   - `docs/projects/model-forward-trait.md` and `docs/projects/runtime-complexity-paydown.md` tried to share model execution too broadly; this work should share only the kernel layer and leave runtime policy in root.
@@ -63,54 +62,53 @@
 - `cargo fmt --all` applied formatting, then `cargo fmt --all --check` passed.
 - `PEGAINFER_CUDA_SM=120 cargo check --release` reached the `pegainfer-kernels` build script and failed at `nvcc` execution because this machine has no `nvcc`.
 
-### Step 6: 5090 release compile
-- Avoided overwriting `/root/develop/xingming/pegainfer` because that remote checkout has unrelated uncommitted work.
-- Synced the local working tree to `/root/develop/xingming/pegainfer-kernels-crate-build` with `rsync`, excluding `.git/`, `target/`, `.venv/`, and `models/`.
-- Copied the existing remote FlashInfer submodule contents from `/root/develop/xingming/pegainfer/third_party/flashinfer` into `crates/pegainfer-kernels/third_party/flashinfer` inside the build directory.
-- `PEGAINFER_CUDA_SM=120 cargo build --release` passed on 5090. First pass exposed two Rust warnings from this split (`SamplingParams::is_greedy` unused and root `PrefillPagedPlan` visibility too wide); both were cleaned up.
+### Step 6: GPU release compile
+- Avoided overwriting `<validation-checkout>` because that validation checkout has unrelated uncommitted work.
+- Synced the local working tree to `<validation-worktree>` with `rsync`, excluding `.git/`, `target/`, `.venv/`, and `models/`.
+- Copied the existing validation FlashInfer submodule contents from `<validation-checkout>/third_party/flashinfer` into `crates/pegainfer-kernels/third_party/flashinfer` inside the build directory.
+- `PEGAINFER_CUDA_SM=120 cargo build --release` passed on the CUDA validation host. First pass exposed two Rust warnings from this split (`SamplingParams::is_greedy` unused and root `PrefillPagedPlan` visibility too wide); both were cleaned up.
 - Re-synced and reran `PEGAINFER_CUDA_SM=120 cargo build --release`; it passed in 14.16s with only build-script informational warnings.
 - `PEGAINFER_CUDA_SM=120 cargo test --release --no-run` passed in 12.28s and compiled all unit, binary, e2e, paged-attention, and regen test targets.
 
-### Step 7: 5090 e2e and serving benchmark
-- Ran Qwen3-4B e2e on the same remote build directory:
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release --test e2e -- --nocapture`
+### Step 7: GPU e2e and serving benchmark
+- Ran Qwen3-4B e2e on the same validation build directory:
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release --test e2e -- --nocapture`
   - Result: pass, 1 test passed in 9.36s.
   - Covered greedy golden outputs, multi-request generation, and consumer-drop scheduler survival.
 - Ran the standard in-process serving snapshot:
-  - `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path /data/Qwen3-4B snapshot`
+  - `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path <model-path> snapshot`
   - Result: pass.
   - RTX 5090 Qwen3-4B snapshot:
     - `prefill_heavy (10000,1)`: TTFT p50 `501.93ms`, p99 `503.75ms`.
     - `decode_heavy (1024,256)`: TPOT p50 `7.40ms`, p99 `7.46ms`.
-  - Snapshot was written on the remote build dir at `bench_snapshots/rtx-5090/qwen3-4b.json`.
+  - Snapshot was written on the validation build dir at `bench_snapshots/rtx-5090/qwen3-4b.json`.
   - Pulled the snapshot back into the local repo as `bench_snapshots/rtx-5090/qwen3-4b.json` so it can be committed with the crate split.
   - The isolated rsync build directory intentionally excludes `.git/`, so the generated `commit` field was `unknown`; after pulling it back, set it to the current local `HEAD` short hash `3448f87`.
-- Checked `/data/Qwen3.5-4B`; it is not present on this 5090 box, so no Qwen3.5 e2e was run.
+- Checked `<qwen35-model-path>`; it is not present on this CUDA validation host, so no Qwen3.5 e2e was run.
 
-### Step 8: 5090 clippy and final local checks
+### Step 8: GPU clippy and final local checks
 - Ran local `cargo fmt --all --check`: pass.
 - Ran local `cargo metadata --no-deps --format-version 1`: pass.
-- Synced the current working tree to `/root/develop/xingming/pegainfer-kernels-crate-build`.
-- Ran `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` on 5090: pass in 1m42s.
-- Updated `docs/resources/5090.md` with the temporary validation worktree path and usage.
+- Synced the current working tree to `<validation-worktree>`.
+- Ran `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` on the CUDA validation host: pass in 1m42s.
 
 ### Unexpected
 - Local `cargo check --release` reached `pegainfer-kernels` build script but failed because this machine does not have `nvcc`; the user will provide a GPU build machine for compilation.
 - A second `cargo check --release -p pegainfer-kernels --lib` without `PEGAINFER_CUDA_SM` failed earlier at GPU SM detection, which is expected on this local machine without `nvidia-smi`.
-- The 5090 main checkout was dirty, so verification used a separate remote build directory instead of modifying that checkout.
-- The 5090 isolated build directory does not include `.git/`, so `bench_serving snapshot` reports `commit: unknown`.
+- The validation checkout was dirty, so verification used a separate validation build directory instead of modifying that checkout.
+- The validation build directory does not include `.git/`, so `bench_serving snapshot` reports `commit: unknown`.
 
 ## Debrief
 
-- **Outcome**: Implemented and validated the crate-first Phase 1 split. Kernel source, Triton source, FlashInfer submodule ownership, CUDA/Triton build script, FFI, kernel ABI tensor helpers, paged-KV layout metadata, and Qwen3-used Rust ops now live under `crates/pegainfer-kernels`. Root `pegainfer` keeps server/model code, `KvPool`, `PagePool`, `SamplingParams`, and thin compatibility adapters. The split passes local format/metadata checks, 5090 release build/test-target compilation, release clippy, Qwen3-4B e2e, and the standard Qwen3-4B `bench_serving snapshot`.
+- **Outcome**: Implemented and validated the crate-first Phase 1 split. Kernel source, Triton source, FlashInfer submodule ownership, CUDA/Triton build script, FFI, kernel ABI tensor helpers, paged-KV layout metadata, and Qwen3-used Rust ops now live under `crates/pegainfer-kernels`. Root `pegainfer` keeps server/model code, `KvPool`, `PagePool`, `SamplingParams`, and thin compatibility adapters. The split passes local format/metadata checks, GPU release build/test-target compilation, release clippy, Qwen3-4B e2e, and the standard Qwen3-4B `bench_serving snapshot`.
 - **Pitfalls encountered**:
   - Root `src/ops/recurrent.rs` cannot be moved cleanly in this pass because it takes Qwen3.5's `GdrChunkwiseScratch35` type. Moving it would pull hybrid-model scratch ownership into the kernels crate, which is outside the Qwen3-4B Phase 1 scope.
   - Initially moved `KvPool`, `PagePool`, and `SamplingParams` into the kernels crate. That was too broad; those belong to runtime policy and have been moved back to root.
-  - Local compile verification is blocked by missing `nvcc`, so GPU compile verification should happen on 5090 or another CUDA build host.
+  - Local compile verification is blocked by missing `nvcc`, so GPU compile verification should happen on a CUDA build host.
 - **Lessons learned**:
   - The kernel crate should own source and build artifacts physically, not only re-export copied Rust wrappers. Keeping `csrc/`, `tools/triton/`, and `third_party/flashinfer` in root creates exactly the duplicate context we are trying to remove.
   - The human/LLM routing index belongs beside the kernels crate because it helps edit reusable kernels. Machine-readable model DAG manifests should not live there unless they are generated or validated; they belong with the model crate that owns the DAG.
 - **Follow-ups**:
   - Phase 2 can extract the Qwen3 model crate on top of `pegainfer-kernels`.
   - In the Qwen3 model crate, define the model-owned kernel DAG and decide whether any TOML/JSON manifest is generated from Rust code, validated against wrappers, or avoided entirely in favor of trace IDs emitted directly from the executor.
-  - Run Qwen3.5 e2e separately on a box with `/data/Qwen3.5-4B` if later changes touch the compatibility kernels or recurrent wrappers.
+  - Run Qwen3.5 e2e separately on a box with `<qwen35-model-path>` if later changes touch the compatibility kernels or recurrent wrappers.

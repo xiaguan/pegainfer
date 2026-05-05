@@ -23,7 +23,7 @@
   2. Add a model-local TOML manifest for Qwen3-4B kernel reports, initially covering only op names, phases, shape sweeps, and variants.
   3. Replace `crates/pegainfer-qwen3-4b/benches/qwen3_kernel_snapshot.rs` with a manifest-driven `qwen3_kernel_report` bin; do not keep a bench wrapper.
   4. Add a composition command that reads per-op case results and emits a decode phase report by joining the manifest's op repeat rules with measured per-op reports.
-  5. Run formatting and the strongest local compile checks available; GPU execution may still require the 5090 box because this machine lacks local CUDA tooling.
+  5. Run formatting and the strongest local compile checks available; GPU execution may still require the CUDA validation host because this machine lacks local CUDA tooling.
 - **Risks / open questions**:
   - The first composition report can only explain measured ops. It should report uncovered/residual structure explicitly instead of pretending to estimate full TPOT from one op.
   - Adding more providers later should not require changing the per-op report schema, so the first schema needs stable IDs and generic `serde_json::Value` fields for shape and selector keys.
@@ -48,11 +48,11 @@
 ### Step 4: Local validation
 - `cargo fmt --all --check` passed.
 - `cargo metadata --no-deps --format-version 1` passed.
-- Local `cargo check --release -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot` previously failed before Rust type checking because this Mac lacks a usable `nvcc`; GPU validation moved to the 5090 box.
+- Local `cargo check --release -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot` previously failed before Rust type checking because this local host lacks a usable `nvcc`; GPU validation moved to the CUDA validation host.
 
-### Step 5: 5090 minimal validation
-- Rebuilt the disposable 5090 worktree at `/root/develop/xingming/pegainfer-kernels-crate-build` from local `HEAD` commit `612850f`, then rsynced the current working tree changes over it.
-- Copied initialized FlashInfer headers from `/root/develop/xingming/pegainfer/third_party/flashinfer` into the clean worktree's `crates/pegainfer-kernels/third_party/flashinfer` directory.
+### Step 5: GPU minimal validation
+- Rebuilt the disposable validation worktree at `<validation-worktree>` from local `HEAD` commit `612850f`, then rsynced the current working tree changes over it.
+- Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `crates/pegainfer-kernels/third_party/flashinfer` directory.
 - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
 - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out /tmp/qwen3_kernel_op_report_min.json` passed.
 - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base /tmp/qwen3_kernel_op_report_min.json --new /tmp/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
@@ -60,8 +60,8 @@
 - CUPTI minimal validation passed with `non_partition,split_kv_256x64` at `bs=1,ctx=1024`; the report contained 2 cases, 1 selection, CUPTI metrics for both cases, and selected `split_kv_256x64`.
 - Default package build without the report feature also passed: `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b`.
 
-### Step 6: Full 5090 manifest run
-- Ran the full manifest command on the 5090 validation worktree:
+### Step 6: Full GPU manifest run
+- Ran the full manifest command on the validation worktree:
   - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --out /tmp/qwen3_kernel_report_full.json`
 - Result:
   - `126` cases: `6` batch sizes x `7` context lengths x `3` variants.
@@ -88,8 +88,8 @@
   - Output total: cold-L2 `958.473us`, `split_kv_256x64` repeated across 36 layers.
   - Coverage note still applies: only `paged_decode_attention` is included; linear, MLP, norm, embedding, and sampling are not covered yet.
 - Preserved the generated JSONs under:
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-164134/qwen3_kernel_report_full.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-164134/qwen3_kernel_composition_full_bs1_ctx4096.json`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
 
 ### Step 7: Remove warm-cache latency
 - CUDA official APIs expose `cudaCtxResetPersistingL2Cache` / `cuCtxResetPersistingL2Cache` for resetting persisting L2 lines to normal status, not for evicting ordinary L2 cache contents. The report runner therefore keeps the explicit L2 sweep buffer for cache-cleared timing.
@@ -120,7 +120,7 @@
   - removed old split-K tuning sweep constants;
   - removed `default_attention_kernel_specs`;
   - removed the old multi-launch `measure_decode_only` helper and `INNER_LAUNCHES`.
-- 5090 validation in `/root/develop/xingming/pegainfer-kernels-crate-build`:
+- GPU validation in `<validation-worktree>`:
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
   - Decode report, `bs=1,ctx=1024`, no CUPTI, `iters=3`: `2` cases, `0` errors, selected `split_kv_256x64`; measured `non_partition=45.739us`, `split_kv_256x64=20.480us`.
@@ -134,7 +134,7 @@
 - Removed derived CUPTI fields such as `gpu_time_us`, `dram_gb_s`, `dram_peak_pct`, and `kv_read_over_dram_read_pct`.
 - Removed the compare-time DRAM read-amplification gate. `compare` now gates only `latency_us`; metric interpretation is intentionally outside the runner.
 - Bumped op report schema to `4` and composition report schema to `3`.
-- 5090 validation:
+- GPU validation:
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
   - Decode raw-CUPTI validation: `2` cases, `0` errors, schema `4`; `case.cupti` keys were exactly the configured CUPTI metric names.
@@ -143,20 +143,20 @@
   - Composition consumed the schema-4 decode report and wrote a schema-3 composition report.
 
 ### Step 11: Full raw-CUPTI cold-L2 manifest run
-- Preserved full-run JSONs under `/root/develop/xingming/pegainfer-kernel-reports/20260504-172531-raw-cupti-full/`.
+- Preserved full-run JSONs under `<kernel-report-dir>`.
 - Decode full command:
-  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --out /root/develop/xingming/pegainfer-kernel-reports/20260504-172531-raw-cupti-full/qwen3_paged_decode_attention_full.json`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --out <kernel-report-dir>`
   - Result: schema `4`, `126` cases, `42` selections, `0` errors, `126` CUPTI cases, `128` measured iterations, elapsed `2:11.77`.
   - Selection counts: `split_kv_256x64=22`, `non_partition=13`, `split_kv_512x64=7`.
   - `case.cupti` contains exactly the configured CUPTI metric names. Cases and selections do not contain `diagnosis`.
 - Prefill full command:
-  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --op paged_prefill_attention --out /root/develop/xingming/pegainfer-kernel-reports/20260504-172531-raw-cupti-full/qwen3_paged_prefill_attention_full.json`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --op paged_prefill_attention --out <kernel-report-dir>`
   - Result: schema `4`, `7` cases, `7` selections, `0` errors, `7` CUPTI cases, `128` measured iterations, elapsed `0:07.43`.
   - Latency by `seq_len`: `128=24.687us`, `512=53.467us`, `1024=143.462us`, `2048=318.688us`, `4096=911.097us`, `8192=3015.025us`, `10000=4316.861us`.
   - `case.cupti` contains exactly the configured CUPTI metric names. Cases and selections do not contain `diagnosis`.
 - Both decode and prefill full JSONs passed self-compare with `warnings=0 failures=0`.
 - Decode composition command:
-  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input /root/develop/xingming/pegainfer-kernel-reports/20260504-172531-raw-cupti-full/qwen3_paged_decode_attention_full.json --batch-size 1 --context 4096 --out /root/develop/xingming/pegainfer-kernel-reports/20260504-172531-raw-cupti-full/qwen3_decode_attention_composition_bs1_ctx4096.json`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input <kernel-report-dir> --batch-size 1 --context 4096 --out <kernel-report-dir>`
   - Result: schema `3`, no `diagnosis`, total decode-attention-only contribution `958.527us`.
 
 ### Step 12: Split prefill stages
@@ -166,8 +166,8 @@
   - `prefill_attention_core`: `batch_prefill_paged_cuda`
 - Added `PrefillStage` launch paths in `kernel_bench.rs`. For stage reports, prerequisites run outside the timed/profiled launch and then L2 is swept before the measured stage. This keeps each stage report tied to one target kernel while still preparing valid inputs.
 - Added the three stage ops to `kernel_manifests/qwen3-4b.toml`; each currently covers `batch_size=[1]` and the same `seq_len` grid as the full prefill report.
-- Preserved stage JSONs under `/root/develop/xingming/pegainfer-kernel-reports/20260504-173633-prefill-stages/`.
-- 5090 validation:
+- Preserved stage JSONs under `<kernel-report-dir>`.
+- GPU validation:
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
   - Full stage reports passed self-compare with `warnings=0 failures=0`.
@@ -189,11 +189,11 @@
 ### Step 13: Compare paged and single prefill attention core at 10k
 - Added report support for `single_prefill_attention_core`, backed by `single_prefill_cuda` with contiguous HND K/V buffers. This is a comparison point for the same single-request causal prefill attention core without paged KV indirection.
 - Generalized `AttentionPrefillCase` to support `batch_size > 1` using `PrefillPagedPlan::new_batch`, so the current paged attention core can be profiled at `bs=2`.
-- Preserved sequential JSONs under `/root/develop/xingming/pegainfer-kernel-reports/20260504-174843-prefill-single-bs2-seq/`:
+- Preserved sequential JSONs under `<kernel-report-dir>`:
   - `paged_attention_core_bs1_seq10000.json`
   - `single_attention_core_bs1_seq10000.json`
   - `paged_attention_core_bs2_seq10000.json`
-- The earlier concurrent run in `/root/develop/xingming/pegainfer-kernel-reports/20260504-174753-prefill-single-bs2/` is not used for conclusions because the paged `bs=1` wall latency was inflated by simultaneous GPU work.
+- The earlier concurrent run in `<kernel-report-dir>` is not used for conclusions because the paged `bs=1` wall latency was inflated by simultaneous GPU work.
 - All three sequential JSONs passed self-compare with `warnings=0 failures=0`.
 - Sequential results:
   - Paged `bs=1,seq=10000`: `3983.682us`, `gpu__time_duration.sum=4019.648us`, SM throughput `41.527%`, active warps `16.030%`, DRAM `205.001MB`, L2 `6650.173MB`.
@@ -204,18 +204,18 @@
   - Local `cargo fmt --all --check` passed.
   - Local `cargo metadata --no-deps --format-version 1` passed.
   - Local `git diff --check` passed.
-  - 5090 `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
+  - CUDA host `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
 
 ### Step 14: Add direct tensor-path CUPTI metrics
-- Investigated the 5090 metric catalog with `/usr/local/cuda/bin/ncu --query-metrics-mode all --query-metrics --devices 0`. Non-interactive SSH shells did not have `ncu` in `PATH`, but the binary exists under `/usr/local/cuda/bin/ncu`.
+- Investigated the RTX 5090 metric catalog with `/usr/local/cuda/bin/ncu --query-metrics-mode all --query-metrics --devices 0`. Non-interactive shells did not have `ncu` in `PATH`, but the binary exists under `/usr/local/cuda/bin/ncu`.
 - Added direct tensor-path metrics to the default CUPTI list instead of adding runner-owned MFU fields:
   - `sm__cycles_elapsed.avg.per_second`
   - `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`
   - `sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed`
   - `sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed`
   - `sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_second`
-- Preserved the tensor-metric validation JSON under `/root/develop/xingming/pegainfer-kernel-reports/20260504-181000-prefill-attn-tensor-metrics/paged_attention_core_bs1_seq10000_default_tensor_metrics.json`.
-- 5090 validation for `prefill_attention_core bs=1 seq=10000` passed with `0` case errors. Key raw CUPTI values:
+- Preserved the tensor-metric validation JSON under `<kernel-report-dir>`.
+- GPU validation for `prefill_attention_core bs=1 seq=10000` passed with `0` case errors. Key raw CUPTI values:
   - `latency_us=3978.180`
   - `gpu__time_duration.sum=4015.616us`
   - `sm__cycles_elapsed.avg.per_second=2.926GHz`
@@ -227,7 +227,7 @@
 
 ### Step 15: NCU explanation for 10k prefill attention core
 - Collected a targeted Nsight Compute profile for the second `BatchPrefillWithPagedKVCacheKernel` launch in `prefill_attention_core bs=1 seq=10000`:
-  - Report: `/root/develop/xingming/pegainfer-kernel-reports/20260504-182000-ncu-prefill-attn/attention_core_deep.ncu-rep`
+  - Report: `<kernel-report-dir>`
   - Command used `/usr/local/cuda/bin/ncu` with `--kernel-name regex:BatchPrefillWithPagedKVCache`, `--launch-skip-before-match 1`, `--launch-count 1`, and sections `SpeedOfLight`, `SchedulerStats`, `WarpStateStats`, `MemoryWorkloadAnalysis`, `Occupancy`.
 - Kernel identity:
   - `BatchPrefillWithPagedKVCacheKernel<KernelTraits<1,128,2,2,8,8,4,1,...>>`
@@ -271,7 +271,7 @@
 - The wrapper currently transposes `Q_PAGED_KV_NHD` to HND with `.transpose(-3, -2).contiguous()`. PegaInfer's KV pool is page-first NHD with separate K/V offsets across layers, so the zero-copy route would need either an HND view/storage path or a lower-level wrapper that bypasses the Python NHD transpose.
 - Under the hood, FlashInfer generates FMHA v2 sources through `gen_fmha_v2_module(...)`, compiles generated kernels plus `fmha_v2_run.cu`, and exports `run` through TVM FFI (`fmha_v2_jit_binding.cu`). Direct Rust/CUDA integration is therefore not a drop-in header include like the current FA2 path.
 - Practical use options:
-  - Lowest risk: benchmark it through FlashInfer's Python API on the 5090 with Qwen3-equivalent tensors to decide whether it beats FA2 at `seq_len=10000`.
+  - Lowest risk: benchmark it through FlashInfer's Python API on RTX 5090 with Qwen3-equivalent tensors to decide whether it beats FA2 at `seq_len=10000`.
   - Medium effort: build a standalone C++ prototype that reuses generated FMHA v2 sources and constructs the required `TensorView` objects, accepting the TVM FFI dependency.
   - Higher effort: vendor a small generated-kernel subset and write a dedicated C ABI around FMHA v2 dispatch, avoiding Python at runtime but still adding nontrivial build integration.
 
@@ -280,13 +280,13 @@
   - `flashinfer-python` is the core package.
   - `flashinfer-cubin` provides precompiled cubins.
   - `flashinfer-jit-cache` provides prebuilt JIT cache packages for specific CUDA versions.
-- The 5090 environment already has a uv-created venv at `/root/develop/xingming/.venv`:
+- The validation environment already has a uv-created venv at `<python-venv>`:
   - Python `3.13.11`, `uv 0.9.21`.
   - `torch 2.10.0+cu128`.
   - `flashinfer-python 0.6.6` and `flashinfer-cubin 0.6.6`.
   - The official package does not expose `trtllm_fmha_v2_prefill`; it exposes `get_trtllm_gen_prefill_module` and the public `BatchPrefillWithPagedKVCacheWrapper` API.
 - Benchmarked local-source `trtllm_fmha_v2_prefill` through the uv venv and local FlashInfer checkout because the package API did not export it:
-  - Report: `/root/develop/xingming/pegainfer-kernel-reports/20260504-184323-flashinfer-fmha-v2-python-release/qwen3_trtllm_fmha_v2_prefill_python_release.json`
+  - Report: `<kernel-report-dir>`
   - Shape: `seq_len=10000`, `page_size=16`, `num_qo_heads=32`, `num_kv_heads=8`, `head_dim=128`, BF16, causal, `128 MiB` workspace, CUDA event timing, `100` measured launches after `10` untimed launches.
   - Used a dedicated `FLASHINFER_WORKSPACE_BASE` under the report directory and explicitly set `FLASHINFER_JIT_DEBUG=0`, `FLASHINFER_JIT_VERBOSE=0`, `FLASHINFER_JIT_LINEINFO=0`.
   - Verified generated `build.ninja` files had `-O3` and did not contain `-O0`, `-G`, or `CUTLASS_DEBUG_TRACE_LEVEL`.
@@ -301,11 +301,11 @@
   - Local-source FMHA v2 HND is `1.587x` slower than current paged FA2 at `bs=1`; its `bs=2` total is `1.540x` slower than current paged FA2 `bs=2`.
   - NHD and HND are effectively the same latency in this direct function test (`1.003x` ratio), but the Python NHD path includes a contiguous transpose before the kernel and is therefore not a zero-copy integration path for PegaInfer.
 - Also tested the official package public wrapper:
-  - Report: `/root/develop/xingming/pegainfer-kernel-reports/20260504-184657-flashinfer-package-trtllm-gen-prefill/qwen3_flashinfer_package_trtllm_gen_prefill.json`
+  - Report: `<kernel-report-dir>`
   - `backend="fa2"`, `kv_layout="NHD"`, `bs=1`: median `4095.216us`, close to our current FA2 path.
   - `backend="trtllm-gen"` initially hit a Python wrapper bug when passing `max_token_per_sequence` / `max_sequence_kv`: `UnboundLocalError: qo_indptr_host`.
   - Retrying without those max arguments reached the underlying TRT-LLM runner and failed for all tested `trtllm-gen` cases with `Unsupported architecture` on RTX 5090:
-    `/root/develop/xingming/pegainfer-kernel-reports/20260504-184829-flashinfer-package-trtllm-gen-prefill-no-max/qwen3_flashinfer_package_trtllm_gen_prefill_no_max.json`.
+    `<kernel-report-dir>`.
 - Conclusion: there is no measured reason to wire `trtllm_fmha_v2_prefill` into PegaInfer for the Qwen3 10k BF16 prefill attention core on RTX 5090. The current FA2 path is materially faster, and the official package's public `trtllm-gen` wrapper is not usable on this GPU through the tested release package.
 
 ### Step 19: Tune FA2 prefill CTA tile Q
@@ -318,13 +318,13 @@
   - Exposed `PrefillPagedPlan::new_with_cta_tile_q` / `new_batch_with_cta_tile_q` through `pegainfer-core`.
   - Switched Qwen3 production prefill planning to model-local `PREFILL_ATTENTION_CTA_TILE_Q = 64`; the global FlashInfer heuristic is unchanged.
 - Preserved tile-sweep JSONs under:
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/prefill_attention_core_cta_sweep_seq10000_no_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/prefill_attention_core_cta_sweep_seq10000_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/prefill_attention_core_cta_sweep_all_seq_no_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/paged_prefill_attention_cta_sweep_all_seq_no_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/paged_prefill_attention_cta_q64_seq10000_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/prefill_attention_core_cta_q64_bs1_bs2_seq10000_no_cupti.json`
-  - `/root/develop/xingming/pegainfer-kernel-reports/20260504-185613-prefill-cta-tile-sweep/paged_prefill_attention_cta_q64_bs1_bs2_seq10000_no_cupti.json`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
+  - `<kernel-report-dir>`
 - `prefill_attention_core`, `bs=1,seq=10000`, no CUPTI, `64` measured iterations:
   - `default`: `4012.176us`.
   - `cta_q128`: `4015.460us`.
@@ -349,7 +349,7 @@
 - `bs=2,seq=10000` check:
   - Attention core: default `7542.625us` total vs `cta_q64=7403.535us`, about `1.9%` faster.
   - Full paged prefill op: default `8241.567us` total vs `cta_q64=8113.489us`, about `1.6%` faster.
-- 5090 validation:
+- GPU validation:
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
   - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b` passed.
   - `PEGAINFER_CUDA_SM=120 cargo test --release -p pegainfer-qwen3-4b` ran, but the existing `batch_decode::tests::batch_matches_sequential` test failed before exercising this change because the validation worktree has no model weights at the default model path (`No such file or directory` from `Qwen3Model::from_safetensors_with_runtime`). The earlier release builds and report runs are the validation for this kernel-level change.
@@ -362,27 +362,27 @@
   - `cargo fmt --all --check`
   - `cargo metadata --no-deps --format-version 1 >/tmp/pegainfer_metadata.json`
   - `git diff --check`
-- 5090 release clippy passed on the synced validation worktree:
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/.venv/bin/python cargo clippy --release -p pegainfer-kernels --all-targets -- -D warnings`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/.venv/bin/python cargo clippy --release -p pegainfer-core --all-targets -- -D warnings`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/.venv/bin/python cargo clippy --release -p pegainfer-qwen3-4b --features kernel-report --all-targets -- -D warnings`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/.venv/bin/python cargo clippy --release -p pegainfer --bin pegainfer -- -D warnings`
+- GPU release clippy passed on the synced validation worktree:
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-kernels --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-core --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-qwen3-4b --features kernel-report --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer --bin pegainfer -- -D warnings`
 
 ## Debrief
 
-- **Outcome**: Replaced the Qwen3 kernel snapshot bench with a normal, feature-gated `qwen3_kernel_report` binary. The runner now covers paged decode attention, paged prefill attention, split prefill stages, and contiguous single-request prefill attention core with cold-L2 latency only. Full 5090 manifest runs passed for decode/prefill, targeted 10k stage comparisons passed for paged `bs=1`, single contiguous `bs=1`, and paged `bs=2`, FlashInfer Python/package alternatives were measured for the same Qwen3 10k BF16 prefill attention-core shape, and Qwen3 production prefill now uses measured FA2 `CTA_TILE_Q=64`.
+- **Outcome**: Replaced the Qwen3 kernel snapshot bench with a normal, feature-gated `qwen3_kernel_report` binary. The runner now covers paged decode attention, paged prefill attention, split prefill stages, and contiguous single-request prefill attention core with cold-L2 latency only. GPU manifest runs passed for decode/prefill, targeted 10k stage comparisons passed for paged `bs=1`, single contiguous `bs=1`, and paged `bs=2`, FlashInfer Python/package alternatives were measured for the same Qwen3 10k BF16 prefill attention-core shape, and Qwen3 production prefill now uses measured FA2 `CTA_TILE_Q=64`.
 - **Pitfalls encountered**:
   - `cargo bench` appends a trailing `--bench` argument to `harness=false` binaries. That made the new `clap` parser fail and confirmed this should be a real bin, not a bench target.
   - A normal `src/bin` target cannot use dev-dependencies. Making report-only dependencies ordinary non-optional dependencies would pull CUPTI into default Qwen3/server builds, so the bin now uses `required-features = ["kernel-report"]`.
   - The first attempted full-run command removed `/tmp/qwen3_kernel_report_full.json` before running. Future profiling commands should not delete prior JSONs; save new reports under a timestamped or explicit report directory.
-  - The 5090 main checkout is dirty and lacked the local commit object, so validation used a bundle-derived clean worktree plus rsync of current changes.
+  - The validation checkout is dirty and lacked the local commit object, so validation used a bundle-derived clean worktree plus rsync of current changes.
   - FlashInfer's JIT environment treats `FLASHINFER_JIT_VERBOSE=1` as a debug build switch for backward compatibility. The first FMHA v2 cache contained `-O0 -G`; those results were discarded, and the release measurement used a separate cache directory with explicit debug flags disabled.
   - The official `flashinfer-python 0.6.6` package did not expose `trtllm_fmha_v2_prefill`. Its public `trtllm-gen` wrapper also has a plan-argument bug with explicit max lengths and then reports unsupported architecture on RTX 5090 once that is worked around.
-  - The temporary 5090 validation worktree does not have model weights under the default model path, so model-loading tests fail with `No such file or directory`. For kernel-report work, keep using report binaries and release builds unless a model path is explicitly staged.
+  - The temporary validation worktree does not have model weights under the default model path, so model-loading tests fail with `No such file or directory`. For kernel-report work, keep using report binaries and release builds unless a model path is explicitly staged.
 - **Lessons learned**:
   - Kernel reporting should be treated as tooling, not benchmarking harness plumbing. Cargo bench's hidden behavior is a poor fit for a manifest-driven CLI.
   - Report tooling that needs profiler libraries should be feature-gated from the production model crate dependency graph.
-  - Full manifest profiling is cheap enough for Qwen3 paged decode attention on 5090 with the previous grid: about three minutes for 126 CUPTI-covered cases.
+  - Full manifest profiling is cheap enough for Qwen3 paged decode attention on the CUDA validation host with the previous grid: about three minutes for 126 CUPTI-covered cases.
   - Warm-cache latency is not a useful selector metric for paged decode attention because the production path is dominated by KV reads that should be treated as cold or streaming.
   - Metric interpretation should stay out of the runner. Store raw CUPTI values in the JSON, then compute bandwidth, utilization labels, or IO-model checks in a separate report/notebook layer.
   - The prefill wrapper should stay reportable as a whole, but stage reports are necessary for actionable optimization. Whole-op CUPTI hid that `batch_prefill_paged_cuda` dominates long prompts.

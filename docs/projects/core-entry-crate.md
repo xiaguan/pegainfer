@@ -2,7 +2,7 @@
 
 **Created**: 2026-05-03
 **Status**: ready for diff review
-**TL;DR**: `pegainfer-core` now holds the shared runtime/API entry for future model crates. Root `pegainfer` remains the product entrypoint and vLLM frontend host. Trace is intentionally not part of the active public entry; the old file reporter stays as archived source only. Full 5090 release build, clippy, Qwen3 e2e, and `bench_serving snapshot` pass.
+**TL;DR**: `pegainfer-core` now holds the shared runtime/API entry for future model crates. Root `pegainfer` remains the product entrypoint and vLLM frontend host. Trace is intentionally not part of the active public entry; the old file reporter stays as archived source only. Full GPU release build, clippy, Qwen3 e2e, and `bench_serving snapshot` pass.
 
 ## Preparation
 
@@ -19,7 +19,7 @@
   2. Move shared runtime entry APIs into it: sampling params, tensor/FFI re-exports, paged KV/page pool, weight loading, CUDA graph state, simple KV cache, shared op adapters, and direct-model traits.
   3. Keep root `pegainfer` source paths as compatibility re-exports so existing tests, benches, Qwen3, and Qwen3.5 code continue to compile.
   4. Remove trace from active CLI/lib surface. Keep `src/trace_reporter.rs` as archived source, but do not export it from `lib.rs`.
-  5. Verify locally with format/metadata, then on 5090 with release build/test/e2e/full benchmark snapshot.
+  5. Verify locally with format/metadata, then on a CUDA validation host with release build/test/e2e/full benchmark snapshot.
 - **Risks / open questions**:
   - Visibility must become public in `pegainfer-core` where future model crates need the APIs. This broadens the API surface, but it is the point of the core crate.
   - Root compatibility re-exports should be temporary; once `pegainfer-qwen3` exists, root can depend on model crates directly instead of carrying old paths.
@@ -50,13 +50,13 @@
 - `cargo fmt --all --check` passes.
 - `cargo metadata --no-deps --format-version 1` passes.
 
-### Step 4: 5090 verification
-- Used the isolated build directory from `docs/resources/5090.md`: `/root/develop/xingming/pegainfer-kernels-crate-build`.
+### Step 4: GPU verification
+- Used `<validation-worktree>` as the CUDA validation checkout.
 - `PEGAINFER_CUDA_SM=120 cargo build --release` passes.
 - `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
 - `PEGAINFER_CUDA_SM=120 cargo build --release && PEGAINFER_CUDA_SM=120 cargo test --release --no-run` passes.
-- `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release --test e2e -- --nocapture` passes.
-- `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path /data/Qwen3-4B snapshot` passes:
+- `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release --test e2e -- --nocapture` passes.
+- `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path <model-path> snapshot` passes:
   - `prefill_heavy (10000,1)`: TTFT p50 `502.60ms`, p99 `503.94ms`
   - `decode_heavy (1024,256)`: TPOT p50 `7.39ms`, p99 `7.45ms`
 - Snapshot pulled back to `bench_snapshots/rtx-5090/qwen3-4b.json`.
