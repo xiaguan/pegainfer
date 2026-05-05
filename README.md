@@ -143,7 +143,7 @@ OpenAI-compatible `/v1/completions` endpoint.
 HTTP / vLLM frontend → EngineHandle → per-model engine crate
                                   │
                     ┌─────────────┴─────────────┐
-        pegainfer-qwen3-4b                 root Qwen3.5 engine
+        pegainfer-qwen3-4b              pegainfer-qwen35-4b
           (full attention)              (24 linear + 8 full attn)
                     │                             │
                     └────────────┬────────────────┘
@@ -160,7 +160,7 @@ HTTP / vLLM frontend → EngineHandle → per-model engine crate
 - **Fused operators** — attention and MLP are each a single kernel launch
 - **BF16 storage, FP32 accumulation** — numerical stability without memory overhead
 - **CUDA Graph** on decode path — eliminates kernel launch overhead
-- **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `crates/pegainfer-qwen3-4b`
+- **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `pegainfer-qwen3-4b`
 
 **Model details:**
 
@@ -177,7 +177,7 @@ HTTP / vLLM frontend → EngineHandle → per-model engine crate
 
 ```bash
 # Unit tests
-cargo test --release
+cargo test --release --workspace --lib
 
 # E2E greedy regression (needs GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
@@ -188,7 +188,7 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qw
 
 Triton compiles the Qwen3.5 compatibility AOT kernels at build time. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
 
-See `crates/pegainfer-kernels/tools/triton/README.md` for setup and troubleshooting.
+See `pegainfer-kernels/tools/triton/README.md` for setup and troubleshooting.
 
 ### Source Layout
 
@@ -196,37 +196,38 @@ See `crates/pegainfer-kernels/tools/triton/README.md` for setup and troubleshoot
 <summary>Expand</summary>
 
 ```
-src/
-├── main.rs                # CLI + vLLM/OpenAI server startup
-├── vllm_frontend.rs       # vLLM engine-core bridge into a generic EngineHandle
-├── server_engine.rs       # Model detection and shared server helpers
-├── scheduler.rs           # Compatibility re-export of core engine request/event types
-├── ops.rs                 # Compatibility re-export of shared GPU ops
-├── ops/
-│   └── tests.rs           # Root operator smoke tests
-├── tensor.rs              # Re-export of pegainfer-kernels tensor types
-├── sampler.rs             # Temperature, top-k, top-p sampling
-└── logging.rs             # Runtime logging setup
+Cargo.toml                         # Virtual workspace root
 
-crates/pegainfer-core/             # Shared runtime API for model crates
+pegainfer-server/                  # Product package: CLI, vLLM frontend, benchmarks
+├── src/main.rs                    # CLI + vLLM/OpenAI server startup
+├── src/vllm_frontend.rs           # vLLM engine-core bridge into a generic EngineHandle
+├── src/server_engine.rs           # Model detection and shared server helpers
+├── src/scheduler.rs               # Compatibility re-export of core engine request/event types
+├── src/ops.rs                     # Compatibility re-export of shared GPU ops
+├── src/ops/tests.rs               # Server package operator smoke tests
+├── src/tensor.rs                  # Re-export of pegainfer-kernels tensor types
+├── src/sampler.rs                 # Temperature, top-k, top-p sampling
+└── src/logging.rs                 # Runtime logging setup
+
+pegainfer-core/                    # Shared runtime API for model crates
 ├── src/engine.rs                  # EngineHandle, GenerateRequest, TokenEvent
 ├── src/kv_pool.rs                 # Paged KV pool and request state
 ├── src/ops.rs                     # Shared op wrappers over pegainfer-kernels
 └── src/weight_loader.rs           # Safetensors helpers shared by model crates
 
-crates/pegainfer-kernels/          # Shared GPU kernel/runtime crate
+pegainfer-kernels/                 # Shared GPU kernel/runtime crate
 ├── KERNELS.md                     # LLM routing index for model op -> wrapper -> FFI -> source
 ├── src/                           # GPU tensor types, FFI, paged KV layout, Rust ops
 ├── csrc/                          # Hand-written CUDA / FlashInfer C++ wrappers
 └── tools/triton/                  # Triton AOT kernels (build-time compiled)
 
-crates/pegainfer-qwen3-4b/         # Qwen3-4B model-owned engine crate
+pegainfer-qwen3-4b/                # Qwen3-4B model-owned engine crate
 ├── src/                           # Config, weights, prefill/decode/unified, scheduler/executor
 ├── tests/                         # Qwen3 e2e, paged attention, regression data generation
 ├── benches/                       # Qwen3 model-level benchmarks
 └── src/kernel_plan.rs             # Model DAG phase -> kernel routing index
 
-crates/pegainfer-qwen35-4b/        # Qwen3.5-4B model-owned engine crate
+pegainfer-qwen35-4b/               # Qwen3.5-4B model-owned engine crate
 ├── src/                           # Config, weights, prefill/decode/unified, recurrent state, scheduler
 ├── tests/                         # Qwen3.5 exact e2e, scheduler e2e, regression data generation
 └── benches/                       # Qwen3.5 recurrent/norm operator benchmarks

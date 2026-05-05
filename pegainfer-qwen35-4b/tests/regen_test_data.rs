@@ -10,7 +10,7 @@ use vllm_text::tokenizer::DynTokenizer;
 mod common;
 
 const DEFAULT_QWEN35_MODEL_PATH: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3.5-4B");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 static GPU_REGEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -88,7 +88,7 @@ fn model_name(model_path: &str) -> String {
 
 fn test_data_path(model_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data")
+        .join("../test_data")
         .join(format!("{model_name}.json"))
 }
 

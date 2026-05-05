@@ -43,13 +43,13 @@ Verify:
 cargo build --release
 ```
 
-First build takes ~30s. Compiles CUDA kernels (`crates/pegainfer-kernels/csrc/*.cu`) and Triton AOT kernels (`crates/pegainfer-kernels/tools/triton/*.py`).
+First build takes ~30s. Compiles CUDA kernels (`pegainfer-kernels/csrc/*.cu`) and Triton AOT kernels (`pegainfer-kernels/tools/triton/*.py`).
 
 ## 4. Run Tests
 
 ```bash
-cargo test -r              # unit tests (~9s)
-cargo test -r --test e2e   # e2e: greedy correctness, streaming, consistency (~50s, needs GPU + model)
+cargo test -r --workspace --lib   # unit tests (~9s)
+cargo test -r -p pegainfer-qwen3-4b --test e2e     # Qwen3 e2e (~50s, needs GPU + model)
 ```
 
 > **Always use `--release`**. Debug builds are extremely slow for GPU code and will timeout.

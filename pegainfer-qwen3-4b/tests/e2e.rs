@@ -15,7 +15,7 @@ use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
+const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
 fn get_model_path() -> String {
     let model_path =
@@ -30,7 +30,7 @@ fn get_test_data_path(model_path: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(model_path);
     let test_data_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data")
+        .join("../test_data")
         .join(format!("{model_name}.json"));
     info!("Using test data path: {}", test_data_path.display());
     test_data_path

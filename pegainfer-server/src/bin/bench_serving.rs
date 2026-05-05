@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use vllm_text::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
-const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench_snapshots");
+const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
 const SNAPSHOT_DECODE_OUTPUT_LEN: usize = 256;
@@ -44,7 +44,7 @@ fn snapshot_prefill_prompt_len(_model_type: ModelType) -> usize {
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
 const DEFAULT_CURVE_PROMPT_LEN: usize = 512;
 const SYNTHETIC_PATTERN: &str = "token_id = 100 + (idx % 1000)";

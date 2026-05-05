@@ -1,0 +1,58 @@
+[package]
+autobenches = false
+name = "pegainfer-server"
+default-run = "pegainfer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pegainfer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pegainfer"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_serving"
+path = "src/bin/bench_serving.rs"
+
+[dependencies]
+pegainfer-core = { workspace = true }
+pegainfer-qwen3-4b = { workspace = true }
+pegainfer-qwen35-4b = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+comfy-table = { workspace = true }
+cudarc = { workspace = true }
+fastrace = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
+rand = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+vllm-engine-core-client = { workspace = true }
+vllm-server = { workspace = true }
+vllm-text = { workspace = true }
+zeromq = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "ops_bench"
+harness = false
+
+[[bench]]
+name = "nccl_bench"
+harness = false

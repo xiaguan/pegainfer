@@ -1,18 +1,13 @@
-[package]
-autobenches = false
-name = "pegainfer"
-default-run = "pegainfer"
-version = "0.1.0"
-edition = "2024"
-
 [workspace]
 resolver = "3"
+default-members = ["pegainfer-server"]
 members = [
-    "crates/pegainfer-core",
-    "crates/pegainfer-cupti",
-    "crates/pegainfer-kernels",
-    "crates/pegainfer-qwen3-4b",
-    "crates/pegainfer-qwen35-4b",
+    "pegainfer-server",
+    "pegainfer-core",
+    "pegainfer-cupti",
+    "pegainfer-kernels",
+    "pegainfer-qwen3-4b",
+    "pegainfer-qwen35-4b",
 ]
 
 [workspace.dependencies]
@@ -37,11 +32,11 @@ log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
 memmap2 = "0.9"
 parking_lot = "0.12.5"
-pegainfer-core = { path = "crates/pegainfer-core" }
-pegainfer-cupti = { path = "crates/pegainfer-cupti" }
-pegainfer-kernels = { path = "crates/pegainfer-kernels" }
-pegainfer-qwen3-4b = { path = "crates/pegainfer-qwen3-4b" }
-pegainfer-qwen35-4b = { path = "crates/pegainfer-qwen35-4b" }
+pegainfer-core = { path = "pegainfer-core" }
+pegainfer-cupti = { path = "pegainfer-cupti" }
+pegainfer-kernels = { path = "pegainfer-kernels" }
+pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
+pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }
 rand = "0.10"
 rmp-serde = "1.3"
 rmpv = "1.3"
@@ -98,46 +93,3 @@ rest_pat_in_fully_bound_structs = "warn"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 unreachable_pub = "warn"
-
-[dependencies]
-pegainfer-core = { workspace = true }
-pegainfer-qwen3-4b = { workspace = true }
-pegainfer-qwen35-4b = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
-colored = { workspace = true }
-comfy-table = { workspace = true }
-cudarc = { workspace = true }
-fastrace = { workspace = true }
-half = { workspace = true }
-log = { workspace = true }
-logforth = { workspace = true }
-rand = { workspace = true }
-rmp-serde = { workspace = true }
-rmpv = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
-vllm-engine-core-client = { workspace = true }
-vllm-server = { workspace = true }
-vllm-text = { workspace = true }
-zeromq = { workspace = true }
-
-[features]
-reference = []
-
-[dev-dependencies]
-criterion = { workspace = true }
-
-[lints]
-workspace = true
-
-[[bench]]
-name = "ops_bench"
-harness = false
-
-[[bench]]
-name = "nccl_bench"
-harness = false

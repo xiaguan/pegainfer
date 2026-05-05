@@ -23,7 +23,7 @@ struct NvccTask {
 }
 
 fn workspace_root() -> PathBuf {
-    crate_root().join("../..")
+    crate_root().join("..")
 }
 
 fn crate_root() -> PathBuf {
@@ -209,12 +209,12 @@ fn find_triton_python() -> Result<String, String> {
         let candidate = candidate.trim();
         if candidate.is_empty() {
             return Err(
-                "PEGAINFER_TRITON_PYTHON is set but empty. See crates/pegainfer-kernels/tools/triton/README.md.".to_string(),
+                "PEGAINFER_TRITON_PYTHON is set but empty. See pegainfer-kernels/tools/triton/README.md.".to_string(),
             );
         }
         return probe_triton_python(candidate).map_err(|message| {
             format!(
-                "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See crates/pegainfer-kernels/tools/triton/README.md."
+                "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See pegainfer-kernels/tools/triton/README.md."
             )
         });
     }

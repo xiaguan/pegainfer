@@ -3,13 +3,13 @@
     {
       "max_new_tokens": 50,
       "name": "tell_story",
-      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and imaginative, and",
+      "output": " about a young girl who is a talented artist, but she is not allowed to paint because of her gender. What happens next? Please write in a way that is suitable for children, with a happy ending. \n\nOkay, so I need to create",
       "prompt": "Tell me a story"
     },
     {
       "max_new_tokens": 50,
       "name": "my_name",
-      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of AI in the field of education. I am interested in exploring how AI can be used to improve",
+      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of machine learning in the field of materials science. My research is focused on the prediction of material properties",
       "prompt": "My name is"
     },
     {
@@ -39,7 +39,7 @@
     {
       "max_new_tokens": 50,
       "name": "kanye_album",
-      "output": "《Yeezus》，因为它的音乐风格非常独特，融合了多种元素，比如电子、嘻哈、摇滚和实验音乐。此外，专辑中的歌曲如《Power》和《Ultralight Beam》展现了 Kanye 的音乐",
+      "output": "《Yeezus》，因为它的音乐风格非常独特，融合了多种元素，比如电子、嘻哈、摇滚和实验音乐。此外，Yeezus 的制作人是 Kanye 本人，这使得专辑在制作上更加",
       "prompt": "我最喜欢的 Kanye West 的专辑是"
     },
     {

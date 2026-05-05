@@ -3036,37 +3036,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pegainfer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "comfy-table",
- "criterion",
- "cudarc",
- "fastrace",
- "half",
- "log",
- "logforth",
- "pegainfer-core",
- "pegainfer-qwen3-4b",
- "pegainfer-qwen35-4b",
- "rand 0.10.1",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "uuid",
- "vllm-engine-core-client",
- "vllm-server",
- "vllm-text",
- "zeromq",
-]
-
-[[package]]
 name = "pegainfer-core"
 version = "0.1.0"
 dependencies = [
@@ -3141,6 +3110,37 @@ dependencies = [
  "serde_json",
  "tokio",
  "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "comfy-table",
+ "criterion",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "logforth",
+ "pegainfer-core",
+ "pegainfer-qwen3-4b",
+ "pegainfer-qwen35-4b",
+ "rand 0.10.1",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "vllm-engine-core-client",
+ "vllm-server",
+ "vllm-text",
+ "zeromq",
 ]
 
 [[package]]

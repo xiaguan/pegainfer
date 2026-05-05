@@ -5,9 +5,9 @@
 
 ## Current Use
 
-- Rust wrapper: `crates/pegainfer-cupti`
-- C++ Range Profiler bridge: `crates/pegainfer-cupti/csrc/range_profiler.cpp`
-- Qwen3 paged decode report tool: `crates/pegainfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`
+- Rust wrapper: `pegainfer-cupti`
+- C++ Range Profiler bridge: `pegainfer-cupti/csrc/range_profiler.cpp`
+- Qwen3 paged decode report tool: `pegainfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`
 
 The report runner should enable CUPTI by default. Use `--no-cupti` only for latency-only local validation or when the host profiler stack is unavailable.
 

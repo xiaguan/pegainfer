@@ -61,7 +61,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
-if [[ -f .gitmodules ]] && [[ ! -f third_party/flashinfer/include/flashinfer/norm.cuh ]]; then
+if [[ -f .gitmodules ]] && [[ ! -f pegainfer-kernels/third_party/flashinfer/include/flashinfer/norm.cuh ]]; then
   git submodule update --init --recursive
 fi
 

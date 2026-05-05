@@ -114,7 +114,7 @@ mod tests {
     use super::*;
     use pegainfer_core::kv_pool::KvState;
 
-    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
     fn get_model_path() -> String {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())

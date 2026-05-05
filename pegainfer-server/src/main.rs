@@ -7,7 +7,7 @@ use pegainfer::logging;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer_core::engine::EngineLoadOptions;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
 #[derive(Parser)]
 #[command(name = "pegainfer", about = "Qwen3/3.5 GPU inference server")]

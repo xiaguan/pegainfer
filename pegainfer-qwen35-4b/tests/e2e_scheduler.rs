@@ -16,7 +16,7 @@ use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3.5-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
 fn get_model_path() -> String {
     std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
@@ -28,7 +28,7 @@ fn get_test_data_path(model_path: &str) -> PathBuf {
         .and_then(|n| n.to_str())
         .unwrap_or(model_path);
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data")
+        .join("../test_data")
         .join(format!("{name}.json"))
 }
 

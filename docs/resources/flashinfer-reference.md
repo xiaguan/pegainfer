@@ -20,7 +20,7 @@ At the packaging level, FlashInfer is Python-first and PyTorch-oriented, but int
 
 ## 2. Where Its Docs Are
 
-The main docs entry is `crates/pegainfer-kernels/third_party/flashinfer/docs/index.rst`. The structure is straightforward:
+The main docs entry is `pegainfer-kernels/third_party/flashinfer/docs/index.rst`. The structure is straightforward:
 
 ### Get Started
 

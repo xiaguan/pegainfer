@@ -9,7 +9,7 @@ use pegainfer_qwen3_4b::runtime::{
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
+const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DEFAULT_CONTEXTS: &[usize] = &[128, 512, 1024, 2048, 4096, 8192, 10_000];
 const DEFAULT_MEASURE_ITERS: usize = 5;
 const DEFAULT_PROFILE_STEPS: usize = 32;

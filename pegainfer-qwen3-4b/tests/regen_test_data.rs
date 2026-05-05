@@ -8,7 +8,7 @@ use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
 struct Case {
     name: &'static str,
@@ -79,7 +79,7 @@ fn model_name(model_path: &str) -> String {
 
 fn test_data_path(model_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data")
+        .join("../test_data")
         .join(format!("{model_name}.json"))
 }
 

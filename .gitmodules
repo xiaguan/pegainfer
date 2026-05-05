@@ -1,3 +1,3 @@
-[submodule "crates/pegainfer-kernels/third_party/flashinfer"]
-	path = crates/pegainfer-kernels/third_party/flashinfer
+[submodule "pegainfer-kernels/third_party/flashinfer"]
+	path = pegainfer-kernels/third_party/flashinfer
 	url = https://github.com/flashinfer-ai/flashinfer

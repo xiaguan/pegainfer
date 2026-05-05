@@ -21,11 +21,11 @@ cargo run --release -- --model-path models/Qwen3.5-4B
 
 ```bash
 # Unit tests (~9s)
-cargo test --release
+cargo test --release --workspace --lib
 
 # E2E greedy regression — requires GPU + model weights
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
-cargo test --release --test e2e_qwen35
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e
 
 # Single test
 cargo test --release embedding_variants -- --nocapture
@@ -36,35 +36,32 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 ## Architecture
 
 ```
-HTTP Request → GenericServerEngine<M> → tokenizer.encode() → generate(model, state, ...) → tokenizer.decode() → SSE/JSON Response
-                                                                        │
-                                                  ┌─────────────────────┤
-                                                  │                     │
-                                            Qwen3Model            Qwen35Model
-                                           (full attention)  (24 linear + 8 full attn)
-                                                  │                     │
-                                                  └─────────────────────┘
-                                                            │
-                                            M.forward(tokens, state)  ← ModelForward trait
-                                                            │
-                                            Prefill (batch GEMM) / Decode (GEMV, CUDA Graph)
-                                                            │
-                                                      ops.rs → ffi.rs → CUDA/Triton kernels
+HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor → TokenEvent
+                                               │
+                         ┌─────────────────────┴─────────────────────┐
+                         │                                           │
+              pegainfer-qwen3-4b                         pegainfer-qwen35-4b
+               (full attention)                       (24 linear + 8 full attn)
+                         │                                           │
+                         └─────────────────────┬─────────────────────┘
+                                               │
+                         pegainfer-core runtime + pegainfer-kernels
+                                               │
+                                 CUDA / cuBLAS / Triton / FlashInfer
 ```
 
 **Key abstractions:**
 
-- **`ModelForward` trait** (`model.rs`) — single `forward(&self, tokens, state)` method; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable, shareable), per-request mutable state lives in the associated `State` type. Shared `generate()` / `generate_streaming()` in `server_engine.rs` replace per-model generation loops. `GenericServerEngine<M: ModelForward>` provides request handling (stop sequences, streaming, sampling).
-- **Model submodules** — each model lives under `src/model/{qwen3,qwen35}/` with `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `config.rs`, `decode_buffers.rs`. Shared code: `model/cuda_graph.rs` (CUDA Graph capture/replay), `model/kv_cache.rs`.
-- **`ops.rs`** — high-level GPU operators (gemv, rms_norm, rope, fused_mlp, fused_attention, sampling). Calls unsafe C FFI in `ffi.rs`.
-- **Tensor types** (`tensor.rs`) — `DeviceVec` (1D bf16), `DeviceMatrix` (2D bf16), `HiddenStates` (batched hidden states). All GPU-resident, accessed via cudarc.
-- **CUDA Graph** (`model/cuda_graph.rs`) — decode path captured on first token, replayed on subsequent tokens. `embedding_decode_cuda()` reads token_id from GPU memory (not CPU) so the graph is stable. Pre-allocated `DecodeBuffers` ensure pointer stability.
-- **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers, seq_len tracking, reset between requests (keeps allocations).
-- **RecurrentState** (`model/qwen35/recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
+- **`pegainfer-core::engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates.
+- **Per-model crates** — Qwen3 and Qwen3.5 own config, weights, prefill/decode/unified execution, scheduler, tests, and benches.
+- **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
+- **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS wrappers, FlashInfer wrappers, and Triton AOT outputs.
+- **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
+- **KV state** — model schedulers own request state; shared paged-KV primitives live in `pegainfer-core`.
 
-**Build system**: the root `build.rs` is intentionally empty. `crates/pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
-1. Compiles `crates/pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Runs Triton AOT via `crates/pegainfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 compatibility kernels
+**Build system**: the virtual workspace root has no package build script. `pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
+1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
+2. Runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 compatibility kernels
 
 ---
 

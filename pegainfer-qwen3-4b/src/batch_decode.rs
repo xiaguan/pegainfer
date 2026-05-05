@@ -305,7 +305,7 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
+    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
     fn get_model_path() -> String {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())

@@ -84,8 +84,8 @@ Internal pointer arithmetic (`base + page_id × page_stride + layer × layer_kv_
 Done:
 - `PagePool`: generic fixed-page allocator, RAII `OwnedPagePermit`, `try_acquire_many(n)`, `try_grow(n)`.
 - `KvPool` + `KvState` + `KvDesc` in `src/kv_pool.rs`. Data structures + unit tests (geometry, lifecycle, OOM, drop). Page-first layout with `KvLayout` stride geometry. `KvPool` is `Clone` via `Arc` for trait-compatible state ownership.
-- FlashInfer submodule at `crates/pegainfer-kernels/third_party/flashinfer` (header-only C++, `include/flashinfer/`).
-- `crates/pegainfer-kernels/csrc/paged_attention.cu`: thin C wrappers around FlashInfer's `BatchDecodeWithPagedKVCacheDispatched` (decode), `AppendPagedKVCacheDecode` (KV write), and `SinglePrefillWithKVCacheDispatched` (prefill). bf16, HEAD_DIM=128, no RoPE (applied externally). Non-partition path for Phase 1.
+- FlashInfer submodule at `pegainfer-kernels/third_party/flashinfer` (header-only C++, `include/flashinfer/`).
+- `pegainfer-kernels/csrc/paged_attention.cu`: thin C wrappers around FlashInfer's `BatchDecodeWithPagedKVCacheDispatched` (decode), `AppendPagedKVCacheDecode` (KV write), and `SinglePrefillWithKVCacheDispatched` (prefill). bf16, HEAD_DIM=128, no RoPE (applied externally). Non-partition path for Phase 1.
 - `qk_norm_rope_cuda`: standalone QK RMSNorm + RoPE kernel for decode, reuses `prefill_qk_norm_rope_kernel` with seq_len=1.
 - Rust FFI bindings (`ffi.rs`) and ops wrappers (`ops/attention.rs`) for all three kernels.
 
@@ -184,7 +184,7 @@ QKV projections → prefill_qk_norm_rope_only_cuda (QK norm + RoPE, in-place on 
 
 Used `SinglePrefillWithKVCacheDispatched` (not the batch API) — handles tiling internally, no metadata arrays to compute. K/V read from contiguous HND cache via custom strides (`kv_stride_n = head_dim`, `kv_stride_h = max_seq_len × head_dim`). `PosEncodingMode::kNone` since RoPE is applied externally by `prefill_attention_prep_cuda`.
 
-Implementation: `single_prefill_cuda` C wrapper in `crates/pegainfer-kernels/csrc/paged_attention.cu` + Rust FFI/ops. Triton `flash_attention_prefill_cuda` FFI removed (HD256 variant for Qwen3.5 retained).
+Implementation: `single_prefill_cuda` C wrapper in `pegainfer-kernels/csrc/paged_attention.cu` + Rust FFI/ops. Triton `flash_attention_prefill_cuda` FFI removed (HD256 variant for Qwen3.5 retained).
 
 **Precision:** 5/6 test prompts produce identical greedy output. 1/6 ("My name is") diverges at 2nd token: "Li Hua" (FlashInfer) vs "Xiaoyu" (Triton). Both coherent and valid — top-2 probabilities were near-equal, different FP accumulation order tips the selection. Not a correctness bug. Baselines re-generated.
 

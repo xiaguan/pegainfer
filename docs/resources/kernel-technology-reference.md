@@ -12,11 +12,11 @@ pegainfer (~7K Rust, ~3.4K CUDA) already mixes three operator backends in produc
 
 | Backend | Role | Scale |
 |---------|------|-------|
-| **Handwritten CUDA / FlashInfer wrappers** | GEMV, fused MLP, RMSNorm, sampling, GDR recurrence, Conv1D, paged attention | ~2.6K LOC in `crates/pegainfer-kernels/csrc/` |
-| **Triton AOT** | Qwen3.5 HD256 prefill and GDR chunkwise compatibility kernels | ~1.4K LOC in `crates/pegainfer-kernels/tools/triton/` |
+| **Handwritten CUDA / FlashInfer wrappers** | GEMV, fused MLP, RMSNorm, sampling, GDR recurrence, Conv1D, paged attention | ~2.6K LOC in `pegainfer-kernels/csrc/` |
+| **Triton AOT** | Qwen3.5 HD256 prefill and GDR chunkwise compatibility kernels | ~1.4K LOC in `pegainfer-kernels/tools/triton/` |
 | **cuBLAS** (via cudarc) | Prefill GEMM, decode GEMV projections | Call-site only |
 
-The build pipeline (`crates/pegainfer-kernels/build.rs`) compiles both handwritten CUDA and Triton AOT artifacts, linking them through `pegainfer-kernels` FFI and op wrappers. The root `src/ops.rs` is now a compatibility dispatch layer plus model-specific adapters. Python is a build-time dependency only; the runtime is pure Rust + GPU.
+The build pipeline (`pegainfer-kernels/build.rs`) compiles both handwritten CUDA and Triton AOT artifacts, linking them through `pegainfer-kernels` FFI and op wrappers. The server package keeps a compatibility `ops` surface for tools and smoke tests. Python is a build-time dependency only; the runtime is pure Rust + GPU.
 
 ### Handwritten CUDA kernels
 
