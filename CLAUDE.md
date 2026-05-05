@@ -62,9 +62,9 @@ HTTP Request → GenericServerEngine<M> → tokenizer.encode() → generate(mode
 - **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers, seq_len tracking, reset between requests (keeps allocations).
 - **RecurrentState** (`model/qwen35/recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
 
-**Build system** (`build.rs`) does two things:
-1. Compiles `csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Runs Triton AOT compilation via `tools/triton/gen_triton_aot.py` for 7 kernels (silu_mul, add, embedding variants, split-KV attention decode/reduce)
+**Build system**: the root `build.rs` is intentionally empty. `crates/pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
+1. Compiles `crates/pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
+2. Runs Triton AOT via `crates/pegainfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 compatibility kernels
 
 ---
 

@@ -87,9 +87,6 @@ cargo run --release -- --model-path models/Qwen3.5-4B
 
 # Disable CUDA Graph (useful for debugging)
 cargo run --release -- --cuda-graph=false
-
-# Performance tracing (Chrome Trace JSON → open with Perfetto UI)
-cargo run --release -- --trace-output-path traces/
 ```
 
 **Environment variables:**
@@ -143,26 +140,27 @@ OpenAI-compatible `/v1/completions` endpoint.
 ## Architecture
 
 ```
-HTTP → GenericServerEngine<M: ModelForward> → model.forward(tokens, state)
-                                                       │
-                                         ┌─────────────┴─────────────┐
-                                    Qwen3Model                 Qwen35Model
-                                  (full attention)        (24 linear + 8 full attn)
-                                         │                         │
-                                         └────────────┬────────────┘
-                                                      │
-                                        Prefill (GEMM) / Decode (GEMV + CUDA Graph)
-                                                      │
-                                            ops → ffi → CUDA / Triton kernels
+HTTP / vLLM frontend → EngineHandle → per-model engine crate
+                                  │
+                    ┌─────────────┴─────────────┐
+        pegainfer-qwen3-4b                 root Qwen3.5 engine
+          (full attention)              (24 linear + 8 full attn)
+                    │                             │
+                    └────────────┬────────────────┘
+                                 │
+                 pegainfer-core runtime + pegainfer-kernels
+                                 │
+                       CUDA / cuBLAS / Triton / FlashInfer
 ```
 
 **Key design decisions:**
 
 - **All computation on GPU** — no CPU fallback, no hybrid execution
-- **Custom GPU kernels** — CUDA for decode-critical paths (GEMV, fused MLP, GDR recurrence), Triton AOT for attention, embedding, and prefill. Matrix multiplication via cuBLAS
+- **Custom GPU kernels** — CUDA for decode-critical paths (GEMV, fused MLP, GDR recurrence), Triton AOT for Qwen3.5 compatibility kernels, FlashInfer for paged attention/sampling, and cuBLAS for matrix multiplication
 - **Fused operators** — attention and MLP are each a single kernel launch
 - **BF16 storage, FP32 accumulation** — numerical stability without memory overhead
 - **CUDA Graph** on decode path — eliminates kernel launch overhead
+- **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `crates/pegainfer-qwen3-4b`
 
 **Model details:**
 
@@ -171,10 +169,8 @@ HTTP → GenericServerEngine<M: ModelForward> → model.forward(tokens, state)
 
 ### What's not (yet) implemented
 
-- Batched requests / continuous batching
-- PagedAttention
-- Multi-GPU / tensor parallelism
 - Quantization (INT8/INT4)
+- Qwen3.5 extraction into a standalone model crate
 
 ## Development
 
@@ -185,15 +181,15 @@ HTTP → GenericServerEngine<M: ModelForward> → model.forward(tokens, state)
 cargo test --release
 
 # E2E greedy regression (needs GPU + model weights)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
 cargo test --release --test e2e_qwen35
 ```
 
 ### Triton AOT
 
-Triton compiles **16+ kernels** at build time (silu_mul, add, embedding variants, split-KV attention decode/reduce, FlashAttention prefill, chunk-wise GDR prefill). Runtime has no Python dependency — everything runs through generated C wrappers.
+Triton compiles the Qwen3.5 compatibility AOT kernels at build time. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
 
-See `tools/triton/README.md` for setup and troubleshooting.
+See `crates/pegainfer-kernels/tools/triton/README.md` for setup and troubleshooting.
 
 ### Source Layout
 
@@ -203,54 +199,40 @@ See `tools/triton/README.md` for setup and troubleshooting.
 ```
 src/
 ├── main.rs                # CLI + vLLM/OpenAI server startup
-├── vllm_frontend.rs       # vLLM engine-core bridge into pegainfer scheduler
-├── server_engine.rs       # Model detection and shared scheduler-facing types
-├── scheduler.rs           # Qwen3 continuous batching scheduler
+├── vllm_frontend.rs       # vLLM engine-core bridge into a generic EngineHandle
+├── server_engine.rs       # Model detection and compatibility re-exports
+├── scheduler.rs           # Compatibility re-export of core engine request/event types
 ├── scheduler_qwen35.rs    # Qwen3.5 scheduler
-├── model_executor.rs      # Shared execution helpers for scheduler paths
-├── model.rs               # ModelForward trait
+├── model.rs               # Root-local Qwen3.5 model
 ├── model/
-│   ├── cuda_graph.rs      # CUDA Graph capture/replay
-│   ├── kv_cache.rs        # KV cache
-│   ├── qwen3/             # Qwen3: config, weights, forward, prefill, decode
 │   └── qwen35/            # Qwen3.5: config, weights, forward, prefill, decode, recurrent_state
-├── ops.rs                 # GPU operator dispatch
+├── ops.rs                 # Root compatibility dispatch + Qwen3.5 recurrent wrapper
 ├── ops/
-│   ├── attention.rs       # Fused GQA attention, prefill attention
-│   ├── elementwise.rs     # Add, copy, softmax
-│   ├── embedding.rs       # Token embedding lookup
-│   ├── linear.rs          # GEMV, cuBLAS GEMM
-│   ├── norm.rs            # RMSNorm (+ fused Add+RMSNorm)
 │   ├── recurrent.rs       # Conv1d, Gated Delta Rule (Qwen3.5)
-│   └── sampling.rs        # GPU argmax, top-k/top-p
-├── tensor.rs              # GPU tensor types (DeviceVec, DeviceMatrix, HiddenStates)
-├── ffi.rs                 # FFI bindings to CUDA/Triton kernels
+│   └── tests.rs           # Operator tests
+├── tensor.rs              # Re-export of pegainfer-kernels tensor types
+├── ffi.rs                 # Re-export of pegainfer-kernels FFI bindings
 ├── weight_loader.rs       # Safetensors loading + RoPE precomputation
 ├── sampler.rs             # Temperature, top-k, top-p sampling
-└── trace_reporter.rs      # Chrome Trace JSON profiling
+└── trace_reporter.rs      # Archived fastrace JSON reporter, not wired into CLI
 
-csrc/                      # Hand-written CUDA kernels
-├── gemv.cu                # GEMV (BF16×2 vectorized)
-├── fused_attention.cu     # Fused GQA decode attention (head_dim=128)
-├── fused_mlp.cu           # Fused SwiGLU MLP (gate+up→SiLU→down)
-├── gated_delta_rule.cu    # GDR decode recurrence (Qwen3.5)
-├── norm.cu                # RMSNorm (+ fused Add+RMSNorm)
-├── pos_enc.cu             # RoPE
-├── prefill_attention.cu   # Batched prefill attention (head_dim=128)
-├── prefill_attention_hd256.cu  # Prefill attention (head_dim=256)
-├── conv1d.cu              # Conv1d (Qwen3.5)
-└── sampling.cu            # GPU argmax, top-k/top-p
+crates/pegainfer-core/             # Shared runtime API for model crates
+├── src/engine.rs                  # EngineHandle, GenerateRequest, TokenEvent
+├── src/kv_pool.rs                 # Paged KV pool and request state
+├── src/ops.rs                     # Shared op wrappers over pegainfer-kernels
+└── src/weight_loader.rs           # Safetensors helpers shared by model crates
 
-tools/triton/              # Triton AOT kernels (build-time compiled)
-├── gen_triton_aot.py      # AOT compilation driver
-├── silu_mul_kernel.py
-├── basic_kernels.py       # add, embedding variants
-├── attention_decode_kernel.py
-├── attention_reduce_kernel.py
-├── flash_attention_prefill_kernel.py
-├── flash_attention_prefill_hd256_kernel.py
-├── gated_delta_rule_chunkwise_kernels.py
-└── README.md
+crates/pegainfer-kernels/          # Shared GPU kernel/runtime crate
+├── KERNELS.md                     # LLM routing index for model op -> wrapper -> FFI -> source
+├── src/                           # GPU tensor types, FFI, paged KV layout, Rust ops
+├── csrc/                          # Hand-written CUDA / FlashInfer C++ wrappers
+└── tools/triton/                  # Triton AOT kernels (build-time compiled)
+
+crates/pegainfer-qwen3-4b/         # Qwen3-4B model-owned engine crate
+├── src/                           # Config, weights, prefill/decode/unified, scheduler/executor
+├── tests/                         # Qwen3 e2e, paged attention, regression data generation
+├── benches/                       # Qwen3 model-level benchmarks
+└── src/kernel_plan.rs             # Model DAG phase -> kernel routing index
 ```
 
 </details>

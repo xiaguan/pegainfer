@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+use pegainfer::model::Qwen35Model;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
 use pegainfer::scheduler_qwen35;
@@ -11,7 +11,6 @@ use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_QWEN35_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
 static GPU_REGEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -111,7 +110,7 @@ fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
     }
 }
 
-/// Generate text via the scheduler (Qwen3 path).
+/// Generate text via a scheduler handle.
 fn generate_text_scheduler(
     handle: &scheduler::SchedulerHandle,
     tokenizer: &DynTokenizer,
@@ -155,7 +154,7 @@ fn write_golden_json(output_path: &Path, model_name: &str, cases_json: &[serde_j
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("Failed to create test data directory");
     }
-    std::fs::write(output_path, &json).expect("Failed to write test data");
+    std::fs::write(output_path, format!("{json}\n")).expect("Failed to write test data");
     eprintln!("Wrote {}", output_path.display());
 }
 
@@ -164,56 +163,6 @@ fn lock_gpu_regen_test() -> MutexGuard<'static, ()> {
     GPU_REGEN_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[test]
-#[ignore = "regenerates checked-in golden data; run manually when fixtures need refresh"]
-fn regen_test_data() {
-    let _guard = lock_gpu_regen_test();
-    pegainfer::logging::init_stderr("info");
-
-    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-        .unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
-    let model_name = model_name(&model_path);
-    let prompt_style = prompt_style(&model_name);
-    let output_path = test_data_path(&model_name);
-
-    eprintln!(
-        "Regenerating golden data: model={}, path={}, prompt_style={:?}, output={}",
-        model_name,
-        model_path,
-        prompt_style,
-        output_path.display()
-    );
-
-    let model = Qwen3Model::from_safetensors_with_runtime(
-        &model_path,
-        ModelRuntimeConfig {
-            enable_cuda_graph: true,
-            ..Default::default()
-        },
-    )
-    .expect("Failed to load model");
-    let tokenizer = common::load_tokenizer(&model_path);
-    let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
-
-    let mut cases_json = Vec::new();
-    for case in CASES {
-        let prompt = wrap_prompt(case.prompt, prompt_style);
-        let output = generate_text_scheduler(&handle, &tokenizer, &prompt, case.max_new_tokens);
-        eprintln!(
-            "[{}] raw_prompt={:?} prompt={:?} output={:?}",
-            case.name, case.prompt, prompt, output
-        );
-        cases_json.push(serde_json::json!({
-            "name": case.name,
-            "prompt": prompt,
-            "max_new_tokens": case.max_new_tokens,
-            "output": output,
-        }));
-    }
-
-    write_golden_json(&output_path, &model_name, &cases_json);
 }
 
 #[test]

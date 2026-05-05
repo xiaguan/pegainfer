@@ -5,7 +5,18 @@ default-run = "pegainfer"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    "crates/pegainfer-core",
+    "crates/pegainfer-cupti",
+    "crates/pegainfer-kernels",
+    "crates/pegainfer-qwen3-4b",
+]
+
 [dependencies]
+pegainfer-core = { path = "crates/pegainfer-core" }
+pegainfer-kernels = { path = "crates/pegainfer-kernels" }
+pegainfer-qwen3-4b = { path = "crates/pegainfer-qwen3-4b" }
 safetensors = "0.7"
 anyhow = "1.0"
 ndarray = "0.16"
@@ -44,9 +55,6 @@ zeromq = { git = "https://github.com/BugenZhao/zmq.rs", rev = "dde4ee5c48846b0cc
 
 [features]
 reference = []
-
-[build-dependencies]
-cc = "1.0"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

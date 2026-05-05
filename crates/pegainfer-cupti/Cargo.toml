@@ -1,0 +1,13 @@
+[package]
+name = "pegainfer-cupti"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+cc = "1"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

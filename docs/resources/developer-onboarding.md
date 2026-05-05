@@ -43,7 +43,7 @@ Verify:
 cargo build --release
 ```
 
-First build takes ~30s. Compiles CUDA kernels (`csrc/*.cu`) and Triton AOT kernels (`tools/triton/*.py`).
+First build takes ~30s. Compiles CUDA kernels (`crates/pegainfer-kernels/csrc/*.cu`) and Triton AOT kernels (`crates/pegainfer-kernels/tools/triton/*.py`).
 
 ## 4. Run Tests
 

@@ -31,7 +31,7 @@ Start server, wait for ready, run benchmarks, kill server:
 
 ```bash
 # Start
-$VLLM_CMD serve $MODEL_PATH --port $PORT --max-model-len 4096 --gpu-memory-utilization 0.9 \
+$VLLM_CMD serve $MODEL_PATH --port $PORT --max-model-len 8192 --gpu-memory-utilization 0.9 \
   --served-model-name <short-name> &
 
 # Poll until ready (up to 180s — vLLM torch.compile warmup)
@@ -42,7 +42,7 @@ $VLLM_CMD bench serve \
   --backend openai --model <short-name> --port $PORT \
   --dataset-name random --input-len <in> --output-len <out> \
   --num-prompts 20 --request-rate inf --max-concurrency 1 \
-  --ignore-eos --tokenizer $MODEL_PATH \
+  --ignore-eos --temperature 0 --tokenizer $MODEL_PATH \
   --save-result --result-dir $RESULTS_DIR \
   --result-filename vllm-in<in>-out<out>.json
 
@@ -69,7 +69,7 @@ $VLLM_CMD bench serve \
   --backend openai --model <short-name> --port $PORT \
   --dataset-name random --input-len <in> --output-len <out> \
   --num-prompts 20 --request-rate inf --max-concurrency 1 \
-  --ignore-eos --tokenizer $MODEL_PATH \
+  --ignore-eos --temperature 0 --tokenizer $MODEL_PATH \
   --save-result --result-dir $RESULTS_DIR \
   --result-filename pega-in<in>-out<out>.json
 
@@ -101,8 +101,13 @@ Read both JSON results. Key metrics:
 ## Gotchas
 
 - **vLLM cold start:** torch.compile triggers on the first 1–3 requests. With `n=10`, mean TTFT is inflated 5–50× and p99 is always a cold-start spike — neither is meaningful. **Read median only.** For stable p99, use `n>=30` (cold-start requests become a small tail of the distribution). Example: Qwen3.5-4B at (2048,1), n=10: mean=1279ms, median=222ms, p99=9846ms.
+- **vLLM prefix cache:** Disable with `vllm serve --no-enable-prefix-caching` for random synthetic prefill probes unless prefix-cache behavior is intentionally part of the experiment. A 2026-05-04 `input_len=4096,output_len=64` run showed vLLM prefix cache hits even on the random dataset.
+- **Greedy must be explicit:** vLLM 0.19.1 `vllm bench serve` no longer forces `temperature=0`; pass `--temperature 0` in both vLLM and pegainfer runs when comparing kernel/runtime speed.
+- **Context limit includes output:** `--max-model-len` is prompt plus generated tokens. For `input-len=4096, output-len=64`, use at least `4160`; `8192` is the simple safe value on RTX 5090.
+- **vLLM serve log flag drift:** vLLM 0.19.1 rejects the old `--disable-log-requests` flag. Omit it unless `vllm serve --help=all` on that machine shows a supported equivalent.
 - **Text-only Qwen3.5 on vLLM:** Some Qwen3.5 checkpoints expose multimodal metadata. For text-only benchmarking, start `vllm serve` with `--language-model-only` (equivalent to `--limit-mm-per-prompt '{"image":0,"video":0}'`).
 - **pegainfer empty prompts:** Random dataset may produce empty prompts which pegainfer rejects. Check failed request count.
+- **pegainfer streaming usage:** The vLLM frontend can overreport streaming `usage.completion_tokens` in `vllm bench serve` results. For fixed-output probes, trust TTFT/TPOT/ITL and recompute output throughput from `num_prompts * output_len / duration` until usage accounting is fixed.
 - **Zombie processes:** Always `pkill` after benchmarking. Leftover servers block the port and hold GPU memory.
 - **CUDA Graph:** pegainfer enables CUDA Graph by default. For apples-to-apples decode comparison, note this in the report. vLLM also uses CUDA Graph by default.
 - **Concurrency:** `--max-concurrency N` controls batch size. pegainfer supports continuous batching (bucket CUDA Graphs at [1,2,4,8,16,32,64]). Throughput scales near-linearly with concurrency for bandwidth-bound decode.

@@ -1,6 +1,6 @@
 # Kernel Technology Reference
 
-> **TL;DR:** pegainfer uses a three-tier operator stack: cuBLAS for dense GEMM, Triton AOT for regular fused and prefill kernels, and handwritten CUDA for decode-critical hotpaths. FlashAttention and FlashInfer serve as algorithm and serving-architecture references, not direct dependencies. Specialist tools (CUTLASS/CuTe, ThunderKittens, TileLang, Gluon) are reserved for proven, durable hot kernels where the default stack has clearly plateaued.
+> **TL;DR:** pegainfer uses a three-tier operator stack: cuBLAS for dense GEMM, handwritten CUDA/FlashInfer C++ wrappers for decode-critical hotpaths, and Triton AOT for selected Qwen3.5 compatibility kernels. Specialist tools (CUTLASS/CuTe, ThunderKittens, TileLang, Gluon) are reserved for proven, durable hot kernels where the default stack has clearly plateaued.
 >
 > **Status:** Active. Next step: apply this framework to the next operator decision instead of choosing ad hoc.
 
@@ -12,11 +12,11 @@ pegainfer (~7K Rust, ~3.4K CUDA) already mixes three operator backends in produc
 
 | Backend | Role | Scale |
 |---------|------|-------|
-| **Handwritten CUDA** | GEMV, fused MLP, RMSNorm, sampling, GDR recurrence, Conv1D, fused attention | ~2.6K LOC in `csrc/` |
-| **Triton AOT** | SiLU\*gate, Add, Embedding, FlashAttention prefill, GDR chunkwise, decode split-KV attention | ~1.4K LOC in `tools/triton/` |
+| **Handwritten CUDA / FlashInfer wrappers** | GEMV, fused MLP, RMSNorm, sampling, GDR recurrence, Conv1D, paged attention | ~2.6K LOC in `crates/pegainfer-kernels/csrc/` |
+| **Triton AOT** | Qwen3.5 HD256 prefill and GDR chunkwise compatibility kernels | ~1.4K LOC in `crates/pegainfer-kernels/tools/triton/` |
 | **cuBLAS** (via cudarc) | Prefill GEMM, decode GEMV projections | Call-site only |
 
-The build pipeline (`build.rs`) compiles both handwritten CUDA and Triton AOT artifacts, linking them through `src/ffi.rs` into a unified Rust operator surface (`src/ops.rs`). Python is a build-time dependency only; the runtime is pure Rust + GPU.
+The build pipeline (`crates/pegainfer-kernels/build.rs`) compiles both handwritten CUDA and Triton AOT artifacts, linking them through `pegainfer-kernels` FFI and op wrappers. The root `src/ops.rs` is now a compatibility dispatch layer plus model-specific adapters. Python is a build-time dependency only; the runtime is pure Rust + GPU.
 
 ### Handwritten CUDA kernels
 
