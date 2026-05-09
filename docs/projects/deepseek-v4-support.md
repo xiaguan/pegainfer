@@ -1,7 +1,7 @@
 # DeepSeek V4 Support
 
 **Created**: 2026-05-07
-**Status**: Draft PR open - initial DeepSeek V4 support is wired through the native engine, TileLang build-time kernels, exact E2E, and OpenAI-compatible HTTP paths. Bring-up Python probes were removed from the PR and archived locally outside the repository; deeper profiling work is deferred.
+**Status**: Draft PR open - initial DeepSeek V4 support is wired through the native engine, TileLang build-time kernels, exact E2E, and OpenAI-compatible HTTP paths. Prompt prefill now reuses the direct runtime's request-scope RoPE caches instead of rebuilding them per layer/rank. Bring-up Python probes were removed from the PR and archived locally outside the repository; deeper profiling work is deferred.
 
 ## Scope
 
@@ -182,10 +182,13 @@ The temporary validation server on port `18080` was stopped after validation.
 The major validation bottlenecks were fixed with nsys-guided changes:
 
 - prompt prefill now seeds decode cache;
+- prompt prefill reuses direct-runtime RoPE caches instead of rebuilding per request/layer/rank;
 - decode RoPE tables are cached at request scope instead of rebuilt for every token/layer/rank;
 - compressor decode projection was parallelized;
 - compressor prefill weighting was parallelized;
 - MoE gate, HC mixes, and compressor BF16 linear reuse per-device scratch/handles.
+
+The 2026-05-09 prefill RoPE reuse pass changed `prefill_logits_and_decode_cache_group_bf16_hidden` to require caller-provided RoPE caches. The direct engine passes `runtime.ropes`, so cache-seeding prompt prefill no longer calls `precompute_rope_cache` inside the per-layer loop. Local release format/check passed, and exact E2E validation was verified after the change with a low single-digit percent speedup.
 
 Earlier exact-request profiling removed the large synchronous `cudaMalloc/cudaFree` cliff. The current decode-heavy profile shows the remaining allocation issue is many small async allocations and frees inside decode, alongside kernel launch count. The next GPU buckets are NCCL all-reduce and TileLang FP4/FP8 GEMM.
 

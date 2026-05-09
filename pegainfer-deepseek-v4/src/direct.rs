@@ -480,6 +480,7 @@ fn run_prefill_logits_and_seed_decode_cache(
         config,
         seq_len,
         &mut runtime.caches,
+        &runtime.ropes,
     )
     .context("prefill_logits_and_decode_cache_group_bf16_hidden")
 }

@@ -632,6 +632,7 @@ pub fn prefill_logits_and_decode_cache_group_bf16_hidden(
     config: &Config,
     seq_len: usize,
     caches: &mut [Vec<LayerDecodeCache>],
+    ropes: &[Vec<DeepSeekRopeCache>],
 ) -> Result<Vec<F32Logits>> {
     ensure!(
         !ranks.is_empty(),
@@ -652,6 +653,28 @@ pub fn prefill_logits_and_decode_cache_group_bf16_hidden(
             ranks.len()
         );
     }
+    ensure!(
+        ropes.len() == config.n_layers,
+        "prefill rope layer count mismatch: have {}, need {}",
+        ropes.len(),
+        config.n_layers
+    );
+    for (layer, rank_ropes) in ropes.iter().enumerate() {
+        ensure!(
+            rank_ropes.len() == ranks.len(),
+            "prefill rope rank count mismatch at layer {layer}: have {}, need {}",
+            rank_ropes.len(),
+            ranks.len()
+        );
+        for (rank, rope) in rank_ropes.iter().enumerate() {
+            ensure!(
+                rope.max_seq_len >= seq_len,
+                "prefill rope cache too short at layer {layer} rank {rank}: have {}, need {}",
+                rope.max_seq_len,
+                seq_len
+            );
+        }
+    }
 
     let hidden = embedding_vocab_parallel_group(ranks, config, seq_len)?;
     let mut hcs = ranks
@@ -661,11 +684,7 @@ pub fn prefill_logits_and_decode_cache_group_bf16_hidden(
         .collect::<Result<Vec<_>>>()?;
 
     for (layer, layer_caches) in caches.iter_mut().enumerate().take(config.n_layers) {
-        let ropes = ranks
-            .iter()
-            .map(|(ctx, _, _, _)| precompute_rope_cache(ctx, config, layer, seq_len))
-            .collect::<Result<Vec<_>>>()?;
-        let rope_refs = ropes.iter().collect::<Vec<_>>();
+        let rope_refs = ropes[layer].iter().collect::<Vec<_>>();
         let block_inputs = ranks
             .iter()
             .zip(hcs.iter())
