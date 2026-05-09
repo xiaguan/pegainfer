@@ -61,7 +61,7 @@ The direct engine seeds decode cache from prompt prefill instead of replaying pr
 
 ### TileLang Kernels
 
-`pegainfer-kernels/tools/tilelang/gen_deepseek_v4_tilelang.py` generates CUDA sources for official-style DeepSeek V4 kernels:
+`pegainfer-kernels/tools/tilelang/deepseek_v4/generate.py` generates CUDA sources for official-style DeepSeek V4 kernels:
 
 - `act_quant_kernel`
 - `fp8_gemm_kernel`
@@ -78,13 +78,13 @@ DeepSeek CUDA glue is split by subsystem:
 
 | File | Role |
 | --- | --- |
-| `deepseek_quant.cu` | FP8/FP4 quantized linear dispatch and TileLang linear wrappers |
-| `deepseek_attention.cu` | head norm, RoPE, sparse/indexed attention, BF16/F32 conversion |
-| `deepseek_indexer.cu` | indexer scoring/top-k and Hadamard plus FP4 quant |
-| `deepseek_compressor.cu` | hidden RoPE, compressor prefill/decode, concat, BF16 linear |
-| `deepseek_hc.cu` | HC expand/mixes/sinkhorn/post and final logits |
-| `deepseek_moe.cu` | routing, SwiGLU, and expert accumulation |
-| `deepseek_common.cuh` | shared device helpers |
+| `csrc/deepseek_v4/deepseek_quant.cu` | FP8/FP4 quantized linear dispatch and TileLang linear wrappers |
+| `csrc/deepseek_v4/deepseek_attention.cu` | head norm, RoPE, sparse/indexed attention, BF16/F32 conversion |
+| `csrc/deepseek_v4/deepseek_indexer.cu` | indexer scoring/top-k and Hadamard plus FP4 quant |
+| `csrc/deepseek_v4/deepseek_compressor.cu` | hidden RoPE, compressor prefill/decode, concat, BF16 linear |
+| `csrc/deepseek_v4/deepseek_hc.cu` | HC expand/mixes/sinkhorn/post and final logits |
+| `csrc/deepseek_v4/deepseek_moe.cu` | routing, SwiGLU, and expert accumulation |
+| `csrc/deepseek_v4/deepseek_common.cuh` | shared device helpers |
 
 The split keeps each DeepSeek CUDA translation unit under about one thousand lines.
 

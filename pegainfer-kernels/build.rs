@@ -227,6 +227,51 @@ fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
     args
 }
 
+fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|err| panic!("Failed to read entry in {}: {err}", dir.display()))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursively(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
+        relative
+            .components()
+            .any(|part| part.as_os_str() == "deepseek_v4")
+    })
+}
+
+fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
+    let Some(relative) = cu_file.strip_prefix(csrc_dir).ok() else {
+        return format!("{}_cuda.o", cu_file.file_stem().unwrap().to_string_lossy());
+    };
+
+    let mut parts: Vec<String> = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if let Some(last) = parts.last_mut() {
+        if let Some(stem) = Path::new(last).file_stem().and_then(|stem| stem.to_str()) {
+            *last = stem.to_string();
+        }
+    }
+
+    format!("{}_cuda.o", parts.join("_"))
+}
+
 fn probe_triton_python(candidate: &str) -> Result<String, String> {
     let output = Command::new(candidate)
         .args(["-c", "import triton"])
@@ -337,7 +382,7 @@ fn generate_deepseek_tilelang_artifacts(out_dir: &Path) -> TileLangArtifacts {
     });
 
     let root = crate_root();
-    let generator_path = root.join("tools/tilelang/gen_deepseek_v4_tilelang.py");
+    let generator_path = root.join("tools/tilelang/deepseek_v4/generate.py");
     assert!(
         generator_path.exists(),
         "DeepSeek V4 TileLang generator is missing: {}",
@@ -811,7 +856,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let arch_args = nvcc_arch_args(&sm_targets);
-    let deepseek_enabled = std::env::var_os("CARGO_FEATURE_DEEPSEEK_V4").is_some();
+    let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
         Some(generate_deepseek_tilelang_artifacts(&out_dir))
     } else {
@@ -831,27 +876,26 @@ fn main() {
 
     let root = crate_root();
     let csrc_dir = root.join("csrc");
-    let mut cu_files: Vec<_> = std::fs::read_dir(&csrc_dir)
-        .expect("Failed to read csrc/ directory")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
+    let mut csrc_files = Vec::new();
+    collect_files_recursively(&csrc_dir, &mut csrc_files);
+    let mut cu_files: Vec<_> = csrc_files
+        .iter()
+        .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
-            if !deepseek_enabled && file_name.starts_with("deepseek_") {
+            if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
                 return None;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
             {
-                Some(path)
+                Some(path.clone())
             } else {
                 None
             }
         })
         .collect();
     cu_files.sort();
-    for entry in std::fs::read_dir(&csrc_dir).expect("Failed to read csrc/ directory") {
-        let path = entry.expect("Failed to read csrc/ entry").path();
+    for path in &csrc_files {
         let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
             continue;
         };
@@ -880,7 +924,7 @@ fn main() {
     let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
-        let obj_file = out_dir.join(format!("{}_cuda.o", stem));
+        let obj_file = out_dir.join(cuda_object_name(&csrc_dir, cu_file));
 
         let mut nvcc_args = vec![
             "-c".to_string(),
