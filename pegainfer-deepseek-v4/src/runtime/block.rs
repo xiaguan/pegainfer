@@ -1,5 +1,26 @@
 use super::*;
 
+use std::thread;
+
+struct RankComm(usize);
+
+// SAFETY: Each NCCL communicator is used only by its owning rank lane. The
+// parallel block path sends one distinct communicator reference to one scoped
+// thread, matching cudarc's TP worker ownership pattern.
+unsafe impl Send for RankComm {}
+
+impl RankComm {
+    fn new(comm: &Comm) -> Self {
+        Self(std::ptr::from_ref(comm) as usize)
+    }
+
+    fn get(self) -> &'static Comm {
+        // SAFETY: the pointer comes from a `Comm` borrowed by a scoped thread.
+        // The caller only uses it before the scope exits.
+        unsafe { &*(self.0 as *const Comm) }
+    }
+}
+
 pub fn block_prefill_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
@@ -585,6 +606,315 @@ pub fn block_decode_group_bf16_hidden(
         out.push(hc_post_bf16_hidden(ctx, ffn_out, input, state)?);
     }
     Ok(out)
+}
+
+pub fn block_decode_group_rank_threads_bf16_hidden(
+    ranks: &[(
+        &RankGpuContext,
+        &RankWeightView<'_>,
+        &Comm,
+        &HcHiddenStates,
+        &CudaSlice<u32>,
+    )],
+    config: &Config,
+    layer: usize,
+    ropes: &[&DeepSeekRopeCache],
+    start_pos: usize,
+    caches: &mut [LayerDecodeCache],
+) -> Result<Vec<HcHiddenStates>> {
+    ensure!(
+        !ranks.is_empty(),
+        "rank-thread block decode group must contain at least one rank"
+    );
+    ensure!(
+        ranks.len() == ropes.len(),
+        "rank-thread block decode ranks/ropes length mismatch: ranks={}, ropes={}",
+        ranks.len(),
+        ropes.len()
+    );
+    ensure!(
+        ranks.len() == caches.len(),
+        "rank-thread block decode ranks/cache length mismatch: ranks={}, caches={}",
+        ranks.len(),
+        caches.len()
+    );
+    ensure!(
+        layer < config.n_layers,
+        "rank-thread group block decode layer {layer} out of range"
+    );
+
+    let mut out = Vec::with_capacity(ranks.len());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(ranks.len());
+        for (rank, (((ctx, weights, comm, input, token_ids), rope), cache)) in ranks
+            .iter()
+            .zip(ropes.iter())
+            .zip(caches.iter_mut())
+            .enumerate()
+        {
+            let comm = RankComm::new(comm);
+            handles.push(scope.spawn(move || -> Result<(usize, HcHiddenStates)> {
+                let comm = comm.get();
+                ensure!(
+                    input.seq_len == 1,
+                    "rank-thread block decode expects HC seq_len=1, got {}",
+                    input.seq_len
+                );
+                let block = weights.block(layer)?;
+
+                let (attn_input, attn_hc) = hc_pre_bf16_hidden(
+                    ctx,
+                    config,
+                    input,
+                    &block.hc_attn_fn,
+                    &block.hc_attn_scale,
+                    &block.hc_attn_base,
+                )
+                .with_context(|| format!("hc_pre attention layer {layer} rank {rank}"))?;
+                let attn_norm =
+                    rms_norm_bf16_hidden(ctx, &attn_input, &block.attn_norm, config.rms_norm_eps)
+                        .with_context(|| format!("attention rms_norm layer {layer} rank {rank}"))?;
+                let mut attn_out = attention_decode_rank_local_collective_bf16_hidden(
+                    ctx,
+                    config,
+                    layer,
+                    &attn_norm,
+                    &block.attn,
+                    rope,
+                    start_pos,
+                    cache,
+                    comm,
+                )
+                .with_context(|| format!("attention decode layer {layer} rank {rank}"))?;
+                all_reduce_hidden_fp32_in_place(ctx, &mut attn_out, comm)
+                    .with_context(|| format!("attention all_reduce layer {layer} rank {rank}"))?;
+                let after_attn = hc_post_bf16_hidden(ctx, &attn_out, input, &attn_hc)
+                    .with_context(|| format!("hc_post attention layer {layer} rank {rank}"))?;
+
+                let (ffn_input, ffn_hc) = hc_pre_bf16_hidden(
+                    ctx,
+                    config,
+                    &after_attn,
+                    &block.hc_ffn_fn,
+                    &block.hc_ffn_scale,
+                    &block.hc_ffn_base,
+                )
+                .with_context(|| format!("hc_pre ffn layer {layer} rank {rank}"))?;
+                let ffn_norm =
+                    rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)
+                        .with_context(|| format!("ffn rms_norm layer {layer} rank {rank}"))?;
+
+                let ffn = weights.ffn(layer)?;
+                let routed = if layer < config.n_hash_layers {
+                    hash_route_bf16_hidden(ctx, config, &ffn_norm, &ffn, token_ids)?
+                } else {
+                    score_route_bf16_hidden(ctx, config, &ffn_norm, &ffn)?
+                };
+                let plan =
+                    build_moe_fused_route_plan(ctx, config, weights, routed, ffn_norm.hidden_dim)?;
+                let expanded_input = expand_moe_fused_input(ctx, &ffn_norm, &plan)?;
+                let expanded_out = local_experts_forward_packed_bf16_hidden(
+                    ctx,
+                    config,
+                    weights,
+                    layer,
+                    &expanded_input,
+                    &plan,
+                )?;
+                let mut routed_out =
+                    reduce_moe_fused_output_f32(ctx, &expanded_out, &plan, ffn_norm.hidden_dim)?;
+                let shared_out =
+                    shared_expert_forward_bf16_hidden(ctx, &ffn_norm, &ffn, config.swiglu_limit)?;
+                all_reduce_f32_hidden_in_place(&mut routed_out, comm)
+                    .with_context(|| format!("moe routed all_reduce layer {layer} rank {rank}"))?;
+                let ffn_out = add_f32_bf16_to_bf16_hidden(ctx, &routed_out, &shared_out)?;
+                let hidden = hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
+                    .with_context(|| format!("hc_post ffn layer {layer} rank {rank}"))?;
+                Ok((rank, hidden))
+            }));
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("rank-thread block decode worker panicked"))??,
+            );
+        }
+        results.sort_by_key(|(rank, _)| *rank);
+        for (_, hidden) in results {
+            out.push(hidden);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn attention_decode_rank_local_collective_bf16_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    cache: &mut LayerDecodeCache,
+    comm: &Comm,
+) -> Result<Bf16HiddenStates> {
+    match config.compress_ratios[layer] {
+        0 => attention_decode_rank_local_bf16_hidden(
+            ctx,
+            config,
+            layer,
+            input,
+            attn,
+            rope,
+            start_pos,
+            &mut cache.kv,
+        ),
+        4 => attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
+            ctx, config, layer, input, attn, rope, start_pos, cache, comm,
+        ),
+        _ => attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
+            ctx, config, layer, input, attn, rope, start_pos, cache,
+        ),
+    }
+}
+
+fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    cache: &mut LayerDecodeCache,
+    comm: &Comm,
+) -> Result<Bf16HiddenStates> {
+    ensure!(input.seq_len == 1, "ratio-4 decode expects seq_len=1");
+    ensure!(
+        config.compress_ratios[layer] == 4,
+        "ratio-4 decode called for layer {layer} with ratio {}",
+        config.compress_ratios[layer]
+    );
+
+    let compressor = attn
+        .compressor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor weights"))?;
+    let indexer = attn
+        .indexer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing ratio-4 indexer weights"))?;
+    let compressor_state = cache
+        .compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor state"))?;
+
+    let mut projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
+    apply_rope_attention_projections(ctx, &mut projections, rope, start_pos)?;
+    copy_bf16_rows_to_cache(
+        ctx,
+        &projections.kv,
+        &mut cache.kv,
+        0,
+        start_pos % config.sliding_window,
+        1,
+    )?;
+    if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden(
+        ctx,
+        config,
+        input,
+        compressor,
+        rope,
+        start_pos,
+        compressor_state,
+    )? {
+        copy_bf16_rows_to_cache(
+            ctx,
+            &compressed_kv,
+            &mut cache.kv,
+            0,
+            config.sliding_window + start_pos / 4,
+            1,
+        )?;
+    }
+
+    let indexer_kv = cache
+        .indexer_kv
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer kv cache"))?;
+    let indexer_state = cache
+        .indexer_compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer compressor state"))?;
+    let mut scores = indexer_scores_decode_bf16_hidden(
+        ctx,
+        config,
+        input,
+        &projections.qr,
+        indexer,
+        rope,
+        start_pos,
+        indexer_kv,
+        indexer_state,
+    )?;
+
+    if let Some(scores) = scores.as_mut() {
+        comm.all_reduce_in_place(scores, &ReduceOp::Sum)
+            .map_err(|err| {
+                anyhow::anyhow!("NCCL decode indexer score all-reduce failed: {err:?}")
+            })?;
+    }
+
+    let (window_idxs, window_topk) =
+        window_topk_indices_decode(ctx, start_pos, config.sliding_window)?;
+    let compressed_len = (start_pos + 1) / 4;
+    let (topk_idxs, topk) = if compressed_len > 0 {
+        let scores = scores
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing indexer decode scores"))?;
+        let (compress_idxs, compress_topk) = indexer_topk_indices_decode(
+            ctx,
+            config,
+            scores,
+            compressed_len,
+            config.sliding_window,
+        )?;
+        (
+            concat_topk_indices(
+                ctx,
+                &window_idxs,
+                window_topk,
+                &compress_idxs,
+                compress_topk,
+                1,
+            )?,
+            window_topk + compress_topk,
+        )
+    } else {
+        (window_idxs, window_topk)
+    };
+    let mut attn_out = indexed_attention_cache_bf16_hidden(
+        ctx,
+        config,
+        &projections,
+        &cache.kv,
+        attn,
+        &topk_idxs,
+        topk,
+    )?;
+    attention_output_project_bf16_hidden(
+        ctx,
+        &mut attn_out,
+        attn,
+        rope,
+        projections.local_heads,
+        projections.head_dim,
+        start_pos,
+    )
 }
 
 pub fn prefill_logits_group_bf16_hidden(

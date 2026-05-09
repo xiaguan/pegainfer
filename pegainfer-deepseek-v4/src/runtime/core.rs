@@ -683,6 +683,27 @@ pub fn fp4_linear_bf16_hidden(
     input: &Bf16HiddenStates,
     linear: &QuantLinearRef<'_>,
 ) -> Result<Bf16HiddenStates> {
+    fp4_linear_bf16_device(ctx, &input.data, input.hidden_dim, input.seq_len, linear)
+}
+
+pub fn fp4_linear_bf16_view(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenView<'_>,
+    linear: &QuantLinearRef<'_>,
+) -> Result<Bf16HiddenStates> {
+    fp4_linear_bf16_device(ctx, &input.data, input.hidden_dim, input.seq_len, linear)
+}
+
+fn fp4_linear_bf16_device<T>(
+    ctx: &RankGpuContext,
+    input_data: &T,
+    input_hidden_dim: usize,
+    input_seq_len: usize,
+    linear: &QuantLinearRef<'_>,
+) -> Result<Bf16HiddenStates>
+where
+    T: DevicePtr<bf16>,
+{
     ctx.set_current()?;
     ensure!(
         linear.weight.tensor.dtype == safetensors::Dtype::F4,
@@ -705,11 +726,11 @@ pub fn fp4_linear_bf16_hidden(
     let out_dim = linear.weight.tensor.shape[0];
     let in_dim = linear.weight.tensor.shape[1];
     ensure!(
-        in_dim == input.hidden_dim,
+        in_dim == input_hidden_dim,
         "FP4 linear input dim mismatch: weight {} expects {}, got {}",
         linear.weight.name,
         in_dim,
-        input.hidden_dim
+        input_hidden_dim
     );
     ensure!(
         in_dim.is_multiple_of(32),
@@ -723,9 +744,9 @@ pub fn fp4_linear_bf16_hidden(
         linear.scale.tensor.shape
     );
 
-    let mut out = Bf16HiddenStates::zeros(ctx, out_dim, input.seq_len)?;
+    let mut out = Bf16HiddenStates::zeros(ctx, out_dim, input_seq_len)?;
     {
-        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (x_ptr, _x_guard) = input_data.device_ptr(&ctx.stream);
         let (w_ptr, _w_guard) = linear.weight.tensor.data.device_ptr(&ctx.stream);
         let (s_ptr, _s_guard) = linear.scale.tensor.data.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
@@ -735,7 +756,7 @@ pub fn fp4_linear_bf16_hidden(
                 w_ptr as *const u8,
                 s_ptr as *const u8,
                 out_ptr as *mut ffi::Half,
-                input.seq_len as i32,
+                input_seq_len as i32,
                 in_dim as i32,
                 out_dim as i32,
                 ctx.stream.cu_stream(),
@@ -835,61 +856,6 @@ pub fn swiglu_clamp_bf16_hidden(
     Ok(out)
 }
 
-pub(crate) fn swiglu_clamp_weighted_bf16_hidden(
-    ctx: &RankGpuContext,
-    gate: &Bf16HiddenStates,
-    up: &Bf16HiddenStates,
-    routed: &RoutedExperts,
-    global_expert: usize,
-    limit: f32,
-) -> Result<Bf16HiddenStates> {
-    ctx.set_current()?;
-    ensure!(
-        gate.hidden_dim == up.hidden_dim,
-        "weighted SwiGLU hidden dim mismatch: gate={}, up={}",
-        gate.hidden_dim,
-        up.hidden_dim
-    );
-    ensure!(
-        gate.seq_len == up.seq_len,
-        "weighted SwiGLU seq len mismatch: gate={}, up={}",
-        gate.seq_len,
-        up.seq_len
-    );
-    ensure!(
-        routed.seq_len == gate.seq_len,
-        "weighted SwiGLU route seq len mismatch: route={}, gate={}",
-        routed.seq_len,
-        gate.seq_len
-    );
-
-    let mut out = Bf16HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
-    {
-        let (gate_ptr, _gate_guard) = gate.data.device_ptr(&ctx.stream);
-        let (up_ptr, _up_guard) = up.data.device_ptr(&ctx.stream);
-        let (weights_ptr, _weights_guard) = routed.weights.device_ptr(&ctx.stream);
-        let (indices_ptr, _indices_guard) = routed.indices.device_ptr(&ctx.stream);
-        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-        let result = unsafe {
-            ffi::deepseek_swiglu_clamp_weighted_cuda(
-                gate_ptr as *const ffi::Half,
-                up_ptr as *const ffi::Half,
-                weights_ptr as *const f32,
-                indices_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                (gate.hidden_dim * gate.seq_len) as i32,
-                gate.hidden_dim as i32,
-                routed.topk as i32,
-                global_expert as i32,
-                limit,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-    Ok(out)
-}
-
 pub fn local_expert_forward_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -900,22 +866,6 @@ pub fn local_expert_forward_bf16_hidden(
     let gate = fp4_linear_bf16_hidden(ctx, input, &expert.w1)?;
     let up = fp4_linear_bf16_hidden(ctx, input, &expert.w3)?;
     let activated = swiglu_clamp_bf16_hidden(ctx, &gate, &up, swiglu_limit)?;
-    fp4_linear_bf16_hidden(ctx, &activated, &expert.w2)
-}
-
-pub fn local_expert_forward_weighted_bf16_hidden(
-    ctx: &RankGpuContext,
-    input: &Bf16HiddenStates,
-    expert: &ExpertWeights<'_>,
-    routed: &RoutedExperts,
-    global_expert: usize,
-    swiglu_limit: f32,
-) -> Result<Bf16HiddenStates> {
-    ctx.set_current()?;
-    let gate = fp4_linear_bf16_hidden(ctx, input, &expert.w1)?;
-    let up = fp4_linear_bf16_hidden(ctx, input, &expert.w3)?;
-    let activated =
-        swiglu_clamp_weighted_bf16_hidden(ctx, &gate, &up, routed, global_expert, swiglu_limit)?;
     fp4_linear_bf16_hidden(ctx, &activated, &expert.w2)
 }
 

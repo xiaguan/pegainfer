@@ -10,9 +10,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
-    TensorParallelConfig, block_decode_group_bf16_hidden, embedding_vocab_parallel_group,
-    final_logits_group_bf16_hidden, hc_expand_bf16_hidden, load_rank_to_gpu, precompute_rope_cache,
-    prefill_logits_and_decode_cache_group_bf16_hidden,
+    TensorParallelConfig, block_decode_group_rank_threads_bf16_hidden,
+    embedding_vocab_parallel_group, final_logits_group_bf16_hidden, hc_expand_bf16_hidden,
+    load_rank_to_gpu, precompute_rope_cache, prefill_logits_and_decode_cache_group_bf16_hidden,
 };
 
 struct FullDirectRuntime<'a> {
@@ -411,7 +411,7 @@ fn run_direct_decode_logits(
                 )
             })
             .collect::<Vec<_>>();
-        hcs = block_decode_group_bf16_hidden(
+        hcs = block_decode_group_rank_threads_bf16_hidden(
             &block_inputs,
             config,
             layer,
@@ -419,7 +419,9 @@ fn run_direct_decode_logits(
             start_pos,
             &mut runtime.caches[layer],
         )
-        .with_context(|| format!("block_decode_group_bf16_hidden layer {layer} pos {start_pos}"))?;
+        .with_context(|| {
+            format!("block_decode_group_rank_threads_bf16_hidden layer {layer} pos {start_pos}")
+        })?;
     }
 
     let logits_inputs = (0..8)

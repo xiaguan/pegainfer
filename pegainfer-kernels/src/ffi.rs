@@ -258,20 +258,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_swiglu_clamp_weighted_cuda(
-        gate: *const Half,
-        up: *const Half,
-        route_weights: *const f32,
-        route_indices: *const i32,
-        out: *mut Half,
-        n: i32,
-        hidden_dim: i32,
-        topk: i32,
-        global_expert: i32,
-        limit: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn deepseek_hash_gate_cuda(
         x: *const Half,
         gate_weight: *const Half,
@@ -318,34 +304,43 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_weighted_expert_accum_cuda(
-        expert_out: *const Half,
-        route_weights: *const f32,
+    pub fn deepseek_moe_local_mapping_cuda(
         route_indices: *const i32,
-        accum: *mut Half,
+        pos_to_expert: *mut i32,
+        pos_to_token: *mut i32,
+        pos_to_token_topk: *mut i32,
+        token_topk_to_pos: *mut i32,
+        expert_start: *mut i32,
+        expert_end: *mut i32,
+        num_tokens_per_expert: *mut i32,
         seq_len: i32,
-        hidden_dim: i32,
         topk: i32,
-        global_expert: i32,
+        global_start: i32,
+        local_experts: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_weighted_expert_accum_f32_cuda(
-        expert_out: *const Half,
+    pub fn deepseek_moe_expand_to_fused_cuda(
+        x: *const Half,
+        pos_to_token: *const i32,
+        expanded: *mut Half,
+        seq_len: i32,
+        hidden_dim: i32,
+        topk: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_moe_clear_bf16_cuda(data: *mut Half, n: i32, stream: CUstream) -> CUresult;
+
+    pub fn deepseek_moe_reduce_fused_f32_cuda(
+        expanded: *const Half,
         route_weights: *const f32,
-        route_indices: *const i32,
+        token_topk_to_pos: *const i32,
         accum: *mut f32,
         seq_len: i32,
         hidden_dim: i32,
         topk: i32,
-        global_expert: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_expert_accum_f32_cuda(
-        expert_out: *const Half,
-        accum: *mut f32,
-        n: i32,
         stream: CUstream,
     ) -> CUresult;
 

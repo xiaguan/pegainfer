@@ -94,45 +94,6 @@ __global__ void deepseek_swiglu_clamp_kernel(
   }
 }
 
-__global__ void deepseek_swiglu_clamp_weighted_kernel(
-    const __nv_bfloat16 *__restrict__ gate,
-    const __nv_bfloat16 *__restrict__ up,
-    const float *__restrict__ route_weights,
-    const int *__restrict__ route_indices,
-    __nv_bfloat16 *__restrict__ out,
-    int n,
-    int hidden_dim,
-    int topk,
-    int global_expert,
-    float limit) {
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-       idx < n;
-       idx += gridDim.x * blockDim.x) {
-    int token = idx / hidden_dim;
-    float scale = 0.0f;
-    for (int route = 0; route < topk; ++route) {
-      int route_offset = token * topk + route;
-      if (route_indices[route_offset] == global_expert) {
-        scale += route_weights[route_offset];
-      }
-    }
-    if (scale == 0.0f) {
-      out[idx] = __float2bfloat16(0.0f);
-      continue;
-    }
-
-    float gate_value = __bfloat162float(gate[idx]);
-    float up_value = __bfloat162float(up[idx]);
-    if (limit > 0.0f) {
-      gate_value = fminf(gate_value, limit);
-      up_value = fminf(fmaxf(up_value, -limit), limit);
-    }
-
-    float silu_gate = gate_value / (1.0f + expf(-gate_value));
-    out[idx] = __float2bfloat16(scale * silu_gate * up_value);
-  }
-}
-
 extern "C" {
 
 cudaError_t deepseek_swiglu_clamp_cuda(
@@ -146,25 +107,6 @@ cudaError_t deepseek_swiglu_clamp_cuda(
   int blocks = (n + threads - 1) / threads;
   deepseek_swiglu_clamp_kernel<<<blocks, threads, 0, stream>>>(
       gate, up, out, n, limit);
-  return cudaGetLastError();
-}
-
-cudaError_t deepseek_swiglu_clamp_weighted_cuda(
-    const __nv_bfloat16 *gate,
-    const __nv_bfloat16 *up,
-    const float *route_weights,
-    const int *route_indices,
-    __nv_bfloat16 *out,
-    int n,
-    int hidden_dim,
-    int topk,
-    int global_expert,
-    float limit,
-    cudaStream_t stream) {
-  constexpr int threads = 256;
-  int blocks = (n + threads - 1) / threads;
-  deepseek_swiglu_clamp_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      gate, up, route_weights, route_indices, out, n, hidden_dim, topk, global_expert, limit);
   return cudaGetLastError();
 }
 
@@ -569,69 +511,6 @@ cudaError_t deepseek_score_gate_debug_cuda(
 
 }  // extern "C"
 
-__global__ void deepseek_weighted_expert_accum_kernel(
-    const __nv_bfloat16 *__restrict__ expert_out,
-    const float *__restrict__ route_weights,
-    const int *__restrict__ route_indices,
-    __nv_bfloat16 *__restrict__ accum,
-    int seq_len,
-    int hidden_dim,
-    int topk,
-    int global_expert) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = seq_len * hidden_dim;
-  if (idx >= total) return;
-
-  int token = idx / hidden_dim;
-  float scale = 0.0f;
-  for (int route = 0; route < topk; ++route) {
-    int route_offset = token * topk + route;
-    if (route_indices[route_offset] == global_expert) {
-      scale += route_weights[route_offset];
-    }
-  }
-  if (scale == 0.0f) return;
-
-  float current = __bfloat162float(accum[idx]);
-  float update = __bfloat162float(expert_out[idx]) * scale;
-  accum[idx] = __float2bfloat16(current + update);
-}
-
-__global__ void deepseek_weighted_expert_accum_f32_kernel(
-    const __nv_bfloat16 *__restrict__ expert_out,
-    const float *__restrict__ route_weights,
-    const int *__restrict__ route_indices,
-    float *__restrict__ accum,
-    int seq_len,
-    int hidden_dim,
-    int topk,
-    int global_expert) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = seq_len * hidden_dim;
-  if (idx >= total) return;
-
-  int token = idx / hidden_dim;
-  float scale = 0.0f;
-  for (int route = 0; route < topk; ++route) {
-    int route_offset = token * topk + route;
-    if (route_indices[route_offset] == global_expert) {
-      scale += route_weights[route_offset];
-    }
-  }
-  if (scale == 0.0f) return;
-
-  accum[idx] += __bfloat162float(expert_out[idx]) * scale;
-}
-
-__global__ void deepseek_expert_accum_f32_kernel(
-    const __nv_bfloat16 *__restrict__ expert_out,
-    float *__restrict__ accum,
-    int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= n) return;
-  accum[idx] += __bfloat162float(expert_out[idx]);
-}
-
 __global__ void deepseek_add_f32_bf16_to_bf16_kernel(
     const float *__restrict__ a,
     const __nv_bfloat16 *__restrict__ b,
@@ -642,54 +521,193 @@ __global__ void deepseek_add_f32_bf16_to_bf16_kernel(
   out[idx] = __float2bfloat16(a[idx] + __bfloat162float(b[idx]));
 }
 
+__global__ void deepseek_moe_clear_i32_kernel(int* data, int n, int value) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    data[idx] = value;
+  }
+}
+
+__global__ void deepseek_moe_clear_bf16_kernel(__nv_bfloat16* data, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    data[idx] = __float2bfloat16(0.0f);
+  }
+}
+
+__global__ void deepseek_moe_local_mapping_kernel(
+    const int *__restrict__ route_indices,
+    int *__restrict__ pos_to_expert,
+    int *__restrict__ pos_to_token,
+    int *__restrict__ pos_to_token_topk,
+    int *__restrict__ token_topk_to_pos,
+    int *__restrict__ expert_start,
+    int *__restrict__ expert_end,
+    int *__restrict__ num_tokens_per_expert,
+    int seq_len,
+    int topk,
+    int global_start,
+    int local_experts) {
+  int local_expert = blockIdx.x;
+  if (local_expert >= local_experts) return;
+
+  int global_expert = global_start + local_expert;
+  int cursor = local_expert * seq_len * topk;
+  int count = 0;
+  for (int token = 0; token < seq_len; ++token) {
+    for (int route = 0; route < topk; ++route) {
+      int route_offset = token * topk + route;
+      if (route_indices[route_offset] == global_expert) {
+        int pos = cursor + count;
+        pos_to_expert[pos] = global_expert;
+        pos_to_token[pos] = token;
+        pos_to_token_topk[pos] = route_offset;
+        token_topk_to_pos[route_offset] = pos;
+        count += 1;
+      }
+    }
+  }
+  expert_start[local_expert] = cursor;
+  expert_end[local_expert] = cursor + count;
+  num_tokens_per_expert[local_expert] = count;
+}
+
+__global__ void deepseek_moe_expand_to_fused_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const int *__restrict__ pos_to_token,
+    __nv_bfloat16 *__restrict__ expanded,
+    int hidden_dim,
+    int num_expanded) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_expanded * hidden_dim;
+  if (idx >= total) return;
+  int pos = idx / hidden_dim;
+  int dim = idx - pos * hidden_dim;
+  int token = pos_to_token[pos];
+  if (token < 0) {
+    expanded[idx] = __float2bfloat16(0.0f);
+  } else {
+    expanded[idx] = x[token * hidden_dim + dim];
+  }
+}
+
+__global__ void deepseek_moe_reduce_fused_f32_kernel(
+    const __nv_bfloat16 *__restrict__ expanded,
+    const float *__restrict__ route_weights,
+    const int *__restrict__ token_topk_to_pos,
+    float *__restrict__ out,
+    int seq_len,
+    int hidden_dim,
+    int topk) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * hidden_dim;
+  if (idx >= total) return;
+  int token = idx / hidden_dim;
+  int dim = idx - token * hidden_dim;
+
+  float acc = 0.0f;
+  for (int route = 0; route < topk; ++route) {
+    int route_offset = token * topk + route;
+    int pos = token_topk_to_pos[route_offset];
+    if (pos >= 0) {
+      acc += __bfloat162float(expanded[pos * hidden_dim + dim]) * route_weights[route_offset];
+    }
+  }
+  out[idx] = acc;
+}
+
 extern "C" {
 
-cudaError_t deepseek_weighted_expert_accum_cuda(
-    const __nv_bfloat16 *expert_out,
-    const float *route_weights,
+cudaError_t deepseek_moe_local_mapping_cuda(
     const int *route_indices,
-    __nv_bfloat16 *accum,
+    int *pos_to_expert,
+    int *pos_to_token,
+    int *pos_to_token_topk,
+    int *token_topk_to_pos,
+    int *expert_start,
+    int *expert_end,
+    int *num_tokens_per_expert,
     int seq_len,
-    int hidden_dim,
     int topk,
-    int global_expert,
+    int global_start,
+    int local_experts,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  int total = seq_len * hidden_dim;
-  int blocks = (total + threads - 1) / threads;
-  deepseek_weighted_expert_accum_kernel<<<blocks, threads, 0, stream>>>(
-      expert_out, route_weights, route_indices, accum,
-      seq_len, hidden_dim, topk, global_expert);
+  int num_expanded = seq_len * topk * local_experts;
+  int route_elems = seq_len * topk;
+  int clear_blocks = (num_expanded + threads - 1) / threads;
+  int route_blocks = (route_elems + threads - 1) / threads;
+  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_expert, num_expanded, -1);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token, num_expanded, -1);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token_topk, num_expanded, -1);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<route_blocks, threads, 0, stream>>>(token_topk_to_pos, route_elems, -1);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(expert_start, local_experts, 0);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(expert_end, local_experts, 0);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(num_tokens_per_expert, local_experts, 0);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  deepseek_moe_local_mapping_kernel<<<local_experts, 1, 0, stream>>>(
+      route_indices, pos_to_expert, pos_to_token, pos_to_token_topk,
+      token_topk_to_pos, expert_start, expert_end, num_tokens_per_expert,
+      seq_len, topk, global_start, local_experts);
   return cudaGetLastError();
 }
 
-cudaError_t deepseek_weighted_expert_accum_f32_cuda(
-    const __nv_bfloat16 *expert_out,
-    const float *route_weights,
-    const int *route_indices,
-    float *accum,
+cudaError_t deepseek_moe_expand_to_fused_cuda(
+    const __nv_bfloat16 *x,
+    const int *pos_to_token,
+    __nv_bfloat16 *expanded,
     int seq_len,
     int hidden_dim,
     int topk,
-    int global_expert,
+    int local_experts,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  int total = seq_len * hidden_dim;
+  int num_expanded = seq_len * topk * local_experts;
+  int total = num_expanded * hidden_dim;
   int blocks = (total + threads - 1) / threads;
-  deepseek_weighted_expert_accum_f32_kernel<<<blocks, threads, 0, stream>>>(
-      expert_out, route_weights, route_indices, accum,
-      seq_len, hidden_dim, topk, global_expert);
+  deepseek_moe_expand_to_fused_kernel<<<blocks, threads, 0, stream>>>(
+      x, pos_to_token, expanded, hidden_dim, num_expanded);
   return cudaGetLastError();
 }
 
-cudaError_t deepseek_expert_accum_f32_cuda(
-    const __nv_bfloat16 *expert_out,
-    float *accum,
+cudaError_t deepseek_moe_clear_bf16_cuda(
+    __nv_bfloat16 *data,
     int n,
     cudaStream_t stream) {
   constexpr int threads = 256;
   int blocks = (n + threads - 1) / threads;
-  deepseek_expert_accum_f32_kernel<<<blocks, threads, 0, stream>>>(expert_out, accum, n);
+  deepseek_moe_clear_bf16_kernel<<<blocks, threads, 0, stream>>>(data, n);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_moe_reduce_fused_f32_cuda(
+    const __nv_bfloat16 *expanded,
+    const float *route_weights,
+    const int *token_topk_to_pos,
+    float *out,
+    int seq_len,
+    int hidden_dim,
+    int topk,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  int total = seq_len * hidden_dim;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_moe_reduce_fused_f32_kernel<<<blocks, threads, 0, stream>>>(
+      expanded, route_weights, token_topk_to_pos, out, seq_len, hidden_dim, topk);
   return cudaGetLastError();
 }
 

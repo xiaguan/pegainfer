@@ -50,6 +50,12 @@ pub struct RankGpuContext {
     pub device_ordinal: usize,
 }
 
+// SAFETY: A rank context is pinned to one CUDA device. The parallel runtime only
+// drives each rank's context from one worker at a time; different ranks use
+// distinct contexts/streams/devices.
+unsafe impl Send for RankGpuContext {}
+unsafe impl Sync for RankGpuContext {}
+
 impl RankGpuContext {
     pub fn new(device_ordinal: usize) -> Result<Self> {
         Self::set_current_device(device_ordinal)?;

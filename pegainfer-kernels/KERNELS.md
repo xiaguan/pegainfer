@@ -52,8 +52,8 @@ symbols directly through `pegainfer_kernels::ffi`.
 | `deepseek_v4.hc` | `runtime/core.rs` | `deepseek_hc_expand_cuda`, `deepseek_hc_mixes_cuda`, `deepseek_hc_split_sinkhorn_cuda`, `deepseek_hc_pre_output_cuda`, `deepseek_hc_head_pre_cuda`, `deepseek_hc_post_cuda` | `csrc/deepseek_v4/deepseek_hc.cu`, `tools/tilelang/deepseek_v4/generate.py` | CUDA + TileLang sinkhorn helper + cuBLAS wrapper | HC split sinkhorn TileLang shape currently `hc4_i20`; other HC stages include expand/mix/pre/post transforms. |
 | `deepseek_v4.logits.last_token` | `runtime/core.rs` | `deepseek_last_token_bf16_logits_cuda` | `csrc/deepseek_v4/deepseek_hc.cu` | cuBLAS-backed CUDA wrapper | Computes final logits from the last BF16 hidden token. |
 | `deepseek_v4.moe.route` | `runtime/moe.rs` | `deepseek_hash_gate_cuda`, `deepseek_score_gate_cuda`, `deepseek_score_gate_debug_cuda` | `csrc/deepseek_v4/deepseek_moe.cu` | CUDA + cuBLAS wrapper | Hash/score gate routing and debug score extraction. |
-| `deepseek_v4.moe.activation` | `runtime/core.rs` | `deepseek_swiglu_clamp_cuda`, `deepseek_swiglu_clamp_weighted_cuda` | `csrc/deepseek_v4/deepseek_moe.cu` | CUDA | SwiGLU clamp for shared and routed expert paths. |
-| `deepseek_v4.moe.accum` | `runtime/moe.rs` | `deepseek_weighted_expert_accum_cuda`, `deepseek_weighted_expert_accum_f32_cuda`, `deepseek_expert_accum_f32_cuda`, `deepseek_add_f32_bf16_to_bf16_cuda` | `csrc/deepseek_v4/deepseek_moe.cu` | CUDA | Expert output accumulation in BF16/F32 and residual conversion helpers. |
+| `deepseek_v4.moe.activation` | `runtime/core.rs` | `deepseek_swiglu_clamp_cuda` | `csrc/deepseek_v4/deepseek_moe.cu` | CUDA | SwiGLU clamp for shared and packed routed expert paths. |
+| `deepseek_v4.moe.fused_layout` | `runtime/moe.rs` | `deepseek_moe_local_mapping_cuda`, `deepseek_moe_expand_to_fused_cuda`, `deepseek_moe_reduce_fused_f32_cuda`, `deepseek_add_f32_bf16_to_bf16_cuda` | `csrc/deepseek_v4/deepseek_moe.cu` | CUDA | GPU-resident local expert mapping, expert-major input expansion, packed routed output reduction, and residual conversion helpers. |
 
 ## Non-Qwen3 Compatibility
 
