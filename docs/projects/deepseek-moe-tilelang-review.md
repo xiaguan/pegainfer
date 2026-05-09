@@ -7,9 +7,11 @@
 
 - Official DeepSeek `tile_kernels/moe` is routing/layout infrastructure, not a drop-in fused FP4 expert MLP. The useful pieces are `top2_sum_gate`, TP masking, group/count helpers, `get_fused_mapping`, `expand_to_fused`, and `reduce_fused`.
 - The first local packed-layout experiment preserved exact DeepSeek V4 output, but it did not fix decode TPOT. Non-nsys `prompt-len=1`, `output-len=32` measured `171.11ms/token`; nsys measured `268.51ms/token` with profiler overhead.
-- The NCCL bucket was over-interpreted: grouped by 8-rank logical collective, the trace shows most apparent NCCL duration is rank arrival skew/waiting, not pure communication. The bigger immediate issue was CPU rank dispatch.
+- The NCCL bucket was over-interpreted: grouped by 8-rank logical collective, the trace shows most apparent NCCL duration is rank arrival skew/waiting, not pure communication. CPU rank dispatch was the first large cause; after persistent rank workers, the remaining skew mostly comes from uneven rank-local MoE decode work before each all-reduce.
 - A scoped rank-thread decode slice improved 1x32 steady TPOT to `113.54ms/token`. Replacing it with 8 persistent Qwen3-style rank workers improved the same bench to `94.84ms/token`; full exact E2E passed all 20 cases.
-- Next optimization should continue with decode-specific grouped/fused routed expert execution and scratch/allocator cleanup. Polishing standalone MoE expand/reduce kernels is not enough for single-token decode.
+- Persistent-worker nsys shows about `107` f32 all-reduce collectives per steady decode token. Post-arrival NCCL tail is only about `0.019ms/collective`, while arrival skew averages about `0.83ms/collective`; per-token skew is therefore the Amdahl-sized bucket. The root cause is not a single 60ms NCCL transfer, and EP8 routed expert imbalance alone does not explain 100ms TPOT. The stronger explanation is repeated rank phase skew before collectives, amplified by runtime/allocator/host-loop overhead and then serialized across 43 layers.
+- Failed optimizations to avoid repeating: replacing hot zeroed allocations with uninitialized allocation regressed 1x32 TPOT to `107.52ms/token`; sharing W1/W3 FP4 activation quantization regressed it to `119.63ms/token`. Both were reverted.
+- Next optimization should reduce per-rank MoE decode imbalance and/or the number of f32 collectives. Polishing kernel launch, memset, or standalone MoE expand/reduce details is not enough unless it moves the per-token skew bucket.
 - Keep this profile as the decode composition baseline for the next refactor; do not judge future MoE changes only by exact e2e text pass.
 
 ## Preparation
@@ -329,19 +331,136 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - Persistent rank workers are an effective CPU-dispatch optimization: scoped rank-thread steady TPOT `113.54ms/token` moved to `94.84ms/token`.
   - The remaining decode floor is more likely the many tiny FP4/FP8 GEMMs, activation quantization, allocator/memset churn, and model-specific compressor/indexer work than raw NCCL link time.
 
+### Step 9: Persistent-worker nsys skew root cause
+- Captured a follow-up nsys trace for the persistent worker path:
+
+```bash
+nsys profile --stats=false --force-overwrite=true \
+  --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+  --delay=34 --duration=12 \
+  -o target/profiling/dsv4_persistent_workers_decode_1x32_direct \
+  target/release/bench_serving \
+  --model-path /data/DeepSeek-V4-Flash --format json \
+  request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+```
+
+  - Trace artifacts:
+    - `target/profiling/dsv4_persistent_workers_decode_1x32_direct.nsys-rep`
+    - `target/profiling/dsv4_persistent_workers_decode_1x32_direct.sqlite`
+  - The nsys run was distorted (`145.32ms/token`) and ended with the existing NCCL destructor panic after benchmark JSON had been emitted. Use it for composition and ordering, not absolute TPOT.
+- Corrected f32 NCCL interpretation:
+  - The final logits all-gather groups give `32` decode token boundaries.
+  - Steady tokens contain about `107` f32 all-reduce collectives:
+    - `43` attention output all-reduces,
+    - `43` MoE routed output all-reduces,
+    - `21` ratio-4 indexer score all-reduces.
+  - Across complete steady-token f32 all-reduce groups:
+    - average arrival skew: `0.830ms/collective` (`p50=0.865ms`, `p95=1.449ms`);
+    - average post-arrival tail: about `0.019ms/collective`;
+    - steady token intervals under nsys average `~88ms/token` of f32 collective arrival skew but only `~2.05ms/token` of post-arrival NCCL tail.
+  - Therefore the raw `ncclDevKernel_AllReduce_Sum_f32` total (`~25s` in this trace) is mostly rank wait time. It should not be read as link transfer cost.
+- Root-cause signal for the skew:
+  - Per-device f32 collective lateness is not completely uniform, but no single device explains the bucket. Devices 1 and 3 are late most often; devices 4 and 0 are early most often.
+  - The largest-skew collective ordinals have a repeated pre-collective fingerprint: routed MoE FP4 expert work. Example high-skew ordinals show latest ranks running roughly `5-7` FP4 expert kernels before entering the all-reduce while earliest ranks usually run `0`.
+  - Full-trace FP4 expert kernel counts are also uneven by device:
+
+| Device | FP4 kernels | FP4 total |
+| ---: | ---: | ---: |
+| 0 | `5943` | `327.4ms` |
+| 1 | `5979` | `337.1ms` |
+| 2 | `6057` | `331.8ms` |
+| 3 | `6225` | `346.8ms` |
+| 4 | `5340` | `294.9ms` |
+| 5 | `5448` | `305.0ms` |
+| 6 | `6009` | `335.8ms` |
+| 7 | `5826` | `324.5ms` |
+
+  - Average FP4 kernel duration is similar across devices (`~55us`), so the imbalance is mostly how many routed local experts each rank executes, not a slow individual GPU kernel.
+  - The current packed MoE decode path still does `clone_dtoh(&plan.expert_start)`, `clone_dtoh(&plan.expert_end)`, and `ctx.sync()` inside `local_experts_forward_packed_bf16_hidden`, then uses a host loop to run only active local experts. This makes rank-local route imbalance visible as all-reduce arrival skew.
+  - Runtime API counts under nsys confirm the path is still heavily fragmented on rank worker threads: about `1.46M` kernel launches, `1.04M` async allocs/frees, and `40.8K` D2H memcpy calls on rank-worker threads in the captured window. These are important only insofar as they amplify the MoE imbalance; the Amdahl bucket remains arrival skew before collectives.
+- Follow-up sanity check after questioning the EP8-only explanation:
+  - Current runtime is best described as MP8: tensor-parallel dense/attention plus EP8-style routed expert ownership. Routed experts are not tensor-sliced within each expert; `256` experts are assigned by id across 8 ranks, `32` complete experts per rank.
+  - Even in the worst per-token route imbalance, routed FP4 expert compute alone is too small to explain 100ms TPOT. In the persistent-worker trace, per-device FP4 totals are roughly `~10-12ms/token`.
+  - Re-mapping the 107 steady-token collectives by code order gives average skew contribution per token:
+
+| Collective class | Count/token | Skew/token |
+| --- | ---: | ---: |
+| MoE routed all-reduce | `43` | `~43.0ms` |
+| Attention output all-reduce | `43` | `~25.5ms` |
+| Ratio-4 indexer score all-reduce | `21` | `~20.4ms` |
+| Total | `107` | `~88.8ms` |
+
+  - Late-vs-early segment decomposition shows most of the wall skew is runtime/API overhead rather than active GPU compute:
+
+| Collective class | Late wall | Early wall | Late GPU active | Early GPU active | Late runtime/API | Early runtime/API |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Indexer | `1.613ms` | `0.642ms` | `0.170ms` | `0.169ms` | `1.449ms` | `0.552ms` |
+| Attention | `0.976ms` | `0.384ms` | `0.085ms` | `0.084ms` | `0.864ms` | `0.325ms` |
+| MoE | `1.379ms` | `0.379ms` | `0.402ms` | `0.115ms` | `1.240ms` | `0.329ms` |
+
+  - Interpretation: MoE EP8 route imbalance creates some phase skew, but the 100ms-scale TPOT comes from many small phase skews being paid at every barrier. Attention and indexer collectives also pay large skew despite nearly equal active GPU work, which points at CPU runtime, allocation/free, launch gaps, and host-controlled loops as the amplification mechanism.
+  - Next experiments should measure or reduce runtime churn and host-controlled MoE decode scheduling before assuming expert compute or raw NCCL bandwidth is the limiting factor.
+- Temporary NVTX proof trace:
+  - Added a temporary profiling-only NVTX loader using runtime `dlopen`/`dlsym` for `nvtxRangePushA`, `nvtxRangePop`, and `nvtxMarkA`, gated by `PEGAINFER_DSV4_NVTX=1`. The instrumentation marked rank worker decode stages (`attn_local`, `indexer_ar`, `attention_ar`, `moe_route`, `moe_plan`, `moe_experts`, `moe_reduce`, `shared_expert`, `moe_ar`) plus active local expert counts and per-local-expert ranges. The temporary code was removed after the trace, so it is not part of the hot path.
+  - Build and trace commands:
+
+```bash
+PEGAINFER_NVCC_JOBS=8 cargo build --release -p pegainfer-server --bin bench_serving --features deepseek-v4
+
+PEGAINFER_DSV4_NVTX=1 nsys profile --stats=false --force-overwrite=true \
+  --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+  --delay=34 --duration=12 \
+  -o target/profiling/dsv4_rank_stage_proof \
+  target/release/bench_serving \
+  --model-path /data/DeepSeek-V4-Flash --format json \
+  request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+
+nsys export --type sqlite --force-overwrite=true \
+  -o target/profiling/dsv4_rank_stage_proof.sqlite \
+  target/profiling/dsv4_rank_stage_proof.nsys-rep
+```
+
+  - Trace artifacts:
+    - `target/profiling/dsv4_rank_stage_proof.nsys-rep`
+    - `target/profiling/dsv4_rank_stage_proof.sqlite`
+  - The nsys run was distorted (`149.51ms/token`) and ended with the known NCCL destructor abort after benchmark JSON. The trace is still useful for timeline proof.
+  - Clean MoE proof case: `token=12`, `layer=17`, `moe_ar`, skew `1.200ms`.
+    - `rank0` entered MoE all-reduce at `+0.000ms`; its NCCL kernel ran `+0.018..+1.238ms`.
+    - `rank4` entered at `+1.200ms`; before that it was still in `moe_experts` `+0.176..+1.042ms` and `shared_expert` `+1.081..+1.199ms`.
+    - NVTX expert ranges show `rank4 active_local_experts=3`: global experts `129` (`+0.221..+0.632ms`), `143` (`+0.632..+0.873ms`), and `158` (`+0.875..+1.042ms`).
+    - Interpretation: this is a direct proof that the long NCCL duration on early ranks is wait time; the late rank had not reached the all-reduce because it was still running MoE expert/shared work.
+  - Extreme MoE phase-skew case: `token=22`, `layer=12`, `moe_ar`, skew `7.174ms`.
+    - `rank5` entered at `+0.000ms`; its NCCL kernel ran `+0.018..+7.433ms`.
+    - `rank7` entered at `+7.174ms`; it was in `moe_route` until `+6.738ms`, then `moe_plan`, `moe_expand`, `moe_experts` `+6.848..+7.084ms`, and `shared_expert` `+7.100..+7.173ms`.
+    - Interpretation: a 7ms NCCL kernel here is still mostly waiting, but the full 7ms should not be attributed to current-layer expert compute. The late rank already carried phase delay before this MoE stage, so skew can propagate across barriers.
+  - Indexer proof case: `token=28`, `layer=26`, `indexer_ar`, skew `1.199ms`.
+    - `rank1` entered indexer all-reduce at `+0.000ms`; its NCCL kernel ran `+0.019..+1.231ms`.
+    - `rank3` entered at `+1.199ms`; it was still inside `attn_local ratio=4` from `+0.644..+1.554ms`.
+    - Interpretation: indexer/attention-side collectives also show early ranks waiting for late ranks that are still in local decode work; this is not unique to MoE expert GEMMs.
+  - Practical lesson: proof should be taken from a concrete barrier window. A clean `~1ms` skew can be tied to active local expert count or ratio-4 local attention work. Larger multi-ms skew often includes phase delay carried from earlier barriers, so it should be treated as propagation unless the local NVTX window proves otherwise.
+- Failed attempts recorded:
+  - **Uninitialized hot outputs / memset slice**: changed hot outputs from zeroed allocation to uninitialized allocation in FP4/FP8/MoE/logits paths. `cargo check` passed, but 1x32 bench regressed from `94.84ms/token` to `107.52ms/token`. Reverted. Lesson: memset/zeroing was not the dominant Amdahl bucket, and allocation semantics can perturb scheduling enough to lose.
+  - **Shared W1/W3 FP4 activation quantization**: added a paired FP4 linear wrapper to reuse one `act_quant_k4096` for expert W1/W3. `cargo check` passed, but 1x32 bench regressed to `119.63ms/token`. Reverted. Lesson: removing one quant launch per active expert did not address rank arrival skew and worsened wall time.
+- Next action:
+  - Stop chasing raw kernel-launch and memset counts until a change shows it reduces per-token skew.
+  - Focus on MoE decode imbalance: either make routed expert execution more uniform/grouped across ranks, keep expert routing and execution GPU-resident without host expert loops, or reduce/fuse f32 collectives so each rank-local imbalance is paid fewer times.
+  - Any BF16/faster all-reduce experiment must be judged by exact E2E plus logical-collective wall analysis. A faster NCCL tail alone cannot move TPOT much while `~80-100ms/token` is arrival skew.
+
 ## Debrief
 
-- **Outcome**: Official DeepSeek TileKernels MoE source was inspected at commit `36d9e45d38e204ebb87e6f6e833821eee0482fe5`. The main finding is that official MoE support centers on GPU-resident routing selection, TP/EP masking/remapping, expert-major fused mapping, input expansion, and output reduction. A first packed-layout experiment preserved exact output but did not improve decode. Rank-thread decode showed the largest immediate issue was CPU rank dispatch/rank arrival skew, improving 1x32 steady TPOT to `113.54ms/token`; persistent rank workers pushed it further to `94.84ms/token` with all 20 exact cases passing.
+- **Outcome**: Official DeepSeek TileKernels MoE source was inspected at commit `36d9e45d38e204ebb87e6f6e833821eee0482fe5`. The main finding is that official MoE support centers on GPU-resident routing selection, TP/EP masking/remapping, expert-major fused mapping, input expansion, and output reduction. A first packed-layout experiment preserved exact output but did not improve decode. Rank-thread decode showed the largest immediate issue was CPU rank dispatch/rank arrival skew, improving 1x32 steady TPOT to `113.54ms/token`; persistent rank workers pushed it further to `94.84ms/token` with all 20 exact cases passing. Persistent-worker nsys then showed the remaining large bucket is not raw NCCL transfer. It is repeated rank phase skew before `107` f32 collectives per token; EP8 routed expert imbalance contributes, but runtime/allocator/host-loop amplification is necessary to explain the 100ms-scale TPOT.
 - **Pitfalls encountered**:
   - The name `moe` is easy to misread as a fused expert MLP implementation. In this repository it is mostly layout and routing infrastructure.
   - Local exact text passing does not prove the execution path matches official routing topology; it can still be correct enough for text while doing too much full-batch expert work and synchronizing through host route indices.
   - Expert-major packing alone is not sufficient for decode. With `seq_len=1`, the runtime must also group or fuse routed expert GEMMs; otherwise it still pays many small W1/W3/W2 launches.
   - Raw NCCL kernel-duration sums can mislead because they include overlapped per-rank kernels and spin-wait for slower-arriving ranks.
+  - Optimizing small-looking details without Amdahl weighting can regress: uninitialized hot allocations and W1/W3 shared FP4 quantization both passed compile checks but made 1x32 TPOT worse.
 - **Lessons learned**:
   - For DeepSeek V4 MoE, routing indices should become GPU-resident execution metadata. The CPU should not decide active experts from a full D2H route-index copy in the hot path.
   - The next useful kernel import is likely `mask_indices_by_tp` / `group_count` or `get_fused_mapping`, not `topk_gate`, but decode performance ultimately needs grouped/fused routed expert execution.
   - DeepSeek MP8 decode should keep the persistent worker architecture. Worker-owned contexts/comms removed the per-layer thread lifecycle cost and lowered the dispatch skew enough to make smaller GPU buckets visible.
+  - After persistent workers, the next performance question is why ranks reach each collective at different times. Current evidence points to route-dependent MoE expert work count plus runtime/API amplification from allocation/free, launch gaps, D2H synchronization, and host-controlled local-expert loops, not NCCL link bandwidth.
 - **Follow-ups**:
-  - Re-profile the persistent-worker decode path and recompute NCCL as logical collectives, not raw per-rank kernel-duration sums.
+  - Build the next experiment around reducing MoE rank-local imbalance or reducing the number of f32 collectives, then recompute logical-collective skew.
   - Add a targeted MoE routing parity test against official `top2_sum_gate` semantics for the current config.
   - Decide whether to keep packed layout only for prefill and add a separate decode-specific routed expert kernel.
