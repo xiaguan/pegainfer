@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    EngineCoreRequestType, EngineCoreSamplingParams, StopReason, UtilityOutput,
-    UtilityResultEnvelope, encode_msgpack,
+    EngineCoreRequestType, EngineCoreSamplingParams, Logprobs, MaybeWireLogprobs, PositionLogprobs,
+    StopReason, TokenLogprob as WireTokenLogprob, UtilityOutput, UtilityResultEnvelope,
+    encode_msgpack,
 };
 use vllm_engine_core_client::{EngineId, TransportMode};
 use vllm_server::{
@@ -24,7 +25,9 @@ use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use crate::sampler::SamplingParams;
-use pegainfer_core::engine::{EngineHandle, FinishReason, GenerateRequest, TokenEvent};
+use pegainfer_core::engine::{
+    EngineHandle, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
+};
 
 const ENGINE_INDEX: u32 = 0;
 
@@ -274,8 +277,8 @@ async fn run_request_stream(
 ) {
     while let Some(event) = token_rx.recv().await {
         match event {
-            TokenEvent::Token { id, .. } => {
-                if send_token_output(&output_tx, &request_id, id).is_err() {
+            TokenEvent::Token { id, logprob } => {
+                if send_token_output(&output_tx, &request_id, id, logprob).is_err() {
                     return;
                 }
             }
@@ -328,6 +331,7 @@ fn send_token_output(
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     request_id: &str,
     token_id: u32,
+    logprob: Option<TokenLogprob>,
 ) -> Result<()> {
     send_outputs(
         output_tx,
@@ -336,6 +340,7 @@ fn send_token_output(
             outputs: vec![engine_output(
                 request_id.to_string(),
                 vec![token_id],
+                to_wire_logprobs(token_id, logprob),
                 None,
                 None,
             )],
@@ -358,6 +363,7 @@ fn send_terminal_output(
             outputs: vec![engine_output(
                 request_id.clone(),
                 Vec::new(),
+                None,
                 Some(finish_reason),
                 stop_reason,
             )],
@@ -408,13 +414,14 @@ fn send_outputs(
 fn engine_output(
     request_id: String,
     new_token_ids: Vec<u32>,
+    new_logprobs: Option<MaybeWireLogprobs>,
     finish_reason: Option<EngineCoreFinishReason>,
     stop_reason: Option<StopReason>,
 ) -> EngineCoreOutput {
     EngineCoreOutput {
         request_id,
         new_token_ids,
-        new_logprobs: None,
+        new_logprobs,
         new_prompt_logprobs_tensors: None,
         pooling_output: None,
         finish_reason,
@@ -426,6 +433,29 @@ fn engine_output(
         routed_experts: None,
         num_nans_in_logits: 0,
     }
+}
+
+fn to_wire_logprobs(token_id: u32, logprob: Option<TokenLogprob>) -> Option<MaybeWireLogprobs> {
+    let lp = logprob?;
+    let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
+    // The sampled/selected token. pegainfer-core does not track its actual vocab
+    // rank, so we record rank=1 (correct for greedy sampling and a reasonable
+    // default for sampling).
+    entries.push(WireTokenLogprob {
+        token_id,
+        logprob: lp.logprob,
+        rank: 1,
+    });
+    for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
+        entries.push(WireTokenLogprob {
+            token_id: alt_id,
+            logprob: alt_logprob,
+            rank: (index + 1) as u32,
+        });
+    }
+    Some(MaybeWireLogprobs::Direct(Logprobs {
+        positions: vec![PositionLogprobs { entries }],
+    }))
 }
 
 fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
@@ -520,4 +550,38 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
         shutdown.cancel();
     });
     token
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_wire_logprobs_returns_none_when_input_is_none() {
+        assert!(to_wire_logprobs(7, None).is_none());
+    }
+
+    #[test]
+    fn to_wire_logprobs_emits_sampled_then_alternatives() {
+        let lp = TokenLogprob {
+            logprob: -0.5,
+            top_logprobs: vec![(7, -0.5), (42, -1.5)],
+        };
+        let wire = to_wire_logprobs(7, Some(lp)).expect("logprob payload");
+        let direct = match wire {
+            MaybeWireLogprobs::Direct(d) => d,
+            MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
+        };
+        assert_eq!(direct.positions.len(), 1);
+        let entries = &direct.positions[0].entries;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].token_id, 7);
+        assert_eq!(entries[0].logprob, -0.5);
+        assert_eq!(entries[0].rank, 1);
+        assert_eq!(entries[1].token_id, 7);
+        assert_eq!(entries[1].rank, 1);
+        assert_eq!(entries[2].token_id, 42);
+        assert_eq!(entries[2].logprob, -1.5);
+        assert_eq!(entries[2].rank, 2);
+    }
 }
