@@ -115,7 +115,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Round 2 result: `steady_tpot_ms.avg = 102.89ms`, `p50 = 98.18ms`, `p95 = 118.52ms`, `p99 = 127.17ms`, `first_decode_step_ms.avg = 93.72ms`, `decode_tok_s = 9.72`.
 - Observation: average TPOT differs by about `3.1%` across two clean runs and p99 varies more than the mean. This bench shape is useful for stability tracking, but more runs are needed before treating a single measurement as reproducible.
 - Both long bench runs printed a rank-7 `NcclError` panic while aborting the communicator after scheduler exit. The process returned success and metrics were emitted, but shutdown cleanup should be investigated separately.
-- Bench rigor note: always pass `--seed 42` explicitly and compare `generated_token_traces` once available. DeepSeek V4 direct decode is greedy, so the seed is not expected to change tokens today; the token trace still matters because token ids affect hash routing and expert balance.
+- Bench rigor note: always pass `--seed 42` explicitly, but do not treat seed equality as workload equality. DeepSeek V4 direct decode is greedy today; the generated token trace still must be compared because token ids affect hash routing, EPLB/expert balance, and therefore TPOT.
 
 ### Step 3: Fuse decode final HC head plus RMSNorm
 - Tried a decode-only final-head fused kernel for `seq_len=1`.
@@ -149,7 +149,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - `hash`: stable FNV-1a hash of generated token ids
   - `prefix`: first 16 generated token ids
   - `len`: generated token count
-- Reason: DeepSeek V4 direct decode is greedy and the bench seed defaults to `42`, but generated token ids still matter for hash routing and expert balance. Future TPOT comparisons should first check token traces match.
+- Reason: DeepSeek V4 direct decode is greedy and the bench seed defaults to `42`, but generated token ids still matter for hash routing and EPLB/expert balance. Future TPOT comparisons should first check token traces match; otherwise a TPOT delta may be caused by a different expert-load sequence rather than the code change under test.
 - Updated this document's benchmark commands to pass `--seed 42` explicitly.
 - Verification:
   - local `cargo fmt --check` passed
@@ -176,5 +176,24 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - 1x160 round 1 with `--seed 42`: `steady_tpot_ms.avg = 110.17ms`, token hash `6346f03343d75a65` for all measured iterations
   - 1x160 round 2 with `--seed 42`: `steady_tpot_ms.avg = 105.99ms`, `p50 = 106.24ms`, `p95 = 115.04ms`, token hash `6346f03343d75a65` for all measured iterations
 - Result: keep. The short bench improves over the final-logits-scratch 1x32 result (`93.14ms`), while the longer bench remains in the known `~103-106ms` band on its second run. The first long run shows the existing stability variance rather than a token-sequence difference.
+
+### Step 7: Fuse attention KV RoPE plus no-PE quant
+- Added `deepseek_apply_rope_and_fp8_act_quant_nope_bf16_cuda` for attention KV prep.
+- Replaced the attention projection KV path from two launches:
+  - `deepseek_apply_rope_hidden_cuda`
+  - `deepseek_fp8_act_quant_nope_bf16_cuda`
+- with one fused launch. Q RoPE stays on the existing kernel, and compressor/indexer paths stay unchanged.
+- Reason: KV RoPE writes the rotary slice while no-PE quant writes the non-rotary slice, so the operations are independent within the same KV tensor.
+- Local verification:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- Sync pitfall: the first 5090 sync used multi-source `rsync` without `-R/--relative`, which copied basenames into the remote repo root. Removed the misplaced root files and reran `rsync -avR ...` so paths were preserved. Future targeted syncs should use `rsync -avR` or run one rsync per destination path.
+- Verification:
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+- Bench result:
+  - 1x32 run 1 with `--seed 42`: `steady_tpot_ms.avg = 97.82ms`, token hash `5f6c64b667f2abf5`.
+  - 1x32 run 2 with `--seed 42`: `steady_tpot_ms.avg = 95.21ms`, token hash `5f6c64b667f2abf5`.
+- Result: reverted the code. Even with identical generated-token hash, fusing these two tiny KV-prep kernels regressed the short decode bench versus the previous `91.84ms` result. The likely cause is worse block scheduling/occupancy from combining a tiny RoPE block with quant blocks; the saved launch did not offset that cost.
 
 ## Debrief
