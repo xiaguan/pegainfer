@@ -240,4 +240,20 @@ nsys stats --report cuda_gpu_kern_sum --format csv --output /tmp/dsv4_current_de
   - 1x32 with `--seed 42`: `steady_tpot_ms.avg = 110.71ms`, `p50 = 109.78ms`, `p95 = 115.26ms`, token hash `5f6c64b667f2abf5`.
 - Result: reverted the code. The token hash matched the baseline, but TPOT regressed heavily versus `91.84ms`. Avoid folding the RMS-scale reduction into the conversion kernel; the extra reduction work and altered kernel shape cost more than rereading the HC input in the existing scale kernel.
 
+### Step 11: Try parallel indexer decode score kernel
+- Changed `deepseek_indexer_scores_decode_cuda` experimentally from the serial one-thread-per-compressed-entry kernel to the existing parallel one-block-per-compressed-entry reduction kernel.
+- Reason: `deepseek_indexer_scores_decode_serial_kernel` appears in the non-NCCL profile, but the serial shape may still be better for small compressed lengths; this experiment measures rather than guessing.
+- Local verification:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- Verification:
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+- Bench result:
+  - 1x32 run 1 with `--seed 42`: `steady_tpot_ms.avg = 89.60ms`, token hash `5f6c64b667f2abf5`.
+  - 1x32 run 2 with `--seed 42`: `steady_tpot_ms.avg = 102.59ms`, token hash `5f6c64b667f2abf5`.
+  - 1x160 run 1 with `--seed 42`: `steady_tpot_ms.avg = 95.42ms`, token hash `6346f03343d75a65`.
+  - 1x160 run 2 with `--seed 42`: `steady_tpot_ms.avg = 112.10ms`, token hash `6346f03343d75a65`.
+- Result: reverted the code. The token hashes matched within each shape, but TPOT was not reproducible. The average of the two short runs was worse than the current `91.84ms` short baseline, and the two long runs bracketed the existing noisy range rather than proving a stable improvement.
+
 ## Debrief
