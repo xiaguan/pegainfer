@@ -196,4 +196,34 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - 1x32 run 2 with `--seed 42`: `steady_tpot_ms.avg = 95.21ms`, token hash `5f6c64b667f2abf5`.
 - Result: reverted the code. Even with identical generated-token hash, fusing these two tiny KV-prep kernels regressed the short decode bench versus the previous `91.84ms` result. The likely cause is worse block scheduling/occupancy from combining a tiny RoPE block with quant blocks; the saved launch did not offset that cost.
 
+### Step 8: Profiling interpretation guardrails
+- Nsight Systems CUDA kernel wall time for NCCL kernels is not pure link-transfer time. NCCL kernels include synchronization/rank-arrival waiting, so a large NCCL total can reflect upstream rank skew, load imbalance, or barrier placement rather than raw communication cost.
+- Profiling should therefore use NCCL rows as synchronization-window evidence, not as a direct instruction to optimize transport first.
+- For decode kernel work, prioritize:
+  - token hash equality before comparing TPOT,
+  - non-NCCL compute/launch clusters that are repeated per layer,
+  - rank-skew sources before treating collectives as bandwidth-bound.
+- Profiling pitfall: a direct `target/release/bench_serving` nsys run after rsync can accidentally profile a stale binary. Use `cargo build --release -p pegainfer-server --features deepseek-v4` or `cargo run --release ...` after syncing code before trusting profile artifacts.
+
+### Step 9: Current nsys non-NCCL decode snapshot
+- Rebuilt 5090 `pegainfer-server` after reverting the KV-prep fusion, then collected a short nsys CUDA profile:
+
+```bash
+nsys profile --force-overwrite=true --stats=false --sample=none --trace=cuda,nvtx,cublas --delay=35 --duration=12 -o /tmp/dsv4_current_decode_profile target/release/bench_serving --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1 --seed 42
+nsys stats --report cuda_gpu_kern_sum --format csv --output /tmp/dsv4_current_decode_kern_sum /tmp/dsv4_current_decode_profile.nsys-rep
+```
+
+- The top NCCL rows were intentionally ignored as optimization targets because they include synchronization wait.
+- Top non-NCCL rows in the captured window:
+  - `deepseek_tilelang_fp4_grouped_gemm_n2048_k4096_kernel`: `437.83ms`, `10298` instances, `42.52us` avg. MoE path; defer for now.
+  - `deepseek_hc_pre_norm_from_mixes_kernel`: `252.25ms`, `10144` instances, `24.87us` avg.
+  - `deepseek_tilelang_fp8_gemm_n2048_k4096_kernel`: `205.44ms`, `10298` instances, `19.95us` avg. Shared/MoE FFN path; defer for now.
+  - `deepseek_tilelang_act_quant_k4096_kernel`: `129.93ms`, `30891` instances, `4.21us` avg.
+  - `deepseek_tilelang_fp4_grouped_gemm_n4096_k2048_kernel`: `124.99ms`, `5150` instances, `24.27us` avg. MoE path; defer for now.
+  - cuBLAS small GEMV for HC mixes: `109.64ms`, `4713` instances, `23.26us` avg.
+  - `deepseek_compressor_decode_project_kernel`: `82.98ms`, `7421` instances, `11.18us` avg.
+  - `deepseek_tilelang_sparse_attn_local_h16_d512_kernel`: `63.26ms`, `5146` instances, `12.29us` avg.
+  - `deepseek_indexer_scores_decode_serial_kernel`: `33.73ms`, `2180` instances, `15.47us` avg.
+- Takeaway: after excluding MoE and treating NCCL as synchronization evidence, the next non-MoE candidates are HC pre/mixes structure, compressor decode project, sparse attention, and indexer scoring. Tiny KV-prep kernels are not promising by themselves; the failed Step 7 confirms launch-count reduction alone is not enough.
+
 ## Debrief
