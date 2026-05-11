@@ -280,4 +280,10 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Result: `steady_tpot_ms.avg = 107.25ms`, token hash `5f6c64b667f2abf5`.
 - Takeaway: single 1x32 runs are currently too noisy to use as the only decision gate. Keep using token hash equality, repeated runs, and the longer `1x160 warmup=2 iters=3` shape when a candidate looks promising.
 
+### Step 14: Add h8 sparse attention TileLang shape
+- Added a `local_h8_d512` TileLang sparse attention shape.
+- Changed `deepseek_indexed_attention_prefill_cuda` to call the h8 sparse attention symbol directly for the current MP8 `local_heads=8, head_dim=512` shape.
+- Reason: the previous wrapper only had `local_h16_d512`, so every sparse attention call padded Q and sink from h8 to h16, ran the h16 kernel, then copied output back to h8.
+- Result: reverted the code before remote testing. Local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` failed during TileLang generation: `M must be divisible by 16, but got 8`. The current TileLang GEMM lowering used by sparse attention requires the head dimension of the GEMM tile to be a multiple of 16, so a direct h8 sparse attention shape is not viable without a different kernel formulation.
+
 ## Debrief
