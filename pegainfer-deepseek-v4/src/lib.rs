@@ -34,7 +34,7 @@ pub use runtime::{
     fp8_act_quant_nope_bf16_hidden_in_place, fp8_linear_bf16_hidden,
     hadamard_fp4_quant_bf16_hidden_in_place, hash_route_bf16_hidden,
     hash_routed_moe_rank_local_bf16_hidden, hc_expand_bf16_hidden, hc_head_bf16_hidden,
-    hc_post_bf16_hidden, hc_pre_bf16_hidden, head_rms_norm_bf16_hidden,
+    hc_post_bf16_hidden, hc_pre_bf16_hidden, hc_pre_norm_bf16_hidden, head_rms_norm_bf16_hidden,
     indexed_attention_cache_bf16_hidden, indexed_attention_prefill_bf16_hidden,
     indexer_scores_decode_bf16_hidden, indexer_scores_prefill_bf16_hidden,
     indexer_topk_indices_decode, indexer_topk_indices_prefill, local_expert_forward_bf16_hidden,

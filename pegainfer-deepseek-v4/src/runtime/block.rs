@@ -154,17 +154,16 @@ pub fn block_decode_rank_lane_bf16_hidden(
     );
     let block = weights.block(layer)?;
 
-    let (attn_input, attn_hc) = hc_pre_bf16_hidden(
+    let (attn_norm, attn_hc) = hc_pre_norm_bf16_hidden(
         ctx,
         config,
         input,
         &block.hc_attn_fn,
         &block.hc_attn_scale,
         &block.hc_attn_base,
+        &block.attn_norm,
     )
-    .with_context(|| format!("hc_pre attention layer {layer}"))?;
-    let attn_norm = rms_norm_bf16_hidden(ctx, &attn_input, &block.attn_norm, config.rms_norm_eps)
-        .with_context(|| format!("attention rms_norm layer {layer}"))?;
+    .with_context(|| format!("hc_pre_norm attention layer {layer}"))?;
     let mut attn_out = attention_decode_rank_local_collective_bf16_hidden(
         ctx,
         config,
@@ -182,17 +181,16 @@ pub fn block_decode_rank_lane_bf16_hidden(
     let after_attn = hc_post_bf16_hidden(ctx, &attn_out, input, &attn_hc)
         .with_context(|| format!("hc_post attention layer {layer}"))?;
 
-    let (ffn_input, ffn_hc) = hc_pre_bf16_hidden(
+    let (ffn_norm, ffn_hc) = hc_pre_norm_bf16_hidden(
         ctx,
         config,
         &after_attn,
         &block.hc_ffn_fn,
         &block.hc_ffn_scale,
         &block.hc_ffn_base,
+        &block.ffn_norm,
     )
-    .with_context(|| format!("hc_pre ffn layer {layer}"))?;
-    let ffn_norm = rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)
-        .with_context(|| format!("ffn rms_norm layer {layer}"))?;
+    .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?;
 
     let ffn_out =
         decode_moe_ag_rs_bf16_hidden(ctx, config, weights, comm, layer, &ffn_norm, token_ids)

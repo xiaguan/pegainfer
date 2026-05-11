@@ -142,6 +142,18 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - 5090 `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash --offset 0 --limit 1` passed
   - 5090 full `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
 
+### Step 11: Decode HC pre plus RMSNorm fuse
+- Added a second decode-shape HC fused CUDA entry:
+  - `deepseek_hc_pre_norm_from_mixes_cuda`
+  - It consumes already scaled `mixes`, computes `pre/post/comb`, runs the `hc=4`, `sinkhorn_iters=20` sinkhorn loop, preserves the BF16 rounding boundary of the old `hc_pre` output, and emits the following RMSNorm output directly.
+- `block_decode_rank_lane_bf16_hidden` now uses `hc_pre_norm_bf16_hidden` for both attention and FFN decode branches. Prefill still uses the old `hc_pre_bf16_hidden` plus `rms_norm_bf16_hidden` path.
+- Correctness and performance checks on 5090:
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash --offset 0 --limit 1` passed
+  - full `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
+  - profiling benchmark with hard-coded sync markers showed attention path sums of `35.019ms`, `31.378ms`, and `36.826ms` for the three measured decode steps, down from `37.287ms`, `33.595ms`, and `40.627ms` after Step 10.
+  - The same profiling run reported `steady_tpot_ms.avg = 93.04ms`, `first_decode_step_ms = 104.01ms`; these numbers include forced sync/log overhead and are for comparison only.
+
 ### Step 3: Expand scope to decode backend replacement
 - User goal changed from adding standalone AG/RS collectives to completing the MoE all-to-all backend replacement and passing DeepSeek V4 E2E.
 - Current-state audit before coding:

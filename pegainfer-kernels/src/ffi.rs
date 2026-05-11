@@ -720,6 +720,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_hc_pre_norm_from_mixes_cuda(
+        x: *const Half,
+        mixes: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        norm_weight: *const Half,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        hc_eps: f32,
+        norm_eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_hc_head_pre_cuda(
         mixes: *const f32,
         hc_scale: *const f32,

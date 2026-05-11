@@ -430,6 +430,159 @@ pub fn hc_pre_bf16_hidden(
     ))
 }
 
+pub fn hc_pre_norm_bf16_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &HcHiddenStates,
+    hc_fn: &TensorRef<'_>,
+    hc_scale: &TensorRef<'_>,
+    hc_base: &TensorRef<'_>,
+    norm_weight: &TensorRef<'_>,
+) -> Result<(Bf16HiddenStates, HcPreState)> {
+    let use_fused_pre_norm = input.seq_len == 1
+        && input.hc == 4
+        && config.hc_sinkhorn_iters == 20
+        && (config.hc_eps - 1.0e-6).abs() <= 1.0e-12;
+    if !use_fused_pre_norm {
+        let (pre, state) = hc_pre_bf16_hidden(ctx, config, input, hc_fn, hc_scale, hc_base)?;
+        let normed = rms_norm_bf16_hidden(ctx, &pre, norm_weight, config.rms_norm_eps)?;
+        return Ok((normed, state));
+    }
+
+    ctx.set_current()?;
+    ensure!(
+        input.hidden_dim == config.dim,
+        "HC norm input hidden dim mismatch: expected {}, got {}",
+        config.dim,
+        input.hidden_dim
+    );
+    ensure!(
+        hc_fn.tensor.dtype == safetensors::Dtype::F32,
+        "HC fn {} must be F32, got {:?}",
+        hc_fn.name,
+        hc_fn.tensor.dtype
+    );
+    ensure!(
+        hc_scale.tensor.dtype == safetensors::Dtype::F32,
+        "HC scale {} must be F32, got {:?}",
+        hc_scale.name,
+        hc_scale.tensor.dtype
+    );
+    ensure!(
+        hc_base.tensor.dtype == safetensors::Dtype::F32,
+        "HC base {} must be F32, got {:?}",
+        hc_base.name,
+        hc_base.tensor.dtype
+    );
+    ensure!(
+        norm_weight.tensor.dtype == safetensors::Dtype::BF16,
+        "HC fused norm weight {} must be BF16, got {:?}",
+        norm_weight.name,
+        norm_weight.tensor.dtype
+    );
+
+    let mix_hc = (2 + input.hc) * input.hc;
+    let hc_dim = input.hc * input.hidden_dim;
+    ensure!(
+        hc_fn.tensor.shape == [mix_hc, hc_dim],
+        "HC fn {} shape mismatch: expected {:?}, got {:?}",
+        hc_fn.name,
+        [mix_hc, hc_dim],
+        hc_fn.tensor.shape
+    );
+    ensure!(
+        hc_scale.tensor.shape == [3],
+        "HC scale {} shape mismatch: expected {:?}, got {:?}",
+        hc_scale.name,
+        [3],
+        hc_scale.tensor.shape
+    );
+    ensure!(
+        hc_base.tensor.shape == [mix_hc],
+        "HC base {} shape mismatch: expected {:?}, got {:?}",
+        hc_base.name,
+        [mix_hc],
+        hc_base.tensor.shape
+    );
+    ensure!(
+        norm_weight.tensor.shape == [input.hidden_dim],
+        "HC fused norm weight {} shape mismatch: expected {:?}, got {:?}",
+        norm_weight.name,
+        [input.hidden_dim],
+        norm_weight.tensor.shape
+    );
+
+    let mut mixes: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * mix_hc)?;
+    let mut post: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * input.hc)?;
+    let mut comb: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(input.seq_len * input.hc * input.hc)?;
+    let mut out = Bf16HiddenStates::zeros(ctx, input.hidden_dim, input.seq_len)?;
+
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (fn_ptr, _fn_guard) = hc_fn.tensor.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _mixes_guard) = mixes.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_hc_mixes_cuda(
+                x_ptr as *const ffi::Half,
+                fn_ptr as *const f32,
+                mixes_ptr as *mut f32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                input.seq_len as i32,
+                input.hc as i32,
+                input.hidden_dim as i32,
+                mix_hc as i32,
+                config.rms_norm_eps,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _mixes_guard) = mixes.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = hc_scale.tensor.data.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = hc_base.tensor.data.device_ptr(&ctx.stream);
+        let (norm_ptr, _norm_guard) = norm_weight.tensor.data.device_ptr(&ctx.stream);
+        let (post_ptr, _post_guard) = post.device_ptr_mut(&ctx.stream);
+        let (comb_ptr, _comb_guard) = comb.device_ptr_mut(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_hc_pre_norm_from_mixes_cuda(
+                x_ptr as *const ffi::Half,
+                mixes_ptr as *const f32,
+                scale_ptr as *const f32,
+                base_ptr as *const f32,
+                norm_ptr as *const ffi::Half,
+                post_ptr as *mut f32,
+                comb_ptr as *mut f32,
+                out_ptr as *mut ffi::Half,
+                input.seq_len as i32,
+                input.hc as i32,
+                input.hidden_dim as i32,
+                config.hc_sinkhorn_iters as i32,
+                config.hc_eps,
+                config.rms_norm_eps,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+
+    Ok((
+        out,
+        HcPreState {
+            post,
+            comb,
+            seq_len: input.seq_len,
+            hc: input.hc,
+        },
+    ))
+}
+
 pub fn hc_post_bf16_hidden(
     ctx: &RankGpuContext,
     branch_out: &Bf16HiddenStates,
