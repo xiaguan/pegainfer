@@ -164,7 +164,7 @@ pub fn block_decode_rank_lane_bf16_hidden(
         &block.attn_norm,
     )
     .with_context(|| format!("hc_pre_norm attention layer {layer}"))?;
-    let mut attn_out = attention_decode_rank_local_collective_bf16_hidden(
+    let attn_out = attention_decode_rank_local_collective_bf16_hidden(
         ctx,
         config,
         layer,
@@ -176,10 +176,8 @@ pub fn block_decode_rank_lane_bf16_hidden(
         comm,
     )
     .with_context(|| format!("attention decode layer {layer}"))?;
-    all_reduce_hidden_fp32_in_place(ctx, &mut attn_out, comm)
-        .with_context(|| format!("attention all_reduce layer {layer}"))?;
-    let after_attn = hc_post_bf16_hidden(ctx, &attn_out, input, &attn_hc)
-        .with_context(|| format!("hc_post attention layer {layer}"))?;
+    let after_attn = all_reduce_hidden_fp32_hc_post(ctx, &attn_out, input, &attn_hc, comm)
+        .with_context(|| format!("attention all_reduce hc_post layer {layer}"))?;
 
     let (ffn_norm, ffn_hc) = hc_pre_norm_bf16_hidden(
         ctx,

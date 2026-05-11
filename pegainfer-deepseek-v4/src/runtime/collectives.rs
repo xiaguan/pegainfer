@@ -144,3 +144,103 @@ pub fn all_reduce_hidden_fp32_in_place(
         Ok(())
     })
 }
+
+pub(crate) fn all_reduce_hidden_fp32_hc_post(
+    ctx: &RankGpuContext,
+    branch_out: &Bf16HiddenStates,
+    residual: &HcHiddenStates,
+    pre_state: &HcPreState,
+    comm: &Comm,
+) -> Result<HcHiddenStates> {
+    ensure!(
+        branch_out.hidden_dim == residual.hidden_dim,
+        "HC post all-reduce hidden dim mismatch: branch={}, residual={}",
+        branch_out.hidden_dim,
+        residual.hidden_dim
+    );
+    ensure!(
+        branch_out.seq_len == residual.seq_len,
+        "HC post all-reduce seq len mismatch: branch={}, residual={}",
+        branch_out.seq_len,
+        residual.seq_len
+    );
+    ensure!(
+        pre_state.seq_len == branch_out.seq_len,
+        "HC post all-reduce pre-state seq len mismatch: state={}, branch={}",
+        pre_state.seq_len,
+        branch_out.seq_len
+    );
+    ensure!(
+        pre_state.hc == residual.hc,
+        "HC post all-reduce pre-state multiplier mismatch: state={}, residual={}",
+        pre_state.hc,
+        residual.hc
+    );
+
+    FP32_ALL_REDUCE_SCRATCH.with(|scratch| -> Result<HcHiddenStates> {
+        let mut scratch = scratch.borrow_mut();
+        if scratch.is_empty() {
+            scratch.push(None);
+        }
+
+        let len = branch_out.hidden_dim * branch_out.seq_len;
+        ctx.set_current()?;
+        let slot = &mut scratch[0];
+        let needs_alloc = slot
+            .as_ref()
+            .map(|(device_ordinal, capacity, _)| {
+                *device_ordinal != ctx.device_ordinal || *capacity < len
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            *slot = Some((ctx.device_ordinal, len, ctx.stream.alloc_zeros::<f32>(len)?));
+        }
+
+        let (_, _, scratch_buf) = slot
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing FP32 all-reduce scratch"))?;
+        let mut temp = scratch_buf.slice_mut(0..len);
+        {
+            let (input_ptr, _input_guard) = branch_out.data.device_ptr(&ctx.stream);
+            let (temp_ptr, _temp_guard) = temp.device_ptr_mut(&ctx.stream);
+            let result = unsafe {
+                ffi::deepseek_bf16_to_f32_cuda(
+                    input_ptr as *const ffi::Half,
+                    temp_ptr as *mut f32,
+                    len as i32,
+                    ctx.stream.cu_stream(),
+                )
+            };
+            result.result()?;
+        }
+
+        if let Err(err) = comm.all_reduce_in_place(&mut temp, &ReduceOp::Sum) {
+            return Err(anyhow::anyhow!("NCCL FP32 all-reduce failed: {err:?}"));
+        }
+
+        let mut out =
+            HcHiddenStates::zeros(ctx, branch_out.hidden_dim, branch_out.seq_len, residual.hc)?;
+        {
+            let (temp_ptr, _temp_guard) = temp.device_ptr(&ctx.stream);
+            let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
+            let (post_ptr, _post_guard) = pre_state.post.device_ptr(&ctx.stream);
+            let (comb_ptr, _comb_guard) = pre_state.comb.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+            let result = unsafe {
+                ffi::deepseek_hc_post_f32_branch_cuda(
+                    temp_ptr as *const f32,
+                    residual_ptr as *const ffi::Half,
+                    post_ptr as *const f32,
+                    comb_ptr as *const f32,
+                    out_ptr as *mut ffi::Half,
+                    branch_out.seq_len as i32,
+                    residual.hc as i32,
+                    branch_out.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+            };
+            result.result()?;
+        }
+        Ok(out)
+    })
+}

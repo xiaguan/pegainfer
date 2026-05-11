@@ -612,6 +612,50 @@ __global__ void deepseek_hc_post_kernel(
   out[idx] = __float2bfloat16(sum);
 }
 
+__global__ void deepseek_hc_post_f32_branch_kernel(
+    const float *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ residual,
+    const float *__restrict__ post,
+    const float *__restrict__ comb,
+    __nv_bfloat16 *__restrict__ out,
+    int seq_len,
+    int hc,
+    int dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * hc * dim;
+  if (idx >= total) return;
+  int dim_idx = idx % dim;
+  int h_out = (idx / dim) % hc;
+  int token = idx / (hc * dim);
+  float residual_sum = 0.0f;
+  if (hc == 4) {
+    float term0 = __fmul_rn(
+        comb[(token * hc + 0) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 0) * dim + dim_idx]));
+    float term1 = __fmul_rn(
+        comb[(token * hc + 1) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 1) * dim + dim_idx]));
+    float term2 = __fmul_rn(
+        comb[(token * hc + 2) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 2) * dim + dim_idx]));
+    float term3 = __fmul_rn(
+        comb[(token * hc + 3) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 3) * dim + dim_idx]));
+    residual_sum = __fadd_rn(__fadd_rn(__fadd_rn(term0, term1), term2), term3);
+  } else {
+    for (int h_in = 0; h_in < hc; ++h_in) {
+      float term = __fmul_rn(
+          comb[(token * hc + h_in) * hc + h_out],
+          __bfloat162float(residual[(token * hc + h_in) * dim + dim_idx]));
+      residual_sum = __fadd_rn(residual_sum, term);
+    }
+  }
+  float branch = __bfloat162float(__float2bfloat16(x[token * dim + dim_idx]));
+  float post_term = __fmul_rn(post[token * hc + h_out], branch);
+  float sum = __fadd_rn(post_term, residual_sum);
+  out[idx] = __float2bfloat16(sum);
+}
+
 __global__ void deepseek_last_token_bf16_logits_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ weight,
@@ -875,6 +919,24 @@ cudaError_t deepseek_hc_post_cuda(
   int total = seq_len * hc * dim;
   int blocks = (total + threads - 1) / threads;
   deepseek_hc_post_kernel<<<blocks, threads, 0, stream>>>(
+      x, residual, post, comb, out, seq_len, hc, dim);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_hc_post_f32_branch_cuda(
+    const float *x,
+    const __nv_bfloat16 *residual,
+    const float *post,
+    const float *comb,
+    __nv_bfloat16 *out,
+    int seq_len,
+    int hc,
+    int dim,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  int total = seq_len * hc * dim;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_hc_post_f32_branch_kernel<<<blocks, threads, 0, stream>>>(
       x, residual, post, comb, out, seq_len, hc, dim);
   return cudaGetLastError();
 }

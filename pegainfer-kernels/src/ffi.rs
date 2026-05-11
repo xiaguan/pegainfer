@@ -761,6 +761,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_hc_post_f32_branch_cuda(
+        x: *const f32,
+        residual: *const Half,
+        post: *const f32,
+        comb: *const f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_last_token_bf16_logits_cuda(
         x: *const Half,
         weight: *const Half,

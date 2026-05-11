@@ -160,4 +160,21 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - hash: `5f6c64b667f2abf5`
   - prefix: `[303, 1207, 1724, 993, 15238, 303, 36428, 58828, 303, 86532, 18048, 11301, 303, 75379, 1927, 5746]`
 
+### Step 6: Fuse attention FP32 all-reduce tail into HC post
+- Added `deepseek_hc_post_f32_branch_cuda` and `all_reduce_hidden_fp32_hc_post`.
+- Kept attention output and NCCL all-reduce semantics unchanged: BF16 attention output is converted to F32, then NCCL sums F32.
+- Replaced the old attention-tail `deepseek_f32_to_bf16_cuda` plus `deepseek_hc_post_cuda` pair with an attention-specific HC post kernel that reads the F32 all-reduce scratch.
+- Preserved the old rounding boundary by converting each F32 reduced branch value to BF16 and back to F32 inside the fused HC post kernel before multiplying by `post`.
+- FFN/MoE HC post stays unchanged.
+- Verification:
+  - local `cargo fmt --check` passed
+  - local `git diff --check` passed
+  - local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`
+- Bench result:
+  - 1x32 with `--seed 42`: `steady_tpot_ms.avg = 91.84ms`, `p50 = 91.63ms`, `p95 = 96.21ms`, token hash `5f6c64b667f2abf5`
+  - 1x160 round 1 with `--seed 42`: `steady_tpot_ms.avg = 110.17ms`, token hash `6346f03343d75a65` for all measured iterations
+  - 1x160 round 2 with `--seed 42`: `steady_tpot_ms.avg = 105.99ms`, `p50 = 106.24ms`, `p95 = 115.04ms`, token hash `6346f03343d75a65` for all measured iterations
+- Result: keep. The short bench improves over the final-logits-scratch 1x32 result (`93.14ms`), while the longer bench remains in the known `~103-106ms` band on its second run. The first long run shows the existing stability variance rather than a token-sequence difference.
+
 ## Debrief
