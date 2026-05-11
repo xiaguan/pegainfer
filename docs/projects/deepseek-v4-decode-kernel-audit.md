@@ -97,7 +97,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Comparable short bench:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1 --seed 42
 ```
 
 - Result: `steady_tpot_ms.avg = 93.14ms`, `p50 = 92.11ms`, `p95 = 99.18ms`, `first_decode_step_ms = 90.98ms`, `decode_tok_s = 10.74`.
@@ -107,7 +107,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - New longer bench shape:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 160 --warmup 2 --iters 3
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 160 --warmup 2 --iters 3 --seed 42
 ```
 
 - Reason: `output_len=160` crosses the ratio-128 compressed-attention boundary, so it is a better stability probe than 1x32.
@@ -115,6 +115,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Round 2 result: `steady_tpot_ms.avg = 102.89ms`, `p50 = 98.18ms`, `p95 = 118.52ms`, `p99 = 127.17ms`, `first_decode_step_ms.avg = 93.72ms`, `decode_tok_s = 9.72`.
 - Observation: average TPOT differs by about `3.1%` across two clean runs and p99 varies more than the mean. This bench shape is useful for stability tracking, but more runs are needed before treating a single measurement as reproducible.
 - Both long bench runs printed a rank-7 `NcclError` panic while aborting the communicator after scheduler exit. The process returned success and metrics were emitted, but shutdown cleanup should be investigated separately.
+- Bench rigor note: always pass `--seed 42` explicitly and compare `generated_token_traces` once available. DeepSeek V4 direct decode is greedy, so the seed is not expected to change tokens today; the token trace still matters because token ids affect hash routing and expert balance.
 
 ### Step 3: Fuse decode final HC head plus RMSNorm
 - Tried a decode-only final-head fused kernel for `seq_len=1`.
@@ -128,5 +129,35 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - 1x32 run 1: `steady_tpot_ms.avg = 100.69ms`
   - 1x32 run 2: `steady_tpot_ms.avg = 107.65ms`
 - Result: reverted the code. Reducing two small launches did not offset replacing FlashInfer RMSNorm with the custom fused reduction kernel.
+
+### Step 4: Reuse decode window top-k indices across layers
+- Tried generating `window_topk_indices_decode` once per rank decode token in `run_decode_on_rank_lane`, then passing the shared `window_idxs/window_topk` through every decode block.
+- Kept compressed/indexer top-k generation layer-local because those depend on ratio, compressed length, and scores.
+- Expected launch change was up to 43 window-index launches/token/rank down to 1.
+- Verification:
+  - local `cargo fmt --check` passed
+  - local `git diff --check` passed
+  - local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`
+- Bench result:
+  - 1x32: `steady_tpot_ms.avg = 98.80ms`
+  - 1x160: `steady_tpot_ms.avg = 110.27ms`
+- Result: reverted the runtime code. The launch reduction did not translate into TPOT improvement, likely because the saved window-index kernels are tiny and allocation/lifetime changes plus normal variance dominate.
+
+### Step 5: Record generated token traces in bench output
+- Added `generated_token_traces` to `bench_serving` metrics. Each measured iteration records:
+  - `hash`: stable FNV-1a hash of generated token ids
+  - `prefix`: first 16 generated token ids
+  - `len`: generated token count
+- Reason: DeepSeek V4 direct decode is greedy and the bench seed defaults to `42`, but generated token ids still matter for hash routing and expert balance. Future TPOT comparisons should first check token traces match.
+- Updated this document's benchmark commands to pass `--seed 42` explicitly.
+- Verification:
+  - local `cargo fmt --check` passed
+  - local `git diff --check` passed
+  - local `cargo check --release -p pegainfer-server --features deepseek-v4` passed
+  - 5090 `bench_serving request --prompt-len 1 --output-len 32 --warmup 1 --iters 1 --seed 42` emitted `generated_token_traces`
+- Trace from the verification run:
+  - hash: `5f6c64b667f2abf5`
+  - prefix: `[303, 1207, 1724, 993, 15238, 303, 36428, 58828, 303, 86532, 18048, 11301, 303, 75379, 1927, 5746]`
 
 ## Debrief
