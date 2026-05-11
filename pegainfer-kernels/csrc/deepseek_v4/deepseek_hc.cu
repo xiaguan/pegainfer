@@ -9,6 +9,10 @@ constexpr int kMaxHcScratchDevices = 16;
 struct DeepseekHcScratch {
   float* x_f32 = nullptr;
   size_t x_elems = 0;
+  float* logits_weight_f32 = nullptr;
+  size_t logits_weight_capacity = 0;
+  size_t logits_weight_valid_elems = 0;
+  const __nv_bfloat16* logits_weight_src = nullptr;
   cublasHandle_t handle = nullptr;
   std::mutex mutex;
 };
@@ -884,76 +888,62 @@ cudaError_t deepseek_last_token_bf16_logits_cuda(
     int vocab_size,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  float *x_f32 = nullptr;
-  float *weight_f32 = nullptr;
-  cudaError_t cuda_status = cudaMalloc(&x_f32, sizeof(float) * dim);
-  if (cuda_status != cudaSuccess) return cuda_status;
-  cuda_status = cudaMalloc(&weight_f32, sizeof(float) * vocab_size * dim);
-  if (cuda_status != cudaSuccess) {
-    cudaFree(x_f32);
-    return cuda_status;
+  if (seq_len <= 0 || dim <= 0 || vocab_size <= 0) {
+    return cudaErrorInvalidValue;
   }
+  DeepseekHcScratch* scratch_ptr = nullptr;
+  cudaError_t cuda_status = deepseek_hc_scratch_for_device(&scratch_ptr);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  DeepseekHcScratch& scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
 
   const __nv_bfloat16 *last_x = x + (seq_len - 1) * dim;
+  cuda_status = deepseek_ensure_hc_f32_scratch(
+      &scratch.x_f32, &scratch.x_elems, static_cast<size_t>(dim));
+  if (cuda_status != cudaSuccess) return cuda_status;
   int x_blocks = (dim + threads - 1) / threads;
-  deepseek_hc_bf16_to_f32_kernel<<<x_blocks, threads, 0, stream>>>(last_x, x_f32, dim);
+  deepseek_hc_bf16_to_f32_kernel<<<x_blocks, threads, 0, stream>>>(
+      last_x, scratch.x_f32, dim);
   cuda_status = cudaGetLastError();
-  if (cuda_status != cudaSuccess) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cuda_status;
-  }
-  int weight_total = vocab_size * dim;
-  int weight_blocks = (weight_total + threads - 1) / threads;
-  deepseek_hc_bf16_to_f32_kernel<<<weight_blocks, threads, 0, stream>>>(
-      weight, weight_f32, weight_total);
-  cuda_status = cudaGetLastError();
-  if (cuda_status != cudaSuccess) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cuda_status;
+  if (cuda_status != cudaSuccess) return cuda_status;
+
+  size_t weight_total = static_cast<size_t>(vocab_size) * dim;
+  bool need_weight_convert =
+      scratch.logits_weight_src != weight ||
+      scratch.logits_weight_valid_elems != weight_total;
+  if (need_weight_convert) {
+    cuda_status = deepseek_ensure_hc_f32_scratch(
+        &scratch.logits_weight_f32, &scratch.logits_weight_capacity, weight_total);
+    if (cuda_status != cudaSuccess) return cuda_status;
+    int weight_blocks = (static_cast<int>(weight_total) + threads - 1) / threads;
+    deepseek_hc_bf16_to_f32_kernel<<<weight_blocks, threads, 0, stream>>>(
+        weight, scratch.logits_weight_f32, static_cast<int>(weight_total));
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) return cuda_status;
+    scratch.logits_weight_src = weight;
+    scratch.logits_weight_valid_elems = weight_total;
   }
 
-  cublasHandle_t handle = nullptr;
-  cublasStatus_t status = cublasCreate(&handle);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
-  status = cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cublasDestroy(handle);
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
-  status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cublasDestroy(handle);
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
+  cuda_status = deepseek_ensure_hc_cublas_handle(scratch);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  cublasStatus_t status = cublasSetStream(scratch.handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
   status = cublasSgemv(
-      handle,
+      scratch.handle,
       CUBLAS_OP_T,
       dim,
       vocab_size,
       &alpha,
-      weight_f32,
+      scratch.logits_weight_f32,
       dim,
-      x_f32,
+      scratch.x_f32,
       1,
       &beta,
       out,
       1);
-  cublasDestroy(handle);
-  cudaFree(weight_f32);
-  cudaFree(x_f32);
   if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
   return cudaSuccess;
 }
