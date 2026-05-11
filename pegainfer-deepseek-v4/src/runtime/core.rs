@@ -228,65 +228,25 @@ pub fn final_logits_rank_local_bf16_hidden(
     rank_local_logits_from_hidden(ctx, &normed, &weights.head()?)
 }
 
-pub fn all_gather_logits_group(
-    ranks: &[(&RankGpuContext, &Comm, &F32Logits)],
-) -> Result<Vec<F32Logits>> {
+pub(crate) fn all_gather_logits(
+    ctx: &RankGpuContext,
+    comm: &Comm,
+    local: &F32Logits,
+    world_size: usize,
+) -> Result<F32Logits> {
+    ctx.set_current()?;
     ensure!(
-        !ranks.is_empty(),
-        "logits all-gather group must contain at least one rank"
+        world_size > 0,
+        "logits all-gather world size must be positive"
     );
-    let local_vocab = ranks[0].2.vocab_size;
-    ensure!(local_vocab > 0, "local vocab size must be positive");
-    for (_, _, logits) in ranks {
-        ensure!(
-            logits.vocab_size == local_vocab,
-            "logits local vocab mismatch: expected {}, got {}",
-            local_vocab,
-            logits.vocab_size
-        );
-    }
-
-    let mut gathered = Vec::with_capacity(ranks.len());
-    for (ctx, _, _) in ranks {
-        gathered.push(F32Logits {
-            data: ctx.stream.alloc_zeros(local_vocab * ranks.len())?,
-            vocab_size: local_vocab * ranks.len(),
-        });
-    }
-
-    group_start().map_err(|err| anyhow::anyhow!("NCCL group_start failed: {err:?}"))?;
-    for ((_, comm, local), full) in ranks.iter().zip(gathered.iter_mut()) {
-        if let Err(err) = comm.all_gather(&local.data, &mut full.data) {
-            let _ = group_end();
-            return Err(anyhow::anyhow!("NCCL logits all-gather failed: {err:?}"));
-        }
-    }
-    group_end().map_err(|err| anyhow::anyhow!("NCCL group_end failed: {err:?}"))?;
-
+    ensure!(local.vocab_size > 0, "local vocab size must be positive");
+    let mut gathered = F32Logits {
+        data: ctx.stream.alloc_zeros(local.vocab_size * world_size)?,
+        vocab_size: local.vocab_size * world_size,
+    };
+    comm.all_gather(&local.data, &mut gathered.data)
+        .map_err(|err| anyhow::anyhow!("NCCL logits all-gather failed: {err:?}"))?;
     Ok(gathered)
-}
-
-pub fn final_logits_group_bf16_hidden(
-    ranks: &[(&RankGpuContext, &RankWeightView<'_>, &Comm, &HcHiddenStates)],
-    config: &Config,
-) -> Result<Vec<F32Logits>> {
-    ensure!(
-        !ranks.is_empty(),
-        "final logits group must contain at least one rank"
-    );
-    let mut local = Vec::with_capacity(ranks.len());
-    for (ctx, weights, _, input) in ranks {
-        local.push(final_logits_rank_local_bf16_hidden(
-            ctx, config, weights, input,
-        )?);
-    }
-
-    let gather_inputs = ranks
-        .iter()
-        .zip(local.iter())
-        .map(|((ctx, _, comm, _), logits)| (*ctx, *comm, logits))
-        .collect::<Vec<_>>();
-    all_gather_logits_group(&gather_inputs)
 }
 
 pub fn hc_pre_bf16_hidden(
@@ -544,35 +504,6 @@ pub fn embedding_rank_local(
     Ok(out)
 }
 
-pub fn embedding_vocab_parallel_group(
-    ranks: &[(&RankGpuContext, &RankWeightView<'_>, &Comm, &CudaSlice<u32>)],
-    config: &Config,
-    seq_len: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        !ranks.is_empty(),
-        "embedding group must contain at least one rank"
-    );
-
-    let mut hidden = Vec::with_capacity(ranks.len());
-    for (ctx, weights, _comm, token_ids) in ranks {
-        hidden.push(embedding_rank_local(
-            ctx, config, weights, token_ids, seq_len,
-        )?);
-    }
-
-    group_start().map_err(|err| anyhow::anyhow!("NCCL group_start failed: {err:?}"))?;
-    for ((_, _, comm, _), hidden) in ranks.iter().zip(hidden.iter_mut()) {
-        if let Err(err) = comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum) {
-            let _ = group_end();
-            return Err(anyhow::anyhow!("NCCL embedding all-reduce failed: {err:?}"));
-        }
-    }
-    group_end().map_err(|err| anyhow::anyhow!("NCCL group_end failed: {err:?}"))?;
-
-    Ok(hidden)
-}
-
 pub fn rms_norm_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -683,27 +614,6 @@ pub fn fp4_linear_bf16_hidden(
     input: &Bf16HiddenStates,
     linear: &QuantLinearRef<'_>,
 ) -> Result<Bf16HiddenStates> {
-    fp4_linear_bf16_device(ctx, &input.data, input.hidden_dim, input.seq_len, linear)
-}
-
-pub fn fp4_linear_bf16_view(
-    ctx: &RankGpuContext,
-    input: &Bf16HiddenView<'_>,
-    linear: &QuantLinearRef<'_>,
-) -> Result<Bf16HiddenStates> {
-    fp4_linear_bf16_device(ctx, &input.data, input.hidden_dim, input.seq_len, linear)
-}
-
-fn fp4_linear_bf16_device<T>(
-    ctx: &RankGpuContext,
-    input_data: &T,
-    input_hidden_dim: usize,
-    input_seq_len: usize,
-    linear: &QuantLinearRef<'_>,
-) -> Result<Bf16HiddenStates>
-where
-    T: DevicePtr<bf16>,
-{
     ctx.set_current()?;
     ensure!(
         linear.weight.tensor.dtype == safetensors::Dtype::F4,
@@ -726,11 +636,11 @@ where
     let out_dim = linear.weight.tensor.shape[0];
     let in_dim = linear.weight.tensor.shape[1];
     ensure!(
-        in_dim == input_hidden_dim,
+        in_dim == input.hidden_dim,
         "FP4 linear input dim mismatch: weight {} expects {}, got {}",
         linear.weight.name,
         in_dim,
-        input_hidden_dim
+        input.hidden_dim
     );
     ensure!(
         in_dim.is_multiple_of(32),
@@ -744,9 +654,9 @@ where
         linear.scale.tensor.shape
     );
 
-    let mut out = Bf16HiddenStates::zeros(ctx, out_dim, input_seq_len)?;
+    let mut out = Bf16HiddenStates::zeros(ctx, out_dim, input.seq_len)?;
     {
-        let (x_ptr, _x_guard) = input_data.device_ptr(&ctx.stream);
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (w_ptr, _w_guard) = linear.weight.tensor.data.device_ptr(&ctx.stream);
         let (s_ptr, _s_guard) = linear.scale.tensor.data.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
@@ -756,7 +666,7 @@ where
                 w_ptr as *const u8,
                 s_ptr as *const u8,
                 out_ptr as *mut ffi::Half,
-                input_seq_len as i32,
+                input.seq_len as i32,
                 in_dim as i32,
                 out_dim as i32,
                 ctx.stream.cu_stream(),

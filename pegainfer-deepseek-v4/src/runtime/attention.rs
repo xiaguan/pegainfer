@@ -177,77 +177,6 @@ pub(crate) fn attention_prefill_compressed_nonoverlap_rank_local_bf16_hidden_wit
     )
 }
 
-pub fn attention_prefill_compressed_nonoverlap_group_bf16_hidden(
-    ranks: &[(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "compressed attention group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input), rope) in ranks.iter().zip(ropes.iter()) {
-        out.push(
-            attention_prefill_compressed_nonoverlap_rank_local_bf16_hidden(
-                ctx, config, input, attn, rope, layer, start_pos,
-            )?,
-        );
-    }
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
-}
-
-pub(crate) fn attention_prefill_compressed_nonoverlap_group_bf16_hidden_with_cache(
-    ranks: &mut [(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-        &mut LayerDecodeCache,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "compressed attention cache group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input, cache), rope) in ranks.iter_mut().zip(ropes.iter()) {
-        out.push(
-            attention_prefill_compressed_nonoverlap_rank_local_bf16_hidden_with_cache(
-                ctx, config, input, attn, rope, layer, start_pos, cache,
-            )?,
-        );
-    }
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
-}
-
 fn finish_compressed_overlap_attention_rank_local(
     ctx: &RankGpuContext,
     config: &Config,
@@ -350,389 +279,155 @@ pub fn attention_prefill_compressed_overlap_rank_local_bf16_hidden(
     )
 }
 
-pub fn attention_prefill_compressed_overlap_group_bf16_hidden(
-    ranks: &[(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-    )],
+pub(crate) fn attention_prefill_compressed_overlap_rank_local_collective_bf16_hidden_with_cache(
+    ctx: &RankGpuContext,
     config: &Config,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
     layer: usize,
-    ropes: &[&DeepSeekRopeCache],
     start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
+    cache: &mut LayerDecodeCache,
+    comm: &Comm,
+) -> Result<Bf16HiddenStates> {
     ensure!(
-        ranks.len() == ropes.len(),
-        "ratio-4 attention group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
+        config.compress_ratios[layer] == 4,
+        "ratio-4 rank-lane attention cache path called for layer {layer} with compress_ratio={}",
+        config.compress_ratios[layer]
     );
-    if ranks[0].3.seq_len < 4 {
-        let mut out = Vec::with_capacity(ranks.len());
-        for ((ctx, attn, _comm, input), rope) in ranks.iter().zip(ropes.iter()) {
-            out.push(attention_prefill_compressed_overlap_rank_local_bf16_hidden(
-                ctx, config, input, attn, rope, layer, start_pos,
-            )?);
-        }
-        let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-            .iter()
-            .zip(out.iter_mut())
-            .map(|((ctx, _, comm, _), hidden)| (*ctx, *comm, hidden))
-            .collect();
-        all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-        return Ok(out);
-    }
+    let compressor = attn
+        .compressor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor weights"))?;
+    let indexer = attn
+        .indexer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing ratio-4 indexer weights"))?;
+    let compressor_state = cache
+        .compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor state"))?;
+    let indexer_kv = cache
+        .indexer_kv
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer kv cache"))?;
+    let indexer_state = cache
+        .indexer_compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer compressor state"))?;
 
-    let mut projections = Vec::with_capacity(ranks.len());
-    let mut compressed_kvs = Vec::with_capacity(ranks.len());
-    let mut index_scores = Vec::with_capacity(ranks.len());
-    let mut compressed_len = None;
-    for ((ctx, attn, _comm, input), rope) in ranks.iter().zip(ropes.iter()) {
-        ensure!(
-            config.compress_ratios[layer] == 4,
-            "ratio-4 group attention called for layer {layer} with compress_ratio={}",
-            config.compress_ratios[layer]
-        );
-        let compressor = attn
-            .compressor
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor weights"))?;
-        let indexer = attn
-            .indexer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing ratio-4 indexer weights"))?;
+    let mut projections = attention_project_bf16_hidden(ctx, config, input, attn)
+        .with_context(|| format!("ratio-4 rank-lane attention_project layer {layer}"))?;
+    apply_rope_attention_projections(ctx, &mut projections, rope, start_pos)
+        .with_context(|| format!("ratio-4 rank-lane apply_rope layer {layer}"))?;
+    copy_window_prefill_to_ring_cache(ctx, &projections.kv, &mut cache.kv, config.sliding_window)
+        .with_context(|| format!("ratio-4 rank-lane raw kv layer {layer}"))?;
+    init_overlap_compressor_state_from_prefill(
+        ctx,
+        config,
+        input,
+        compressor,
+        rope,
+        config.head_dim,
+        compressor_state,
+        false,
+    )
+    .with_context(|| format!("ratio-4 rank-lane compressor tail layer {layer}"))?;
+    init_overlap_compressor_state_from_prefill(
+        ctx,
+        config,
+        input,
+        &indexer.compressor,
+        rope,
+        config.index_head_dim,
+        indexer_state,
+        true,
+    )
+    .with_context(|| format!("ratio-4 rank-lane indexer tail layer {layer}"))?;
 
-        let mut rank_projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
-        apply_rope_attention_projections(ctx, &mut rank_projections, rope, start_pos)?;
-        let rank_compressed_kv = compressor_overlap_prefill_bf16_hidden(
-            ctx, config, input, compressor, rope, start_pos,
-        )?;
-        let (rank_scores, rank_compressed_len) = indexer_scores_prefill_bf16_hidden(
+    if input.seq_len < 4 {
+        let mut attn_out = sparse_attention_prefill_bf16_hidden(ctx, config, &projections, attn)?;
+        return attention_output_project_bf16_hidden(
             ctx,
-            config,
-            input,
-            &rank_projections.qr,
-            indexer,
-            rope,
-            start_pos,
-        )?;
-        if let Some(expected) = compressed_len {
-            ensure!(
-                rank_compressed_len == expected,
-                "indexer compressed len mismatch: expected {}, got {}",
-                expected,
-                rank_compressed_len
-            );
-        } else {
-            compressed_len = Some(rank_compressed_len);
-        }
-
-        projections.push(rank_projections);
-        compressed_kvs.push(rank_compressed_kv);
-        index_scores.push(rank_scores);
-    }
-
-    group_start().map_err(|err| anyhow::anyhow!("NCCL group_start failed: {err:?}"))?;
-    for ((_, _, comm, _), scores) in ranks.iter().zip(index_scores.iter_mut()) {
-        if let Err(err) = comm.all_reduce_in_place(scores, &ReduceOp::Sum) {
-            let _ = group_end();
-            return Err(anyhow::anyhow!(
-                "NCCL indexer score all-reduce failed: {err:?}"
-            ));
-        }
-    }
-    group_end().map_err(|err| anyhow::anyhow!("NCCL group_end failed: {err:?}"))?;
-
-    let compressed_len =
-        compressed_len.ok_or_else(|| anyhow::anyhow!("ratio-4 group has no compressed len"))?;
-    let mut out = Vec::with_capacity(ranks.len());
-    for (((((ctx, attn, _comm, input), rope), rank_projections), rank_compressed_kv), scores) in
-        ranks
-            .iter()
-            .zip(ropes.iter())
-            .zip(projections.into_iter())
-            .zip(compressed_kvs.into_iter())
-            .zip(index_scores.iter())
-    {
-        let (window_idxs, window_topk) =
-            window_topk_indices(ctx, input.seq_len, config.sliding_window)?;
-        let (compress_idxs, compress_topk) = indexer_topk_indices_prefill(
-            ctx,
-            config,
-            scores,
-            input.seq_len,
-            compressed_len,
-            rank_projections.kv.seq_len,
-        )?;
-        let topk_idxs = concat_topk_indices(
-            ctx,
-            &window_idxs,
-            window_topk,
-            &compress_idxs,
-            compress_topk,
-            input.seq_len,
-        )?;
-        out.push(finish_compressed_overlap_attention_rank_local(
-            ctx,
-            config,
-            rank_projections,
-            rank_compressed_kv,
+            &mut attn_out,
             attn,
             rope,
-            &topk_idxs,
-            window_topk + compress_topk,
+            projections.local_heads,
+            projections.head_dim,
             start_pos,
-        )?);
-    }
-
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
-}
-
-pub(crate) fn attention_prefill_compressed_overlap_group_bf16_hidden_with_cache(
-    ranks: &mut [(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-        &mut LayerDecodeCache,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "ratio-4 attention cache group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-
-    let mut projections = Vec::with_capacity(ranks.len());
-    let mut compressed_kvs = Vec::with_capacity(ranks.len());
-    let mut index_scores = Vec::with_capacity(ranks.len());
-    let mut compressed_len = None;
-    for (((ctx, attn, _comm, input, cache), rope), rank) in
-        ranks.iter_mut().zip(ropes.iter()).zip(0..)
-    {
-        ensure!(
-            config.compress_ratios[layer] == 4,
-            "ratio-4 group attention cache path called for layer {layer} with compress_ratio={}",
-            config.compress_ratios[layer]
         );
-        let compressor = attn
-            .compressor
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor weights"))?;
-        let indexer = attn
-            .indexer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing ratio-4 indexer weights"))?;
-        let compressor_state = cache
-            .compressor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor state"))?;
-        let indexer_kv = cache
-            .indexer_kv
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer kv cache"))?;
-        let indexer_state = cache
-            .indexer_compressor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer compressor state"))?;
-
-        let mut rank_projections = attention_project_bf16_hidden(ctx, config, input, attn)
-            .with_context(|| {
-                format!("ratio-4 cache attention_project layer {layer} rank {rank}")
-            })?;
-        apply_rope_attention_projections(ctx, &mut rank_projections, rope, start_pos)
-            .with_context(|| format!("ratio-4 cache apply_rope layer {layer} rank {rank}"))?;
-        copy_window_prefill_to_ring_cache(
-            ctx,
-            &rank_projections.kv,
-            &mut cache.kv,
-            config.sliding_window,
-        )
-        .with_context(|| format!("ratio-4 cache raw kv layer {layer} rank {rank}"))?;
-        init_overlap_compressor_state_from_prefill(
-            ctx,
-            config,
-            input,
-            compressor,
-            rope,
-            config.head_dim,
-            compressor_state,
-            false,
-        )
-        .with_context(|| format!("ratio-4 cache compressor tail layer {layer} rank {rank}"))?;
-        init_overlap_compressor_state_from_prefill(
-            ctx,
-            config,
-            input,
-            &indexer.compressor,
-            rope,
-            config.index_head_dim,
-            indexer_state,
-            true,
-        )
-        .with_context(|| format!("ratio-4 cache indexer tail layer {layer} rank {rank}"))?;
-
-        if input.seq_len < 4 {
-            projections.push(rank_projections);
-            compressed_kvs.push(None);
-            index_scores.push(None);
-            continue;
-        }
-
-        let rank_compressed_kv = compressor_overlap_prefill_bf16_hidden(
-            ctx, config, input, compressor, rope, start_pos,
-        )?;
-        copy_bf16_rows_to_cache(
-            ctx,
-            &rank_compressed_kv,
-            &mut cache.kv,
-            0,
-            config.sliding_window,
-            rank_compressed_kv.seq_len,
-        )
-        .with_context(|| format!("ratio-4 cache compressed kv layer {layer} rank {rank}"))?;
-        let indexer_compressed_kv = compressor_overlap_prefill_bf16_hidden_with_dim(
-            ctx,
-            config,
-            input,
-            &indexer.compressor,
-            rope,
-            start_pos,
-            config.index_head_dim,
-        )?;
-        copy_bf16_rows_to_cache(
-            ctx,
-            &indexer_compressed_kv,
-            indexer_kv,
-            0,
-            0,
-            indexer_compressed_kv.seq_len,
-        )
-        .with_context(|| format!("ratio-4 cache indexer kv layer {layer} rank {rank}"))?;
-        let (rank_scores, rank_compressed_len) = indexer_scores_prefill_bf16_hidden(
-            ctx,
-            config,
-            input,
-            &rank_projections.qr,
-            indexer,
-            rope,
-            start_pos,
-        )?;
-        if let Some(expected) = compressed_len {
-            ensure!(
-                rank_compressed_len == expected,
-                "indexer compressed len mismatch: expected {}, got {}",
-                expected,
-                rank_compressed_len
-            );
-        } else {
-            compressed_len = Some(rank_compressed_len);
-        }
-
-        projections.push(rank_projections);
-        compressed_kvs.push(Some(rank_compressed_kv));
-        index_scores.push(Some(rank_scores));
     }
 
-    if let Some(_compressed_len) = compressed_len {
-        group_start().map_err(|err| anyhow::anyhow!("NCCL group_start failed: {err:?}"))?;
-        for ((_, _, comm, _, _), scores) in ranks.iter().zip(index_scores.iter_mut()) {
-            let Some(scores) = scores.as_mut() else {
-                let _ = group_end();
-                return Err(anyhow::anyhow!("missing rank indexer scores"));
-            };
-            if let Err(err) = comm.all_reduce_in_place(scores, &ReduceOp::Sum) {
-                let _ = group_end();
-                return Err(anyhow::anyhow!(
-                    "NCCL indexer score all-reduce failed: {err:?}"
-                ));
-            }
-        }
-        group_end().map_err(|err| anyhow::anyhow!("NCCL group_end failed: {err:?}"))?;
-    }
+    let compressed_kv =
+        compressor_overlap_prefill_bf16_hidden(ctx, config, input, compressor, rope, start_pos)?;
+    copy_bf16_rows_to_cache(
+        ctx,
+        &compressed_kv,
+        &mut cache.kv,
+        0,
+        config.sliding_window,
+        compressed_kv.seq_len,
+    )
+    .with_context(|| format!("ratio-4 rank-lane compressed kv layer {layer}"))?;
+    let indexer_compressed_kv = compressor_overlap_prefill_bf16_hidden_with_dim(
+        ctx,
+        config,
+        input,
+        &indexer.compressor,
+        rope,
+        start_pos,
+        config.index_head_dim,
+    )?;
+    copy_bf16_rows_to_cache(
+        ctx,
+        &indexer_compressed_kv,
+        indexer_kv,
+        0,
+        0,
+        indexer_compressed_kv.seq_len,
+    )
+    .with_context(|| format!("ratio-4 rank-lane indexer kv layer {layer}"))?;
+    let (mut scores, compressed_len) = indexer_scores_prefill_bf16_hidden(
+        ctx,
+        config,
+        input,
+        &projections.qr,
+        indexer,
+        rope,
+        start_pos,
+    )?;
+    comm.all_reduce_in_place(&mut scores, &ReduceOp::Sum)
+        .map_err(|err| anyhow::anyhow!("NCCL indexer score all-reduce failed: {err:?}"))?;
 
-    let mut out = Vec::with_capacity(ranks.len());
-    for (
-        ((((ctx, attn, _comm, input, _cache), rope), rank_projections), rank_compressed_kv),
-        scores,
-    ) in ranks
-        .iter()
-        .zip(ropes.iter())
-        .zip(projections.into_iter())
-        .zip(compressed_kvs.into_iter())
-        .zip(index_scores.iter())
-    {
-        if input.seq_len < 4 {
-            let mut attn_out =
-                sparse_attention_prefill_bf16_hidden(ctx, config, &rank_projections, attn)?;
-            out.push(attention_output_project_bf16_hidden(
-                ctx,
-                &mut attn_out,
-                attn,
-                rope,
-                rank_projections.local_heads,
-                rank_projections.head_dim,
-                start_pos,
-            )?);
-            continue;
-        }
-        let compressed_len =
-            compressed_len.ok_or_else(|| anyhow::anyhow!("ratio-4 group has no compressed len"))?;
-        let rank_compressed_kv =
-            rank_compressed_kv.ok_or_else(|| anyhow::anyhow!("missing compressed kv"))?;
-        let scores = scores
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing indexer scores"))?;
-        let (window_idxs, window_topk) =
-            window_topk_indices(ctx, input.seq_len, config.sliding_window)?;
-        let (compress_idxs, compress_topk) = indexer_topk_indices_prefill(
-            ctx,
-            config,
-            scores,
-            input.seq_len,
-            compressed_len,
-            rank_projections.kv.seq_len,
-        )?;
-        let topk_idxs = concat_topk_indices(
-            ctx,
-            &window_idxs,
-            window_topk,
-            &compress_idxs,
-            compress_topk,
-            input.seq_len,
-        )?;
-        out.push(finish_compressed_overlap_attention_rank_local(
-            ctx,
-            config,
-            rank_projections,
-            rank_compressed_kv,
-            attn,
-            rope,
-            &topk_idxs,
-            window_topk + compress_topk,
-            start_pos,
-        )?);
-    }
-
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
+    let (window_idxs, window_topk) =
+        window_topk_indices(ctx, input.seq_len, config.sliding_window)?;
+    let (compress_idxs, compress_topk) = indexer_topk_indices_prefill(
+        ctx,
+        config,
+        &scores,
+        input.seq_len,
+        compressed_len,
+        projections.kv.seq_len,
+    )?;
+    let topk_idxs = concat_topk_indices(
+        ctx,
+        &window_idxs,
+        window_topk,
+        &compress_idxs,
+        compress_topk,
+        input.seq_len,
+    )?;
+    finish_compressed_overlap_attention_rank_local(
+        ctx,
+        config,
+        projections,
+        compressed_kv,
+        attn,
+        rope,
+        &topk_idxs,
+        window_topk + compress_topk,
+        start_pos,
+    )
 }
 
 pub fn indexed_attention_prefill_bf16_hidden(
@@ -946,39 +641,6 @@ pub(crate) fn attention_prefill_rank_local_bf16_hidden_with_cache(
     )
 }
 
-pub fn attention_prefill_group_bf16_hidden(
-    ranks: &[(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "attention group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input), rope) in ranks.iter().zip(ropes.iter()) {
-        out.push(attention_prefill_rank_local_bf16_hidden(
-            ctx, config, layer, input, attn, rope, start_pos,
-        )?);
-    }
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
-}
-
 pub fn attention_decode_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
@@ -1048,40 +710,6 @@ pub fn attention_decode_rank_local_bf16_hidden(
         start_pos,
     )
     .with_context(|| format!("attention_output_project layer {layer}"))
-}
-
-pub fn attention_decode_group_bf16_hidden(
-    ranks: &mut [(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-        &mut Bf16Cache,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "attention decode group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input, kv_cache), rope) in ranks.iter_mut().zip(ropes.iter()) {
-        out.push(attention_decode_rank_local_bf16_hidden(
-            ctx, config, layer, input, attn, rope, start_pos, kv_cache,
-        )?);
-    }
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
 }
 
 pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
@@ -1187,228 +815,4 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
         projections.head_dim,
         start_pos,
     )
-}
-
-pub(crate) fn attention_decode_compressed_nonoverlap_group_bf16_hidden(
-    ranks: &mut [(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-        &mut LayerDecodeCache,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "compressed decode group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input, cache), rope) in ranks.iter_mut().zip(ropes.iter()) {
-        out.push(
-            attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
-                ctx, config, layer, input, attn, rope, start_pos, cache,
-            )?,
-        );
-    }
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
-}
-
-pub(crate) fn attention_decode_compressed_overlap_group_bf16_hidden(
-    ranks: &mut [(
-        &RankGpuContext,
-        &AttentionWeights<'_>,
-        &Comm,
-        &Bf16HiddenStates,
-        &mut LayerDecodeCache,
-    )],
-    config: &Config,
-    layer: usize,
-    ropes: &[&DeepSeekRopeCache],
-    start_pos: usize,
-) -> Result<Vec<Bf16HiddenStates>> {
-    ensure!(
-        ranks.len() == ropes.len(),
-        "ratio-4 decode group ranks/ropes length mismatch: ranks={}, ropes={}",
-        ranks.len(),
-        ropes.len()
-    );
-    ensure!(
-        config.compress_ratios[layer] == 4,
-        "ratio-4 decode called for layer {layer} with ratio {}",
-        config.compress_ratios[layer]
-    );
-
-    let mut projections = Vec::with_capacity(ranks.len());
-    let mut index_scores: Vec<Option<CudaSlice<f32>>> = Vec::with_capacity(ranks.len());
-    for ((ctx, attn, _comm, input, cache), rope) in ranks.iter_mut().zip(ropes.iter()) {
-        ensure!(input.seq_len == 1, "ratio-4 decode expects seq_len=1");
-        let compressor = attn
-            .compressor
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor weights"))?;
-        let indexer = attn
-            .indexer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing ratio-4 indexer weights"))?;
-        let compressor_state = cache
-            .compressor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor state"))?;
-
-        let mut rank_projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
-        apply_rope_attention_projections(ctx, &mut rank_projections, rope, start_pos)?;
-        copy_bf16_rows_to_cache(
-            ctx,
-            &rank_projections.kv,
-            &mut cache.kv,
-            0,
-            start_pos % config.sliding_window,
-            1,
-        )?;
-        if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden(
-            ctx,
-            config,
-            input,
-            compressor,
-            rope,
-            start_pos,
-            compressor_state,
-        )? {
-            copy_bf16_rows_to_cache(
-                ctx,
-                &compressed_kv,
-                &mut cache.kv,
-                0,
-                config.sliding_window + start_pos / 4,
-                1,
-            )?;
-        }
-
-        let indexer_kv = cache
-            .indexer_kv
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer kv cache"))?;
-        let indexer_state = cache
-            .indexer_compressor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer compressor state"))?;
-        let scores = indexer_scores_decode_bf16_hidden(
-            ctx,
-            config,
-            input,
-            &rank_projections.qr,
-            indexer,
-            rope,
-            start_pos,
-            indexer_kv,
-            indexer_state,
-        )?;
-        projections.push(rank_projections);
-        index_scores.push(scores);
-    }
-
-    if let Some(compressed_len) = index_scores
-        .iter()
-        .find_map(|scores| scores.as_ref().map(|scores| scores.len()))
-    {
-        group_start().map_err(|err| anyhow::anyhow!("NCCL group_start failed: {err:?}"))?;
-        for ((_, _, comm, _, _), scores) in ranks.iter().zip(index_scores.iter_mut()) {
-            let Some(scores) = scores.as_mut() else {
-                let _ = group_end();
-                return Err(anyhow::anyhow!(
-                    "missing rank indexer scores for compressed_len={compressed_len}"
-                ));
-            };
-            if scores.len() != compressed_len {
-                let _ = group_end();
-                return Err(anyhow::anyhow!(
-                    "indexer decode score len mismatch: expected {}, got {}",
-                    compressed_len,
-                    scores.len()
-                ));
-            }
-            if let Err(err) = comm.all_reduce_in_place(scores, &ReduceOp::Sum) {
-                let _ = group_end();
-                return Err(anyhow::anyhow!(
-                    "NCCL decode indexer score all-reduce failed: {err:?}"
-                ));
-            }
-        }
-        group_end().map_err(|err| anyhow::anyhow!("NCCL group_end failed: {err:?}"))?;
-    }
-
-    let mut out = Vec::with_capacity(ranks.len());
-    for ((((ctx, attn, _comm, _input, cache), rope), rank_projections), scores) in ranks
-        .iter_mut()
-        .zip(ropes.iter())
-        .zip(projections.into_iter())
-        .zip(index_scores.iter())
-    {
-        let (window_idxs, window_topk) =
-            window_topk_indices_decode(ctx, start_pos, config.sliding_window)?;
-        let compressed_len = (start_pos + 1) / 4;
-        let (topk_idxs, topk) = if compressed_len > 0 {
-            let scores = scores
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing indexer decode scores"))?;
-            let (compress_idxs, compress_topk) = indexer_topk_indices_decode(
-                ctx,
-                config,
-                scores,
-                compressed_len,
-                config.sliding_window,
-            )?;
-            (
-                concat_topk_indices(
-                    ctx,
-                    &window_idxs,
-                    window_topk,
-                    &compress_idxs,
-                    compress_topk,
-                    1,
-                )?,
-                window_topk + compress_topk,
-            )
-        } else {
-            (window_idxs, window_topk)
-        };
-        let mut attn_out = indexed_attention_cache_bf16_hidden(
-            ctx,
-            config,
-            &rank_projections,
-            &cache.kv,
-            attn,
-            &topk_idxs,
-            topk,
-        )?;
-        out.push(attention_output_project_bf16_hidden(
-            ctx,
-            &mut attn_out,
-            attn,
-            rope,
-            rank_projections.local_heads,
-            rank_projections.head_dim,
-            start_pos,
-        )?);
-    }
-
-    let mut comms_and_hidden: Vec<(&RankGpuContext, &Comm, &mut Bf16HiddenStates)> = ranks
-        .iter()
-        .zip(out.iter_mut())
-        .map(|((ctx, _, comm, _, _), hidden)| (*ctx, *comm, hidden))
-        .collect();
-    all_reduce_hidden_group_fp32(&mut comms_and_hidden)?;
-    Ok(out)
 }

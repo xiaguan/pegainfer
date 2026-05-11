@@ -1,14 +1,6 @@
 use super::*;
-use cudarc::driver::CudaView;
-
 pub struct Bf16HiddenStates {
     pub data: CudaSlice<bf16>,
-    pub hidden_dim: usize,
-    pub seq_len: usize,
-}
-
-pub struct Bf16HiddenView<'a> {
-    pub data: CudaView<'a, bf16>,
     pub hidden_dim: usize,
     pub seq_len: usize,
 }
@@ -65,13 +57,12 @@ pub struct RoutedExperts {
 
 pub struct MoeFusedRoutePlan {
     pub routed: RoutedExperts,
-    pub pos_to_expert: CudaSlice<i32>,
     pub pos_to_token: CudaSlice<i32>,
     pub pos_to_token_topk: CudaSlice<i32>,
     pub token_topk_to_pos: CudaSlice<i32>,
-    pub expert_start: CudaSlice<i32>,
-    pub expert_end: CudaSlice<i32>,
-    pub num_tokens_per_expert: CudaSlice<i32>,
+    pub expert_indptr: CudaSlice<i32>,
+    pub expert_cursor: CudaSlice<i32>,
+    pub local_count: CudaSlice<i32>,
     pub local_experts: usize,
     pub global_start: usize,
     pub num_expanded: usize,

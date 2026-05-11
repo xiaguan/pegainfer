@@ -38,11 +38,6 @@ path = "src/bin/deepseek_kernel_check.rs"
 required-features = ["deepseek-v4"]
 
 [[bin]]
-name = "deepseek_mp8_check"
-path = "src/bin/deepseek_mp8_check.rs"
-required-features = ["deepseek-v4"]
-
-[[bin]]
 name = "deepseek_v4_e2e"
 path = "src/bin/deepseek_v4_e2e.rs"
 required-features = ["deepseek-v4"]

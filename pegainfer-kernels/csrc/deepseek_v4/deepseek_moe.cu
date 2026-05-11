@@ -537,39 +537,64 @@ __global__ void deepseek_moe_clear_bf16_kernel(__nv_bfloat16* data, int n) {
 
 __global__ void deepseek_moe_local_mapping_kernel(
     const int *__restrict__ route_indices,
-    int *__restrict__ pos_to_expert,
     int *__restrict__ pos_to_token,
     int *__restrict__ pos_to_token_topk,
     int *__restrict__ token_topk_to_pos,
-    int *__restrict__ expert_start,
-    int *__restrict__ expert_end,
-    int *__restrict__ num_tokens_per_expert,
+    int *__restrict__ expert_indptr,
+    int *__restrict__ expert_cursor,
     int seq_len,
     int topk,
     int global_start,
     int local_experts) {
-  int local_expert = blockIdx.x;
-  if (local_expert >= local_experts) return;
+  int route_offset = blockIdx.x * blockDim.x + threadIdx.x;
+  int route_elems = seq_len * topk;
+  if (route_offset >= route_elems) return;
 
-  int global_expert = global_start + local_expert;
-  int cursor = local_expert * seq_len * topk;
-  int count = 0;
-  for (int token = 0; token < seq_len; ++token) {
-    for (int route = 0; route < topk; ++route) {
-      int route_offset = token * topk + route;
-      if (route_indices[route_offset] == global_expert) {
-        int pos = cursor + count;
-        pos_to_expert[pos] = global_expert;
-        pos_to_token[pos] = token;
-        pos_to_token_topk[pos] = route_offset;
-        token_topk_to_pos[route_offset] = pos;
-        count += 1;
-      }
-    }
+  int expert = route_indices[route_offset];
+  if (expert < global_start || expert >= global_start + local_experts) {
+    return;
   }
-  expert_start[local_expert] = cursor;
-  expert_end[local_expert] = cursor + count;
-  num_tokens_per_expert[local_expert] = count;
+  int local_expert = expert - global_start;
+  int pos = atomicAdd(&expert_cursor[local_expert], 1);
+  if (pos >= route_elems) return;
+  int token = route_offset / topk;
+  pos_to_token[pos] = token;
+  pos_to_token_topk[pos] = route_offset;
+  token_topk_to_pos[route_offset] = pos;
+}
+
+__global__ void deepseek_moe_count_local_experts_kernel(
+    const int *__restrict__ route_indices,
+    int *__restrict__ expert_indptr,
+    int seq_len,
+    int topk,
+    int global_start,
+    int local_experts) {
+  int route_offset = blockIdx.x * blockDim.x + threadIdx.x;
+  int route_elems = seq_len * topk;
+  if (route_offset >= route_elems) return;
+  int expert = route_indices[route_offset];
+  if (expert < global_start || expert >= global_start + local_experts) {
+    return;
+  }
+  atomicAdd(&expert_indptr[expert - global_start + 1], 1);
+}
+
+__global__ void deepseek_moe_prefix_local_experts_kernel(
+    int *__restrict__ expert_indptr,
+    int *__restrict__ expert_cursor,
+    int *__restrict__ local_count,
+    int local_experts) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int sum = 0;
+  for (int expert = 0; expert < local_experts; ++expert) {
+    int count = expert_indptr[expert + 1];
+    expert_indptr[expert] = sum;
+    expert_cursor[expert] = sum;
+    sum += count;
+  }
+  expert_indptr[local_experts] = sum;
+  local_count[0] = sum;
 }
 
 __global__ void deepseek_moe_expand_to_fused_kernel(
@@ -632,48 +657,53 @@ extern "C" {
 
 cudaError_t deepseek_moe_local_mapping_cuda(
     const int *route_indices,
-    int *pos_to_expert,
     int *pos_to_token,
     int *pos_to_token_topk,
     int *token_topk_to_pos,
-    int *expert_start,
-    int *expert_end,
-    int *num_tokens_per_expert,
+    int *expert_indptr,
+    int *expert_cursor,
+    int *local_count,
     int seq_len,
     int topk,
     int global_start,
     int local_experts,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  int num_expanded = seq_len * topk * local_experts;
   int route_elems = seq_len * topk;
-  int clear_blocks = (num_expanded + threads - 1) / threads;
+  int clear_blocks = (route_elems + threads - 1) / threads;
   int route_blocks = (route_elems + threads - 1) / threads;
-  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_expert, num_expanded, -1);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token, num_expanded, -1);
+  cudaError_t err = cudaSuccess;
+  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token, route_elems, -1);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token_topk, num_expanded, -1);
+  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token_topk, route_elems, -1);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
   deepseek_moe_clear_i32_kernel<<<route_blocks, threads, 0, stream>>>(token_topk_to_pos, route_elems, -1);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(expert_start, local_experts, 0);
+  deepseek_moe_clear_i32_kernel<<<1, 256, 0, stream>>>(expert_indptr, local_experts + 1, 0);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(expert_end, local_experts, 0);
+  deepseek_moe_clear_i32_kernel<<<1, 256, 0, stream>>>(expert_cursor, local_experts, 0);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, threads, 0, stream>>>(num_tokens_per_expert, local_experts, 0);
+  deepseek_moe_clear_i32_kernel<<<1, 1, 0, stream>>>(local_count, 1, 0);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
-  deepseek_moe_local_mapping_kernel<<<local_experts, 1, 0, stream>>>(
-      route_indices, pos_to_expert, pos_to_token, pos_to_token_topk,
-      token_topk_to_pos, expert_start, expert_end, num_tokens_per_expert,
+  deepseek_moe_count_local_experts_kernel<<<route_blocks, threads, 0, stream>>>(
+      route_indices, expert_indptr, seq_len, topk, global_start, local_experts);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  deepseek_moe_prefix_local_experts_kernel<<<1, 1, 0, stream>>>(
+      expert_indptr, expert_cursor, local_count, local_experts);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  deepseek_moe_local_mapping_kernel<<<route_blocks, threads, 0, stream>>>(
+      route_indices, pos_to_token, pos_to_token_topk,
+      token_topk_to_pos, expert_indptr, expert_cursor,
       seq_len, topk, global_start, local_experts);
   return cudaGetLastError();
 }
@@ -682,13 +712,10 @@ cudaError_t deepseek_moe_expand_to_fused_cuda(
     const __nv_bfloat16 *x,
     const int *pos_to_token,
     __nv_bfloat16 *expanded,
-    int seq_len,
     int hidden_dim,
-    int topk,
-    int local_experts,
+    int num_expanded,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  int num_expanded = seq_len * topk * local_experts;
   int total = num_expanded * hidden_dim;
   int blocks = (total + threads - 1) / threads;
   deepseek_moe_expand_to_fused_kernel<<<blocks, threads, 0, stream>>>(

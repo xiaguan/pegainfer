@@ -249,6 +249,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_moe_fp4_grouped_linear_cuda(
+        x: *const Half,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        expert_indptr: *const i32,
+        out: *mut Half,
+        rows: i32,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_swiglu_clamp_cuda(
         gate: *const Half,
         up: *const Half,
@@ -306,13 +319,12 @@ unsafe extern "C" {
 
     pub fn deepseek_moe_local_mapping_cuda(
         route_indices: *const i32,
-        pos_to_expert: *mut i32,
         pos_to_token: *mut i32,
         pos_to_token_topk: *mut i32,
         token_topk_to_pos: *mut i32,
-        expert_start: *mut i32,
-        expert_end: *mut i32,
-        num_tokens_per_expert: *mut i32,
+        expert_indptr: *mut i32,
+        expert_cursor: *mut i32,
+        local_count: *mut i32,
         seq_len: i32,
         topk: i32,
         global_start: i32,
@@ -324,10 +336,8 @@ unsafe extern "C" {
         x: *const Half,
         pos_to_token: *const i32,
         expanded: *mut Half,
-        seq_len: i32,
         hidden_dim: i32,
-        topk: i32,
-        local_experts: i32,
+        num_expanded: i32,
         stream: CUstream,
     ) -> CUresult;
 

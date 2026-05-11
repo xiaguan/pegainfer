@@ -463,6 +463,50 @@ def renamed_kernel_source(program, old_name: str, new_name: str) -> str:
     return source.replace(old_name, new_name)
 
 
+def grouped_fp4_gemm_kernel_source(out_dim: int, in_dim: int, kernel_name: str) -> str:
+    source = renamed_kernel_source(
+        fp4_gemm_kernel(out_dim, in_dim),
+        "fp4_gemm_kernel__kernel",
+        kernel_name,
+    )
+    old_args = (
+        "const fp8_e4_t* __restrict__ A, const fp4_e2_t* __restrict__ B, "
+        "bfloat16_t* __restrict__ C, const fp8_e8_t* __restrict__ scales_a, "
+        "const fp8_e8_t* __restrict__ scales_b, int M"
+    )
+    new_args = (
+        "const fp8_e4_t* __restrict__ A, const fp4_e2_t* const* __restrict__ B_ptrs, "
+        "bfloat16_t* __restrict__ C, const fp8_e8_t* __restrict__ scales_a, "
+        "const fp8_e8_t* const* __restrict__ scales_b_ptrs, "
+        "const int* __restrict__ expert_indptr, int M"
+    )
+    if old_args not in source:
+        raise RuntimeError("TileLang FP4 GEMM signature changed; update grouped transform")
+    source = source.replace(old_args, new_args)
+    setup = f"""  const int expert = static_cast<int>(blockIdx.z);
+  const int expert_start = expert_indptr[expert];
+  const int expert_m = expert_indptr[expert + 1] - expert_start;
+  if (static_cast<int>(blockIdx.y) * 32 >= expert_m) {{
+    return;
+  }}
+  const fp8_e4_t* __restrict__ A_group = A + static_cast<int64_t>(expert_start) * {in_dim};
+  bfloat16_t* __restrict__ C_group = C + static_cast<int64_t>(expert_start) * {out_dim};
+  const fp8_e8_t* __restrict__ scales_a_group =
+      scales_a + static_cast<int64_t>(expert_start) * {in_dim // 128};
+  const fp4_e2_t* __restrict__ B = B_ptrs[expert];
+  const fp8_e8_t* __restrict__ scales_b = scales_b_ptrs[expert];
+"""
+    marker = "  const dim3 blockIdx = tl::rasterization2DRow<10>();\n"
+    if marker not in source:
+        raise RuntimeError("TileLang FP4 GEMM blockIdx marker changed; update grouped transform")
+    source = source.replace(marker, marker + setup)
+    source = source.replace("A[", "A_group[")
+    source = source.replace("scales_a[", "scales_a_group[")
+    source = source.replace("C + (", "C_group + (")
+    source = source.replace(" < M", " < expert_m")
+    return source
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", required=True)
@@ -587,6 +631,43 @@ extern "C" int deepseek_tilelang_fp4_gemm_n{out_dim}_k{in_dim}(
       reinterpret_cast<bfloat16_t*>(c),
       reinterpret_cast<const fp8_e8_t*>(scales_a),
       reinterpret_cast<const fp8_e8_t*>(scales_b),
+      m);
+  return static_cast<int>(cudaGetLastError());
+}}
+"""
+        )
+
+        grouped_name = f"deepseek_tilelang_fp4_grouped_gemm_n{out_dim}_k{in_dim}_kernel"
+        sources.append(grouped_fp4_gemm_kernel_source(out_dim, in_dim, grouped_name))
+        launchers.append(
+            f"""
+extern "C" int deepseek_tilelang_fp4_grouped_gemm_n{out_dim}_k{in_dim}(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    cudaStream_t stream) {{
+  constexpr int kThreads = 128;
+  constexpr int kSharedBytes = 98304;
+  cudaError_t err = cudaFuncSetAttribute(
+      {grouped_name},
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      kSharedBytes);
+  if (err != cudaSuccess && err != cudaErrorInvalidValue) {{
+    return static_cast<int>(err);
+  }}
+  dim3 grid({out_dim // 128}, (m + 31) / 32, local_experts);
+  {grouped_name}<<<grid, kThreads, kSharedBytes, stream>>>(
+      reinterpret_cast<const fp8_e4_t*>(a),
+      reinterpret_cast<const fp4_e2_t* const*>(b),
+      reinterpret_cast<bfloat16_t*>(c),
+      reinterpret_cast<const fp8_e8_t*>(scales_a),
+      reinterpret_cast<const fp8_e8_t* const*>(scales_b),
+      expert_indptr,
       m);
   return static_cast<int>(cudaGetLastError());
 }}

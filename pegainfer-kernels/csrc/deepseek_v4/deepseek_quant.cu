@@ -361,12 +361,37 @@ extern "C" int deepseek_tilelang_fp4_gemm_n4096_k2048(
     int m,
     cudaStream_t stream);
 
+extern "C" int deepseek_tilelang_fp4_grouped_gemm_n2048_k4096(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    cudaStream_t stream);
+
+extern "C" int deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    cudaStream_t stream);
+
 using DeepseekTilelangActQuantFn = int (*)(
     const void*, void*, void*, int, cudaStream_t);
 using DeepseekTilelangFp8GemmFn = int (*)(
     const void*, const void*, void*, const void*, const void*, int, cudaStream_t);
 using DeepseekTilelangFp4GemmFn = int (*)(
     const void*, const void*, void*, const void*, const void*, int, cudaStream_t);
+using DeepseekTilelangGroupedFp4GemmFn = int (*)(
+    const void*, const void* const*, void*, const void*, const void* const*,
+    const int*, int, int, cudaStream_t);
 
 static bool deepseek_tilelang_fp8_linear_fns(
     int in_dim,
@@ -753,6 +778,66 @@ cudaError_t deepseek_fp4_linear_cuda(
   deepseek_fp4_linear_serial_kernel<<<blocks, threads, 0, stream>>>(
       x, weight, weight_scale, out, seq_len, in_dim, out_dim);
   return cudaGetLastError();
+}
+
+cudaError_t deepseek_moe_fp4_grouped_linear_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *const *weights,
+    const unsigned char *const *scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *out,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  if (rows < 0 || in_dim <= 0 || out_dim <= 0 || local_experts <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (rows == 0) return cudaSuccess;
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangGroupedFp4GemmFn gemm_fn = nullptr;
+  if (in_dim == 4096 && out_dim == 2048) {
+    act_fn = deepseek_tilelang_act_quant_k4096;
+    gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n2048_k4096;
+  } else if (in_dim == 2048 && out_dim == 4096) {
+    act_fn = deepseek_tilelang_act_quant_k2048;
+    gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n4096_k2048;
+  } else {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= kMaxQuantScratchDevices) return cudaErrorInvalidDevice;
+
+  DeepseekQuantScratch& scratch = g_quant_scratch[device];
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  err = deepseek_ensure_byte_scratch(
+      &scratch.act, &scratch.act_bytes, (size_t)rows * in_dim);
+  if (err != cudaSuccess) return err;
+  err = deepseek_ensure_byte_scratch(
+      &scratch.act_scale, &scratch.act_scale_bytes, (size_t)rows * scale_cols);
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(
+      act_fn(x, scratch.act, scratch.act_scale, rows, stream));
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(gemm_fn(
+      scratch.act,
+      reinterpret_cast<const void* const*>(weights),
+      out,
+      scratch.act_scale,
+      reinterpret_cast<const void* const*>(scales),
+      expert_indptr,
+      rows,
+      local_experts,
+      stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
 }
 
 }  // extern "C"

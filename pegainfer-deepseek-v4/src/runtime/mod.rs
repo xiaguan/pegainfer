@@ -2,10 +2,7 @@ use std::ptr;
 
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-use cudarc::nccl::{
-    ReduceOp,
-    safe::{Comm, group_end, group_start},
-};
+use cudarc::nccl::{ReduceOp, safe::Comm};
 use half::bf16;
 use pegainfer_kernels::ffi;
 
