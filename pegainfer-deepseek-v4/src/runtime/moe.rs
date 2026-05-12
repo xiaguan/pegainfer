@@ -344,140 +344,191 @@ pub fn reduce_moe_fused_output_f32(
     Ok(out)
 }
 
-pub fn local_experts_forward_packed_bf16_hidden(
+pub fn build_moe_expert_ptr_cache(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+) -> Result<MoeGroupedPtrCache> {
+    ctx.set_current()?;
+    let local_experts = weights.local_experts();
+    ensure!(
+        local_experts > 0,
+        "MoE grouped pointer cache needs local experts"
+    );
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for layer in 0..config.n_layers {
+        layers.push(MoeLayerGroupedPtrs {
+            w1: build_moe_grouped_linear_ptrs(
+                ctx,
+                local_experts,
+                config.dim,
+                config.moe_inter_dim,
+                |local_expert| {
+                    weights
+                        .local_expert(layer, local_expert)
+                        .map(|expert| expert.w1)
+                },
+            )
+            .with_context(|| format!("build grouped ptr cache layer {layer} w1"))?,
+            w2: build_moe_grouped_linear_ptrs(
+                ctx,
+                local_experts,
+                config.moe_inter_dim,
+                config.dim,
+                |local_expert| {
+                    weights
+                        .local_expert(layer, local_expert)
+                        .map(|expert| expert.w2)
+                },
+            )
+            .with_context(|| format!("build grouped ptr cache layer {layer} w2"))?,
+            w3: build_moe_grouped_linear_ptrs(
+                ctx,
+                local_experts,
+                config.dim,
+                config.moe_inter_dim,
+                |local_expert| {
+                    weights
+                        .local_expert(layer, local_expert)
+                        .map(|expert| expert.w3)
+                },
+            )
+            .with_context(|| format!("build grouped ptr cache layer {layer} w3"))?,
+        });
+    }
+    Ok(MoeGroupedPtrCache {
+        layers,
+        local_experts,
+    })
+}
+
+fn build_moe_grouped_linear_ptrs<'a, F>(
+    ctx: &RankGpuContext,
+    local_experts: usize,
+    in_dim: usize,
+    out_dim: usize,
+    mut linear_for_expert: F,
+) -> Result<MoeGroupedLinearPtrs>
+where
+    F: FnMut(usize) -> Result<QuantLinearRef<'a>>,
+{
+    let mut weight_ptrs = Vec::with_capacity(local_experts);
+    let mut scale_ptrs = Vec::with_capacity(local_experts);
+    for local_expert in 0..local_experts {
+        let linear = linear_for_expert(local_expert)?;
+        validate_grouped_fp4_linear(&linear, in_dim, out_dim)
+            .with_context(|| format!("validate grouped FP4 local expert {local_expert}"))?;
+        let (weight_ptr, _weight_guard) = linear.weight.tensor.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = linear.scale.tensor.data.device_ptr(&ctx.stream);
+        weight_ptrs.push(weight_ptr as *const u8 as u64);
+        scale_ptrs.push(scale_ptr as *const u8 as u64);
+    }
+    Ok(MoeGroupedLinearPtrs {
+        weight_ptrs: ctx.stream.clone_htod(&weight_ptrs)?,
+        scale_ptrs: ctx.stream.clone_htod(&scale_ptrs)?,
+        in_dim,
+        out_dim,
+    })
+}
+
+fn validate_grouped_fp4_linear(
+    linear: &QuantLinearRef<'_>,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<()> {
+    ensure!(
+        linear.weight.tensor.dtype == safetensors::Dtype::F4,
+        "grouped FP4 weight {} must be F4, got {:?}",
+        linear.weight.name,
+        linear.weight.tensor.dtype
+    );
+    ensure!(
+        linear.scale.tensor.dtype == safetensors::Dtype::F8_E8M0,
+        "grouped FP4 scale {} must be F8_E8M0, got {:?}",
+        linear.scale.name,
+        linear.scale.tensor.dtype
+    );
+    ensure!(
+        linear.weight.tensor.shape == [out_dim, in_dim],
+        "grouped FP4 weight {} shape mismatch: expected {:?}, got {:?}",
+        linear.weight.name,
+        [out_dim, in_dim],
+        linear.weight.tensor.shape
+    );
+    ensure!(
+        in_dim.is_multiple_of(32),
+        "grouped FP4 input dim must be divisible by 32, got {}",
+        in_dim
+    );
+    ensure!(
+        linear.scale.tensor.shape == [out_dim, in_dim / 32],
+        "grouped FP4 scale {} shape mismatch: expected {:?}, got {:?}",
+        linear.scale.name,
+        [out_dim, in_dim / 32],
+        linear.scale.tensor.shape
+    );
+    Ok(())
+}
+
+pub fn local_experts_forward_packed_bf16_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    ptr_cache: &MoeGroupedPtrCache,
     layer: usize,
     expanded_input: &Bf16HiddenStates,
     plan: &MoeFusedRoutePlan,
 ) -> Result<Bf16HiddenStates> {
     ctx.set_current()?;
-    let gate = fp4_grouped_linear_bf16_hidden(
-        ctx,
-        expanded_input,
-        &plan.expert_indptr,
-        plan.local_experts,
-        |local_expert| {
-            weights
-                .local_expert(layer, local_expert)
-                .map(|expert| expert.w1)
-        },
-    )?;
-    let up = fp4_grouped_linear_bf16_hidden(
-        ctx,
-        expanded_input,
-        &plan.expert_indptr,
-        plan.local_experts,
-        |local_expert| {
-            weights
-                .local_expert(layer, local_expert)
-                .map(|expert| expert.w3)
-        },
-    )?;
+    ensure!(
+        layer < ptr_cache.layers.len(),
+        "MoE grouped pointer cache layer {layer} out of range {}",
+        ptr_cache.layers.len()
+    );
+    ensure!(
+        ptr_cache.local_experts == plan.local_experts,
+        "MoE grouped pointer cache local_experts mismatch: cache={}, plan={}",
+        ptr_cache.local_experts,
+        plan.local_experts
+    );
+    let ptrs = &ptr_cache.layers[layer];
+    let gate = fp4_grouped_linear_bf16_hidden(ctx, expanded_input, &plan.expert_indptr, &ptrs.w1)?;
+    let up = fp4_grouped_linear_bf16_hidden(ctx, expanded_input, &plan.expert_indptr, &ptrs.w3)?;
     let activated = swiglu_clamp_bf16_hidden(ctx, &gate, &up, config.swiglu_limit)?;
-    fp4_grouped_linear_bf16_hidden(
-        ctx,
-        &activated,
-        &plan.expert_indptr,
-        plan.local_experts,
-        |local_expert| {
-            weights
-                .local_expert(layer, local_expert)
-                .map(|expert| expert.w2)
-        },
-    )
+    fp4_grouped_linear_bf16_hidden(ctx, &activated, &plan.expert_indptr, &ptrs.w2)
 }
 
-fn fp4_grouped_linear_bf16_hidden<'a, F>(
+fn fp4_grouped_linear_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
     expert_indptr: &CudaSlice<i32>,
-    local_experts: usize,
-    mut linear_for_expert: F,
-) -> Result<Bf16HiddenStates>
-where
-    F: FnMut(usize) -> Result<QuantLinearRef<'a>>,
-{
+    ptrs: &MoeGroupedLinearPtrs,
+) -> Result<Bf16HiddenStates> {
     ctx.set_current()?;
+    let local_experts = expert_indptr.len().saturating_sub(1);
     ensure!(local_experts > 0, "grouped FP4 needs local experts");
     ensure!(
-        expert_indptr.len() == local_experts + 1,
-        "grouped FP4 expert indptr length mismatch: indptr={}, local_experts={}",
-        expert_indptr.len(),
+        ptrs.weight_ptrs.len() == local_experts,
+        "grouped FP4 weight pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.weight_ptrs.len(),
         local_experts
     );
-
-    let mut weight_ptrs = Vec::with_capacity(local_experts);
-    let mut scale_ptrs = Vec::with_capacity(local_experts);
-    let mut weight_guards = Vec::with_capacity(local_experts);
-    let mut scale_guards = Vec::with_capacity(local_experts);
-    let mut out_dim = None;
-    for local_expert in 0..local_experts {
-        let linear = linear_for_expert(local_expert)?;
-        ensure!(
-            linear.weight.tensor.dtype == safetensors::Dtype::F4,
-            "grouped FP4 weight {} must be F4, got {:?}",
-            linear.weight.name,
-            linear.weight.tensor.dtype
-        );
-        ensure!(
-            linear.scale.tensor.dtype == safetensors::Dtype::F8_E8M0,
-            "grouped FP4 scale {} must be F8_E8M0, got {:?}",
-            linear.scale.name,
-            linear.scale.tensor.dtype
-        );
-        ensure!(
-            linear.weight.tensor.shape.len() == 2,
-            "grouped FP4 weight {} must be rank-2, got {:?}",
-            linear.weight.name,
-            linear.weight.tensor.shape
-        );
-        let expert_out_dim = linear.weight.tensor.shape[0];
-        let expert_in_dim = linear.weight.tensor.shape[1];
-        ensure!(
-            expert_in_dim == input.hidden_dim,
-            "grouped FP4 input dim mismatch: weight {} expects {}, got {}",
-            linear.weight.name,
-            expert_in_dim,
-            input.hidden_dim
-        );
-        ensure!(
-            input.hidden_dim.is_multiple_of(32),
-            "grouped FP4 input dim must be divisible by 32, got {}",
-            input.hidden_dim
-        );
-        ensure!(
-            linear.scale.tensor.shape == [expert_out_dim, input.hidden_dim / 32],
-            "grouped FP4 scale {} shape mismatch: expected {:?}, got {:?}",
-            linear.scale.name,
-            [expert_out_dim, input.hidden_dim / 32],
-            linear.scale.tensor.shape
-        );
-        if let Some(expected) = out_dim {
-            ensure!(
-                expert_out_dim == expected,
-                "grouped FP4 output dim mismatch: expert {local_expert} has {expert_out_dim}, expected {expected}"
-            );
-        } else {
-            out_dim = Some(expert_out_dim);
-        }
-        let (weight_ptr, weight_guard) = linear.weight.tensor.data.device_ptr(&ctx.stream);
-        let (scale_ptr, scale_guard) = linear.scale.tensor.data.device_ptr(&ctx.stream);
-        weight_ptrs.push(weight_ptr as *const u8 as u64);
-        scale_ptrs.push(scale_ptr as *const u8 as u64);
-        weight_guards.push(weight_guard);
-        scale_guards.push(scale_guard);
-    }
-
-    let out_dim = out_dim.ok_or_else(|| anyhow::anyhow!("grouped FP4 has no experts"))?;
-    let mut out = Bf16HiddenStates::zeros(ctx, out_dim, input.seq_len)?;
-    let weight_ptrs_gpu = ctx.stream.clone_htod(&weight_ptrs)?;
-    let scale_ptrs_gpu = ctx.stream.clone_htod(&scale_ptrs)?;
+    ensure!(
+        ptrs.scale_ptrs.len() == local_experts,
+        "grouped FP4 scale pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.scale_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        input.hidden_dim == ptrs.in_dim,
+        "grouped FP4 input dim mismatch: expected {}, got {}",
+        ptrs.in_dim,
+        input.hidden_dim
+    );
+    let mut out = Bf16HiddenStates::zeros(ctx, ptrs.out_dim, input.seq_len)?;
     {
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
-        let (weights_ptr, _weights_guard) = weight_ptrs_gpu.device_ptr(&ctx.stream);
-        let (scales_ptr, _scales_guard) = scale_ptrs_gpu.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = ptrs.weight_ptrs.device_ptr(&ctx.stream);
+        let (scales_ptr, _scales_guard) = ptrs.scale_ptrs.device_ptr(&ctx.stream);
         let (expert_ptr, _expert_guard) = expert_indptr.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
@@ -489,15 +540,13 @@ where
                 out_ptr as *mut ffi::Half,
                 input.seq_len as i32,
                 input.hidden_dim as i32,
-                out_dim as i32,
+                ptrs.out_dim as i32,
                 local_experts as i32,
                 ctx.stream.cu_stream(),
             )
         };
         result.result()?;
     }
-    drop(weight_guards);
-    drop(scale_guards);
     Ok(out)
 }
 
@@ -505,6 +554,7 @@ pub fn hash_routed_moe_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     layer: usize,
     input: &Bf16HiddenStates,
     token_ids: &CudaSlice<u32>,
@@ -517,7 +567,7 @@ pub fn hash_routed_moe_rank_local_bf16_hidden(
     let expanded_out = local_experts_forward_packed_bf16_hidden(
         ctx,
         config,
-        weights,
+        ptr_cache,
         layer,
         &expanded_input,
         &plan,
@@ -531,6 +581,7 @@ pub fn moe_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     layer: usize,
     input: &Bf16HiddenStates,
     token_ids: &CudaSlice<u32>,
@@ -547,7 +598,7 @@ pub fn moe_rank_local_bf16_hidden(
     let expanded_out = local_experts_forward_packed_bf16_hidden(
         ctx,
         config,
-        weights,
+        ptr_cache,
         layer,
         &expanded_input,
         &plan,
@@ -561,6 +612,7 @@ pub(crate) fn moe_rank_lane_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
     layer: usize,
     input: &Bf16HiddenStates,
@@ -578,7 +630,7 @@ pub(crate) fn moe_rank_lane_bf16_hidden(
     let expanded_out = local_experts_forward_packed_bf16_hidden(
         ctx,
         config,
-        weights,
+        ptr_cache,
         layer,
         &expanded_input,
         &plan,
@@ -594,6 +646,7 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
     layer: usize,
     input: &Bf16HiddenStates,
@@ -633,7 +686,7 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden(
     let expanded_out = local_experts_forward_packed_bf16_hidden(
         ctx,
         config,
-        weights,
+        ptr_cache,
         layer,
         &expanded_input,
         &plan,

@@ -4,6 +4,7 @@ pub fn block_prefill_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     layer: usize,
     input: &HcHiddenStates,
     token_ids: &CudaSlice<u32>,
@@ -42,13 +43,15 @@ pub fn block_prefill_rank_local_bf16_hidden(
         &block.hc_ffn_base,
     )?;
     let ffn_norm = rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)?;
-    let ffn_out = moe_rank_local_bf16_hidden(ctx, config, weights, layer, &ffn_norm, token_ids)?;
+    let ffn_out =
+        moe_rank_local_bf16_hidden(ctx, config, weights, ptr_cache, layer, &ffn_norm, token_ids)?;
     hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
 }
 
 pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
     ctx: &RankGpuContext,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
     config: &Config,
     layer: usize,
@@ -124,9 +127,10 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
     .with_context(|| format!("hc_pre ffn layer {layer}"))?;
     let ffn_norm = rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)
         .with_context(|| format!("ffn rms_norm layer {layer}"))?;
-    let ffn_out =
-        moe_rank_lane_bf16_hidden(ctx, config, weights, comm, layer, &ffn_norm, token_ids)
-            .with_context(|| format!("prefill MoE rank-lane layer {layer}"))?;
+    let ffn_out = moe_rank_lane_bf16_hidden(
+        ctx, config, weights, ptr_cache, comm, layer, &ffn_norm, token_ids,
+    )
+    .with_context(|| format!("prefill MoE rank-lane layer {layer}"))?;
     hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
         .with_context(|| format!("hc_post ffn layer {layer}"))
 }
@@ -134,6 +138,7 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
 pub fn block_decode_rank_lane_bf16_hidden(
     ctx: &RankGpuContext,
     weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
     config: &Config,
     layer: usize,
@@ -190,9 +195,10 @@ pub fn block_decode_rank_lane_bf16_hidden(
     )
     .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?;
 
-    let ffn_out =
-        decode_moe_ag_rs_bf16_hidden(ctx, config, weights, comm, layer, &ffn_norm, token_ids)
-            .with_context(|| format!("decode MoE AG/RS layer {layer}"))?;
+    let ffn_out = decode_moe_ag_rs_bf16_hidden(
+        ctx, config, weights, ptr_cache, comm, layer, &ffn_norm, token_ids,
+    )
+    .with_context(|| format!("decode MoE AG/RS layer {layer}"))?;
     hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
         .with_context(|| format!("hc_post ffn layer {layer}"))
 }

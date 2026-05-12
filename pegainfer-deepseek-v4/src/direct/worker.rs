@@ -7,8 +7,8 @@ use cudarc::driver::{CudaSlice, DevicePtrMut, result as cuda_result};
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
     TensorParallelConfig, all_reduce_hidden_in_place, block_decode_rank_lane_bf16_hidden,
-    embedding_rank_local, final_logits_rank_local_bf16_hidden, hc_expand_bf16_hidden,
-    load_rank_to_gpu, precompute_rope_cache,
+    build_moe_expert_ptr_cache, embedding_rank_local, final_logits_rank_local_bf16_hidden,
+    hc_expand_bf16_hidden, load_rank_to_gpu, precompute_rope_cache,
     runtime::{all_gather_logits, block_prefill_rank_lane_bf16_hidden_with_decode_cache},
 };
 
@@ -75,9 +75,10 @@ impl RankWorker {
                 let mut ropes = Vec::new();
                 let mut caches = Vec::new();
                 let mut max_cache_seq_len = 0usize;
-                let startup = bind_rank_thread(&ctx);
+                let startup = bind_rank_thread(&ctx)
+                    .and_then(|()| build_moe_expert_ptr_cache(&ctx, config, &weights));
                 match startup {
-                    Ok(()) => {
+                    Ok(ptr_cache) => {
                         let _ = startup_tx.send(Ok(()));
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
@@ -104,6 +105,7 @@ impl RankWorker {
                                         rank,
                                         &ctx,
                                         &weights,
+                                        &ptr_cache,
                                         comm.get(),
                                         &ropes,
                                         config,
@@ -122,6 +124,7 @@ impl RankWorker {
                                         rank,
                                         &ctx,
                                         &weights,
+                                        &ptr_cache,
                                         comm.get(),
                                         &ropes,
                                         config,
@@ -372,6 +375,7 @@ fn run_decode_on_rank_lane(
     rank: usize,
     ctx: &RankGpuContext,
     weights: &RankWeightView<'_>,
+    ptr_cache: &crate::MoeGroupedPtrCache,
     comm: &cudarc::nccl::safe::Comm,
     ropes: &[DeepSeekRopeCache],
     config: &Config,
@@ -408,6 +412,7 @@ fn run_decode_on_rank_lane(
         hc = block_decode_rank_lane_bf16_hidden(
             ctx,
             weights,
+            ptr_cache,
             comm,
             config,
             layer,
@@ -430,6 +435,7 @@ fn run_prefill_on_rank_lane(
     rank: usize,
     ctx: &RankGpuContext,
     weights: &RankWeightView<'_>,
+    ptr_cache: &crate::MoeGroupedPtrCache,
     comm: &cudarc::nccl::safe::Comm,
     ropes: &[DeepSeekRopeCache],
     config: &Config,
@@ -470,6 +476,7 @@ fn run_prefill_on_rank_lane(
         hc = block_prefill_rank_lane_bf16_hidden_with_decode_cache(
             ctx,
             weights,
+            ptr_cache,
             comm,
             config,
             layer,

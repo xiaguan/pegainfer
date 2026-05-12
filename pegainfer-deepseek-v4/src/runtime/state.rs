@@ -64,6 +64,24 @@ pub struct MoeFusedRoutePlan {
     pub num_expanded: usize,
 }
 
+pub struct MoeGroupedLinearPtrs {
+    pub weight_ptrs: CudaSlice<u64>,
+    pub scale_ptrs: CudaSlice<u64>,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+pub struct MoeLayerGroupedPtrs {
+    pub w1: MoeGroupedLinearPtrs,
+    pub w2: MoeGroupedLinearPtrs,
+    pub w3: MoeGroupedLinearPtrs,
+}
+
+pub struct MoeGroupedPtrCache {
+    pub layers: Vec<MoeLayerGroupedPtrs>,
+    pub local_experts: usize,
+}
+
 pub struct F32HiddenStates {
     pub data: CudaSlice<f32>,
     pub hidden_dim: usize,
