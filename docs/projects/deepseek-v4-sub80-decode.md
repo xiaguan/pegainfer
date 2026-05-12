@@ -110,5 +110,9 @@ After the grouped MoE pointer-cache commit, DeepSeek V4 fixed-token long bench w
 - Decision:
   - Keep rank-worker CPU affinity. It directly reduces corrected f32 all-reduce arrival skew and moves the fixed-token long bench below 80ms with stable hashes.
   - This does not reach the stricter sub-70 target yet; continue with the next largest remaining rank-arrival source.
+- Rejected follow-up:
+  - Tried leaving CPU0 to scheduler/main by pinning rank workers to CPUs `1..8`.
+  - Fixed-token bench regressed to `steady_tpot_ms.avg = 76.729985`, p50 `75.934987`, p95 `80.571165`, hash `6346f03343d75a65`.
+  - Keep the direct rank-to-first-cpuset-CPU mapping (`rank -> cpus[rank]`) on this machine.
 
 ## Debrief
