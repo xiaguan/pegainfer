@@ -5,6 +5,16 @@ pub struct Bf16HiddenStates {
     pub seq_len: usize,
 }
 
+impl Bf16HiddenStates {
+    pub(crate) fn seq_capacity(&self) -> usize {
+        if self.hidden_dim == 0 {
+            0
+        } else {
+            self.data.len() / self.hidden_dim
+        }
+    }
+}
+
 pub struct Bf16Cache {
     pub data: CudaSlice<bf16>,
     pub hidden_dim: usize,
@@ -32,11 +42,115 @@ pub struct HcHiddenStates {
     pub hc: usize,
 }
 
+impl HcHiddenStates {
+    pub(crate) fn seq_capacity(&self) -> usize {
+        if self.hidden_dim == 0 || self.hc == 0 {
+            0
+        } else {
+            self.data.len() / (self.hidden_dim * self.hc)
+        }
+    }
+}
+
 pub struct HcPreState {
     pub post: CudaSlice<f32>,
     pub comb: CudaSlice<f32>,
     pub seq_len: usize,
     pub hc: usize,
+}
+
+pub(crate) struct HcPreStateView<'a> {
+    pub post: &'a CudaSlice<f32>,
+    pub comb: &'a CudaSlice<f32>,
+    pub seq_len: usize,
+    pub hc: usize,
+}
+
+pub(crate) struct HcPreNormScratch {
+    pub mixes: CudaSlice<f32>,
+    pub post: CudaSlice<f32>,
+    pub comb: CudaSlice<f32>,
+    pub out: Bf16HiddenStates,
+    pub seq_capacity: usize,
+    pub hidden_dim: usize,
+    pub hc: usize,
+}
+
+pub(crate) struct DecodeEntryScratch {
+    pub(crate) embedding: Bf16HiddenStates,
+    pub(crate) hc_expand: HcHiddenStates,
+}
+
+pub(crate) struct HcPostScratch {
+    pub(crate) attention_reduce_temp: CudaSlice<f32>,
+    pub(crate) attention_out: HcHiddenStates,
+    pub(crate) layer_outputs: Vec<HcHiddenStates>,
+}
+
+pub(crate) struct FinalLogitsScratch {
+    pub(crate) hc_mixes: CudaSlice<f32>,
+    pub(crate) hc_pre: CudaSlice<f32>,
+    pub(crate) hc_out: Bf16HiddenStates,
+    pub(crate) normed: Bf16HiddenStates,
+    pub(crate) local_logits: F32Logits,
+    pub(crate) gathered_logits: F32Logits,
+}
+
+pub(crate) struct MoeAgRsScratch {
+    pub(crate) global_hidden: Bf16HiddenStates,
+    pub(crate) global_token_ids: CudaSlice<u32>,
+    pub(crate) route_weights: CudaSlice<f32>,
+    pub(crate) route_indices: CudaSlice<i32>,
+    pub(crate) pos_to_token: CudaSlice<i32>,
+    pub(crate) pos_to_token_topk: CudaSlice<i32>,
+    pub(crate) token_topk_to_pos: CudaSlice<i32>,
+    pub(crate) expert_indptr: CudaSlice<i32>,
+    pub(crate) expert_cursor: CudaSlice<i32>,
+    pub(crate) local_count: CudaSlice<i32>,
+    pub(crate) expanded_input: Bf16HiddenStates,
+    pub(crate) expert_gate: Bf16HiddenStates,
+    pub(crate) expert_up: Bf16HiddenStates,
+    pub(crate) expert_activated: Bf16HiddenStates,
+    pub(crate) expert_out: Bf16HiddenStates,
+    pub(crate) fp4_act_workspace: CudaSlice<u8>,
+    pub(crate) fp4_act_scale_workspace: CudaSlice<u8>,
+    pub(crate) partial_routed: F32HiddenStates,
+    pub(crate) local_routed: F32HiddenStates,
+    pub(crate) out: Bf16HiddenStates,
+}
+
+pub(crate) struct SharedExpertScratch {
+    pub(crate) gate: Bf16HiddenStates,
+    pub(crate) up: Bf16HiddenStates,
+    pub(crate) activated: Bf16HiddenStates,
+    pub(crate) out: Bf16HiddenStates,
+    pub(crate) seq_capacity: usize,
+}
+
+pub(crate) struct AttentionOutputScratch {
+    pub(crate) attn_out: Bf16HiddenStates,
+    pub(crate) low_rank: Bf16HiddenStates,
+    pub(crate) out: Bf16HiddenStates,
+    pub(crate) local_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) seq_capacity: usize,
+}
+
+pub(crate) struct AttentionIndexScratch {
+    pub(crate) window_idxs: CudaSlice<i32>,
+    pub(crate) compress_idxs: CudaSlice<i32>,
+    pub(crate) topk_idxs: CudaSlice<i32>,
+}
+
+pub(crate) struct AttentionAuxScratch {
+    pub(crate) compressor_weighted: CudaSlice<f32>,
+    pub(crate) compressor_out: Bf16HiddenStates,
+    pub(crate) indexer_q: Bf16HiddenStates,
+    pub(crate) indexer_weights: Bf16HiddenStates,
+    pub(crate) indexer_scores: CudaSlice<f32>,
+    pub(crate) max_head_dim: usize,
+    pub(crate) local_index_heads: usize,
+    pub(crate) max_compressed_len: usize,
 }
 
 pub struct F32Logits {
@@ -51,6 +165,13 @@ pub struct RoutedExperts {
     pub seq_len: usize,
 }
 
+pub(crate) struct RoutedExpertsView<'a> {
+    pub(crate) weights: &'a CudaSlice<f32>,
+    pub(crate) indices: &'a CudaSlice<i32>,
+    pub(crate) topk: usize,
+    pub(crate) seq_len: usize,
+}
+
 pub struct MoeFusedRoutePlan {
     pub routed: RoutedExperts,
     pub pos_to_token: CudaSlice<i32>,
@@ -62,6 +183,15 @@ pub struct MoeFusedRoutePlan {
     pub local_experts: usize,
     pub global_start: usize,
     pub num_expanded: usize,
+}
+
+pub(crate) struct MoeFusedRoutePlanView<'a> {
+    pub(crate) routed: RoutedExpertsView<'a>,
+    pub(crate) pos_to_token: &'a CudaSlice<i32>,
+    pub(crate) token_topk_to_pos: &'a CudaSlice<i32>,
+    pub(crate) expert_indptr: &'a CudaSlice<i32>,
+    pub(crate) local_experts: usize,
+    pub(crate) num_expanded: usize,
 }
 
 pub struct MoeGroupedLinearPtrs {
@@ -88,12 +218,42 @@ pub struct F32HiddenStates {
     pub seq_len: usize,
 }
 
+impl F32HiddenStates {
+    pub(crate) fn seq_capacity(&self) -> usize {
+        if self.hidden_dim == 0 {
+            0
+        } else {
+            self.data.len() / self.hidden_dim
+        }
+    }
+}
+
 pub struct AttentionProjections {
     pub qr: Bf16HiddenStates,
     pub q: Bf16HiddenStates,
     pub kv: Bf16HiddenStates,
     pub local_heads: usize,
     pub head_dim: usize,
+}
+
+pub(crate) struct AttentionProjectionsView<'a> {
+    pub(crate) qr: &'a Bf16HiddenStates,
+    pub(crate) q: &'a mut Bf16HiddenStates,
+    pub(crate) kv: &'a mut Bf16HiddenStates,
+    pub(crate) local_heads: usize,
+    pub(crate) head_dim: usize,
+}
+
+pub(crate) struct AttentionProjectionScratch {
+    pub(crate) qr_raw: Bf16HiddenStates,
+    pub(crate) qr: Bf16HiddenStates,
+    pub(crate) q_raw: Bf16HiddenStates,
+    pub(crate) q: Bf16HiddenStates,
+    pub(crate) kv_raw: Bf16HiddenStates,
+    pub(crate) kv: Bf16HiddenStates,
+    pub(crate) local_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) seq_capacity: usize,
 }
 
 pub struct DeepSeekRopeCache {
@@ -129,6 +289,367 @@ impl Bf16HiddenStates {
         let host = ctx.stream.clone_dtoh(&self.data)?;
         ctx.sync()?;
         Ok(host.iter().map(|value| value.to_f32()).collect())
+    }
+}
+
+impl HcPreNormScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, seq_capacity: usize) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "HC pre-norm scratch capacity must be positive"
+        );
+        let mix_hc = (2 + config.hc_mult) * config.hc_mult;
+        let mixes = unsafe { ctx.stream.alloc(seq_capacity * mix_hc)? };
+        let post = unsafe { ctx.stream.alloc(seq_capacity * config.hc_mult)? };
+        let comb = unsafe {
+            ctx.stream
+                .alloc(seq_capacity * config.hc_mult * config.hc_mult)?
+        };
+        let out = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        Ok(Self {
+            mixes,
+            post,
+            comb,
+            out,
+            seq_capacity,
+            hidden_dim: config.dim,
+            hc: config.hc_mult,
+        })
+    }
+}
+
+impl DecodeEntryScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, seq_capacity: usize) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "decode entry scratch capacity must be positive"
+        );
+        let embedding = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        let hc_expand = HcHiddenStates::uninit(ctx, config.dim, seq_capacity, config.hc_mult)?;
+        Ok(Self {
+            embedding,
+            hc_expand,
+        })
+    }
+}
+
+impl HcPostScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, seq_capacity: usize) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "HC post scratch capacity must be positive"
+        );
+        let attention_reduce_temp = unsafe { ctx.stream.alloc(config.dim * seq_capacity)? };
+        let attention_out = HcHiddenStates::uninit(ctx, config.dim, seq_capacity, config.hc_mult)?;
+        let mut layer_outputs = Vec::with_capacity(2);
+        for _ in 0..2 {
+            layer_outputs.push(HcHiddenStates::uninit(
+                ctx,
+                config.dim,
+                seq_capacity,
+                config.hc_mult,
+            )?);
+        }
+        Ok(Self {
+            attention_reduce_temp,
+            attention_out,
+            layer_outputs,
+        })
+    }
+}
+
+impl FinalLogitsScratch {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        seq_capacity: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "final logits scratch capacity must be positive"
+        );
+        ensure!(
+            world_size > 0,
+            "final logits scratch world size must be positive"
+        );
+        ensure!(
+            config.vocab_size.is_multiple_of(world_size),
+            "final logits scratch vocab_size={} not divisible by world_size={world_size}",
+            config.vocab_size
+        );
+        let local_vocab_size = config.vocab_size / world_size;
+        let hc_mixes = unsafe { ctx.stream.alloc(seq_capacity * config.hc_mult)? };
+        let hc_pre = unsafe { ctx.stream.alloc(seq_capacity * config.hc_mult)? };
+        let hc_out = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        let normed = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        let local_logits = F32Logits {
+            data: unsafe { ctx.stream.alloc(local_vocab_size)? },
+            vocab_size: local_vocab_size,
+        };
+        let gathered_logits = F32Logits {
+            data: unsafe { ctx.stream.alloc(config.vocab_size)? },
+            vocab_size: config.vocab_size,
+        };
+        Ok(Self {
+            hc_mixes,
+            hc_pre,
+            hc_out,
+            normed,
+            local_logits,
+            gathered_logits,
+        })
+    }
+}
+
+impl MoeAgRsScratch {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        local_seq_capacity: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            world_size > 0,
+            "MoE AG/RS scratch world size must be positive"
+        );
+        ensure!(
+            local_seq_capacity > 0,
+            "MoE AG/RS scratch local capacity must be positive"
+        );
+        ensure!(
+            config.n_routed_experts.is_multiple_of(world_size),
+            "MoE AG/RS scratch n_routed_experts={} not divisible by world_size={world_size}",
+            config.n_routed_experts
+        );
+        let global_seq_capacity = local_seq_capacity * world_size;
+        let global_hidden = Bf16HiddenStates::uninit(ctx, config.dim, global_seq_capacity)?;
+        let global_token_ids = unsafe { ctx.stream.alloc(global_seq_capacity)? };
+        let route_capacity = global_seq_capacity * config.n_activated_experts;
+        let route_weights = unsafe { ctx.stream.alloc(route_capacity)? };
+        let route_indices = unsafe { ctx.stream.alloc(route_capacity)? };
+        let local_experts = config.n_routed_experts / world_size;
+        let pos_to_token = unsafe { ctx.stream.alloc(route_capacity)? };
+        let pos_to_token_topk = unsafe { ctx.stream.alloc(route_capacity)? };
+        let token_topk_to_pos = unsafe { ctx.stream.alloc(route_capacity)? };
+        let expert_indptr = unsafe { ctx.stream.alloc(local_experts + 1)? };
+        let expert_cursor = unsafe { ctx.stream.alloc(local_experts)? };
+        let local_count = unsafe { ctx.stream.alloc(1)? };
+        let expanded_input = Bf16HiddenStates::uninit(ctx, config.dim, route_capacity)?;
+        let expert_gate = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
+        let expert_up = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
+        let expert_activated = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
+        let expert_out = Bf16HiddenStates::uninit(ctx, config.dim, route_capacity)?;
+        let max_fp4_input_dim = config.dim.max(config.moe_inter_dim);
+        let max_fp4_scale_cols = max_fp4_input_dim.div_ceil(128);
+        let fp4_act_workspace = unsafe { ctx.stream.alloc(route_capacity * max_fp4_input_dim)? };
+        let fp4_act_scale_workspace =
+            unsafe { ctx.stream.alloc(route_capacity * max_fp4_scale_cols)? };
+        let partial_routed = F32HiddenStates {
+            data: unsafe { ctx.stream.alloc(config.dim * global_seq_capacity)? },
+            hidden_dim: config.dim,
+            seq_len: global_seq_capacity,
+        };
+        let local_routed = F32HiddenStates {
+            data: unsafe { ctx.stream.alloc(config.dim * local_seq_capacity)? },
+            hidden_dim: config.dim,
+            seq_len: local_seq_capacity,
+        };
+        let out = Bf16HiddenStates::uninit(ctx, config.dim, local_seq_capacity)?;
+        Ok(Self {
+            global_hidden,
+            global_token_ids,
+            route_weights,
+            route_indices,
+            pos_to_token,
+            pos_to_token_topk,
+            token_topk_to_pos,
+            expert_indptr,
+            expert_cursor,
+            local_count,
+            expanded_input,
+            expert_gate,
+            expert_up,
+            expert_activated,
+            expert_out,
+            fp4_act_workspace,
+            fp4_act_scale_workspace,
+            partial_routed,
+            local_routed,
+            out,
+        })
+    }
+}
+
+impl SharedExpertScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, seq_capacity: usize) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "shared expert scratch capacity must be positive"
+        );
+        let gate = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
+        let up = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
+        let activated = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
+        let out = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        Ok(Self {
+            gate,
+            up,
+            activated,
+            out,
+            seq_capacity,
+        })
+    }
+}
+
+impl AttentionOutputScratch {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        seq_capacity: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "attention output scratch capacity must be positive"
+        );
+        ensure!(
+            world_size > 0,
+            "attention output scratch world size must be positive"
+        );
+        ensure!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "attention output scratch num_attention_heads={} not divisible by world_size={}",
+            config.num_attention_heads,
+            world_size
+        );
+        ensure!(
+            config.o_groups.is_multiple_of(world_size),
+            "attention output scratch o_groups={} not divisible by world_size={}",
+            config.o_groups,
+            world_size
+        );
+        let local_heads = config.num_attention_heads / world_size;
+        let local_groups = config.o_groups / world_size;
+        let q_hidden_dim = local_heads * config.head_dim;
+        let low_rank_dim = local_groups * config.o_lora_rank;
+        let attn_out = Bf16HiddenStates::uninit(ctx, q_hidden_dim, seq_capacity)?;
+        let low_rank = Bf16HiddenStates::uninit(ctx, low_rank_dim, seq_capacity)?;
+        let out = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        Ok(Self {
+            attn_out,
+            low_rank,
+            out,
+            local_heads,
+            head_dim: config.head_dim,
+            seq_capacity,
+        })
+    }
+}
+
+impl AttentionIndexScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            config.sliding_window > 0,
+            "attention index scratch sliding_window must be positive"
+        );
+        let window_capacity = config.sliding_window;
+        let compress_capacity = config.index_topk;
+        let compress_alloc = compress_capacity.max(1);
+        let window_idxs = unsafe { ctx.stream.alloc(window_capacity)? };
+        let compress_idxs = unsafe { ctx.stream.alloc(compress_alloc)? };
+        let topk_idxs = unsafe { ctx.stream.alloc(window_capacity + compress_alloc)? };
+        Ok(Self {
+            window_idxs,
+            compress_idxs,
+            topk_idxs,
+        })
+    }
+}
+
+impl AttentionAuxScratch {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, world_size: usize) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            world_size > 0,
+            "attention aux scratch world size must be positive"
+        );
+        ensure!(
+            config.index_n_heads.is_multiple_of(world_size),
+            "attention aux scratch index_n_heads={} not divisible by world_size={}",
+            config.index_n_heads,
+            world_size
+        );
+        let max_head_dim = config.head_dim.max(config.index_head_dim);
+        let local_index_heads = config.index_n_heads / world_size;
+        let max_compressed_len = config.max_position_embeddings.div_ceil(4).max(1);
+        let compressor_weighted = unsafe { ctx.stream.alloc(max_head_dim)? };
+        let compressor_out = Bf16HiddenStates::uninit(ctx, max_head_dim, 1)?;
+        let indexer_q =
+            Bf16HiddenStates::uninit(ctx, local_index_heads * config.index_head_dim, 1)?;
+        let indexer_weights = Bf16HiddenStates::uninit(ctx, local_index_heads, 1)?;
+        let indexer_scores = unsafe { ctx.stream.alloc(max_compressed_len)? };
+        Ok(Self {
+            compressor_weighted,
+            compressor_out,
+            indexer_q,
+            indexer_weights,
+            indexer_scores,
+            max_head_dim,
+            local_index_heads,
+            max_compressed_len,
+        })
+    }
+}
+
+impl AttentionProjectionScratch {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        seq_capacity: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            seq_capacity > 0,
+            "attention projection scratch capacity must be positive"
+        );
+        ensure!(
+            world_size > 0,
+            "attention projection scratch world size must be positive"
+        );
+        ensure!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "attention projection scratch num_attention_heads={} not divisible by world_size={}",
+            config.num_attention_heads,
+            world_size
+        );
+        let local_heads = config.num_attention_heads / world_size;
+        let q_hidden_dim = local_heads * config.head_dim;
+        let qr_raw = Bf16HiddenStates::uninit(ctx, config.q_lora_rank, seq_capacity)?;
+        let qr = Bf16HiddenStates::uninit(ctx, config.q_lora_rank, seq_capacity)?;
+        let q_raw = Bf16HiddenStates::uninit(ctx, q_hidden_dim, seq_capacity)?;
+        let q = Bf16HiddenStates::uninit(ctx, q_hidden_dim, seq_capacity)?;
+        let kv_raw = Bf16HiddenStates::uninit(ctx, config.head_dim, seq_capacity)?;
+        let kv = Bf16HiddenStates::uninit(ctx, config.head_dim, seq_capacity)?;
+        Ok(Self {
+            qr_raw,
+            qr,
+            q_raw,
+            q,
+            kv_raw,
+            kv,
+            local_heads,
+            head_dim: config.head_dim,
+            seq_capacity,
+        })
     }
 }
 
@@ -356,6 +877,22 @@ impl HcHiddenStates {
     ) -> Result<Self> {
         ctx.set_current()?;
         let data = ctx.stream.alloc_zeros(hidden_dim * seq_len * hc)?;
+        Ok(Self {
+            data,
+            hidden_dim,
+            seq_len,
+            hc,
+        })
+    }
+
+    pub fn uninit(
+        ctx: &RankGpuContext,
+        hidden_dim: usize,
+        seq_len: usize,
+        hc: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        let data = unsafe { ctx.stream.alloc(hidden_dim * seq_len * hc)? };
         Ok(Self {
             data,
             hidden_dim,

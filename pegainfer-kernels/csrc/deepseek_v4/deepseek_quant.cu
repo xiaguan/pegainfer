@@ -425,6 +425,76 @@ static bool deepseek_tilelang_fp8_linear_fns(
   return *act_fn != nullptr && *gemm_fn != nullptr;
 }
 
+static bool deepseek_tilelang_grouped_fp4_linear_fns(
+    int in_dim,
+    int out_dim,
+    DeepseekTilelangActQuantFn* act_fn,
+    DeepseekTilelangGroupedFp4GemmFn* gemm_fn) {
+  *act_fn = nullptr;
+  *gemm_fn = nullptr;
+  if (in_dim == 4096 && out_dim == 2048) {
+    *act_fn = deepseek_tilelang_act_quant_k4096;
+    *gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n2048_k4096;
+  } else if (in_dim == 2048 && out_dim == 4096) {
+    *act_fn = deepseek_tilelang_act_quant_k2048;
+    *gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n4096_k2048;
+  }
+  return *act_fn != nullptr && *gemm_fn != nullptr;
+}
+
+static cudaError_t deepseek_moe_fp4_grouped_linear_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *const *weights,
+    const unsigned char *const *scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  if (rows < 0 || in_dim <= 0 || out_dim <= 0 || local_experts <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (rows == 0) return cudaSuccess;
+  if (act == nullptr || act_scale == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangGroupedFp4GemmFn gemm_fn = nullptr;
+  if (!deepseek_tilelang_grouped_fp4_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  const size_t required_act_bytes = (size_t)rows * (size_t)in_dim;
+  const size_t required_act_scale_bytes = (size_t)rows * (size_t)scale_cols;
+  if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = static_cast<cudaError_t>(
+      act_fn(x, act, act_scale, rows, stream));
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(gemm_fn(
+      act,
+      reinterpret_cast<const void* const*>(weights),
+      out,
+      act_scale,
+      reinterpret_cast<const void* const*>(scales),
+      expert_indptr,
+      rows,
+      local_experts,
+      stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
 static cudaError_t deepseek_fp8_linear_tilelang_cuda(
     const __nv_bfloat16 *x,
     const unsigned char *weight,
@@ -798,13 +868,7 @@ cudaError_t deepseek_moe_fp4_grouped_linear_cuda(
 
   DeepseekTilelangActQuantFn act_fn = nullptr;
   DeepseekTilelangGroupedFp4GemmFn gemm_fn = nullptr;
-  if (in_dim == 4096 && out_dim == 2048) {
-    act_fn = deepseek_tilelang_act_quant_k4096;
-    gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n2048_k4096;
-  } else if (in_dim == 2048 && out_dim == 4096) {
-    act_fn = deepseek_tilelang_act_quant_k2048;
-    gemm_fn = deepseek_tilelang_fp4_grouped_gemm_n4096_k2048;
-  } else {
+  if (!deepseek_tilelang_grouped_fp4_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
     return cudaErrorNotSupported;
   }
 
@@ -838,6 +902,27 @@ cudaError_t deepseek_moe_fp4_grouped_linear_cuda(
       local_experts,
       stream));
   return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
+cudaError_t deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *const *weights,
+    const unsigned char *const *scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  return deepseek_moe_fp4_grouped_linear_workspace_cuda(
+      x, weights, scales, expert_indptr, out,
+      act, act_bytes, act_scale, act_scale_bytes,
+      rows, in_dim, out_dim, local_experts, stream);
 }
 
 }  // extern "C"

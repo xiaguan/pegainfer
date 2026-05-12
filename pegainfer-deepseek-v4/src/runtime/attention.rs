@@ -511,8 +511,8 @@ pub fn indexed_attention_cache_bf16_hidden(
         kv_cache.hidden_dim
     );
     ensure!(
-        topk_idxs.len() == topk,
-        "indexed cache attention topk shape mismatch: expected {}, got {}",
+        topk_idxs.len() >= topk,
+        "indexed cache attention topk capacity too small: need {}, have {}",
         topk,
         topk_idxs.len()
     );
@@ -531,6 +531,74 @@ pub fn indexed_attention_cache_bf16_hidden(
     );
 
     let mut out = Bf16HiddenStates::zeros(ctx, projections.q.hidden_dim, projections.q.seq_len)?;
+    indexed_attention_cache_bf16_hidden_into(
+        ctx,
+        config,
+        projections,
+        kv_cache,
+        attn,
+        topk_idxs,
+        topk,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn indexed_attention_cache_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    config: &Config,
+    projections: &AttentionProjections,
+    kv_cache: &Bf16Cache,
+    attn: &AttentionWeights<'_>,
+    topk_idxs: &CudaSlice<i32>,
+    topk: usize,
+    out: &mut Bf16HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(topk > 0, "indexed cache attention topk must be positive");
+    ensure!(
+        projections.q.seq_len == 1,
+        "indexed cache attention currently expects decode seq_len=1, got {}",
+        projections.q.seq_len
+    );
+    ensure!(
+        kv_cache.hidden_dim == projections.head_dim,
+        "kv cache hidden dim mismatch: expected {}, got {}",
+        projections.head_dim,
+        kv_cache.hidden_dim
+    );
+    ensure!(
+        topk_idxs.len() >= topk,
+        "indexed cache attention topk capacity too small: need {}, have {}",
+        topk,
+        topk_idxs.len()
+    );
+    ensure!(
+        attn.attn_sink.tensor.dtype == safetensors::Dtype::F32,
+        "attn_sink {} must be F32, got {:?}",
+        attn.attn_sink.name,
+        attn.attn_sink.tensor.dtype
+    );
+    ensure!(
+        attn.attn_sink.tensor.shape == [projections.local_heads],
+        "attn_sink {} shape mismatch: expected {:?}, got {:?}",
+        attn.attn_sink.name,
+        [projections.local_heads],
+        attn.attn_sink.tensor.shape
+    );
+    ensure!(
+        out.hidden_dim == projections.q.hidden_dim,
+        "indexed cache attention output dim mismatch: expected {}, got {}",
+        projections.q.hidden_dim,
+        out.hidden_dim
+    );
+    ensure!(
+        out.data.len() >= projections.q.hidden_dim * projections.q.seq_len,
+        "indexed cache attention output capacity too small: need {}, have {}",
+        projections.q.hidden_dim * projections.q.seq_len,
+        out.data.len()
+    );
+    out.seq_len = projections.q.seq_len;
     {
         let (q_ptr, _q_guard) = projections.q.data.device_ptr(&ctx.stream);
         let (kv_ptr, _kv_guard) = kv_cache.data.device_ptr(&ctx.stream);
@@ -555,7 +623,89 @@ pub fn indexed_attention_cache_bf16_hidden(
         };
         result.result()?;
     }
-    Ok(out)
+    Ok(())
+}
+
+pub(crate) fn indexed_attention_cache_bf16_hidden_view_into(
+    ctx: &RankGpuContext,
+    config: &Config,
+    projections: &AttentionProjectionsView<'_>,
+    kv_cache: &Bf16Cache,
+    attn: &AttentionWeights<'_>,
+    topk_idxs: &CudaSlice<i32>,
+    topk: usize,
+    out: &mut Bf16HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(topk > 0, "indexed cache attention topk must be positive");
+    ensure!(
+        projections.q.seq_len == 1,
+        "indexed cache attention currently expects decode seq_len=1, got {}",
+        projections.q.seq_len
+    );
+    ensure!(
+        kv_cache.hidden_dim == projections.head_dim,
+        "kv cache hidden dim mismatch: expected {}, got {}",
+        projections.head_dim,
+        kv_cache.hidden_dim
+    );
+    ensure!(
+        topk_idxs.len() >= topk,
+        "indexed cache attention topk capacity too small: need {}, have {}",
+        topk,
+        topk_idxs.len()
+    );
+    ensure!(
+        attn.attn_sink.tensor.dtype == safetensors::Dtype::F32,
+        "attn_sink {} must be F32, got {:?}",
+        attn.attn_sink.name,
+        attn.attn_sink.tensor.dtype
+    );
+    ensure!(
+        attn.attn_sink.tensor.shape == [projections.local_heads],
+        "attn_sink {} shape mismatch: expected {:?}, got {:?}",
+        attn.attn_sink.name,
+        [projections.local_heads],
+        attn.attn_sink.tensor.shape
+    );
+    ensure!(
+        out.hidden_dim == projections.q.hidden_dim,
+        "indexed cache attention output dim mismatch: expected {}, got {}",
+        projections.q.hidden_dim,
+        out.hidden_dim
+    );
+    ensure!(
+        out.data.len() >= projections.q.hidden_dim * projections.q.seq_len,
+        "indexed cache attention output capacity too small: need {}, have {}",
+        projections.q.hidden_dim * projections.q.seq_len,
+        out.data.len()
+    );
+    out.seq_len = projections.q.seq_len;
+    {
+        let (q_ptr, _q_guard) = projections.q.data.device_ptr(&ctx.stream);
+        let (kv_ptr, _kv_guard) = kv_cache.data.device_ptr(&ctx.stream);
+        let (sink_ptr, _sink_guard) = attn.attn_sink.tensor.data.device_ptr(&ctx.stream);
+        let (topk_ptr, _topk_guard) = topk_idxs.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_indexed_attention_prefill_cuda(
+                q_ptr as *const ffi::Half,
+                kv_ptr as *const ffi::Half,
+                sink_ptr as *const f32,
+                topk_ptr as *const i32,
+                out_ptr as *mut ffi::Half,
+                projections.q.seq_len as i32,
+                kv_cache.slots as i32,
+                projections.local_heads as i32,
+                projections.head_dim as i32,
+                topk as i32,
+                1.0f32 / (config.head_dim as f32).sqrt(),
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 pub fn attention_output_project_bf16_hidden(
@@ -571,6 +721,34 @@ pub fn attention_output_project_bf16_hidden(
     apply_rope_hidden_in_place(ctx, attn_out, rope, local_heads, head_dim, start_pos, true)?;
     let low_rank = bf16_linear_bf16_hidden(ctx, attn_out, &attn.wo_a)?;
     fp8_linear_bf16_hidden(ctx, &low_rank, &attn.wo_b)
+}
+
+pub(crate) fn attention_output_project_bf16_hidden_scratch<'a>(
+    ctx: &RankGpuContext,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    scratch: &'a mut AttentionOutputScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ctx.set_current()?;
+    ensure!(
+        scratch.attn_out.seq_len <= scratch.seq_capacity,
+        "attention output scratch logical seq_len {} exceeds capacity {}",
+        scratch.attn_out.seq_len,
+        scratch.seq_capacity
+    );
+    apply_rope_hidden_in_place(
+        ctx,
+        &mut scratch.attn_out,
+        rope,
+        scratch.local_heads,
+        scratch.head_dim,
+        start_pos,
+        true,
+    )?;
+    bf16_linear_bf16_hidden_into(ctx, &scratch.attn_out, &attn.wo_a, &mut scratch.low_rank)?;
+    fp8_linear_bf16_hidden_into(ctx, &scratch.low_rank, &attn.wo_b, &mut scratch.out)?;
+    Ok(&scratch.out)
 }
 
 pub fn attention_prefill_rank_local_bf16_hidden(
@@ -708,6 +886,90 @@ pub fn attention_decode_rank_local_bf16_hidden(
         projections.local_heads,
         projections.head_dim,
         start_pos,
+    )
+    .with_context(|| format!("attention_output_project layer {layer}"))
+}
+
+pub(crate) fn attention_decode_rank_local_bf16_hidden_with_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    kv_cache: &mut Bf16Cache,
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &'a mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ctx.set_current()?;
+    ensure!(
+        config.compress_ratios[layer] == 0,
+        "rank-local decode attention currently only supports non-compressed layers, layer {layer} has compress_ratio={}",
+        config.compress_ratios[layer]
+    );
+    ensure!(
+        input.seq_len == 1,
+        "rank-local decode attention expects seq_len=1, got {}",
+        input.seq_len
+    );
+    ensure!(
+        kv_cache.hidden_dim == config.head_dim,
+        "decode kv cache hidden dim mismatch: expected {}, got {}",
+        config.head_dim,
+        kv_cache.hidden_dim
+    );
+    ensure!(
+        kv_cache.slots >= config.sliding_window,
+        "decode kv cache slots {} smaller than sliding_window {}",
+        kv_cache.slots,
+        config.sliding_window
+    );
+
+    let mut projections = attention_project_bf16_hidden_scratch(
+        ctx,
+        config,
+        input,
+        attn,
+        attention_projection_scratch,
+    )
+    .with_context(|| format!("attention_project layer {layer}"))?;
+    apply_rope_attention_projections_view(ctx, &mut projections, rope, start_pos)
+        .with_context(|| format!("apply_rope_attention_projections layer {layer}"))?;
+    copy_bf16_rows_to_cache(
+        ctx,
+        projections.kv,
+        kv_cache,
+        0,
+        start_pos % config.sliding_window,
+        1,
+    )
+    .with_context(|| format!("copy kv to cache layer {layer} pos {start_pos}"))?;
+    let topk = window_topk_indices_decode_into(
+        ctx,
+        start_pos,
+        config.sliding_window,
+        &mut attention_index_scratch.window_idxs,
+    )
+    .with_context(|| format!("window_topk_indices_decode layer {layer} pos {start_pos}"))?;
+    indexed_attention_cache_bf16_hidden_view_into(
+        ctx,
+        config,
+        &projections,
+        kv_cache,
+        attn,
+        &attention_index_scratch.window_idxs,
+        topk,
+        &mut attention_output_scratch.attn_out,
+    )
+    .with_context(|| format!("indexed_attention_cache layer {layer} topk {topk}"))?;
+    attention_output_project_bf16_hidden_scratch(
+        ctx,
+        attn,
+        rope,
+        start_pos,
+        attention_output_scratch,
     )
     .with_context(|| format!("attention_output_project layer {layer}"))
 }

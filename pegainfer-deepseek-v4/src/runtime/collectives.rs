@@ -17,12 +17,13 @@ pub fn all_reduce_f32_hidden_in_place(hidden: &mut F32HiddenStates, comm: &Comm)
     Ok(())
 }
 
-pub(crate) fn all_gather_bf16_hidden(
+pub(crate) fn all_gather_bf16_hidden_into(
     ctx: &RankGpuContext,
     comm: &Comm,
     local: &Bf16HiddenStates,
     world_size: usize,
-) -> Result<Bf16HiddenStates> {
+    gathered: &mut Bf16HiddenStates,
+) -> Result<()> {
     ctx.set_current()?;
     ensure!(
         world_size > 0,
@@ -30,33 +31,57 @@ pub(crate) fn all_gather_bf16_hidden(
     );
     ensure!(local.hidden_dim > 0, "BF16 hidden dim must be positive");
     ensure!(local.seq_len > 0, "BF16 hidden seq_len must be positive");
-    let mut gathered = Bf16HiddenStates::zeros(ctx, local.hidden_dim, local.seq_len * world_size)?;
-    comm.all_gather(&local.data, &mut gathered.data)
+    let gathered_seq_len = local.seq_len * world_size;
+    ensure!(
+        gathered.hidden_dim == local.hidden_dim,
+        "BF16 all-gather scratch dim mismatch: gathered={}, local={}",
+        gathered.hidden_dim,
+        local.hidden_dim
+    );
+    ensure!(
+        gathered.seq_capacity() >= gathered_seq_len,
+        "BF16 all-gather scratch capacity too small: gathered={}, required={gathered_seq_len}",
+        gathered.seq_capacity()
+    );
+    gathered.seq_len = gathered_seq_len;
+    let local_len = local.hidden_dim * local.seq_len;
+    let gathered_len = local.hidden_dim * gathered_seq_len;
+    let local_view = local.data.slice(0..local_len);
+    let mut gathered_view = gathered.data.slice_mut(0..gathered_len);
+    comm.all_gather(&local_view, &mut gathered_view)
         .map_err(|err| anyhow::anyhow!("NCCL BF16 hidden all-gather failed: {err:?}"))?;
-    Ok(gathered)
+    Ok(())
 }
 
-pub(crate) fn all_gather_u32(
+pub(crate) fn all_gather_u32_into(
     ctx: &RankGpuContext,
     comm: &Comm,
     local: &CudaSlice<u32>,
     world_size: usize,
-) -> Result<CudaSlice<u32>> {
+    gathered: &mut CudaSlice<u32>,
+) -> Result<()> {
     ctx.set_current()?;
     ensure!(world_size > 0, "u32 all-gather world size must be positive");
     ensure!(!local.is_empty(), "u32 all-gather input must be non-empty");
-    let mut gathered = ctx.stream.alloc_zeros(local.len() * world_size)?;
-    comm.all_gather(local, &mut gathered)
+    let required = local.len() * world_size;
+    ensure!(
+        gathered.len() >= required,
+        "u32 all-gather scratch capacity too small: gathered={}, required={required}",
+        gathered.len()
+    );
+    let mut gathered_view = gathered.slice_mut(0..required);
+    comm.all_gather(local, &mut gathered_view)
         .map_err(|err| anyhow::anyhow!("NCCL u32 all-gather failed: {err:?}"))?;
-    Ok(gathered)
+    Ok(())
 }
 
-pub(crate) fn reduce_scatter_f32_hidden(
+pub(crate) fn reduce_scatter_f32_hidden_into(
     ctx: &RankGpuContext,
     comm: &Comm,
     global: &F32HiddenStates,
     world_size: usize,
-) -> Result<F32HiddenStates> {
+    local: &mut F32HiddenStates,
+) -> Result<()> {
     ctx.set_current()?;
     ensure!(
         world_size > 0,
@@ -74,14 +99,25 @@ pub(crate) fn reduce_scatter_f32_hidden(
         world_size
     );
     let local_seq_len = global.seq_len / world_size;
-    let mut local = F32HiddenStates {
-        data: ctx.stream.alloc_zeros(global.hidden_dim * local_seq_len)?,
-        hidden_dim: global.hidden_dim,
-        seq_len: local_seq_len,
-    };
-    comm.reduce_scatter(&global.data, &mut local.data, &ReduceOp::Sum)
+    ensure!(
+        local.hidden_dim == global.hidden_dim,
+        "F32 reduce-scatter local dim mismatch: local={}, global={}",
+        local.hidden_dim,
+        global.hidden_dim
+    );
+    ensure!(
+        local.seq_capacity() >= local_seq_len,
+        "F32 reduce-scatter local capacity too small: local={}, required={local_seq_len}",
+        local.seq_capacity()
+    );
+    local.seq_len = local_seq_len;
+    let global_len = global.hidden_dim * global.seq_len;
+    let local_len = global.hidden_dim * local_seq_len;
+    let global_view = global.data.slice(0..global_len);
+    let mut local_view = local.data.slice_mut(0..local_len);
+    comm.reduce_scatter(&global_view, &mut local_view, &ReduceOp::Sum)
         .map_err(|err| anyhow::anyhow!("NCCL F32 hidden reduce-scatter failed: {err:?}"))?;
-    Ok(local)
+    Ok(())
 }
 
 pub fn all_reduce_hidden_fp32_in_place(
@@ -105,7 +141,9 @@ pub fn all_reduce_hidden_fp32_in_place(
             })
             .unwrap_or(true);
         if needs_alloc {
-            *slot = Some((ctx.device_ordinal, len, ctx.stream.alloc_zeros::<f32>(len)?));
+            *slot = Some((ctx.device_ordinal, len, unsafe {
+                ctx.stream.alloc::<f32>(len)?
+            }));
         }
 
         let (_, _, scratch_buf) = slot
@@ -145,13 +183,15 @@ pub fn all_reduce_hidden_fp32_in_place(
     })
 }
 
-pub(crate) fn all_reduce_hidden_fp32_hc_post(
+pub(crate) fn all_reduce_hidden_fp32_hc_post_view_into(
     ctx: &RankGpuContext,
     branch_out: &Bf16HiddenStates,
     residual: &HcHiddenStates,
-    pre_state: &HcPreState,
+    pre_state: &HcPreStateView<'_>,
     comm: &Comm,
-) -> Result<HcHiddenStates> {
+    scratch: &mut CudaSlice<f32>,
+    out: &mut HcHiddenStates,
+) -> Result<()> {
     ensure!(
         branch_out.hidden_dim == residual.hidden_dim,
         "HC post all-reduce hidden dim mismatch: branch={}, residual={}",
@@ -176,71 +216,72 @@ pub(crate) fn all_reduce_hidden_fp32_hc_post(
         pre_state.hc,
         residual.hc
     );
+    ensure!(
+        out.hidden_dim == branch_out.hidden_dim,
+        "HC post all-reduce output hidden dim mismatch: out={}, branch={}",
+        out.hidden_dim,
+        branch_out.hidden_dim
+    );
+    ensure!(
+        out.seq_capacity() >= branch_out.seq_len,
+        "HC post all-reduce output capacity too small: out={}, branch={}",
+        out.seq_capacity(),
+        branch_out.seq_len
+    );
+    ensure!(
+        out.hc == residual.hc,
+        "HC post all-reduce output multiplier mismatch: out={}, residual={}",
+        out.hc,
+        residual.hc
+    );
 
-    FP32_ALL_REDUCE_SCRATCH.with(|scratch| -> Result<HcHiddenStates> {
-        let mut scratch = scratch.borrow_mut();
-        if scratch.is_empty() {
-            scratch.push(None);
-        }
+    let len = branch_out.hidden_dim * branch_out.seq_len;
+    ensure!(
+        scratch.len() >= len,
+        "HC post all-reduce scratch too small: scratch={}, required={len}",
+        scratch.len()
+    );
+    out.seq_len = branch_out.seq_len;
+    ctx.set_current()?;
+    let mut temp = scratch.slice_mut(0..len);
+    {
+        let (input_ptr, _input_guard) = branch_out.data.device_ptr(&ctx.stream);
+        let (temp_ptr, _temp_guard) = temp.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_bf16_to_f32_cuda(
+                input_ptr as *const ffi::Half,
+                temp_ptr as *mut f32,
+                len as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
 
-        let len = branch_out.hidden_dim * branch_out.seq_len;
-        ctx.set_current()?;
-        let slot = &mut scratch[0];
-        let needs_alloc = slot
-            .as_ref()
-            .map(|(device_ordinal, capacity, _)| {
-                *device_ordinal != ctx.device_ordinal || *capacity < len
-            })
-            .unwrap_or(true);
-        if needs_alloc {
-            *slot = Some((ctx.device_ordinal, len, ctx.stream.alloc_zeros::<f32>(len)?));
-        }
+    if let Err(err) = comm.all_reduce_in_place(&mut temp, &ReduceOp::Sum) {
+        return Err(anyhow::anyhow!("NCCL FP32 all-reduce failed: {err:?}"));
+    }
 
-        let (_, _, scratch_buf) = slot
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("missing FP32 all-reduce scratch"))?;
-        let mut temp = scratch_buf.slice_mut(0..len);
-        {
-            let (input_ptr, _input_guard) = branch_out.data.device_ptr(&ctx.stream);
-            let (temp_ptr, _temp_guard) = temp.device_ptr_mut(&ctx.stream);
-            let result = unsafe {
-                ffi::deepseek_bf16_to_f32_cuda(
-                    input_ptr as *const ffi::Half,
-                    temp_ptr as *mut f32,
-                    len as i32,
-                    ctx.stream.cu_stream(),
-                )
-            };
-            result.result()?;
-        }
-
-        if let Err(err) = comm.all_reduce_in_place(&mut temp, &ReduceOp::Sum) {
-            return Err(anyhow::anyhow!("NCCL FP32 all-reduce failed: {err:?}"));
-        }
-
-        let mut out =
-            HcHiddenStates::zeros(ctx, branch_out.hidden_dim, branch_out.seq_len, residual.hc)?;
-        {
-            let (temp_ptr, _temp_guard) = temp.device_ptr(&ctx.stream);
-            let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
-            let (post_ptr, _post_guard) = pre_state.post.device_ptr(&ctx.stream);
-            let (comb_ptr, _comb_guard) = pre_state.comb.device_ptr(&ctx.stream);
-            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-            let result = unsafe {
-                ffi::deepseek_hc_post_f32_branch_cuda(
-                    temp_ptr as *const f32,
-                    residual_ptr as *const ffi::Half,
-                    post_ptr as *const f32,
-                    comb_ptr as *const f32,
-                    out_ptr as *mut ffi::Half,
-                    branch_out.seq_len as i32,
-                    residual.hc as i32,
-                    branch_out.hidden_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-            };
-            result.result()?;
-        }
-        Ok(out)
-    })
+    {
+        let (temp_ptr, _temp_guard) = temp.device_ptr(&ctx.stream);
+        let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
+        let (post_ptr, _post_guard) = pre_state.post.device_ptr(&ctx.stream);
+        let (comb_ptr, _comb_guard) = pre_state.comb.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_hc_post_f32_branch_cuda(
+                temp_ptr as *const f32,
+                residual_ptr as *const ffi::Half,
+                post_ptr as *const f32,
+                comb_ptr as *const f32,
+                out_ptr as *mut ffi::Half,
+                branch_out.seq_len as i32,
+                residual.hc as i32,
+                branch_out.hidden_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }

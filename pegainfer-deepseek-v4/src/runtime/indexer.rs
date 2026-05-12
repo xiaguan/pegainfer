@@ -299,6 +299,137 @@ pub fn indexer_scores_decode_bf16_hidden(
     Ok(Some(scores))
 }
 
+pub(crate) fn indexer_scores_decode_bf16_hidden_scratch(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    qr: &Bf16HiddenStates,
+    indexer: &IndexerWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    kv_cache: &mut Bf16Cache,
+    compressor_state: &mut CompressorDecodeState,
+    scratch: &mut AttentionAuxScratch,
+) -> Result<Option<usize>> {
+    ctx.set_current()?;
+    ensure!(
+        input.hidden_dim == config.dim,
+        "indexer decode input dim mismatch: expected {}, got {}",
+        config.dim,
+        input.hidden_dim
+    );
+    ensure!(
+        input.seq_len == 1,
+        "indexer decode expects seq_len=1, got {}",
+        input.seq_len
+    );
+    ensure!(
+        qr.hidden_dim == config.q_lora_rank && qr.seq_len == 1,
+        "indexer decode qr shape mismatch: hidden_dim={}, seq_len={}",
+        qr.hidden_dim,
+        qr.seq_len
+    );
+    ensure!(
+        kv_cache.hidden_dim == config.index_head_dim,
+        "indexer decode kv cache dim mismatch: expected {}, got {}",
+        config.index_head_dim,
+        kv_cache.hidden_dim
+    );
+
+    let local_heads = scratch.local_index_heads;
+    fp8_linear_bf16_hidden_into(ctx, qr, &indexer.wq_b, &mut scratch.indexer_q)?;
+    ensure!(
+        scratch.indexer_q.hidden_dim == local_heads * config.index_head_dim
+            && scratch.indexer_q.seq_len == 1,
+        "indexer decode q shape mismatch: hidden_dim={}, seq_len={}",
+        scratch.indexer_q.hidden_dim,
+        scratch.indexer_q.seq_len
+    );
+    apply_rope_hidden_in_place(
+        ctx,
+        &mut scratch.indexer_q,
+        rope,
+        local_heads,
+        config.index_head_dim,
+        start_pos,
+        false,
+    )?;
+    hadamard_fp4_quant_bf16_hidden_in_place(
+        ctx,
+        &mut scratch.indexer_q,
+        local_heads,
+        config.index_head_dim,
+    )?;
+
+    if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden_with_dim_scratch(
+        ctx,
+        config,
+        input,
+        &indexer.compressor,
+        rope,
+        start_pos,
+        config.index_head_dim,
+        compressor_state,
+        true,
+        scratch,
+    )? {
+        copy_bf16_rows_to_cache(ctx, compressed_kv, kv_cache, 0, start_pos / 4, 1)?;
+    }
+
+    let compressed_len = (start_pos + 1) / 4;
+    if compressed_len == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        compressed_len <= kv_cache.slots,
+        "indexer decode compressed_len {} exceeds kv cache slots {}",
+        compressed_len,
+        kv_cache.slots
+    );
+    ensure!(
+        compressed_len <= scratch.max_compressed_len,
+        "indexer score scratch capacity too small: need {}, have {}",
+        compressed_len,
+        scratch.max_compressed_len
+    );
+
+    bf16_linear_bf16_hidden_into(
+        ctx,
+        input,
+        &indexer.weights_proj,
+        &mut scratch.indexer_weights,
+    )?;
+    ensure!(
+        scratch.indexer_weights.hidden_dim == local_heads && scratch.indexer_weights.seq_len == 1,
+        "indexer decode weights shape mismatch: hidden_dim={}, seq_len={}",
+        scratch.indexer_weights.hidden_dim,
+        scratch.indexer_weights.seq_len
+    );
+    {
+        let (q_ptr, _q_guard) = scratch.indexer_q.data.device_ptr(&ctx.stream);
+        let (kv_ptr, _kv_guard) = kv_cache.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = scratch.indexer_weights.data.device_ptr(&ctx.stream);
+        let (scores_ptr, _scores_guard) = scratch.indexer_scores.device_ptr_mut(&ctx.stream);
+        let score_scale =
+            1.0f32 / (config.index_head_dim as f32).sqrt() / (config.index_n_heads as f32).sqrt();
+        let result = unsafe {
+            ffi::deepseek_indexer_scores_decode_cuda(
+                q_ptr as *const ffi::Half,
+                kv_ptr as *const ffi::Half,
+                weights_ptr as *const ffi::Half,
+                scores_ptr as *mut f32,
+                local_heads as i32,
+                config.index_head_dim as i32,
+                compressed_len as i32,
+                score_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(Some(compressed_len))
+}
+
 pub fn indexer_topk_indices_decode(
     ctx: &RankGpuContext,
     config: &Config,
@@ -311,6 +442,28 @@ pub fn indexer_topk_indices_decode(
         compressed_len > 0,
         "indexer decode compressed_len must be positive"
     );
+    let topk = config.index_topk.min(compressed_len);
+    let mut topk_idxs = unsafe { ctx.stream.alloc(topk)? };
+    indexer_topk_indices_decode_into(ctx, config, scores, compressed_len, offset, &mut topk_idxs)?;
+    Ok((topk_idxs, topk))
+}
+
+pub(crate) fn indexer_topk_indices_decode_into<S>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    scores: &S,
+    compressed_len: usize,
+    offset: usize,
+    topk_idxs: &mut CudaSlice<i32>,
+) -> Result<usize>
+where
+    S: DevicePtr<f32>,
+{
+    ctx.set_current()?;
+    ensure!(
+        compressed_len > 0,
+        "indexer decode compressed_len must be positive"
+    );
     ensure!(
         scores.len() == compressed_len,
         "indexer decode scores shape mismatch: expected {}, got {}",
@@ -318,7 +471,12 @@ pub fn indexer_topk_indices_decode(
         scores.len()
     );
     let topk = config.index_topk.min(compressed_len);
-    let mut topk_idxs = ctx.stream.alloc_zeros(topk)?;
+    ensure!(
+        topk_idxs.len() >= topk,
+        "indexer decode top-k output capacity too small: need {}, have {}",
+        topk,
+        topk_idxs.len()
+    );
     {
         let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
         let (topk_ptr, _topk_guard) = topk_idxs.device_ptr_mut(&ctx.stream);
@@ -334,5 +492,5 @@ pub fn indexer_topk_indices_decode(
         };
         result.result()?;
     }
-    Ok((topk_idxs, topk))
+    Ok(topk)
 }

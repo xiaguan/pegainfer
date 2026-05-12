@@ -486,6 +486,118 @@ pub fn compressor_overlap_decode_bf16_hidden_with_dim(
     }
 }
 
+pub(crate) fn compressor_overlap_decode_bf16_hidden_with_dim_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    compressor: &CompressorWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    head_dim: usize,
+    state: &mut CompressorDecodeState,
+    rotate_fp4: bool,
+    scratch: &'a mut AttentionAuxScratch,
+) -> Result<Option<&'a Bf16HiddenStates>> {
+    ctx.set_current()?;
+    ensure!(
+        input.hidden_dim == config.dim,
+        "overlap decode compressor input dim mismatch: expected {}, got {}",
+        config.dim,
+        input.hidden_dim
+    );
+    ensure!(
+        input.seq_len == 1,
+        "overlap decode compressor expects seq_len=1, got {}",
+        input.seq_len
+    );
+    ensure!(
+        state.hidden_dim == 2 * head_dim && state.slots == 8,
+        "overlap decode compressor state mismatch: hidden_dim={}, slots={}, expected {}x8",
+        state.hidden_dim,
+        state.slots,
+        2 * head_dim
+    );
+    ensure!(
+        head_dim <= scratch.max_head_dim,
+        "overlap decode compressor scratch head_dim capacity too small: need {}, have {}",
+        head_dim,
+        scratch.max_head_dim
+    );
+
+    let should_compress = (start_pos + 1).is_multiple_of(4);
+    scratch.compressor_out.hidden_dim = head_dim;
+    scratch.compressor_out.seq_len = 1;
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (wkv_ptr, _wkv_guard) = compressor.wkv.tensor.data.device_ptr(&ctx.stream);
+        let (wgate_ptr, _wgate_guard) = compressor.wgate.tensor.data.device_ptr(&ctx.stream);
+        let (ape_ptr, _ape_guard) = compressor.ape.tensor.data.device_ptr(&ctx.stream);
+        let (norm_ptr, _norm_guard) = compressor.norm.tensor.data.device_ptr(&ctx.stream);
+        let (kv_state_ptr, _kv_state_guard) = state.kv.device_ptr_mut(&ctx.stream);
+        let (score_state_ptr, _score_state_guard) = state.score.device_ptr_mut(&ctx.stream);
+        let (weighted_ptr, _weighted_guard) = if should_compress {
+            let (ptr, guard) = scratch.compressor_weighted.device_ptr_mut(&ctx.stream);
+            (ptr as *mut f32, Some(guard))
+        } else {
+            (ptr::null_mut(), None)
+        };
+        let (out_ptr, _out_guard) = if should_compress {
+            let (ptr, guard) = scratch.compressor_out.data.device_ptr_mut(&ctx.stream);
+            (ptr as *mut ffi::Half, Some(guard))
+        } else {
+            (ptr::null_mut(), None)
+        };
+        let result = unsafe {
+            ffi::deepseek_compressor_overlap_decode_cuda(
+                x_ptr as *const ffi::Half,
+                wkv_ptr as *const ffi::Half,
+                wgate_ptr as *const ffi::Half,
+                ape_ptr as *const f32,
+                norm_ptr as *const ffi::Half,
+                kv_state_ptr as *mut f32,
+                score_state_ptr as *mut f32,
+                weighted_ptr,
+                out_ptr,
+                start_pos as i32,
+                input.hidden_dim as i32,
+                head_dim as i32,
+                config.rms_norm_eps,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+
+    if should_compress {
+        let rope_start = start_pos + 1 - 4;
+        apply_rope_hidden_strided_in_place(
+            ctx,
+            &mut scratch.compressor_out,
+            rope,
+            1,
+            head_dim,
+            rope_start,
+            4,
+            false,
+        )?;
+        if rotate_fp4 {
+            hadamard_fp4_quant_bf16_hidden_in_place(ctx, &mut scratch.compressor_out, 1, head_dim)?;
+        } else {
+            fp8_act_quant_nope_bf16_hidden_in_place(
+                ctx,
+                &mut scratch.compressor_out,
+                1,
+                head_dim,
+                rope.rotary_dim,
+                64,
+            )?;
+        }
+        Ok(Some(&scratch.compressor_out))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn compressor_overlap_decode_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
@@ -578,7 +690,40 @@ pub fn concat_topk_indices(
         seq_len * b_topk,
         b.len()
     );
-    let mut out = ctx.stream.alloc_zeros(seq_len * (a_topk + b_topk))?;
+    let mut out = unsafe { ctx.stream.alloc(seq_len * (a_topk + b_topk))? };
+    concat_topk_indices_into(ctx, a, a_topk, b, b_topk, seq_len, &mut out)?;
+    Ok(out)
+}
+
+pub(crate) fn concat_topk_indices_into(
+    ctx: &RankGpuContext,
+    a: &CudaSlice<i32>,
+    a_topk: usize,
+    b: &CudaSlice<i32>,
+    b_topk: usize,
+    seq_len: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(seq_len > 0, "top-k concat seq_len must be positive");
+    ensure!(
+        a.len() >= seq_len * a_topk,
+        "top-k concat left capacity too small: need {}, have {}",
+        seq_len * a_topk,
+        a.len()
+    );
+    ensure!(
+        b.len() >= seq_len * b_topk,
+        "top-k concat right capacity too small: need {}, have {}",
+        seq_len * b_topk,
+        b.len()
+    );
+    ensure!(
+        out.len() >= seq_len * (a_topk + b_topk),
+        "top-k concat output capacity too small: need {}, have {}",
+        seq_len * (a_topk + b_topk),
+        out.len()
+    );
     {
         let (a_ptr, _a_guard) = a.device_ptr(&ctx.stream);
         let (b_ptr, _b_guard) = b.device_ptr(&ctx.stream);
@@ -596,5 +741,5 @@ pub fn concat_topk_indices(
         };
         result.result()?;
     }
-    Ok(out)
+    Ok(())
 }

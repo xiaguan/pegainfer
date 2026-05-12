@@ -35,6 +35,60 @@ pub fn attention_project_bf16_hidden(
     })
 }
 
+pub(crate) fn attention_project_bf16_hidden_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    scratch: &'a mut AttentionProjectionScratch,
+) -> Result<AttentionProjectionsView<'a>> {
+    ctx.set_current()?;
+    ensure!(
+        input.seq_len <= scratch.seq_capacity,
+        "attention projection scratch seq capacity too small: need {}, have {}",
+        input.seq_len,
+        scratch.seq_capacity
+    );
+    fp8_linear_bf16_hidden_into(ctx, input, &attn.wq_a, &mut scratch.qr_raw)?;
+    rms_norm_bf16_hidden_into(
+        ctx,
+        &scratch.qr_raw,
+        &attn.q_norm,
+        config.rms_norm_eps,
+        &mut scratch.qr,
+    )?;
+    fp8_linear_bf16_hidden_into(ctx, &scratch.qr, &attn.wq_b, &mut scratch.q_raw)?;
+    ensure!(
+        scratch.local_heads * config.head_dim == scratch.q_raw.hidden_dim,
+        "wq_b output dim {} is not divisible by head_dim {}",
+        scratch.q_raw.hidden_dim,
+        config.head_dim
+    );
+    head_rms_norm_bf16_hidden_into(
+        ctx,
+        &scratch.q_raw,
+        scratch.local_heads,
+        config.head_dim,
+        config.rms_norm_eps,
+        &mut scratch.q,
+    )?;
+    fp8_linear_bf16_hidden_into(ctx, input, &attn.wkv, &mut scratch.kv_raw)?;
+    rms_norm_bf16_hidden_into(
+        ctx,
+        &scratch.kv_raw,
+        &attn.kv_norm,
+        config.rms_norm_eps,
+        &mut scratch.kv,
+    )?;
+    Ok(AttentionProjectionsView {
+        qr: &scratch.qr,
+        q: &mut scratch.q,
+        kv: &mut scratch.kv,
+        local_heads: scratch.local_heads,
+        head_dim: scratch.head_dim,
+    })
+}
+
 pub fn precompute_rope_cache(
     ctx: &RankGpuContext,
     config: &Config,
@@ -172,6 +226,62 @@ pub fn apply_rope_attention_projections(
     fp8_act_quant_nope_bf16_hidden_in_place(
         ctx,
         &mut projections.kv,
+        1,
+        projections.head_dim,
+        rope.rotary_dim,
+        64,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_rope_attention_projections_view(
+    ctx: &RankGpuContext,
+    projections: &mut AttentionProjectionsView<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        start_pos + projections.q.seq_len <= rope.max_seq_len,
+        "RoPE range [{}..{}) exceeds cache len {}",
+        start_pos,
+        start_pos + projections.q.seq_len,
+        rope.max_seq_len
+    );
+    ensure!(
+        rope.rotary_dim <= projections.head_dim,
+        "rotary_dim {} exceeds head_dim {}",
+        rope.rotary_dim,
+        projections.head_dim
+    );
+    ensure!(
+        projections.kv.hidden_dim == projections.head_dim,
+        "kv dim {} must equal head_dim {}",
+        projections.kv.hidden_dim,
+        projections.head_dim
+    );
+
+    apply_rope_hidden_in_place(
+        ctx,
+        projections.q,
+        rope,
+        projections.local_heads,
+        projections.head_dim,
+        start_pos,
+        false,
+    )?;
+    apply_rope_hidden_in_place(
+        ctx,
+        projections.kv,
+        rope,
+        1,
+        projections.head_dim,
+        start_pos,
+        false,
+    )?;
+    fp8_act_quant_nope_bf16_hidden_in_place(
+        ctx,
+        projections.kv,
         1,
         projections.head_dim,
         rope.rotary_dim,
@@ -356,7 +466,7 @@ pub fn window_topk_indices(
     ensure!(seq_len > 0, "seq_len must be positive");
     ensure!(window_size > 0, "window_size must be positive");
     let topk = seq_len.min(window_size);
-    let mut data = ctx.stream.alloc_zeros(seq_len * topk)?;
+    let mut data = unsafe { ctx.stream.alloc(seq_len * topk)? };
     {
         let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
@@ -380,9 +490,27 @@ pub fn window_topk_indices_decode(
 ) -> Result<(CudaSlice<i32>, usize)> {
     ctx.set_current()?;
     ensure!(window_size > 0, "window_size must be positive");
-    let mut data = ctx.stream.alloc_zeros(window_size)?;
+    let mut data = unsafe { ctx.stream.alloc(window_size)? };
+    let topk = window_topk_indices_decode_into(ctx, start_pos, window_size, &mut data)?;
+    Ok((data, topk))
+}
+
+pub(crate) fn window_topk_indices_decode_into(
+    ctx: &RankGpuContext,
+    start_pos: usize,
+    window_size: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<usize> {
+    ctx.set_current()?;
+    ensure!(window_size > 0, "window_size must be positive");
+    ensure!(
+        out.len() >= window_size,
+        "window top-k decode output capacity too small: need {}, have {}",
+        window_size,
+        out.len()
+    );
     {
-        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
         let result = unsafe {
             ffi::deepseek_window_topk_indices_decode_cuda(
                 out_ptr as *mut i32,
@@ -393,7 +521,7 @@ pub fn window_topk_indices_decode(
         };
         result.result()?;
     }
-    Ok((data, window_size))
+    Ok(window_size)
 }
 
 pub fn compress_topk_indices(
@@ -410,7 +538,7 @@ pub fn compress_topk_indices(
         compressed > 0,
         "seq_len {seq_len} is smaller than ratio {ratio}"
     );
-    let mut data = ctx.stream.alloc_zeros(seq_len * compressed)?;
+    let mut data = unsafe { ctx.stream.alloc(seq_len * compressed)? };
     {
         let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
@@ -437,7 +565,7 @@ pub fn compress_topk_indices_decode(
     ctx.set_current()?;
     ensure!(ratio > 0, "compress ratio must be positive");
     let compressed = (start_pos + 1) / ratio;
-    let mut data = ctx.stream.alloc_zeros(compressed)?;
+    let mut data = unsafe { ctx.stream.alloc(compressed)? };
     {
         let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
@@ -471,7 +599,7 @@ pub fn window_and_compress_topk_indices(
         "seq_len {seq_len} is smaller than ratio {ratio}"
     );
     let topk = window_topk + compressed;
-    let mut data = ctx.stream.alloc_zeros(seq_len * topk)?;
+    let mut data = unsafe { ctx.stream.alloc(seq_len * topk)? };
     {
         let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
         let result = unsafe {

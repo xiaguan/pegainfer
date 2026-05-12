@@ -293,6 +293,17 @@ struct RequestMetrics {
     decode_tok_s: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RequestIterationTiming {
+    index: usize,
+    ttft_ms: f64,
+    first_decode_step_ms: Option<f64>,
+    steady_tpot_ms: Option<DurationStats>,
+    e2e_ms: f64,
+    generated_tokens: usize,
+    generated_token_trace: GeneratedTokenTrace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotProfile {
     prompt_len: usize,
@@ -315,6 +326,7 @@ struct RequestReport {
     run: RunInfo,
     workload: RequestWorkload,
     metrics: RequestMetrics,
+    iterations: Vec<RequestIterationTiming>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1023,6 +1035,25 @@ fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
     }
 }
 
+fn build_request_iterations(timings: &[GenTimings]) -> Vec<RequestIterationTiming> {
+    timings
+        .iter()
+        .enumerate()
+        .map(|(index, timing)| {
+            let steady: Vec<Duration> = timing.tbt.iter().skip(1).copied().collect();
+            RequestIterationTiming {
+                index,
+                ttft_ms: dur_ms(timing.ttft),
+                first_decode_step_ms: timing.tbt.first().copied().map(dur_ms),
+                steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
+                e2e_ms: dur_ms(timing.total),
+                generated_tokens: timing.emitted_tokens,
+                generated_token_trace: generated_token_trace(&timing.generated_tokens),
+            }
+        })
+        .collect()
+}
+
 fn run_info(cli: &Cli, command: &'static str, model_type: ModelType, load_ms: f64) -> RunInfo {
     RunInfo {
         command,
@@ -1067,6 +1098,7 @@ fn bench_request(
             seed: args.run.seed,
         },
         metrics: build_request_metrics(&timings),
+        iterations: build_request_iterations(&timings),
     })))
 }
 

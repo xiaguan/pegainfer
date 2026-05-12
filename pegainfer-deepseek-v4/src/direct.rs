@@ -1,3 +1,4 @@
+mod affinity;
 mod scheduler;
 mod worker;
 

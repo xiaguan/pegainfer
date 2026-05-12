@@ -159,8 +159,6 @@ unsafe extern "C" {
     pub fn cublas_init();
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
-    pub fn cudaProfilerStart() -> i32;
-    pub fn cudaProfilerStop() -> i32;
 
     // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
     pub fn prefill_qk_norm_rope_only_cuda(
@@ -255,6 +253,23 @@ unsafe extern "C" {
         scales: *const *const u8,
         expert_indptr: *const i32,
         out: *mut Half,
+        rows: i32,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
+        x: *const Half,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        expert_indptr: *const i32,
+        out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
         rows: i32,
         in_dim: i32,
         out_dim: i32,

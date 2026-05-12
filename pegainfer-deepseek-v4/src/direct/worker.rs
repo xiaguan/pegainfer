@@ -6,10 +6,17 @@ use cudarc::driver::{CudaSlice, DevicePtrMut, result as cuda_result};
 
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
-    TensorParallelConfig, all_reduce_hidden_in_place, block_decode_rank_lane_bf16_hidden,
-    build_moe_expert_ptr_cache, embedding_rank_local, final_logits_rank_local_bf16_hidden,
-    hc_expand_bf16_hidden, load_rank_to_gpu, precompute_rope_cache,
-    runtime::{all_gather_logits, block_prefill_rank_lane_bf16_hidden_with_decode_cache},
+    TensorParallelConfig, all_reduce_hidden_in_place, build_moe_expert_ptr_cache,
+    embedding_rank_local, final_logits_rank_local_bf16_hidden, hc_expand_bf16_hidden,
+    load_rank_to_gpu, precompute_rope_cache,
+    runtime::{
+        AttentionAuxScratch, AttentionIndexScratch, AttentionOutputScratch,
+        AttentionProjectionScratch, DecodeEntryScratch, FinalLogitsScratch, HcPostScratch,
+        HcPreNormScratch, MoeAgRsScratch, SharedExpertScratch, all_gather_logits,
+        all_gather_logits_into, block_decode_rank_lane_bf16_hidden_with_scratch,
+        block_prefill_rank_lane_bf16_hidden_with_decode_cache, embedding_rank_local_into,
+        final_logits_rank_local_bf16_hidden_into, hc_expand_bf16_hidden_into,
+    },
 };
 
 type RankResult = (usize, Option<Vec<f32>>);
@@ -58,6 +65,56 @@ impl OwnedRankComm {
     }
 }
 
+struct RankDecodeScratch {
+    token_ids: CudaSlice<u32>,
+    entry: DecodeEntryScratch,
+    hc_post: HcPostScratch,
+    final_logits: FinalLogitsScratch,
+    hc_pre_norm: HcPreNormScratch,
+    shared_expert: SharedExpertScratch,
+    moe_ag_rs: MoeAgRsScratch,
+    attention_projection: AttentionProjectionScratch,
+    attention_output: AttentionOutputScratch,
+    attention_index: AttentionIndexScratch,
+    attention_aux: AttentionAuxScratch,
+}
+
+impl RankDecodeScratch {
+    fn new(ctx: &RankGpuContext, config: &Config, world_size: usize) -> Result<Self> {
+        ctx.set_current()?;
+        let token_ids = unsafe { ctx.stream.alloc(1)? };
+        let entry = DecodeEntryScratch::new(ctx, config, 1)?;
+        let hc_post = HcPostScratch::new(ctx, config, 1)?;
+        let final_logits = FinalLogitsScratch::new(ctx, config, world_size, 1)?;
+        let hc_pre_norm = HcPreNormScratch::new(ctx, config, 1)?;
+        let shared_expert = SharedExpertScratch::new(ctx, config, 1)?;
+        let moe_ag_rs = MoeAgRsScratch::new(ctx, config, world_size, 1)?;
+        let attention_projection = AttentionProjectionScratch::new(ctx, config, world_size, 1)?;
+        let attention_output = AttentionOutputScratch::new(ctx, config, world_size, 1)?;
+        let attention_index = AttentionIndexScratch::new(ctx, config)?;
+        let attention_aux = AttentionAuxScratch::new(ctx, config, world_size)?;
+        Ok(Self {
+            token_ids,
+            entry,
+            hc_post,
+            final_logits,
+            hc_pre_norm,
+            shared_expert,
+            moe_ag_rs,
+            attention_projection,
+            attention_output,
+            attention_index,
+            attention_aux,
+        })
+    }
+
+    fn token_ids(&mut self, ctx: &RankGpuContext, token_id: u32) -> Result<&CudaSlice<u32>> {
+        ctx.set_current()?;
+        ctx.stream.memcpy_htod(&[token_id], &mut self.token_ids)?;
+        Ok(&self.token_ids)
+    }
+}
+
 impl RankWorker {
     fn spawn(
         rank: usize,
@@ -72,14 +129,18 @@ impl RankWorker {
         let handle = thread::Builder::new()
             .name(format!("deepseek-v4-rank-{rank}"))
             .spawn(move || {
-                pin_rank_worker_thread(rank);
+                super::affinity::pin_rank_worker_thread(rank, ctx.device_ordinal);
                 let mut ropes = Vec::new();
                 let mut caches = Vec::new();
                 let mut max_cache_seq_len = 0usize;
-                let startup = bind_rank_thread(&ctx)
-                    .and_then(|()| build_moe_expert_ptr_cache(&ctx, config, &weights));
+                let startup = bind_rank_thread(&ctx).and_then(|()| {
+                    let ptr_cache = build_moe_expert_ptr_cache(&ctx, config, &weights)?;
+                    let decode_scratch =
+                        RankDecodeScratch::new(&ctx, config, weights.world_size())?;
+                    Ok((ptr_cache, decode_scratch))
+                });
                 match startup {
-                    Ok(ptr_cache) => {
+                    Ok((ptr_cache, mut decode_scratch)) => {
                         let _ = startup_tx.send(Ok(()));
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
@@ -132,6 +193,7 @@ impl RankWorker {
                                         token_id,
                                         start_pos,
                                         &mut caches,
+                                        &mut decode_scratch,
                                     )
                                     .map(|logits| (rank, logits));
                                     let _ = resp.send(result);
@@ -212,45 +274,6 @@ impl RankWorker {
         }
     }
 }
-
-#[cfg(target_os = "linux")]
-fn pin_rank_worker_thread(rank: usize) {
-    unsafe {
-        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
-        let set_size = std::mem::size_of::<libc::cpu_set_t>();
-        if libc::sched_getaffinity(0, set_size, &mut allowed) != 0 {
-            log::warn!("failed to read CPU affinity mask for DeepSeek rank worker {rank}");
-            return;
-        }
-
-        let mut cpus = Vec::new();
-        for cpu in 0..libc::CPU_SETSIZE as usize {
-            if libc::CPU_ISSET(cpu, &allowed) {
-                cpus.push(cpu);
-            }
-        }
-        if cpus.is_empty() {
-            log::warn!("empty CPU affinity mask for DeepSeek rank worker {rank}");
-            return;
-        }
-
-        let cpu = cpus[rank % cpus.len()];
-        let mut target: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut target);
-        libc::CPU_SET(cpu, &mut target);
-        let rc = libc::pthread_setaffinity_np(libc::pthread_self(), set_size, &target);
-        if rc != 0 {
-            log::warn!(
-                "failed to pin DeepSeek rank worker {rank} to CPU {cpu}: pthread_setaffinity_np rc={rc}"
-            );
-        } else {
-            log::info!("pinned DeepSeek rank worker {rank} to CPU {cpu}");
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_rank_worker_thread(_rank: usize) {}
 
 impl Drop for FullDirectRuntime {
     fn drop(&mut self) {
@@ -422,6 +445,7 @@ fn run_decode_on_rank_lane(
     token_id: u32,
     start_pos: usize,
     caches: &mut [LayerDecodeCache],
+    scratch: &mut RankDecodeScratch,
 ) -> Result<Option<Vec<f32>>> {
     ensure!(
         ropes.len() == config.n_layers,
@@ -437,38 +461,134 @@ fn run_decode_on_rank_lane(
     );
 
     ctx.set_current()?;
-    let token_ids = ctx
-        .stream
-        .clone_htod(&[token_id])
+    scratch
+        .token_ids(ctx, token_id)
         .with_context(|| format!("copy token_id to rank {rank}"))?;
-    let mut hidden = embedding_rank_local(ctx, config, weights, &token_ids, 1)
-        .with_context(|| format!("embedding rank {rank}"))?;
-    all_reduce_hidden_in_place(&mut hidden, comm)
+    let token_ids = &scratch.token_ids;
+    embedding_rank_local_into(
+        ctx,
+        config,
+        weights,
+        token_ids,
+        1,
+        &mut scratch.entry.embedding,
+    )
+    .with_context(|| format!("embedding rank {rank}"))?;
+    all_reduce_hidden_in_place(&mut scratch.entry.embedding, comm)
         .with_context(|| format!("embedding all_reduce rank {rank}"))?;
-    let mut hc = hc_expand_bf16_hidden(ctx, &hidden, config.hc_mult)
-        .with_context(|| format!("hc_expand rank {rank}"))?;
+    hc_expand_bf16_hidden_into(
+        ctx,
+        &scratch.entry.embedding,
+        config.hc_mult,
+        &mut scratch.entry.hc_expand,
+    )
+    .with_context(|| format!("hc_expand rank {rank}"))?;
 
+    let mut current_hc_slot = None;
     for layer in 0..config.n_layers {
-        hc = block_decode_rank_lane_bf16_hidden(
-            ctx,
-            weights,
-            ptr_cache,
-            comm,
-            config,
-            layer,
-            &hc,
-            &token_ids,
-            &ropes[layer],
-            start_pos,
-            &mut caches[layer],
-        )
-        .with_context(|| format!("decode layer {layer} rank {rank}"))?;
+        let output_slot = current_hc_slot.map_or(0, |slot| 1 - slot);
+        if let Some(input_slot) = current_hc_slot {
+            let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
+                &mut scratch.hc_post.attention_reduce_temp,
+                &mut scratch.hc_post.attention_out,
+                &mut scratch.hc_post.layer_outputs,
+            );
+            let (hc_input, layer_out) =
+                split_hc_input_output(layer_outputs, input_slot, output_slot)?;
+            block_decode_rank_lane_bf16_hidden_with_scratch(
+                ctx,
+                weights,
+                ptr_cache,
+                comm,
+                config,
+                layer,
+                hc_input,
+                token_ids,
+                &ropes[layer],
+                start_pos,
+                &mut caches[layer],
+                &mut scratch.hc_pre_norm,
+                &mut scratch.shared_expert,
+                &mut scratch.moe_ag_rs,
+                &mut scratch.attention_projection,
+                &mut scratch.attention_output,
+                &mut scratch.attention_index,
+                &mut scratch.attention_aux,
+                attention_reduce_temp,
+                attention_hc_out,
+                layer_out,
+            )
+            .with_context(|| format!("decode layer {layer} rank {rank}"))?;
+        } else {
+            let layer_out = scratch
+                .hc_post
+                .layer_outputs
+                .get_mut(output_slot)
+                .ok_or_else(|| anyhow::anyhow!("missing HC post output slot {output_slot}"))?;
+            block_decode_rank_lane_bf16_hidden_with_scratch(
+                ctx,
+                weights,
+                ptr_cache,
+                comm,
+                config,
+                layer,
+                &scratch.entry.hc_expand,
+                token_ids,
+                &ropes[layer],
+                start_pos,
+                &mut caches[layer],
+                &mut scratch.hc_pre_norm,
+                &mut scratch.shared_expert,
+                &mut scratch.moe_ag_rs,
+                &mut scratch.attention_projection,
+                &mut scratch.attention_output,
+                &mut scratch.attention_index,
+                &mut scratch.attention_aux,
+                &mut scratch.hc_post.attention_reduce_temp,
+                &mut scratch.hc_post.attention_out,
+                layer_out,
+            )
+            .with_context(|| format!("decode layer {layer} rank {rank}"))?;
+        }
+        current_hc_slot = Some(output_slot);
     }
 
-    let local_logits = final_logits_rank_local_bf16_hidden(ctx, config, weights, &hc)
-        .with_context(|| format!("final logits rank {rank}"))?;
-    gather_logits_for_sampling(rank, ctx, comm, weights, &local_logits)
+    let final_hc = current_hc_slot
+        .and_then(|slot| scratch.hc_post.layer_outputs.get(slot))
+        .unwrap_or(&scratch.entry.hc_expand);
+    final_logits_rank_local_bf16_hidden_into(
+        ctx,
+        config,
+        weights,
+        final_hc,
+        &mut scratch.final_logits,
+    )
+    .with_context(|| format!("final logits rank {rank}"))?;
+    gather_logits_for_sampling_into(rank, ctx, comm, weights, &mut scratch.final_logits)
         .with_context(|| format!("final logits all_gather rank {rank}"))
+}
+
+fn split_hc_input_output(
+    layer_outputs: &mut [crate::HcHiddenStates],
+    input_slot: usize,
+    output_slot: usize,
+) -> Result<(&crate::HcHiddenStates, &mut crate::HcHiddenStates)> {
+    ensure!(
+        input_slot != output_slot,
+        "HC input/output slots must be distinct: input={input_slot}, output={output_slot}"
+    );
+    ensure!(
+        input_slot < layer_outputs.len() && output_slot < layer_outputs.len(),
+        "HC slot out of range: input={input_slot}, output={output_slot}, len={}",
+        layer_outputs.len()
+    );
+    if input_slot < output_slot {
+        let (left, right) = layer_outputs.split_at_mut(output_slot);
+        Ok((&left[input_slot], &mut right[0]))
+    } else {
+        let (left, right) = layer_outputs.split_at_mut(input_slot);
+        Ok((&right[0], &mut left[output_slot]))
+    }
 }
 
 fn run_prefill_on_rank_lane(
@@ -545,6 +665,27 @@ fn gather_logits_for_sampling(
     let gathered = all_gather_logits(ctx, comm, local_logits, weights.world_size())?;
     if rank == 0 {
         Ok(Some(gathered.to_host(ctx)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn gather_logits_for_sampling_into(
+    rank: usize,
+    ctx: &RankGpuContext,
+    comm: &cudarc::nccl::safe::Comm,
+    weights: &RankWeightView<'_>,
+    scratch: &mut FinalLogitsScratch,
+) -> Result<Option<Vec<f32>>> {
+    all_gather_logits_into(
+        ctx,
+        comm,
+        &scratch.local_logits,
+        weights.world_size(),
+        &mut scratch.gathered_logits,
+    )?;
+    if rank == 0 {
+        Ok(Some(scratch.gathered_logits.to_host(ctx)?))
     } else {
         Ok(None)
     }

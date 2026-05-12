@@ -135,7 +135,7 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
         .with_context(|| format!("hc_post ffn layer {layer}"))
 }
 
-pub fn block_decode_rank_lane_bf16_hidden(
+pub(crate) fn block_decode_rank_lane_bf16_hidden_with_scratch(
     ctx: &RankGpuContext,
     weights: &RankWeightView<'_>,
     ptr_cache: &MoeGroupedPtrCache,
@@ -147,7 +147,17 @@ pub fn block_decode_rank_lane_bf16_hidden(
     rope: &DeepSeekRopeCache,
     start_pos: usize,
     cache: &mut LayerDecodeCache,
-) -> Result<HcHiddenStates> {
+    hc_pre_norm_scratch: &mut HcPreNormScratch,
+    shared_expert_scratch: &mut SharedExpertScratch,
+    moe_ag_rs_scratch: &mut MoeAgRsScratch,
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+    attention_aux_scratch: &mut AttentionAuxScratch,
+    attention_hc_post_scratch: &mut CudaSlice<f32>,
+    attention_hc_out: &mut HcHiddenStates,
+    layer_out: &mut HcHiddenStates,
+) -> Result<()> {
     ensure!(
         input.seq_len == 1,
         "rank lane block decode expects HC seq_len=1, got {}",
@@ -159,7 +169,7 @@ pub fn block_decode_rank_lane_bf16_hidden(
     );
     let block = weights.block(layer)?;
 
-    let (attn_norm, attn_hc) = hc_pre_norm_bf16_hidden(
+    let (attn_norm, attn_hc) = hc_pre_norm_bf16_hidden_scratch(
         ctx,
         config,
         input,
@@ -167,43 +177,119 @@ pub fn block_decode_rank_lane_bf16_hidden(
         &block.hc_attn_scale,
         &block.hc_attn_base,
         &block.attn_norm,
+        hc_pre_norm_scratch,
     )
     .with_context(|| format!("hc_pre_norm attention layer {layer}"))?;
-    let attn_out = attention_decode_rank_local_collective_bf16_hidden(
-        ctx,
-        config,
-        layer,
-        &attn_norm,
-        &block.attn,
-        rope,
-        start_pos,
-        cache,
-        comm,
-    )
-    .with_context(|| format!("attention decode layer {layer}"))?;
-    let after_attn = all_reduce_hidden_fp32_hc_post(ctx, &attn_out, input, &attn_hc, comm)
-        .with_context(|| format!("attention all_reduce hc_post layer {layer}"))?;
+    match config.compress_ratios[layer] {
+        0 => {
+            let attn_out = attention_decode_rank_local_bf16_hidden_with_scratch(
+                ctx,
+                config,
+                layer,
+                attn_norm,
+                &block.attn,
+                rope,
+                start_pos,
+                &mut cache.kv,
+                attention_projection_scratch,
+                attention_output_scratch,
+                attention_index_scratch,
+            )
+            .with_context(|| format!("attention decode layer {layer}"))?;
+            all_reduce_hidden_fp32_hc_post_view_into(
+                ctx,
+                attn_out,
+                input,
+                &attn_hc,
+                comm,
+                attention_hc_post_scratch,
+                attention_hc_out,
+            )
+        }
+        4 => {
+            let attn_out =
+                attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_scratch(
+                    ctx,
+                    config,
+                    layer,
+                    attn_norm,
+                    &block.attn,
+                    rope,
+                    start_pos,
+                    cache,
+                    comm,
+                    attention_projection_scratch,
+                    attention_output_scratch,
+                    attention_index_scratch,
+                    attention_aux_scratch,
+                )
+                .with_context(|| format!("attention decode layer {layer}"))?;
+            all_reduce_hidden_fp32_hc_post_view_into(
+                ctx,
+                attn_out,
+                input,
+                &attn_hc,
+                comm,
+                attention_hc_post_scratch,
+                attention_hc_out,
+            )
+        }
+        _ => {
+            let attn_out = attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
+                ctx,
+                config,
+                layer,
+                attn_norm,
+                &block.attn,
+                rope,
+                start_pos,
+                cache,
+            )
+            .with_context(|| format!("attention decode layer {layer}"))?;
+            all_reduce_hidden_fp32_hc_post_view_into(
+                ctx,
+                &attn_out,
+                input,
+                &attn_hc,
+                comm,
+                attention_hc_post_scratch,
+                attention_hc_out,
+            )
+        }
+    }
+    .with_context(|| format!("attention all_reduce hc_post layer {layer}"))?;
 
-    let (ffn_norm, ffn_hc) = hc_pre_norm_bf16_hidden(
+    let (ffn_norm, ffn_hc) = hc_pre_norm_bf16_hidden_scratch(
         ctx,
         config,
-        &after_attn,
+        attention_hc_out,
         &block.hc_ffn_fn,
         &block.hc_ffn_scale,
         &block.hc_ffn_base,
         &block.ffn_norm,
+        hc_pre_norm_scratch,
     )
     .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?;
 
-    let ffn_out = decode_moe_ag_rs_bf16_hidden(
-        ctx, config, weights, ptr_cache, comm, layer, &ffn_norm, token_ids,
+    let ffn_out = decode_moe_ag_rs_bf16_hidden_with_scratch(
+        ctx,
+        config,
+        weights,
+        ptr_cache,
+        comm,
+        layer,
+        ffn_norm,
+        token_ids,
+        shared_expert_scratch,
+        moe_ag_rs_scratch,
     )
     .with_context(|| format!("decode MoE AG/RS layer {layer}"))?;
-    hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
-        .with_context(|| format!("hc_post ffn layer {layer}"))
+    hc_post_bf16_hidden_view_into(ctx, ffn_out, attention_hc_out, &ffn_hc, layer_out)
+        .with_context(|| format!("hc_post ffn layer {layer}"))?;
+    Ok(())
 }
 
-fn attention_decode_rank_local_collective_bf16_hidden(
+fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_scratch<'a>(
     ctx: &RankGpuContext,
     config: &Config,
     layer: usize,
@@ -213,38 +299,11 @@ fn attention_decode_rank_local_collective_bf16_hidden(
     start_pos: usize,
     cache: &mut LayerDecodeCache,
     comm: &Comm,
-) -> Result<Bf16HiddenStates> {
-    match config.compress_ratios[layer] {
-        0 => attention_decode_rank_local_bf16_hidden(
-            ctx,
-            config,
-            layer,
-            input,
-            attn,
-            rope,
-            start_pos,
-            &mut cache.kv,
-        ),
-        4 => attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
-            ctx, config, layer, input, attn, rope, start_pos, cache, comm,
-        ),
-        _ => attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
-            ctx, config, layer, input, attn, rope, start_pos, cache,
-        ),
-    }
-}
-
-fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
-    ctx: &RankGpuContext,
-    config: &Config,
-    layer: usize,
-    input: &Bf16HiddenStates,
-    attn: &AttentionWeights<'_>,
-    rope: &DeepSeekRopeCache,
-    start_pos: usize,
-    cache: &mut LayerDecodeCache,
-    comm: &Comm,
-) -> Result<Bf16HiddenStates> {
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &'a mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+    attention_aux_scratch: &mut AttentionAuxScratch,
+) -> Result<&'a Bf16HiddenStates> {
     ensure!(input.seq_len == 1, "ratio-4 decode expects seq_len=1");
     ensure!(
         config.compress_ratios[layer] == 4,
@@ -265,28 +324,37 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("layer {layer} missing overlap compressor state"))?;
 
-    let mut projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
-    apply_rope_attention_projections(ctx, &mut projections, rope, start_pos)?;
+    let mut projections = attention_project_bf16_hidden_scratch(
+        ctx,
+        config,
+        input,
+        attn,
+        attention_projection_scratch,
+    )?;
+    apply_rope_attention_projections_view(ctx, &mut projections, rope, start_pos)?;
     copy_bf16_rows_to_cache(
         ctx,
-        &projections.kv,
+        projections.kv,
         &mut cache.kv,
         0,
         start_pos % config.sliding_window,
         1,
     )?;
-    if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden(
+    if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden_with_dim_scratch(
         ctx,
         config,
         input,
         compressor,
         rope,
         start_pos,
+        config.head_dim,
         compressor_state,
+        false,
+        attention_aux_scratch,
     )? {
         copy_bf16_rows_to_cache(
             ctx,
-            &compressed_kv,
+            compressed_kv,
             &mut cache.kv,
             0,
             config.sliding_window + start_pos / 4,
@@ -302,54 +370,63 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
         .indexer_compressor
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("layer {layer} missing indexer compressor state"))?;
-    let mut scores = indexer_scores_decode_bf16_hidden(
+    let score_len = indexer_scores_decode_bf16_hidden_scratch(
         ctx,
         config,
         input,
-        &projections.qr,
+        projections.qr,
         indexer,
         rope,
         start_pos,
         indexer_kv,
         indexer_state,
+        attention_aux_scratch,
     )?;
 
-    if let Some(scores) = scores.as_mut() {
-        comm.all_reduce_in_place(scores, &ReduceOp::Sum)
+    if let Some(score_len) = score_len {
+        let mut scores = attention_aux_scratch.indexer_scores.slice_mut(0..score_len);
+        comm.all_reduce_in_place(&mut scores, &ReduceOp::Sum)
             .map_err(|err| {
                 anyhow::anyhow!("NCCL decode indexer score all-reduce failed: {err:?}")
             })?;
     }
 
-    let (window_idxs, window_topk) =
-        window_topk_indices_decode(ctx, start_pos, config.sliding_window)?;
+    let window_topk = window_topk_indices_decode_into(
+        ctx,
+        start_pos,
+        config.sliding_window,
+        &mut attention_index_scratch.window_idxs,
+    )?;
     let compressed_len = (start_pos + 1) / 4;
     let (topk_idxs, topk) = if compressed_len > 0 {
-        let scores = scores
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing indexer decode scores"))?;
-        let (compress_idxs, compress_topk) = indexer_topk_indices_decode(
+        let scores = attention_aux_scratch
+            .indexer_scores
+            .slice(0..compressed_len);
+        let compress_topk = indexer_topk_indices_decode_into(
             ctx,
             config,
-            scores,
+            &scores,
             compressed_len,
             config.sliding_window,
+            &mut attention_index_scratch.compress_idxs,
+        )?;
+        concat_topk_indices_into(
+            ctx,
+            &attention_index_scratch.window_idxs,
+            window_topk,
+            &attention_index_scratch.compress_idxs,
+            compress_topk,
+            1,
+            &mut attention_index_scratch.topk_idxs,
         )?;
         (
-            concat_topk_indices(
-                ctx,
-                &window_idxs,
-                window_topk,
-                &compress_idxs,
-                compress_topk,
-                1,
-            )?,
+            &attention_index_scratch.topk_idxs,
             window_topk + compress_topk,
         )
     } else {
-        (window_idxs, window_topk)
+        (&attention_index_scratch.window_idxs, window_topk)
     };
-    let mut attn_out = indexed_attention_cache_bf16_hidden(
+    indexed_attention_cache_bf16_hidden_view_into(
         ctx,
         config,
         &projections,
@@ -357,14 +434,13 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden(
         attn,
         &topk_idxs,
         topk,
+        &mut attention_output_scratch.attn_out,
     )?;
-    attention_output_project_bf16_hidden(
+    attention_output_project_bf16_hidden_scratch(
         ctx,
-        &mut attn_out,
         attn,
         rope,
-        projections.local_heads,
-        projections.head_dim,
         start_pos,
+        attention_output_scratch,
     )
 }

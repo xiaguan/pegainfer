@@ -39,12 +39,14 @@ pub fn hash_route_bf16_hidden(
         tid2eid.tensor.shape
     );
 
-    let mut weights = ctx
-        .stream
-        .alloc_zeros(input.seq_len * config.n_activated_experts)?;
-    let mut indices = ctx
-        .stream
-        .alloc_zeros(input.seq_len * config.n_activated_experts)?;
+    let mut weights = unsafe {
+        ctx.stream
+            .alloc(input.seq_len * config.n_activated_experts)?
+    };
+    let mut indices = unsafe {
+        ctx.stream
+            .alloc(input.seq_len * config.n_activated_experts)?
+    };
     {
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (gate_ptr, _gate_guard) = ffn.gate_weight.tensor.data.device_ptr(&ctx.stream);
@@ -72,6 +74,90 @@ pub fn hash_route_bf16_hidden(
     }
 
     Ok(RoutedExperts {
+        weights,
+        indices,
+        topk: config.n_activated_experts,
+        seq_len: input.seq_len,
+    })
+}
+
+pub(crate) fn hash_route_bf16_hidden_into<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    ffn: &FfnWeights<'_>,
+    token_ids: &CudaSlice<u32>,
+    weights: &'a mut CudaSlice<f32>,
+    indices: &'a mut CudaSlice<i32>,
+) -> Result<RoutedExpertsView<'a>> {
+    ctx.set_current()?;
+    ensure!(
+        ffn.gate_weight.tensor.dtype == safetensors::Dtype::BF16,
+        "gate weight {} must be BF16, got {:?}",
+        ffn.gate_weight.name,
+        ffn.gate_weight.tensor.dtype
+    );
+    ensure!(
+        ffn.gate_weight.tensor.shape == [config.n_routed_experts, input.hidden_dim],
+        "gate weight {} shape mismatch: expected {:?}, got {:?}",
+        ffn.gate_weight.name,
+        [config.n_routed_experts, input.hidden_dim],
+        ffn.gate_weight.tensor.shape
+    );
+    let tid2eid = ffn
+        .gate_tid2eid
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("hash routing requires gate.tid2eid"))?;
+    ensure!(
+        tid2eid.tensor.dtype == safetensors::Dtype::I64,
+        "gate tid2eid {} must be I64, got {:?}",
+        tid2eid.name,
+        tid2eid.tensor.dtype
+    );
+    ensure!(
+        tid2eid.tensor.shape == [config.vocab_size, config.n_activated_experts],
+        "gate tid2eid {} shape mismatch: expected {:?}, got {:?}",
+        tid2eid.name,
+        [config.vocab_size, config.n_activated_experts],
+        tid2eid.tensor.shape
+    );
+    let route_elems = input.seq_len * config.n_activated_experts;
+    ensure!(
+        weights.len() >= route_elems,
+        "hash route weights scratch too small: have {}, need {route_elems}",
+        weights.len()
+    );
+    ensure!(
+        indices.len() >= route_elems,
+        "hash route indices scratch too small: have {}, need {route_elems}",
+        indices.len()
+    );
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (gate_ptr, _gate_guard) = ffn.gate_weight.tensor.data.device_ptr(&ctx.stream);
+        let (tid2eid_ptr, _tid2eid_guard) = tid2eid.tensor.data.device_ptr(&ctx.stream);
+        let (token_ptr, _token_guard) = token_ids.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = weights.device_ptr_mut(&ctx.stream);
+        let (indices_ptr, _indices_guard) = indices.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_hash_gate_cuda(
+                x_ptr as *const ffi::Half,
+                gate_ptr as *const ffi::Half,
+                tid2eid_ptr as *const i64,
+                token_ptr as *const u32,
+                weights_ptr as *mut f32,
+                indices_ptr as *mut i32,
+                input.seq_len as i32,
+                input.hidden_dim as i32,
+                config.n_routed_experts as i32,
+                config.n_activated_experts as i32,
+                config.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(RoutedExpertsView {
         weights,
         indices,
         topk: config.n_activated_experts,
@@ -117,12 +203,14 @@ pub fn score_route_bf16_hidden(
         bias.tensor.shape
     );
 
-    let mut weights = ctx
-        .stream
-        .alloc_zeros(input.seq_len * config.n_activated_experts)?;
-    let mut indices = ctx
-        .stream
-        .alloc_zeros(input.seq_len * config.n_activated_experts)?;
+    let mut weights = unsafe {
+        ctx.stream
+            .alloc(input.seq_len * config.n_activated_experts)?
+    };
+    let mut indices = unsafe {
+        ctx.stream
+            .alloc(input.seq_len * config.n_activated_experts)?
+    };
     {
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (gate_ptr, _gate_guard) = ffn.gate_weight.tensor.data.device_ptr(&ctx.stream);
@@ -148,6 +236,87 @@ pub fn score_route_bf16_hidden(
     }
 
     Ok(RoutedExperts {
+        weights,
+        indices,
+        topk: config.n_activated_experts,
+        seq_len: input.seq_len,
+    })
+}
+
+pub(crate) fn score_route_bf16_hidden_into<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    ffn: &FfnWeights<'_>,
+    weights: &'a mut CudaSlice<f32>,
+    indices: &'a mut CudaSlice<i32>,
+) -> Result<RoutedExpertsView<'a>> {
+    ctx.set_current()?;
+    ensure!(
+        ffn.gate_weight.tensor.dtype == safetensors::Dtype::BF16,
+        "gate weight {} must be BF16, got {:?}",
+        ffn.gate_weight.name,
+        ffn.gate_weight.tensor.dtype
+    );
+    ensure!(
+        ffn.gate_weight.tensor.shape == [config.n_routed_experts, input.hidden_dim],
+        "gate weight {} shape mismatch: expected {:?}, got {:?}",
+        ffn.gate_weight.name,
+        [config.n_routed_experts, input.hidden_dim],
+        ffn.gate_weight.tensor.shape
+    );
+    let bias = ffn
+        .gate_bias
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("score routing requires gate.bias"))?;
+    ensure!(
+        bias.tensor.dtype == safetensors::Dtype::F32,
+        "gate bias {} must be F32, got {:?}",
+        bias.name,
+        bias.tensor.dtype
+    );
+    ensure!(
+        bias.tensor.shape == [config.n_routed_experts],
+        "gate bias {} shape mismatch: expected {:?}, got {:?}",
+        bias.name,
+        [config.n_routed_experts],
+        bias.tensor.shape
+    );
+    let route_elems = input.seq_len * config.n_activated_experts;
+    ensure!(
+        weights.len() >= route_elems,
+        "score route weights scratch too small: have {}, need {route_elems}",
+        weights.len()
+    );
+    ensure!(
+        indices.len() >= route_elems,
+        "score route indices scratch too small: have {}, need {route_elems}",
+        indices.len()
+    );
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (gate_ptr, _gate_guard) = ffn.gate_weight.tensor.data.device_ptr(&ctx.stream);
+        let (bias_ptr, _bias_guard) = bias.tensor.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = weights.device_ptr_mut(&ctx.stream);
+        let (indices_ptr, _indices_guard) = indices.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_score_gate_cuda(
+                x_ptr as *const ffi::Half,
+                gate_ptr as *const ffi::Half,
+                bias_ptr as *const f32,
+                weights_ptr as *mut f32,
+                indices_ptr as *mut i32,
+                input.seq_len as i32,
+                input.hidden_dim as i32,
+                config.n_routed_experts as i32,
+                config.n_activated_experts as i32,
+                config.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(RoutedExpertsView {
         weights,
         indices,
         topk: config.n_activated_experts,
@@ -233,6 +402,113 @@ pub fn build_moe_fused_route_plan(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_moe_fused_route_plan_into<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    weights: &RankWeightView<'_>,
+    routed: RoutedExpertsView<'a>,
+    input_hidden_dim: usize,
+    pos_to_token: &'a mut CudaSlice<i32>,
+    pos_to_token_topk: &'a mut CudaSlice<i32>,
+    token_topk_to_pos: &'a mut CudaSlice<i32>,
+    expert_indptr: &'a mut CudaSlice<i32>,
+    expert_cursor: &'a mut CudaSlice<i32>,
+    local_count: &'a mut CudaSlice<i32>,
+) -> Result<MoeFusedRoutePlanView<'a>> {
+    ctx.set_current()?;
+    ensure!(
+        input_hidden_dim == config.dim,
+        "MoE fused route input dim mismatch: expected {}, got {}",
+        config.dim,
+        input_hidden_dim
+    );
+    ensure!(
+        routed.topk == config.n_activated_experts,
+        "MoE fused route topk mismatch: expected {}, got {}",
+        config.n_activated_experts,
+        routed.topk
+    );
+    ensure!(
+        config.n_routed_experts.is_multiple_of(weights.world_size()),
+        "n_routed_experts={} must be divisible by world_size={}",
+        config.n_routed_experts,
+        weights.world_size()
+    );
+
+    let local_experts = config.n_routed_experts / weights.world_size();
+    let global_start = weights.rank() * local_experts;
+    let num_expanded = routed.seq_len * routed.topk;
+    ensure!(
+        pos_to_token.len() >= num_expanded,
+        "MoE pos_to_token scratch too small: have {}, need {num_expanded}",
+        pos_to_token.len()
+    );
+    ensure!(
+        pos_to_token_topk.len() >= num_expanded,
+        "MoE pos_to_token_topk scratch too small: have {}, need {num_expanded}",
+        pos_to_token_topk.len()
+    );
+    ensure!(
+        token_topk_to_pos.len() >= num_expanded,
+        "MoE token_topk_to_pos scratch too small: have {}, need {num_expanded}",
+        token_topk_to_pos.len()
+    );
+    ensure!(
+        expert_indptr.len() >= local_experts + 1,
+        "MoE expert_indptr scratch too small: have {}, need {}",
+        expert_indptr.len(),
+        local_experts + 1
+    );
+    ensure!(
+        expert_cursor.len() >= local_experts,
+        "MoE expert_cursor scratch too small: have {}, need {local_experts}",
+        expert_cursor.len()
+    );
+    ensure!(
+        !local_count.is_empty(),
+        "MoE local_count scratch must have at least one element"
+    );
+
+    {
+        let (indices_ptr, _indices_guard) = routed.indices.device_ptr(&ctx.stream);
+        let (pos_to_token_ptr, _pos_to_token_guard) = pos_to_token.device_ptr_mut(&ctx.stream);
+        let (pos_to_token_topk_ptr, _pos_to_token_topk_guard) =
+            pos_to_token_topk.device_ptr_mut(&ctx.stream);
+        let (token_topk_to_pos_ptr, _token_topk_to_pos_guard) =
+            token_topk_to_pos.device_ptr_mut(&ctx.stream);
+        let (expert_indptr_ptr, _expert_indptr_guard) = expert_indptr.device_ptr_mut(&ctx.stream);
+        let (expert_cursor_ptr, _expert_cursor_guard) = expert_cursor.device_ptr_mut(&ctx.stream);
+        let (local_count_ptr, _local_count_guard) = local_count.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_local_mapping_cuda(
+                indices_ptr as *const i32,
+                pos_to_token_ptr as *mut i32,
+                pos_to_token_topk_ptr as *mut i32,
+                token_topk_to_pos_ptr as *mut i32,
+                expert_indptr_ptr as *mut i32,
+                expert_cursor_ptr as *mut i32,
+                local_count_ptr as *mut i32,
+                routed.seq_len as i32,
+                routed.topk as i32,
+                global_start as i32,
+                local_experts as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+
+    Ok(MoeFusedRoutePlanView {
+        routed,
+        pos_to_token,
+        token_topk_to_pos,
+        expert_indptr,
+        local_experts,
+        num_expanded,
+    })
+}
+
 pub fn add_f32_bf16_to_bf16_hidden(
     ctx: &RankGpuContext,
     a: &F32HiddenStates,
@@ -251,7 +527,7 @@ pub fn add_f32_bf16_to_bf16_hidden(
         a.seq_len,
         b.seq_len
     );
-    let mut out = Bf16HiddenStates::zeros(ctx, a.hidden_dim, a.seq_len)?;
+    let mut out = Bf16HiddenStates::uninit(ctx, a.hidden_dim, a.seq_len)?;
     {
         let (a_ptr, _a_guard) = a.data.device_ptr(&ctx.stream);
         let (b_ptr, _b_guard) = b.data.device_ptr(&ctx.stream);
@@ -270,6 +546,56 @@ pub fn add_f32_bf16_to_bf16_hidden(
     Ok(out)
 }
 
+pub(crate) fn add_f32_bf16_to_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    a: &F32HiddenStates,
+    b: &Bf16HiddenStates,
+    out: &mut Bf16HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        a.hidden_dim == b.hidden_dim,
+        "add f32/bf16 hidden dim mismatch: a={}, b={}",
+        a.hidden_dim,
+        b.hidden_dim
+    );
+    ensure!(
+        a.seq_len == b.seq_len,
+        "add f32/bf16 seq len mismatch: a={}, b={}",
+        a.seq_len,
+        b.seq_len
+    );
+    ensure!(
+        out.hidden_dim == a.hidden_dim,
+        "add f32/bf16 output dim mismatch: out={}, a={}",
+        out.hidden_dim,
+        a.hidden_dim
+    );
+    ensure!(
+        out.seq_capacity() >= a.seq_len,
+        "add f32/bf16 output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        a.seq_len
+    );
+    out.seq_len = a.seq_len;
+    {
+        let (a_ptr, _a_guard) = a.data.device_ptr(&ctx.stream);
+        let (b_ptr, _b_guard) = b.data.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_add_f32_bf16_to_bf16_cuda(
+                a_ptr as *const f32,
+                b_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                (a.hidden_dim * a.seq_len) as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
 pub fn expand_moe_fused_input(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -282,7 +608,7 @@ pub fn expand_moe_fused_input(
         plan.routed.seq_len,
         input.seq_len
     );
-    let mut out = Bf16HiddenStates::zeros(ctx, input.hidden_dim, plan.num_expanded)?;
+    let mut out = Bf16HiddenStates::uninit(ctx, input.hidden_dim, plan.num_expanded)?;
     {
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (pos_ptr, _pos_guard) = plan.pos_to_token.device_ptr(&ctx.stream);
@@ -302,6 +628,51 @@ pub fn expand_moe_fused_input(
     Ok(out)
 }
 
+pub(crate) fn expand_moe_fused_input_into(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenStates,
+    plan: &MoeFusedRoutePlanView<'_>,
+    out: &mut Bf16HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        plan.routed.seq_len == input.seq_len,
+        "MoE expand route seq len mismatch: route={}, input={}",
+        plan.routed.seq_len,
+        input.seq_len
+    );
+    ensure!(
+        out.hidden_dim == input.hidden_dim,
+        "MoE expand output dim mismatch: out={}, input={}",
+        out.hidden_dim,
+        input.hidden_dim
+    );
+    ensure!(
+        out.seq_capacity() >= plan.num_expanded,
+        "MoE expand output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        plan.num_expanded
+    );
+    out.seq_len = plan.num_expanded;
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (pos_ptr, _pos_guard) = plan.pos_to_token.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_expand_to_fused_cuda(
+                x_ptr as *const ffi::Half,
+                pos_ptr as *const i32,
+                out_ptr as *mut ffi::Half,
+                input.hidden_dim as i32,
+                plan.num_expanded as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
 pub fn reduce_moe_fused_output_f32(
     ctx: &RankGpuContext,
     expanded: &Bf16HiddenStates,
@@ -316,9 +687,7 @@ pub fn reduce_moe_fused_output_f32(
         output_hidden_dim
     );
     let mut out = F32HiddenStates {
-        data: ctx
-            .stream
-            .alloc_zeros(output_hidden_dim * plan.routed.seq_len)?,
+        data: unsafe { ctx.stream.alloc(output_hidden_dim * plan.routed.seq_len)? },
         hidden_dim: output_hidden_dim,
         seq_len: plan.routed.seq_len,
     };
@@ -342,6 +711,54 @@ pub fn reduce_moe_fused_output_f32(
         result.result()?;
     }
     Ok(out)
+}
+
+pub(crate) fn reduce_moe_fused_output_f32_into(
+    ctx: &RankGpuContext,
+    expanded: &Bf16HiddenStates,
+    plan: &MoeFusedRoutePlanView<'_>,
+    output_hidden_dim: usize,
+    out: &mut F32HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        expanded.hidden_dim == output_hidden_dim,
+        "MoE reduce hidden dim mismatch: expanded={}, output={}",
+        expanded.hidden_dim,
+        output_hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == output_hidden_dim,
+        "MoE reduce output dim mismatch: out={}, expected={output_hidden_dim}",
+        out.hidden_dim
+    );
+    ensure!(
+        out.seq_capacity() >= plan.routed.seq_len,
+        "MoE reduce output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        plan.routed.seq_len
+    );
+    out.seq_len = plan.routed.seq_len;
+    {
+        let (expanded_ptr, _expanded_guard) = expanded.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = plan.routed.weights.device_ptr(&ctx.stream);
+        let (map_ptr, _map_guard) = plan.token_topk_to_pos.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_reduce_fused_f32_cuda(
+                expanded_ptr as *const ffi::Half,
+                weights_ptr as *const f32,
+                map_ptr as *const i32,
+                out_ptr as *mut f32,
+                plan.routed.seq_len as i32,
+                output_hidden_dim as i32,
+                plan.routed.topk as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 pub fn build_moe_expert_ptr_cache(
@@ -497,6 +914,67 @@ pub fn local_experts_forward_packed_bf16_hidden(
     fp4_grouped_linear_bf16_hidden(ctx, &activated, &plan.expert_indptr, &ptrs.w2)
 }
 
+pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    ptr_cache: &MoeGroupedPtrCache,
+    layer: usize,
+    expanded_input: &Bf16HiddenStates,
+    plan: &MoeFusedRoutePlanView<'_>,
+    gate: &mut Bf16HiddenStates,
+    up: &mut Bf16HiddenStates,
+    activated: &mut Bf16HiddenStates,
+    out: &'a mut Bf16HiddenStates,
+    fp4_act_workspace: &mut CudaSlice<u8>,
+    fp4_act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<&'a Bf16HiddenStates> {
+    ctx.set_current()?;
+    ensure!(
+        layer < ptr_cache.layers.len(),
+        "MoE grouped pointer cache layer {layer} out of range {}",
+        ptr_cache.layers.len()
+    );
+    ensure!(
+        ptr_cache.local_experts == plan.local_experts,
+        "MoE grouped pointer cache local_experts mismatch: cache={}, plan={}",
+        ptr_cache.local_experts,
+        plan.local_experts
+    );
+    let ptrs = &ptr_cache.layers[layer];
+    fp4_grouped_linear_bf16_hidden_into(
+        ctx,
+        expanded_input,
+        plan.expert_indptr,
+        plan.local_experts,
+        &ptrs.w1,
+        gate,
+        fp4_act_workspace,
+        fp4_act_scale_workspace,
+    )?;
+    fp4_grouped_linear_bf16_hidden_into(
+        ctx,
+        expanded_input,
+        plan.expert_indptr,
+        plan.local_experts,
+        &ptrs.w3,
+        up,
+        fp4_act_workspace,
+        fp4_act_scale_workspace,
+    )?;
+    swiglu_clamp_bf16_hidden_into(ctx, gate, up, config.swiglu_limit, activated)?;
+    fp4_grouped_linear_bf16_hidden_into(
+        ctx,
+        activated,
+        plan.expert_indptr,
+        plan.local_experts,
+        &ptrs.w2,
+        out,
+        fp4_act_workspace,
+        fp4_act_scale_workspace,
+    )?;
+    Ok(out)
+}
+
 fn fp4_grouped_linear_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -524,7 +1002,7 @@ fn fp4_grouped_linear_bf16_hidden(
         ptrs.in_dim,
         input.hidden_dim
     );
-    let mut out = Bf16HiddenStates::zeros(ctx, ptrs.out_dim, input.seq_len)?;
+    let mut out = Bf16HiddenStates::uninit(ctx, ptrs.out_dim, input.seq_len)?;
     {
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (weights_ptr, _weights_guard) = ptrs.weight_ptrs.device_ptr(&ctx.stream);
@@ -548,6 +1026,99 @@ fn fp4_grouped_linear_bf16_hidden(
         result.result()?;
     }
     Ok(out)
+}
+
+fn fp4_grouped_linear_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenStates,
+    expert_indptr: &CudaSlice<i32>,
+    local_experts: usize,
+    ptrs: &MoeGroupedLinearPtrs,
+    out: &mut Bf16HiddenStates,
+    act_workspace: &mut CudaSlice<u8>,
+    act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(local_experts > 0, "grouped FP4 needs local experts");
+    ensure!(
+        expert_indptr.len() > local_experts,
+        "grouped FP4 expert_indptr too small: len={}, local_experts={local_experts}",
+        expert_indptr.len()
+    );
+    ensure!(
+        ptrs.weight_ptrs.len() == local_experts,
+        "grouped FP4 weight pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.weight_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        ptrs.scale_ptrs.len() == local_experts,
+        "grouped FP4 scale pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.scale_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        input.hidden_dim == ptrs.in_dim,
+        "grouped FP4 input dim mismatch: expected {}, got {}",
+        ptrs.in_dim,
+        input.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == ptrs.out_dim,
+        "grouped FP4 output dim mismatch: out={}, expected={}",
+        out.hidden_dim,
+        ptrs.out_dim
+    );
+    ensure!(
+        out.seq_capacity() >= input.seq_len,
+        "grouped FP4 output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        input.seq_len
+    );
+    let act_bytes = input.seq_len * input.hidden_dim;
+    let act_scale_bytes = input.seq_len * input.hidden_dim.div_ceil(128);
+    ensure!(
+        act_workspace.len() >= act_bytes,
+        "grouped FP4 act workspace too small: have {}, need {act_bytes}",
+        act_workspace.len()
+    );
+    ensure!(
+        act_scale_workspace.len() >= act_scale_bytes,
+        "grouped FP4 act scale workspace too small: have {}, need {act_scale_bytes}",
+        act_scale_workspace.len()
+    );
+    out.seq_len = input.seq_len;
+    {
+        let act_workspace_len = act_workspace.len();
+        let act_scale_workspace_len = act_scale_workspace.len();
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = ptrs.weight_ptrs.device_ptr(&ctx.stream);
+        let (scales_ptr, _scales_guard) = ptrs.scale_ptrs.device_ptr(&ctx.stream);
+        let (expert_ptr, _expert_guard) = expert_indptr.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
+        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
+                x_ptr as *const ffi::Half,
+                weights_ptr as *const *const u8,
+                scales_ptr as *const *const u8,
+                expert_ptr as *const i32,
+                out_ptr as *mut ffi::Half,
+                act_ptr as *mut u8,
+                act_workspace_len,
+                act_scale_ptr as *mut u8,
+                act_scale_workspace_len,
+                input.seq_len as i32,
+                input.hidden_dim as i32,
+                ptrs.out_dim as i32,
+                local_experts as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 pub fn hash_routed_moe_rank_local_bf16_hidden(
@@ -642,7 +1213,7 @@ pub(crate) fn moe_rank_lane_bf16_hidden(
     add_f32_bf16_to_bf16_hidden(ctx, &routed_out, &shared)
 }
 
-pub(crate) fn decode_moe_ag_rs_bf16_hidden(
+pub(crate) fn decode_moe_ag_rs_bf16_hidden_with_scratch<'a>(
     ctx: &RankGpuContext,
     config: &Config,
     weights: &RankWeightView<'_>,
@@ -651,7 +1222,9 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden(
     layer: usize,
     input: &Bf16HiddenStates,
     token_ids: &CudaSlice<u32>,
-) -> Result<Bf16HiddenStates> {
+    shared_scratch: &mut SharedExpertScratch,
+    moe_scratch: &'a mut MoeAgRsScratch,
+) -> Result<&'a Bf16HiddenStates> {
     ctx.set_current()?;
     ensure!(
         token_ids.len() == input.seq_len,
@@ -660,40 +1233,95 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden(
         input.seq_len
     );
     let world_size = weights.world_size();
-    let global_hidden = all_gather_bf16_hidden(ctx, comm, input, world_size)?;
+    all_gather_bf16_hidden_into(ctx, comm, input, world_size, &mut moe_scratch.global_hidden)?;
     let global_token_ids = if layer < config.n_hash_layers {
-        Some(all_gather_u32(ctx, comm, token_ids, world_size)?)
+        all_gather_u32_into(
+            ctx,
+            comm,
+            token_ids,
+            world_size,
+            &mut moe_scratch.global_token_ids,
+        )?;
+        Some(&moe_scratch.global_token_ids)
     } else {
         None
     };
 
     let ffn = weights.ffn(layer)?;
     let routed = if layer < config.n_hash_layers {
-        hash_route_bf16_hidden(
+        hash_route_bf16_hidden_into(
             ctx,
             config,
-            &global_hidden,
+            &moe_scratch.global_hidden,
             &ffn,
-            global_token_ids
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing gathered token ids"))?,
+            global_token_ids.ok_or_else(|| anyhow::anyhow!("missing gathered token ids"))?,
+            &mut moe_scratch.route_weights,
+            &mut moe_scratch.route_indices,
         )?
     } else {
-        score_route_bf16_hidden(ctx, config, &global_hidden, &ffn)?
+        score_route_bf16_hidden_into(
+            ctx,
+            config,
+            &moe_scratch.global_hidden,
+            &ffn,
+            &mut moe_scratch.route_weights,
+            &mut moe_scratch.route_indices,
+        )?
     };
-    let plan = build_moe_fused_route_plan(ctx, config, weights, routed, global_hidden.hidden_dim)?;
-    let expanded_input = expand_moe_fused_input(ctx, &global_hidden, &plan)?;
-    let expanded_out = local_experts_forward_packed_bf16_hidden(
+    let plan = build_moe_fused_route_plan_into(
+        ctx,
+        config,
+        weights,
+        routed,
+        moe_scratch.global_hidden.hidden_dim,
+        &mut moe_scratch.pos_to_token,
+        &mut moe_scratch.pos_to_token_topk,
+        &mut moe_scratch.token_topk_to_pos,
+        &mut moe_scratch.expert_indptr,
+        &mut moe_scratch.expert_cursor,
+        &mut moe_scratch.local_count,
+    )?;
+    expand_moe_fused_input_into(
+        ctx,
+        &moe_scratch.global_hidden,
+        &plan,
+        &mut moe_scratch.expanded_input,
+    )?;
+    let expanded_out = local_experts_forward_packed_bf16_hidden_scratch(
         ctx,
         config,
         ptr_cache,
         layer,
-        &expanded_input,
+        &moe_scratch.expanded_input,
         &plan,
+        &mut moe_scratch.expert_gate,
+        &mut moe_scratch.expert_up,
+        &mut moe_scratch.expert_activated,
+        &mut moe_scratch.expert_out,
+        &mut moe_scratch.fp4_act_workspace,
+        &mut moe_scratch.fp4_act_scale_workspace,
     )?;
-    let partial_routed =
-        reduce_moe_fused_output_f32(ctx, &expanded_out, &plan, global_hidden.hidden_dim)?;
-    let local_routed = reduce_scatter_f32_hidden(ctx, comm, &partial_routed, world_size)?;
-    let shared = shared_expert_forward_bf16_hidden(ctx, input, &ffn, config.swiglu_limit)?;
-    add_f32_bf16_to_bf16_hidden(ctx, &local_routed, &shared)
+    reduce_moe_fused_output_f32_into(
+        ctx,
+        expanded_out,
+        &plan,
+        moe_scratch.global_hidden.hidden_dim,
+        &mut moe_scratch.partial_routed,
+    )?;
+    reduce_scatter_f32_hidden_into(
+        ctx,
+        comm,
+        &moe_scratch.partial_routed,
+        world_size,
+        &mut moe_scratch.local_routed,
+    )?;
+    let shared = shared_expert_forward_bf16_hidden_scratch(
+        ctx,
+        input,
+        &ffn,
+        config.swiglu_limit,
+        shared_scratch,
+    )?;
+    add_f32_bf16_to_bf16_hidden_into(ctx, &moe_scratch.local_routed, shared, &mut moe_scratch.out)?;
+    Ok(&moe_scratch.out)
 }
