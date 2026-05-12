@@ -278,6 +278,8 @@ Reference source positions:
 | SGLang | `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
 | SGLang C++ quant | `/data/code/workspace-rustllm/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
 
+The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. PegaInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts. The next MoE copy target is therefore not another activation fusion; it is an active problem/tile list that keeps route metadata on GPU while avoiding the current capacity-style overlaunch.
+
 Current PegaInfer path after W13:
 
 ```text
