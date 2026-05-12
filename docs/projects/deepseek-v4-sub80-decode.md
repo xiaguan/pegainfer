@@ -45,4 +45,34 @@ After the grouped MoE pointer-cache commit, DeepSeek V4 fixed-token long bench i
   - `ReduceScatter_Sum_f32` improved after grouped MoE pointer caching, but its wall is still almost entirely arrival skew, so NCCL duration must not be read as pure transfer time.
   - The next code slice should label or isolate f32 all-reduce call sites before changing algorithms, because the kernel name alone mixes attention hidden all-reduce, indexer score reductions, and any other f32 all-reduce with the same element count.
 
+### Step 2: correct f32 all-reduce grouping and pick first code slice
+- The first pass grouped consecutive f32 NCCL kernels by 8. That is unsafe when one logical collective has large start skew: the group can contain duplicate devices and miss another device.
+- Corrected the grouping by joining `CUPTI_ACTIVITY_KIND_KERNEL.correlationId` to `CUPTI_ACTIVITY_KIND_RUNTIME.globalTid`, aligning each rank worker's f32 all-reduce sequence, and dropping the trace-boundary region.
+- Corrected result over the stable aligned region:
+
+| f32 all-reduce class | Groups | Logical wall sum | Start-skew sum | Tail sum | Avg wall | p50 wall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| attention hidden `1x4096` | 747 | `764.50ms` | `751.34ms` | `13.16ms` | `1.023ms` | `1.045ms` |
+| ratio-4 indexer score | 364 | `148.83ms` | `141.28ms` | `7.56ms` | `0.409ms` | `0.353ms` |
+
+- Interpretation:
+  - The dominant f32 all-reduce window is still attention hidden all-reduce, but the reliable per-window scale is about `1ms`, not the larger values produced by naive grouping.
+  - The time is almost entirely rank-arrival skew, not post-arrival NCCL tail.
+  - The first implementation slice targets repeated deterministic decode top-k index generation before attention all-reduce. `window_topk_indices_decode` is identical for every layer at the same `start_pos`; non-overlap compressed indices are identical for all layers sharing the same ratio.
+- Code attempt:
+  - Added `DecodeTopkIndices`, built once per rank per decode token.
+  - Reused cached window indices in ratio-0, ratio-4, and non-overlap compressed attention.
+  - Reused cached deterministic compressed indices for non-overlap compressed attention.
+  - No new `bs=1` or `seq_len=1` specialization was added.
+- Local validation:
+  - `cargo fmt --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- 5090 validation:
+  - Exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+  - Fixed-token bench round 1: `steady_tpot_ms.avg = 87.691639`, hash `6346f03343d75a65`.
+  - Fixed-token bench round 2: `steady_tpot_ms.avg = 86.373297`, hash `6346f03343d75a65`.
+- Decision:
+  - Do not keep the top-k cache code. It is correct, but it does not move the fixed-token long bench below the existing `83.37-89.65ms` post-pointer-cache range.
+  - The result suggests deterministic top-k index generation is not a dominant contributor to the remaining hidden all-reduce arrival skew.
+
 ## Debrief
