@@ -52,7 +52,9 @@ impl EpAllToAll for RdmaBackend {
         _send_buf: &SendBuf<'_>,
         _recv_buf: &mut RecvBuf<'_>,
     ) -> Result<DispatchHandle> {
-        todo!("§8.5: translate DispatchPlan + buffers into AllToAllContext::dispatch_send")
+        todo!(
+            "§8.5: translate DispatchPlan + buffers into AllToAllContext::dispatch_send"
+        )
     }
 
     fn combine(
@@ -61,7 +63,9 @@ impl EpAllToAll for RdmaBackend {
         _send_buf: &SendBuf<'_>,
         _recv_buf: &mut RecvBuf<'_>,
     ) -> Result<CombineHandle> {
-        todo!("§8.5: translate CombinePlan + buffers into AllToAllContext::combine_send")
+        todo!(
+            "§8.5: translate CombinePlan + buffers into AllToAllContext::combine_send"
+        )
     }
 
     fn poll(&self, _handle: &AnyHandle) -> Result<Poll> {

@@ -41,11 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e
             )
         })?;
-    bindings
-        .write_to_file(out_dir.join("libibverbs-bindings.rs"))
-        .map_err(|e| {
-            format!("libibverbs-sys build error: cannot write libibverbs-bindings.rs: {}", e)
-        })?;
+    bindings.write_to_file(out_dir.join("libibverbs-bindings.rs")).map_err(|e| {
+        format!(
+            "libibverbs-sys build error: cannot write libibverbs-bindings.rs: {}",
+            e
+        )
+    })?;
 
     // Compile wrap_static_fns.c
     cc::Build::new()

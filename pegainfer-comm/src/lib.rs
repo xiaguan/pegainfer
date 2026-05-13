@@ -47,15 +47,15 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod builder;
 mod buffer;
+mod builder;
 mod error;
 mod handle;
 mod plan;
 mod r#trait;
 
-pub use builder::{EpBackend, EpBackendBuilder, EpTopology};
 pub use buffer::{RecvBuf, SendBuf};
+pub use builder::{EpBackend, EpBackendBuilder, EpTopology};
 pub use error::{Error, Result};
 pub use handle::{AnyHandle, CombineHandle, DispatchHandle, Poll};
 pub use plan::{CombinePlan, DispatchPlan};

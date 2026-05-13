@@ -33,11 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_dir.join("cuda-bindings.rs"))
-        .map_err(|e| {
-            format!("cuda-sys build error: cannot write cuda-bindings.rs: {}", e)
-        })?;
+    bindings.write_to_file(out_dir.join("cuda-bindings.rs")).map_err(|e| {
+        format!("cuda-sys build error: cannot write cuda-bindings.rs: {}", e)
+    })?;
 
     // Dynamic link dependencies
     println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_home.display());

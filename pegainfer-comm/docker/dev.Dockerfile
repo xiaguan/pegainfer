@@ -71,4 +71,3 @@ ENV PATH="/root/.cargo/bin:$PATH" \
 # Python dependencies
 RUN python3 -m pip install numpy ninja maturin \
     pytest coverage mypy pylint ruff
-

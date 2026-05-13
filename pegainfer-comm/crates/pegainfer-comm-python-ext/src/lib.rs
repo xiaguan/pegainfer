@@ -7,7 +7,10 @@
 //! a non-hardware host (useful for `cargo build --workspace` and packaging
 //! smoke tests).
 
-use pyo3::{Bound, PyResult, pymodule, types::{PyModule, PyModuleMethods}};
+use pyo3::{
+    Bound, PyResult, pymodule,
+    types::{PyModule, PyModuleMethods},
+};
 
 #[cfg(feature = "hw-rdma")]
 mod py_cumem;

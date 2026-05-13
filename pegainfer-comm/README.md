@@ -130,14 +130,15 @@ window:
 ```rust
 use pegainfer_comm::{EpBackendBuilder, EpTopology};
 
-let topology = EpTopology {
-    world_size: 1,
-    rank: 0,
-    num_experts: 0,
-    hidden_dim: 0,
-    max_num_tokens: 0,
-    // ..non-exhaustive
-};
+// `EpTopology` is `#[non_exhaustive]`; outside this crate the constructor
+// is the only stable way to obtain one.
+let topology = EpTopology::new(
+    /* world_size     */ 1,
+    /* rank           */ 0,
+    /* num_experts    */ 0,
+    /* hidden_dim     */ 0,
+    /* max_num_tokens */ 0,
+);
 
 match EpBackendBuilder::new().topology(topology).build() {
     Ok(_backend) => {

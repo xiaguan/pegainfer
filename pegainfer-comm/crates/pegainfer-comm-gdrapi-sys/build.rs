@@ -31,11 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_dir.join("gdrapi-bindings.rs"))
-        .map_err(|e| {
-            format!("gdrapi-sys build error: cannot write gdrapi-bindings.rs: {}", e)
-        })?;
+    bindings.write_to_file(out_dir.join("gdrapi-bindings.rs")).map_err(|e| {
+        format!("gdrapi-sys build error: cannot write gdrapi-bindings.rs: {}", e)
+    })?;
 
     // Dynamic link dependencies
     println!("cargo:rustc-link-lib=gdrapi");

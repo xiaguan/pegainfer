@@ -21,6 +21,10 @@ use crate::r#trait::EpAllToAll;
 ///
 /// Skeleton: only the fields PegaInfer currently passes are present.
 /// Marked `#[non_exhaustive]` so additions are non-breaking.
+///
+/// Construct with [`EpTopology::new`]; the struct is `#[non_exhaustive]`
+/// so callers outside this crate cannot use a struct literal. Fields
+/// stay `pub` for read-side ergonomics on the builder.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct EpTopology {
@@ -36,6 +40,27 @@ pub struct EpTopology {
     /// carry. Used to size internal staging buffers at construction
     /// time so per-call dispatch never allocates.
     pub max_num_tokens: u32,
+}
+
+impl EpTopology {
+    /// Construct a topology description from the rank-layout values the
+    /// backend needs at build time.
+    ///
+    /// The skeleton-PR contract is: this constructor is the only stable
+    /// way to obtain an `EpTopology` from outside this crate. Adding a
+    /// new field in a follow-up PR will add a new constructor variant
+    /// (or a builder) rather than break this signature, but any caller
+    /// that wants forward-compatibility should treat this signature as
+    /// subject to revision while the public surface is in skeleton form.
+    pub fn new(
+        world_size: u32,
+        rank: u32,
+        num_experts: u32,
+        hidden_dim: u32,
+        max_num_tokens: u32,
+    ) -> Self {
+        Self { world_size, rank, num_experts, hidden_dim, max_num_tokens }
+    }
 }
 
 /// Builder for [`EpBackend`].
@@ -101,9 +126,8 @@ impl EpBackendBuilder {
 
         #[cfg(feature = "hw-rdma")]
         {
-            let _topology = self
-                .topology
-                .ok_or(Error::InvalidPlan("topology not configured"))?;
+            let _topology =
+                self.topology.ok_or(Error::InvalidPlan("topology not configured"))?;
             Err(Error::Unimplemented {
                 what: "RdmaBackend dispatch/combine/poll/release wiring (skeleton PR; landed separately)",
             })

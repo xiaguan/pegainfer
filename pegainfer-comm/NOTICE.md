@@ -63,12 +63,34 @@ Relative to the upstream commit listed above:
 
 ## Attribution policy
 
-The upstream project name `pplx-garden` is preserved here for attribution.
-None of the new public surface (Rust crate names, module names, Python entry
-points) is intended to be renamed away from the upstream identifiers in this
-tree. Any downstream consumer crate (for example `pegainfer-comm`) wrapping
-this tree is responsible for its own public-API naming and for republishing
-this NOTICE alongside the original `LICENSE`.
+The upstream project name `pplx-garden` is preserved here for attribution
+purposes. The upstream commit hash, license, and modification list above are
+the authoritative attribution record for this vendored import; they must be
+retained in any redistribution.
+
+The vendored Rust workspace crates have been renamed under the
+`pegainfer-comm-*` prefix (for example `pegainfer-comm-p2p-all-to-all`,
+`pegainfer-comm-fabric-lib`) so the workspace can coexist with PegaInfer's
+existing crate namespace and so the public surface is PegaInfer-owned:
+
+* **PegaInfer-owned in this tree** — the Rust workspace crate names, the
+  top-level `pegainfer-comm` crate, and the public PegaInfer-facing API it
+  exposes (`EpAllToAll`, `EpBackend`, `EpBackendBuilder`, `EpTopology`,
+  `DispatchPlan` / `CombinePlan`, `SendBuf` / `RecvBuf`, the handle and error
+  types). These names are this tree's, not upstream's.
+* **Preserved from upstream for attribution / interop where intentionally
+  retained** — the Python distribution name `pplx_garden` (Python package /
+  wheel name) and the upstream symbol-level identifiers reachable through it
+  (`AllToAllContext`, `TransferEngine`, `TransferEngineBuilder`, ...). These
+  are kept on the upstream-derived path so the vendored test suite and
+  upstream documentation references stay recognisable.
+* **Internal layout names** — internal module / file names inside the renamed
+  Rust crates may continue to mirror upstream layout when that helps compare
+  against the vendored tests or upstream source. These names are not
+  PegaInfer public API.
+
+When this tree is included in further redistributions, this NOTICE plus the
+original MIT `LICENSE` must be carried alongside the code per the MIT terms.
 
 ## Provenance
 
