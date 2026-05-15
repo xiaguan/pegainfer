@@ -744,6 +744,23 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_compressor_overlap_prefill_projected_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        kv_projected: *mut f32,
+        score_projected: *mut f32,
+        weighted: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_compressor_nonoverlap_decode_cuda(
         x: *const Half,
         wkv: *const Half,

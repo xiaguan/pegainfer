@@ -465,6 +465,64 @@ __global__ void deepseek_compressor_overlap_weighted_serial_kernel(
   weighted[compressed * head_dim + dim] = acc / denom;
 }
 
+__global__ void deepseek_compressor_overlap_combine_projected_kernel(
+    const float *__restrict__ kv_projected,
+    const float *__restrict__ score_projected,
+    const float *__restrict__ ape,
+    float *__restrict__ weighted,
+    int compressed_len,
+    int head_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = compressed_len * head_dim;
+  if (idx >= total) return;
+
+  int dim = idx % head_dim;
+  int compressed = idx / head_dim;
+  constexpr int ratio = 4;
+  constexpr int routes = 8;
+  float scores[routes];
+  float values[routes];
+
+#pragma unroll
+  for (int route = 0; route < routes; ++route) {
+    bool valid = true;
+    int token = 0;
+    int out_dim = 0;
+    int ape_dim = 0;
+    if (route < ratio) {
+      valid = compressed > 0;
+      token = (compressed - 1) * ratio + route;
+      out_dim = dim;
+      ape_dim = route * (2 * head_dim) + dim;
+    } else {
+      int local_route = route - ratio;
+      token = compressed * ratio + local_route;
+      out_dim = head_dim + dim;
+      ape_dim = local_route * (2 * head_dim) + head_dim + dim;
+    }
+
+    int projected_idx = token * (2 * head_dim) + out_dim;
+    scores[route] = valid ? score_projected[projected_idx] + ape[ape_dim]
+                          : -3.4028234663852886e38f;
+    values[route] = valid ? kv_projected[projected_idx] : 0.0f;
+  }
+
+  float max_score = -3.4028234663852886e38f;
+#pragma unroll
+  for (int route = 0; route < routes; ++route) {
+    max_score = fmaxf(max_score, scores[route]);
+  }
+  float denom = 0.0f;
+  float acc = 0.0f;
+#pragma unroll
+  for (int route = 0; route < routes; ++route) {
+    float prob = expf(scores[route] - max_score);
+    denom += prob;
+    acc += prob * values[route];
+  }
+  weighted[idx] = acc / denom;
+}
+
 __global__ void deepseek_compressor_decode_project_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ wkv,
@@ -801,6 +859,52 @@ cudaError_t deepseek_bf16_linear_cuda(
   return cudaGetLastError();
 }
 
+cudaError_t deepseek_bf16_linear_f32_cuda(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *weight,
+    float *out,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    cudaStream_t stream) {
+  DeepseekCompressorScratch* scratch_ptr = nullptr;
+  cudaError_t cuda_status = deepseek_compressor_scratch_for_device(&scratch_ptr);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  DeepseekCompressorScratch& scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  cuda_status = deepseek_ensure_compressor_bf16_linear_handle(scratch);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  cublasStatus_t status = cublasSetStream(scratch.bf16_linear_handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  status = cublasGemmEx(
+      scratch.bf16_linear_handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      out_dim,
+      seq_len,
+      in_dim,
+      &alpha,
+      weight,
+      CUDA_R_16BF,
+      in_dim,
+      x,
+      CUDA_R_16BF,
+      in_dim,
+      &beta,
+      out,
+      CUDA_R_32F,
+      out_dim,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
+  return cudaGetLastError();
+}
+
 cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
@@ -858,6 +962,50 @@ cudaError_t deepseek_compressor_overlap_prefill_cuda(
 
   int norm_total = compressed_len * head_dim;
   int norm_blocks = (norm_total + threads - 1) / threads;
+  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
+      weighted, norm, out, compressed_len, head_dim, eps);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_compressor_overlap_prefill_projected_cuda(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *wkv,
+    const __nv_bfloat16 *wgate,
+    const float *ape,
+    const __nv_bfloat16 *norm,
+    float *kv_projected,
+    float *score_projected,
+    float *weighted,
+    __nv_bfloat16 *out,
+    int seq_len,
+    int hidden_dim,
+    int head_dim,
+    float eps,
+    cudaStream_t stream) {
+  if (seq_len < 4 || hidden_dim <= 0 || head_dim <= 0 || kv_projected == nullptr ||
+      score_projected == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int ratio = 4;
+  int compressed_len = seq_len / ratio;
+  int projected_dim = 2 * head_dim;
+
+  cudaError_t err = deepseek_bf16_linear_f32_cuda(
+      x, wkv, kv_projected, seq_len, hidden_dim, projected_dim, stream);
+  if (err != cudaSuccess) return err;
+  err = deepseek_bf16_linear_f32_cuda(
+      x, wgate, score_projected, seq_len, hidden_dim, projected_dim, stream);
+  if (err != cudaSuccess) return err;
+
+  constexpr int threads = 256;
+  int weighted_total = compressed_len * head_dim;
+  int weighted_blocks = (weighted_total + threads - 1) / threads;
+  deepseek_compressor_overlap_combine_projected_kernel<<<weighted_blocks, threads, 0, stream>>>(
+      kv_projected, score_projected, ape, weighted, compressed_len, head_dim);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  int norm_blocks = (weighted_total + threads - 1) / threads;
   deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
       weighted, norm, out, compressed_len, head_dim, eps);
   return cudaGetLastError();

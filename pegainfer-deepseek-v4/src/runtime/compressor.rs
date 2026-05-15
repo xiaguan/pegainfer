@@ -234,6 +234,9 @@ pub fn compressor_overlap_prefill_bf16_hidden_with_dim(
         compressor.norm.tensor.shape
     );
 
+    let projection_len = input.seq_len * 2 * head_dim;
+    let mut kv_projected: CudaSlice<f32> = ctx.stream.alloc_zeros(projection_len)?;
+    let mut score_projected: CudaSlice<f32> = ctx.stream.alloc_zeros(projection_len)?;
     let mut weighted: CudaSlice<f32> = ctx.stream.alloc_zeros(compressed_len * head_dim)?;
     let mut out = Bf16HiddenStates::zeros(ctx, head_dim, compressed_len)?;
     {
@@ -242,15 +245,20 @@ pub fn compressor_overlap_prefill_bf16_hidden_with_dim(
         let (wgate_ptr, _wgate_guard) = compressor.wgate.tensor.data.device_ptr(&ctx.stream);
         let (ape_ptr, _ape_guard) = compressor.ape.tensor.data.device_ptr(&ctx.stream);
         let (norm_ptr, _norm_guard) = compressor.norm.tensor.data.device_ptr(&ctx.stream);
+        let (kv_projected_ptr, _kv_projected_guard) = kv_projected.device_ptr_mut(&ctx.stream);
+        let (score_projected_ptr, _score_projected_guard) =
+            score_projected.device_ptr_mut(&ctx.stream);
         let (weighted_ptr, _weighted_guard) = weighted.device_ptr_mut(&ctx.stream);
         let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
-            ffi::deepseek_compressor_overlap_prefill_cuda(
+            ffi::deepseek_compressor_overlap_prefill_projected_cuda(
                 x_ptr as *const ffi::Half,
                 wkv_ptr as *const ffi::Half,
                 wgate_ptr as *const ffi::Half,
                 ape_ptr as *const f32,
                 norm_ptr as *const ffi::Half,
+                kv_projected_ptr as *mut f32,
+                score_projected_ptr as *mut f32,
                 weighted_ptr as *mut f32,
                 out_ptr as *mut ffi::Half,
                 input.seq_len as i32,
