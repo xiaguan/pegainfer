@@ -508,6 +508,20 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         });
     }
 
+    // Fallback: when no NICs co-locate with any GPU switch group (intra-node
+    // NVLink-only), distribute the leftover visible NICs across GPUs so the
+    // upstream Worker init (which insists on 1 or 2 Verbs domains per GPU)
+    // still has something to bind. The data plane for single-node EP runs
+    // over NVLink, so the bound NIC is essentially a placeholder.
+    if !topo_groups.is_empty() && topo_groups.iter().all(|g| g.domains.is_empty()) {
+        let fallback: Vec<_> = visible_nics.values().cloned().collect();
+        if let Some(first_nic) = fallback.into_iter().next() {
+            for g in &mut topo_groups {
+                g.domains.push(first_nic.clone());
+            }
+        }
+    }
+
     Ok(topo_groups)
 }
 
