@@ -1,4 +1,6 @@
 mod affinity;
+#[cfg(feature = "pplx-ep")]
+pub mod pplx_bootstrap;
 mod scheduler;
 mod worker;
 

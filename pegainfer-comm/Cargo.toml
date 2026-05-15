@@ -15,9 +15,11 @@ default = []
 hw-rdma = [
     "dep:p2p-all-to-all",
     "dep:fabric-lib",
+    "dep:cuda-lib",
     "dep:anyhow",
     "p2p-all-to-all/hw-rdma",
     "fabric-lib/hw-rdma",
+    "cuda-lib/hw-cuda",
 ]
 
 [dependencies]
@@ -25,4 +27,5 @@ thiserror = { workspace = true }
 # Hardware-only dependencies. Default-feature builds MUST NOT link these.
 p2p-all-to-all = { path = "crates/pegainfer-comm-p2p-all-to-all", package = "pegainfer-comm-p2p-all-to-all", optional = true }
 fabric-lib = { path = "crates/pegainfer-comm-fabric-lib", package = "pegainfer-comm-fabric-lib", optional = true }
+cuda-lib = { path = "crates/pegainfer-comm-cuda-lib", package = "pegainfer-comm-cuda-lib", optional = true }
 anyhow = { workspace = true, optional = true }

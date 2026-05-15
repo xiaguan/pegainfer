@@ -26,3 +26,14 @@ mod ep_backend;
 pub use ep_backend::{
     EpBackend, EpBackendParams, EpDtypes, EpRankBuffers, EpTopology, ScalarType,
 };
+
+/// Re-exports of the underlying `pplx-garden` building blocks. Available
+/// under the `hw-rdma` feature so PegaInfer-side bootstrap code can build
+/// `EpBackendParams` without taking direct dependencies on the vendored
+/// crates.
+#[cfg(feature = "hw-rdma")]
+pub mod raw {
+    pub use cuda_lib;
+    pub use fabric_lib;
+    pub use p2p_all_to_all;
+}

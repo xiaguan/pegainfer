@@ -41,9 +41,8 @@ comfy-table = "7.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
-    "cuda-version-from-build-system",
+    "cuda-12090",
     "cublas",
-    "cuda-13010",
     "f16",
     "nccl",
 ] }
