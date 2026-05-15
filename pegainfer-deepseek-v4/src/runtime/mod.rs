@@ -23,6 +23,8 @@ mod compressor;
 mod core;
 mod indexer;
 mod moe;
+#[cfg(feature = "pplx-ep")]
+mod moe_pplx;
 mod state;
 
 pub use self::attention::*;
@@ -33,4 +35,9 @@ pub use self::compressor::*;
 pub use self::core::*;
 pub use self::indexer::*;
 pub use self::moe::*;
+#[cfg(feature = "pplx-ep")]
+pub use self::moe_pplx::*;
+#[cfg(feature = "pplx-ep")]
+pub(crate) use self::state::MoePplxRunContext;
+pub(crate) use self::state::MoeRunContext;
 pub use self::state::*;

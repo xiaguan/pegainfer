@@ -299,6 +299,20 @@ impl DeepSeekV4DirectGenerator {
         self.config.eos_token_id
     }
 
+    /// Activate the pplx-garden NVLink + RDMA EP backend on every rank.
+    ///
+    /// `ep_backends` must have length equal to the model's tensor-parallel
+    /// world size; element `i` is moved into rank `i`'s worker. After this
+    /// returns Ok, decode-time MoE routing uses dispatch/combine instead
+    /// of NCCL AG/RS. CUDA Graph decode capture must be disabled in the
+    /// caller's run loop when pplx is active (the pplx worker thread
+    /// participates in host-side bookkeeping that is incompatible with
+    /// graph capture/replay).
+    #[cfg(feature = "pplx-ep")]
+    pub fn enable_pplx(&self, ep_backends: Vec<pegainfer_comm::EpBackend>) -> Result<()> {
+        self.runtime.enable_pplx(ep_backends)
+    }
+
     pub fn start_greedy_request(
         &mut self,
         prompt_tokens: &[u32],

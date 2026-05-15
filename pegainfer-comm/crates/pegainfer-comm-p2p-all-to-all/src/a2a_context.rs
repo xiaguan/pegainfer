@@ -1,5 +1,6 @@
 use std::{ffi::c_void, ptr::null_mut, sync::Arc, thread::JoinHandle};
 
+use a2a_kernels::ScalarType;
 use anyhow::{Result, anyhow};
 use cuda_lib::{
     CudaDeviceMemory, cuda_check,
@@ -7,7 +8,6 @@ use cuda_lib::{
 };
 use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
 use thread_lib::pin_cpu;
-use torch_lib::ScalarType;
 
 use crate::{a2a_handles::AllToAllRankHandle, a2a_worker::WorkerState};
 
@@ -484,6 +484,14 @@ impl AllToAllContext {
         }
 
         Ok(())
+    }
+
+    /// Device pointer to the worker's `tokens_per_expert` buffer, sized
+    /// `num_local_experts` u32. Populated by `dispatch_recv`; callers read
+    /// it (typically D2H + prefix-sum) to drive a downstream local
+    /// grouped-expert GEMM. Caller must not mutate the buffer.
+    pub fn tokens_per_expert_ptr(&self) -> *const u32 {
+        self.worker.tokens_per_expert.get_device_ptr()
     }
 }
 

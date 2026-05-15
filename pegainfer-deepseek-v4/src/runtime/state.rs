@@ -118,6 +118,67 @@ pub(crate) struct FinalLogitsScratch {
     pub(crate) gathered_logits: F32Logits,
 }
 
+/// Per-decode-step MoE-side context handed to `block_decode_rank_lane_*`.
+///
+/// Holds the always-present NCCL all-reduce / AG-RS lane plus, when the
+/// `pplx-ep` feature is on, an optional pplx-garden EP lane. The block
+/// decode helper routes the routed-expert step to whichever lane is
+/// configured; both lanes are mutually exclusive within a single layer.
+pub(crate) struct MoeRunContext<'a> {
+    pub(crate) moe_comm: &'a cudarc::nccl::safe::Comm,
+    pub(crate) ag_rs_scratch: &'a mut MoeAgRsScratch,
+    #[cfg(feature = "pplx-ep")]
+    pub(crate) pplx: Option<MoePplxRunContext<'a>>,
+}
+
+/// Per-decode-step pplx-lane bundle. Borrows the rank worker's persistent
+/// `EpBackend`, MoE-side CUDA stream, and pplx scratch.
+#[cfg(feature = "pplx-ep")]
+pub(crate) struct MoePplxRunContext<'a> {
+    pub(crate) ep: &'a mut pegainfer_comm::EpBackend,
+    pub(crate) moe_stream: &'a cudarc::driver::CudaStream,
+    pub(crate) scratch: &'a mut MoePplxScratch,
+}
+
+/// Scratch + MR-registered staging memory for the pplx-garden EP all-to-all
+/// decode path. Field set mirrors only what the pplx flow actually consumes
+/// — no global hidden, no partial/local routed F32 buffers (the combine
+/// kernel reduces in-place into the BF16 output).
+#[cfg(feature = "pplx-ep")]
+pub(crate) struct MoePplxScratch {
+    /// Local route output: top-k weights `[seq_len, topk]`.
+    pub(crate) route_weights: cudarc::driver::CudaSlice<f32>,
+    /// Local route output: top-k global expert indices `[seq_len, topk]`.
+    pub(crate) route_indices: cudarc::driver::CudaSlice<i32>,
+    /// Receiver-side expert-packed activation. Sized for `max_recv_tokens`
+    /// rows; `dispatch_recv` writes here.
+    pub(crate) expanded_input: Bf16HiddenStates,
+    /// Grouped W1 output scratch (intermediate dim).
+    pub(crate) expert_gate: Bf16HiddenStates,
+    /// Grouped W3 output scratch (intermediate dim).
+    pub(crate) expert_up: Bf16HiddenStates,
+    /// Grouped W2 + SwiGLU output (hidden dim). Fed into `combine_send`.
+    pub(crate) expert_out: Bf16HiddenStates,
+    /// FP4 activation workspace shared between grouped GEMMs.
+    pub(crate) fp4_act_workspace: cudarc::driver::CudaSlice<u8>,
+    /// FP4 activation-scale workspace shared between grouped GEMMs.
+    pub(crate) fp4_act_scale_workspace: cudarc::driver::CudaSlice<u8>,
+    /// Exclusive prefix sum of received tokens per local expert
+    /// (`local_experts + 1` entries). Built from a D2H readback of
+    /// `EpBackend::tokens_per_expert_ptr` after `dispatch_recv`.
+    pub(crate) expert_indptr: cudarc::driver::CudaSlice<i32>,
+    /// Single-i32 scratch that `dispatch_recv` writes the local
+    /// received-token count into. Read back to host before `combine_recv`.
+    pub(crate) num_recv_tokens: cudarc::driver::CudaSlice<i32>,
+    /// Host buffer used to readback `tokens_per_expert`
+    /// (sized `local_experts`).
+    pub(crate) tokens_per_expert_host: Vec<u32>,
+    /// Final BF16 output `[seq_len, hidden_dim]`. Shared-expert result is
+    /// staged here first; `combine_recv` then runs with `accumulate=true`
+    /// to fold in the routed contribution.
+    pub(crate) out: Bf16HiddenStates,
+}
+
 pub(crate) struct MoeAgRsScratch {
     pub(crate) global_hidden: Bf16HiddenStates,
     pub(crate) global_token_ids: CudaSlice<u32>,
@@ -507,6 +568,72 @@ impl MoeAgRsScratch {
             fp4_act_scale_workspace,
             partial_routed,
             local_routed,
+            out,
+        })
+    }
+}
+
+#[cfg(feature = "pplx-ep")]
+impl MoePplxScratch {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        local_seq_capacity: usize,
+    ) -> Result<Self> {
+        ctx.set_current()?;
+        ensure!(
+            world_size > 0,
+            "MoE pplx scratch world size must be positive"
+        );
+        ensure!(
+            local_seq_capacity > 0,
+            "MoE pplx scratch local capacity must be positive"
+        );
+        ensure!(
+            config.n_routed_experts.is_multiple_of(world_size),
+            "MoE pplx scratch n_routed_experts={} not divisible by world_size={world_size}",
+            config.n_routed_experts
+        );
+        let topk = config.n_activated_experts;
+        let local_experts = config.n_routed_experts / world_size;
+        // Worst case: every peer's tokens all route to this rank's experts.
+        // Upstream caps the receive buffer at this product; matches the
+        // `max_recv_tokens` we pass to `EpBackend::new`.
+        let max_recv_tokens = local_seq_capacity * world_size * topk;
+
+        let route_capacity = local_seq_capacity * topk;
+        let route_weights = unsafe { ctx.stream.alloc(route_capacity)? };
+        let route_indices = unsafe { ctx.stream.alloc(route_capacity)? };
+
+        let expanded_input = Bf16HiddenStates::uninit(ctx, config.dim, max_recv_tokens)?;
+        let expert_gate = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, max_recv_tokens)?;
+        let expert_up = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, max_recv_tokens)?;
+        let expert_out = Bf16HiddenStates::uninit(ctx, config.dim, max_recv_tokens)?;
+        let max_fp4_input_dim = config.dim.max(config.moe_inter_dim);
+        let max_fp4_scale_cols = max_fp4_input_dim.div_ceil(128);
+        let fp4_act_workspace = unsafe { ctx.stream.alloc(max_recv_tokens * max_fp4_input_dim)? };
+        let fp4_act_scale_workspace =
+            unsafe { ctx.stream.alloc(max_recv_tokens * max_fp4_scale_cols)? };
+
+        let expert_indptr = unsafe { ctx.stream.alloc(local_experts + 1)? };
+        let num_recv_tokens = unsafe { ctx.stream.alloc(1)? };
+        let tokens_per_expert_host = vec![0u32; local_experts];
+
+        let out = Bf16HiddenStates::uninit(ctx, config.dim, local_seq_capacity)?;
+
+        Ok(Self {
+            route_weights,
+            route_indices,
+            expanded_input,
+            expert_gate,
+            expert_up,
+            expert_out,
+            fp4_act_workspace,
+            fp4_act_scale_workspace,
+            expert_indptr,
+            num_recv_tokens,
+            tokens_per_expert_host,
             out,
         })
     }

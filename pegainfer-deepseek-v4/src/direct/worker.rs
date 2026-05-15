@@ -13,8 +13,8 @@ use crate::{
     runtime::{
         AttentionAuxScratch, AttentionIndexScratch, AttentionOutputScratch,
         AttentionProjectionScratch, DecodeBatchMeta, DecodeEntryScratch, F32BatchLogits,
-        FinalLogitsScratch, HcPostScratch, HcPreNormScratch, MoeAgRsScratch, PrefillWindowTopk,
-        SharedExpertScratch, all_gather_logits, all_gather_logits_into,
+        FinalLogitsScratch, HcPostScratch, HcPreNormScratch, MoeAgRsScratch, MoeRunContext,
+        PrefillWindowTopk, SharedExpertScratch, all_gather_logits, all_gather_logits_into,
         block_decode_rank_lane_bf16_hidden_batch_with_scratch,
         block_decode_rank_lane_bf16_hidden_with_scratch,
         block_prefill_rank_lane_bf16_hidden_with_decode_cache, embedding_rank_local_into,
@@ -76,6 +76,17 @@ enum RankCommand {
         slot_id: usize,
         resp: channel::Sender<Result<()>>,
     },
+    /// Move an already-constructed pplx-garden EP backend into this rank
+    /// worker. The worker thread takes ownership; subsequent decode
+    /// commands dispatch the routed-expert step through pplx instead of
+    /// NCCL AG/RS. The companion `MoePplxScratch` is allocated on first
+    /// install. Must be invoked once per rank before the first decode if
+    /// the pplx path is desired.
+    #[cfg(feature = "pplx-ep")]
+    EnablePplx {
+        ep_backend: pegainfer_comm::EpBackend,
+        resp: channel::Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -113,6 +124,14 @@ struct RankDecodeScratch {
     hc_pre_norm: HcPreNormScratch,
     shared_expert: SharedExpertScratch,
     moe_ag_rs: MoeAgRsScratch,
+    /// Allocated only when the rank runs the pplx-garden EP decode path;
+    /// `None` for the default NCCL AG/RS path.
+    #[cfg(feature = "pplx-ep")]
+    moe_pplx: Option<crate::MoePplxScratch>,
+    /// Per-rank EP backend (worker thread + MR-registered buffers). Moved
+    /// in via `RankCommand::EnablePplx`; absent for the NCCL path.
+    #[cfg(feature = "pplx-ep")]
+    ep_backend: Option<pegainfer_comm::EpBackend>,
     attention_projection: AttentionProjectionScratch,
     attention_output: AttentionOutputScratch,
     attention_index: AttentionIndexScratch,
@@ -159,11 +178,39 @@ impl RankDecodeScratch {
             hc_pre_norm,
             shared_expert,
             moe_ag_rs,
+            #[cfg(feature = "pplx-ep")]
+            moe_pplx: None,
+            #[cfg(feature = "pplx-ep")]
+            ep_backend: None,
             attention_projection,
             attention_output,
             attention_index,
             attention_aux,
         })
+    }
+
+    /// Install the rank's pplx-garden EP backend + scratch. After this
+    /// returns Ok, subsequent decode commands route the routed-expert step
+    /// through pplx instead of NCCL AG/RS. Idempotent: a second call
+    /// replaces the existing backend.
+    #[cfg(feature = "pplx-ep")]
+    fn enable_pplx(
+        &mut self,
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        ep_backend: pegainfer_comm::EpBackend,
+    ) -> Result<()> {
+        if self.moe_pplx.is_none() {
+            self.moe_pplx = Some(crate::MoePplxScratch::new(
+                ctx,
+                config,
+                world_size,
+                DIRECT_BATCH_DECODE_CAPACITY,
+            )?);
+        }
+        self.ep_backend = Some(ep_backend);
+        Ok(())
     }
 
     fn token_ids(&mut self, ctx: &RankGpuContext, token_id: u32) -> Result<&CudaSlice<u32>> {
@@ -414,6 +461,16 @@ impl RankWorker {
                                     );
                                     let _ = resp.send(result);
                                 }
+                                #[cfg(feature = "pplx-ep")]
+                                RankCommand::EnablePplx { ep_backend, resp } => {
+                                    let result = decode_scratch.enable_pplx(
+                                        &ctx,
+                                        config,
+                                        weights.world_size(),
+                                        ep_backend,
+                                    );
+                                    let _ = resp.send(result);
+                                }
                                 RankCommand::Shutdown => break,
                             }
                         }
@@ -447,6 +504,23 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed"))?;
         Ok(resp_rx)
+    }
+
+    /// Move an already-constructed pplx-garden EP backend into this rank's
+    /// worker thread. Once acknowledged, subsequent `decode` / `decode_batch`
+    /// calls route the routed-expert step through pplx.
+    #[cfg(feature = "pplx-ep")]
+    fn enable_pplx(&self, ep_backend: pegainfer_comm::EpBackend) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::EnablePplx {
+                ep_backend,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed on EnablePplx"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped EnablePplx response"))?
     }
 
     #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
@@ -541,6 +615,30 @@ impl RankWorker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl FullDirectRuntime {
+    /// Move per-rank pplx-garden EP backends into the rank workers.
+    ///
+    /// `ep_backends` must have length equal to the world size; element `i`
+    /// is moved into rank `i`'s worker. After this returns Ok, subsequent
+    /// `decode` / `decode_batch` commands route the routed-expert step
+    /// through pplx instead of NCCL AG/RS on every rank.
+    #[cfg(feature = "pplx-ep")]
+    pub(super) fn enable_pplx(&self, ep_backends: Vec<pegainfer_comm::EpBackend>) -> Result<()> {
+        ensure!(
+            ep_backends.len() == self.workers.len(),
+            "enable_pplx expected {} EP backends (one per rank), got {}",
+            self.workers.len(),
+            ep_backends.len()
+        );
+        for (rank, (worker, ep)) in self.workers.iter().zip(ep_backends.into_iter()).enumerate() {
+            worker
+                .enable_pplx(ep)
+                .with_context(|| format!("enable pplx EP on rank {rank}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -1037,6 +1135,22 @@ fn run_decode_on_rank_lane(
     let mut current_hc_slot = None;
     for layer in 0..config.n_layers {
         let output_slot = current_hc_slot.map_or(0, |slot| 1 - slot);
+        #[cfg(feature = "pplx-ep")]
+        let moe_stream_arc = moe_comm.stream();
+        let mut moe_run = MoeRunContext {
+            moe_comm,
+            ag_rs_scratch: &mut scratch.moe_ag_rs,
+            #[cfg(feature = "pplx-ep")]
+            pplx: scratch
+                .ep_backend
+                .as_mut()
+                .zip(scratch.moe_pplx.as_mut())
+                .map(|(ep, s)| crate::runtime::MoePplxRunContext {
+                    ep,
+                    moe_stream: moe_stream_arc.as_ref(),
+                    scratch: s,
+                }),
+        };
         if let Some(input_slot) = current_hc_slot {
             let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
                 &mut scratch.hc_post.attention_reduce_temp,
@@ -1050,7 +1164,7 @@ fn run_decode_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
-                moe_comm,
+                &mut moe_run,
                 config,
                 layer,
                 hc_input,
@@ -1060,7 +1174,6 @@ fn run_decode_on_rank_lane(
                 &mut caches[layer],
                 &mut scratch.hc_pre_norm,
                 &mut scratch.shared_expert,
-                &mut scratch.moe_ag_rs,
                 &mut scratch.attention_projection,
                 &mut scratch.attention_output,
                 &mut scratch.attention_index,
@@ -1081,7 +1194,7 @@ fn run_decode_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
-                moe_comm,
+                &mut moe_run,
                 config,
                 layer,
                 &scratch.entry.hc_expand,
@@ -1091,7 +1204,6 @@ fn run_decode_on_rank_lane(
                 &mut caches[layer],
                 &mut scratch.hc_pre_norm,
                 &mut scratch.shared_expert,
-                &mut scratch.moe_ag_rs,
                 &mut scratch.attention_projection,
                 &mut scratch.attention_output,
                 &mut scratch.attention_index,
@@ -1224,6 +1336,22 @@ fn run_decode_batch_on_rank_lane(
             start_pos_host: &scratch.start_pos_host,
             slot_ids_host: &scratch.slot_ids_host,
         };
+        #[cfg(feature = "pplx-ep")]
+        let moe_stream_arc = moe_comm.stream();
+        let mut moe_run = MoeRunContext {
+            moe_comm,
+            ag_rs_scratch: &mut scratch.moe_ag_rs,
+            #[cfg(feature = "pplx-ep")]
+            pplx: scratch
+                .ep_backend
+                .as_mut()
+                .zip(scratch.moe_pplx.as_mut())
+                .map(|(ep, s)| crate::runtime::MoePplxRunContext {
+                    ep,
+                    moe_stream: moe_stream_arc.as_ref(),
+                    scratch: s,
+                }),
+        };
         if let Some(input_slot) = current_hc_slot {
             let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
                 &mut scratch.hc_post.attention_reduce_temp,
@@ -1237,7 +1365,7 @@ fn run_decode_batch_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
-                moe_comm,
+                &mut moe_run,
                 config,
                 layer,
                 hc_input,
@@ -1247,7 +1375,6 @@ fn run_decode_batch_on_rank_lane(
                 &mut caches[layer],
                 &mut scratch.hc_pre_norm,
                 &mut scratch.shared_expert,
-                &mut scratch.moe_ag_rs,
                 &mut scratch.attention_projection,
                 &mut scratch.attention_output,
                 &mut scratch.attention_index,
@@ -1268,7 +1395,7 @@ fn run_decode_batch_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
-                moe_comm,
+                &mut moe_run,
                 config,
                 layer,
                 &scratch.entry.hc_expand,
@@ -1278,7 +1405,6 @@ fn run_decode_batch_on_rank_lane(
                 &mut caches[layer],
                 &mut scratch.hc_pre_norm,
                 &mut scratch.shared_expert,
-                &mut scratch.moe_ag_rs,
                 &mut scratch.attention_projection,
                 &mut scratch.attention_output,
                 &mut scratch.attention_index,

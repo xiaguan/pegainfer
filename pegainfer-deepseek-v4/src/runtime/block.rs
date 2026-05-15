@@ -143,7 +143,7 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_with_scratch(
     weights: &RankWeightView<'_>,
     ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
-    moe_comm: &Comm,
+    moe: &mut MoeRunContext<'_>,
     config: &Config,
     layer: usize,
     input: &HcHiddenStates,
@@ -153,7 +153,6 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_with_scratch(
     cache: &mut LayerDecodeCache,
     hc_pre_norm_scratch: &mut HcPreNormScratch,
     shared_expert_scratch: &mut SharedExpertScratch,
-    moe_ag_rs_scratch: &mut MoeAgRsScratch,
     attention_projection_scratch: &mut AttentionProjectionScratch,
     attention_output_scratch: &mut AttentionOutputScratch,
     attention_index_scratch: &mut AttentionIndexScratch,
@@ -275,22 +274,66 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_with_scratch(
     )
     .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?;
 
-    let ffn_out = decode_moe_ag_rs_bf16_hidden_with_scratch(
+    let ffn_out = dispatch_decode_moe_step(
         ctx,
         config,
         weights,
         ptr_cache,
-        moe_comm,
+        moe,
         layer,
         ffn_norm,
         token_ids,
         shared_expert_scratch,
-        moe_ag_rs_scratch,
     )
-    .with_context(|| format!("decode MoE AG/RS layer {layer}"))?;
+    .with_context(|| format!("decode MoE layer {layer}"))?;
     hc_post_bf16_hidden_view_into(ctx, ffn_out, attention_hc_out, &ffn_hc, layer_out)
         .with_context(|| format!("hc_post ffn layer {layer}"))?;
     Ok(())
+}
+
+/// Routed-expert step dispatcher. Branches to the pplx-garden EP path when
+/// `moe.pplx` is `Some`, otherwise falls back to the always-present NCCL
+/// AG/RS path.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_decode_moe_step<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    weights: &RankWeightView<'_>,
+    ptr_cache: &MoeGroupedPtrCache,
+    moe: &'a mut MoeRunContext<'_>,
+    layer: usize,
+    ffn_norm: &Bf16HiddenStates,
+    token_ids: &CudaSlice<u32>,
+    shared_expert_scratch: &mut SharedExpertScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    #[cfg(feature = "pplx-ep")]
+    if let Some(pplx) = moe.pplx.as_mut() {
+        return super::moe_pplx::decode_moe_pplx_bf16_hidden_with_scratch(
+            ctx,
+            config,
+            weights,
+            ptr_cache,
+            pplx.ep,
+            pplx.moe_stream,
+            layer,
+            ffn_norm,
+            token_ids,
+            shared_expert_scratch,
+            pplx.scratch,
+        );
+    }
+    decode_moe_ag_rs_bf16_hidden_with_scratch(
+        ctx,
+        config,
+        weights,
+        ptr_cache,
+        moe.moe_comm,
+        layer,
+        ffn_norm,
+        token_ids,
+        shared_expert_scratch,
+        moe.ag_rs_scratch,
+    )
 }
 
 pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
@@ -298,7 +341,7 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
     weights: &RankWeightView<'_>,
     ptr_cache: &MoeGroupedPtrCache,
     comm: &Comm,
-    moe_comm: &Comm,
+    moe: &mut MoeRunContext<'_>,
     config: &Config,
     layer: usize,
     input: &HcHiddenStates,
@@ -308,7 +351,6 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
     cache: &mut LayerDecodeCache,
     hc_pre_norm_scratch: &mut HcPreNormScratch,
     shared_expert_scratch: &mut SharedExpertScratch,
-    moe_ag_rs_scratch: &mut MoeAgRsScratch,
     attention_projection_scratch: &mut AttentionProjectionScratch,
     attention_output_scratch: &mut AttentionOutputScratch,
     attention_index_scratch: &mut AttentionIndexScratch,
@@ -441,19 +483,18 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
     )
     .with_context(|| format!("hc_pre_norm batch ffn layer {layer}"))?;
 
-    let ffn_out = decode_moe_ag_rs_bf16_hidden_with_scratch(
+    let ffn_out = dispatch_decode_moe_step(
         ctx,
         config,
         weights,
         ptr_cache,
-        moe_comm,
+        moe,
         layer,
         ffn_norm,
         token_ids,
         shared_expert_scratch,
-        moe_ag_rs_scratch,
     )
-    .with_context(|| format!("decode batch MoE AG/RS layer {layer}"))?;
+    .with_context(|| format!("decode batch MoE layer {layer}"))?;
     hc_post_bf16_hidden_view_into(ctx, ffn_out, attention_hc_out, &ffn_hc, layer_out)
         .with_context(|| format!("hc_post batch ffn layer {layer}"))?;
     Ok(())

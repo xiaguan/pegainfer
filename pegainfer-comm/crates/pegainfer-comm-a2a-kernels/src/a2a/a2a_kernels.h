@@ -4,12 +4,9 @@
 #include <cstdint>
 #include <cstdlib>
 
-#include "pegainfer-comm-torch-lib/src/torch_lib.h"
-
-namespace a2a_kernels {
-using ScalarType = torch_lib::ScalarType;
-} // namespace a2a_kernels
-
+// `ScalarType` is defined inside the cxx bridge below, under the
+// `a2a_kernels` namespace. The cxx-generated header provides the C++ enum
+// declaration that the .cu sources reference as `a2a_kernels::ScalarType`.
 #include "pegainfer-comm-a2a-kernels/src/hw_cuda_impl.rs.h"
 
 namespace a2a_kernels {

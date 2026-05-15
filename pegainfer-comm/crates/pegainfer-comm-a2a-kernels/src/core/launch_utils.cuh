@@ -183,9 +183,9 @@ private:
 #ifndef LAUNCH_BASIC_FLOAT
 #define LAUNCH_BASIC_FLOAT(dtype, var, ...) \
     switch (dtype) { \
-        _LAUNCH_TYPE(torch_lib::ScalarType::F16, var, half, __VA_ARGS__) \
-        _LAUNCH_TYPE(torch_lib::ScalarType::BF16, var, __nv_bfloat16, __VA_ARGS__) \
-        _LAUNCH_TYPE(torch_lib::ScalarType::F32, var, float, __VA_ARGS__) \
+        _LAUNCH_TYPE(a2a_kernels::ScalarType::F16, var, half, __VA_ARGS__) \
+        _LAUNCH_TYPE(a2a_kernels::ScalarType::BF16, var, __nv_bfloat16, __VA_ARGS__) \
+        _LAUNCH_TYPE(a2a_kernels::ScalarType::F32, var, float, __VA_ARGS__) \
         default: { \
             assert(false && "Unsupported dtype"); \
             break; \

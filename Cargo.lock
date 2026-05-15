@@ -3358,6 +3358,8 @@ dependencies = [
 name = "pegainfer-comm"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "pegainfer-comm-fabric-lib",
  "pegainfer-comm-p2p-all-to-all",
  "thiserror 2.0.18",
 ]
@@ -3370,7 +3372,6 @@ dependencies = [
  "cxx",
  "cxx-build",
  "pegainfer-comm-build-utils",
- "pegainfer-comm-torch-lib",
 ]
 
 [[package]]
@@ -3485,7 +3486,6 @@ dependencies = [
  "pegainfer-comm-cuda-lib",
  "pegainfer-comm-fabric-lib",
  "pegainfer-comm-thread-lib",
- "pegainfer-comm-torch-lib",
  "tracing",
 ]
 
@@ -3573,6 +3573,7 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
+ "pegainfer-comm",
  "pegainfer-core",
  "pegainfer-kernels",
  "safetensors",
