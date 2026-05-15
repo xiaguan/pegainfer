@@ -451,11 +451,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     }
     let gpu_pci_device_id = get_gpu_pci_device_id()?;
 
-    // Get visible NICs via Verbs
+    // Get visible NICs via Verbs. May be empty on single-node NVLink-only
+    // deployments — the bootstrap still wants TopologyGroups so it can
+    // resolve CPU pinning.
     let domains = get_visible_domains();
-    if domains.is_empty() {
-        return Err(FabricLibError::Custom("No visible NICs"));
-    }
 
     // Get NIC PCI device ID
     let mut nic_pci_device_id_count = HashMap::new();
@@ -464,12 +463,14 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         *nic_pci_device_id_count.entry(pci_device_id).or_insert(0) += 1;
     }
     // Some systems have one ConnectX-7 per GPU, but also a few additional ConnectX-6.
-    // Use the most popular NIC PCI device ID.
+    // Use the most popular NIC PCI device ID; if there are no NICs at all
+    // fall back to a sentinel (0/0) so detect_system_topo still walks the
+    // GPU-only switch groups.
     let nic_pci_device_id = nic_pci_device_id_count
         .iter()
         .max_by_key(|(_, count)| *count)
         .map(|(pci_device_id, _)| *pci_device_id)
-        .ok_or(FabricLibError::Custom("No visible NICs"))?;
+        .unwrap_or(PciDeviceId { vendor: 0, device: 0 });
 
     // Detect system topology
     let system_topo = detect_system_topo(gpu_pci_device_id, nic_pci_device_id)?;
@@ -495,9 +496,9 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
                 domains.push(domain);
             }
         }
-        if domains.is_empty() {
-            continue;
-        }
+        // Single-node NVLink-only deployments have no co-located NICs.
+        // Emit the GPU with empty domains so the bootstrap can still find
+        // its CPU pinning data.
 
         topo_groups.push(TopologyGroup {
             cuda_device: cuda_device as u8,
