@@ -127,7 +127,7 @@ struct RankDecodeScratch {
     /// Allocated only when the rank runs the pplx-garden EP decode path;
     /// `None` for the default NCCL AG/RS path.
     #[cfg(feature = "pplx-ep")]
-    moe_pplx: Option<crate::MoePplxScratch>,
+    moe_pplx: Option<crate::runtime::MoePplxScratch>,
     /// Per-rank EP backend (worker thread + MR-registered buffers). Moved
     /// in via `RankCommand::EnablePplx`; absent for the NCCL path.
     #[cfg(feature = "pplx-ep")]
@@ -202,7 +202,7 @@ impl RankDecodeScratch {
         ep_backend: pegainfer_comm::EpBackend,
     ) -> Result<()> {
         if self.moe_pplx.is_none() {
-            self.moe_pplx = Some(crate::MoePplxScratch::new(
+            self.moe_pplx = Some(crate::runtime::MoePplxScratch::new(
                 ctx,
                 config,
                 world_size,

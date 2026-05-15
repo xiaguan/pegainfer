@@ -22,7 +22,9 @@ use pegainfer_comm::raw::cuda_lib::cumem::{
 };
 use pegainfer_comm::raw::cuda_lib::{CudaDeviceId, Device};
 use pegainfer_comm::raw::fabric_lib::api::{MemoryRegionDescriptor, MemoryRegionHandle};
-use pegainfer_comm::raw::fabric_lib::{TransferEngine, TransferEngineBuilder, topo};
+use pegainfer_comm::raw::fabric_lib::{
+    RdmaEngine, TransferEngine, TransferEngineBuilder, detect_topology,
+};
 use pegainfer_comm::raw::p2p_all_to_all::{AllToAllRankHandle, ScalarType};
 use pegainfer_comm::{EpBackend, EpBackendParams, EpDtypes, EpRankBuffers, EpTopology};
 
@@ -101,7 +103,7 @@ pub fn build_intra_node_backends(
     let num_local_experts = config.n_routed_experts / world_size;
 
     let max_num_tokens = params.max_num_tokens;
-    let num_experts_per_token = config.num_experts_per_tok;
+    let num_experts_per_token = config.n_activated_experts;
     let num_dp_groups = 1usize; // pure EP, no DP
 
     let avg_tokens_per_expert = {
@@ -142,7 +144,7 @@ pub fn build_intra_node_backends(
     let sync_buffer_bytes = std::mem::size_of::<u32>() * world_size * 2;
 
     // Build the single shared TransferEngine across all 8 GPUs.
-    let system_topo = topo::detect_topology().context("pplx bootstrap: detect_topology failed")?;
+    let system_topo = detect_topology().context("pplx bootstrap: detect_topology failed")?;
     let mut builder = TransferEngineBuilder::default();
     for &dev in devices {
         let group = system_topo
@@ -229,12 +231,13 @@ pub fn build_intra_node_backends(
         });
     }
 
-    // Phase 2: rank handles + per-rank peer pointer tables.
+    // Phase 2: capture per-rank handle descriptors. The fresh
+    // `Vec<AllToAllRankHandle>` is rebuilt per-backend below (the upstream
+    // struct is not `Clone`).
     let main_address = te.main_address();
-    let rank_handles: Vec<AllToAllRankHandle> = (0..world_size)
+    let rank_handle_parts: Vec<(MemoryRegionDescriptor, MemoryRegionDescriptor)> = (0..world_size)
         .map(|r| {
-            AllToAllRankHandle::new(
-                main_address.clone(),
+            (
                 resources[r].num_routed_desc.clone(),
                 resources[r].recv_buffer_desc.clone(),
             )
@@ -323,7 +326,7 @@ pub fn build_intra_node_backends(
         let dtypes = EpDtypes {
             in_elemsize,
             out_elemsize,
-            out_dtype: ScalarType::BFloat16,
+            out_dtype: ScalarType::BF16,
             scale_elemsize,
         };
         let buffers = EpRankBuffers {
@@ -338,11 +341,16 @@ pub fn build_intra_node_backends(
             recv_ptrs: peer_recv_ptrs[rank].clone(),
         };
 
+        let rank_handles: Vec<AllToAllRankHandle> = rank_handle_parts
+            .iter()
+            .map(|(nr, rb)| AllToAllRankHandle::new(main_address.clone(), nr.clone(), rb.clone()))
+            .collect();
+
         let backend = EpBackend::new(EpBackendParams {
             topology,
             dtypes,
             buffers,
-            rank_handles: rank_handles.clone(),
+            rank_handles,
             transfer_engine: te.clone(),
             device: dev_ord as u8,
             imm_base: params.imm_base,
