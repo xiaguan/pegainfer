@@ -46,6 +46,31 @@ GEMM/CuTe projection prototype:
   `deepseek_compressor_overlap_combine_projected_kernel`
 - route-combine bucket: about `7.43ms / 504 calls`
 
+Replacement cost:
+
+| Component | Calls | Total time |
+| --- | ---: | ---: |
+| BF16 GEMM projection, main overlap shape | 336 | `130.29ms` |
+| BF16 GEMM projection, indexer overlap shape | 672 | `68.51ms` |
+| Route-combine kernel | 504 | `7.43ms` |
+
+The measured replacement kernel cost for the two GEMM projection families plus
+route combine is about `206.23ms` in the 10k capture. The `1008` GEMM calls are
+expected: each overlap compressor call performs two projections, `x @ wkv.T`
+and `x @ wgate.T`, and the profile separates the main-compressor and
+indexer-compressor shapes.
+
+The Rust-side projected path also adds two F32 projection scratch buffers at the
+call site:
+
+- main overlap (`head_dim=512`): two buffers of
+  `10580 * 1024 * 4 = 43,335,680` bytes each, about `82.66 MiB` total per rank;
+- indexer overlap (`head_dim=128`): two buffers of
+  `10580 * 256 * 4 = 10,833,920` bytes each, about `20.66 MiB` total per rank.
+
+The existing weighted/output buffers are not new. The two F32 projection buffers
+above are the new memory pressure introduced by this candidate.
+
 The structural performance signal is strong enough to justify a product-level
 decision on numeric tolerance. It is not evidence that the branch is ready to
 become the default path under the current strict output-hash gate.
@@ -94,4 +119,3 @@ path with a quality golden set, such as:
 
 If this drift is not accepted, keep `deepseek_compressor_overlap_prefill_cuda`
 as the default overlap compressor path and do not merge this candidate branch.
-
