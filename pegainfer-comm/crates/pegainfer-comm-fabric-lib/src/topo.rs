@@ -301,11 +301,13 @@ fn scan_all_pci_devices() -> Result<Vec<PciProp>> {
         let pci_device_id = read_pci_device_id(&addr)?;
 
         let numa_node_path = parent_bus.get_sys_path() + "/numa_node";
-        let numa_node = std::fs::read_to_string(numa_node_path)
-            .map_err(|_| FabricLibError::Custom("Failed to read NUMA node"))?
-            .trim()
-            .parse::<usize>();
-        let Ok(numa_node) = numa_node else {
+        // Some derived parent-bus addresses (device=0, function=0) don't
+        // exist as a sysfs PCI device (e.g., when the parent switch port
+        // doesn't have a matching root function). Skip those entries.
+        let Ok(numa_node_text) = std::fs::read_to_string(numa_node_path) else {
+            continue;
+        };
+        let Ok(numa_node) = numa_node_text.trim().parse::<usize>() else {
             // NOTE: /sys/bus/pci/devices/0000:00:00.0/numa_node can be -1.
             continue;
         };
