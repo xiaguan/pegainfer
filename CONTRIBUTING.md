@@ -1,4 +1,4 @@
-\# Contributing to \[Proje Adı]
+# Contributing to pegainfer
 
 
 
