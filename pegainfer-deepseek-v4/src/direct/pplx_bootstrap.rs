@@ -227,6 +227,8 @@ pub fn build_intra_node_backends(
         let sync_mapping = sync_handle
             .map(device)
             .with_context(|| format!("CUMem map sync buffer on cuda:{dev_ord}"))?;
+        cuda_memset_zero(sync_mapping.data_ptr(), sync_buffer_bytes)
+            .with_context(|| format!("zero sync buffer on cuda:{dev_ord}"))?;
 
         let (num_routed_mr, num_routed_desc) = te
             .register_memory_allow_remote(num_routed_host.ptr, num_routed_bytes, Device::Host)
@@ -328,6 +330,13 @@ pub fn build_intra_node_backends(
     // Phase 3: construct EpBackends.
     let mut backends = Vec::with_capacity(world_size);
     for (rank, &dev_ord) in devices.iter().enumerate() {
+        // `EpBackend::new` allocates CUDA workspaces and GDR buffers via
+        // cudaMalloc/cuMemAlloc on the current context. Phase 1 leaves the
+        // process on the last device, so bind the rank device again before
+        // constructing each backend.
+        pegainfer_comm::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
+            .with_context(|| format!("cudaSetDevice({dev_ord}) before EpBackend::new"))?;
+
         let group = system_topo
             .iter()
             .find(|g| g.cuda_device as usize == dev_ord)
@@ -398,7 +407,7 @@ pub fn build_intra_node_backends(
         // The simplest correctness path: leak via Box::leak so they live
         // for process lifetime. Bootstrap is one-shot, so leak is fine.
         let leaked: &'static [CUMemMapping] = Box::leak(holders.into_boxed_slice());
-        std::mem::forget(leaked); // belt-and-suspenders
+        let _ = leaked;
         let _ = rank;
     }
 
@@ -410,5 +419,15 @@ fn round_up(value: usize, multiple: usize) -> usize {
         value
     } else {
         value.div_ceil(multiple) * multiple
+    }
+}
+
+fn cuda_memset_zero(ptr: NonNull<c_void>, bytes: usize) -> Result<()> {
+    let ret =
+        unsafe { pegainfer_comm::raw::cuda_lib::cudart_sys::cudaMemset(ptr.as_ptr(), 0, bytes) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        bail!("cudaMemset failed with code {ret}");
     }
 }

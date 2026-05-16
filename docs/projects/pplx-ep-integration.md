@@ -1,8 +1,8 @@
 # pplx-garden EP 后端接入 dsv4-flash
 
 **创建时间**：2026-05-15
-**状态**：draft（待 review）
-**当前 blocker**：本文档尚未达成共识，先 review 后再开工。
+**状态**：active（kernel-side illegal-address debug）
+**当前 blocker**：LOC_PROT 已解除；本地补齐 CUDA device binding、stride 单位、padded expert layout 后，`cargo check --release -p pegainfer-deepseek-v4 --features pplx-ep` 通过，等待 H200/8-rank 现场验证 `CUDA_ERROR_ILLEGAL_ADDRESS` 是否消失。Codex 默认 PATH 未包含 CUDA toolkit，需要临时带上 `/usr/local/cuda-13.1/bin` 才能让 cc-rs 找到 `nvcc`。
 
 ## TL;DR
 
@@ -193,6 +193,13 @@ RankWorker::spawn
 - `block_decode_rank_lane_bf16_hidden_with_scratch`（含 batch 变体）签名改成 `moe: &mut MoeRunContext<'_>`，内部 `dispatch_decode_moe_step` 按 `moe.pplx.is_some()` 分发到两条路径。
 - `RankWorker` 新增 `RankCommand::EnablePplx { ep_backend }`；`DeepSeekV4DirectGenerator::enable_pplx(Vec<EpBackend>)` 把 per-rank 后端塞进对应 worker。
 - `cargo check -p pegainfer-comm` 通过。dsv4 因为 pegainfer-kernels 在本机 CUDA/flashinfer SDK 缺失编译不了（pre-existing），结构性 review 看 diff。
+- LOC_PROT 后续非法地址修复：
+  - `build_intra_node_backends` Phase 3 在每个 `EpBackend::new` 前重新 `cudaSetDevice(dev_ord)`，避免 `AllToAllContext` 的 CUDA workspace / GDR buffer 分配到上一轮 current device。
+  - CUMem sync buffer 本地映射后 `cudaMemset(0)`，避免同步 flag 读取脏初值。
+  - `dispatch_recv` 的 `out_x_stride` 改为 BF16 byte stride，匹配 kernel 对 `std::byte*` 的寻址。
+  - `combine_recv` 的 `out_tokens_stride` 改为 BF16 element stride，匹配 kernel cast 成 `U*` 后的寻址。
+  - `expert_indptr` 改为 pplx `padded_index` 对应的 padded prefix sum，grouped FP4 GEMM 和 `combine_send` 读取同一套 expert-major row layout。
+  - 本地验证：`PATH=/usr/local/cuda-13.1/bin:$PATH cargo check --release -p pegainfer-deepseek-v4 --features pplx-ep` 通过。
 
 **剩下的全是机器侧的事**
 1. **Bootstrap**：用户在自己的 entry binary 里造 `Vec<EpBackend>`——`fabric_lib::TransferEngine` 初始化、跨 rank 交换 `AllToAllRankHandle`、用 `cuda-lib::CudaDeviceMemory` 分配 send/recv buffer、`fabric_lib::MemoryRegionHandle` 注册 MR，然后 `EpBackend::new(EpBackendParams { ... })`。这套 rendezvous 跟 pplx-garden 的 Python 前端做的是一回事；可以复用 NCCL bootstrap 通道交换 rank-handle 字节。

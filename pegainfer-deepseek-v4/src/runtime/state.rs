@@ -163,16 +163,17 @@ pub(crate) struct MoePplxScratch {
     pub(crate) fp4_act_workspace: cudarc::driver::CudaSlice<u8>,
     /// FP4 activation-scale workspace shared between grouped GEMMs.
     pub(crate) fp4_act_scale_workspace: cudarc::driver::CudaSlice<u8>,
-    /// Exclusive prefix sum of received tokens per local expert
+    /// Exclusive prefix sum of received rows per local expert
     /// (`local_experts + 1` entries). Built from a D2H readback of
-    /// `EpBackend::tokens_per_expert_ptr` after `dispatch_recv`.
+    /// `dispatch_recv`'s per-expert count output.
     pub(crate) expert_indptr: cudarc::driver::CudaSlice<i32>,
-    /// Single-i32 scratch that `dispatch_recv` writes the local
-    /// received-token count into. Read back to host before `combine_recv`.
-    pub(crate) num_recv_tokens: cudarc::driver::CudaSlice<i32>,
-    /// Host buffer used to readback `tokens_per_expert`
+    /// Per-local-expert token counts written by `dispatch_recv`.
+    pub(crate) recv_tokens_per_expert: cudarc::driver::CudaSlice<i32>,
+    /// Host buffer used to read back `recv_tokens_per_expert`
     /// (sized `local_experts`).
-    pub(crate) tokens_per_expert_host: Vec<u32>,
+    pub(crate) recv_tokens_per_expert_host: Vec<i32>,
+    /// Per-expert alignment used by pplx's padded receive layout.
+    pub(crate) expert_padding: usize,
     /// Final BF16 output `[seq_len, hidden_dim]`. Shared-expert result is
     /// staged here first; `combine_recv` then runs with `accumulate=true`
     /// to fold in the routed contribution.
@@ -644,8 +645,8 @@ impl MoePplxScratch {
         // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
         // expert (matches upstream Python `(num_local_experts,)` shape),
         // not a single scalar.
-        let num_recv_tokens = unsafe { ctx.stream.alloc(local_experts)? };
-        let tokens_per_expert_host = vec![0u32; local_experts];
+        let recv_tokens_per_expert = unsafe { ctx.stream.alloc(local_experts)? };
+        let recv_tokens_per_expert_host = vec![0i32; local_experts];
 
         let out = Bf16HiddenStates::uninit(ctx, config.dim, local_seq_capacity)?;
 
@@ -659,8 +660,9 @@ impl MoePplxScratch {
             fp4_act_workspace,
             fp4_act_scale_workspace,
             expert_indptr,
-            num_recv_tokens,
-            tokens_per_expert_host,
+            recv_tokens_per_expert,
+            recv_tokens_per_expert_host,
+            expert_padding: EXPERT_PADDING,
             out,
         })
     }

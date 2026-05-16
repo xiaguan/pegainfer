@@ -24,13 +24,11 @@
 //!
 //! # expert_indptr build
 //!
-//! `dispatch_recv` writes the per-local-expert received-token counter
-//! into the upstream worker's `tokens_per_expert` buffer (exposed via
-//! [`EpBackend::tokens_per_expert_ptr`]). We pull it back to host,
-//! exclusive-prefix-sum on host (≤256 / `world_size` u32 entries —
-//! trivial), and H2D into [`MoePplxScratch::expert_indptr`]. Adding a
-//! device-side prefix-sum kernel is a future optimization once the
-//! basic flow lands.
+//! `dispatch_recv` writes per-local-expert received-token counts into a
+//! caller-provided device buffer. We pull it back to host,
+//! exclusive-prefix-sum on host (≤256 / `world_size` entries — trivial),
+//! and H2D into [`MoePplxScratch::expert_indptr`]. Adding a device-side
+//! prefix-sum kernel is a future optimization once the basic flow lands.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -155,12 +153,14 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
 
     // ---- 4. dispatch_recv on moe_stream -> expert-packed activations ----
     {
-        let (out_num_ptr, _g0) = moe_scratch.num_recv_tokens.device_ptr_mut(moe_stream);
+        let (out_num_ptr, _g0) = moe_scratch
+            .recv_tokens_per_expert
+            .device_ptr_mut(moe_stream);
         let (out_x_ptr, _g1) = moe_scratch.expanded_input.data.device_ptr_mut(moe_stream);
         ep.dispatch_recv(
             out_num_ptr as *mut i32,
             out_x_ptr as *mut c_void,
-            moe_scratch.expanded_input.hidden_dim, // out_x_stride
+            moe_scratch.expanded_input.hidden_dim * std::mem::size_of::<u16>(),
             ptr::null_mut(),
             0,
             0,
@@ -173,24 +173,45 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
     // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
     // expert on moe_stream; sync once so the host readback is safe.
     moe_stream.synchronize()?;
-    let mut per_expert_recv = vec![0i32; local_experts];
-    ctx.stream
-        .memcpy_dtoh(&moe_scratch.num_recv_tokens, &mut per_expert_recv)?;
+    ctx.stream.memcpy_dtoh(
+        &moe_scratch.recv_tokens_per_expert,
+        &mut moe_scratch.recv_tokens_per_expert_host,
+    )?;
     ctx.sync()?;
-    // Exclusive prefix sum on host -> expert_indptr.
+    // Exclusive prefix sum on host -> expert_indptr. pplx writes expert
+    // payload rows at `padded_index`, so grouped GEMM must see the same
+    // padded expert-major layout.
     let mut indptr_host = vec![0i32; local_experts + 1];
-    let mut acc: i32 = 0;
-    for i in 0..local_experts {
-        indptr_host[i] = acc;
-        acc = acc
-            .checked_add(per_expert_recv[i])
-            .ok_or_else(|| anyhow::anyhow!("pplx expert_indptr overflow"))?;
-    }
-    indptr_host[local_experts] = acc;
-    let num_recv_tokens = acc as usize;
+    let mut actual_acc: i32 = 0;
+    let mut padded_acc: i32 = 0;
     ensure!(
-        num_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
-        "pplx num_recv_tokens={num_recv_tokens} exceeds expanded_input capacity {}",
+        moe_scratch.expert_padding > 0,
+        "pplx expert_padding must be positive"
+    );
+    for i in 0..local_experts {
+        let count = moe_scratch.recv_tokens_per_expert_host[i];
+        ensure!(
+            count >= 0,
+            "pplx expert {i} returned negative token count {count}"
+        );
+        indptr_host[i] = padded_acc;
+        actual_acc = actual_acc
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("pplx expert_indptr overflow"))?;
+        let padded_count =
+            (count as usize).div_ceil(moe_scratch.expert_padding) * moe_scratch.expert_padding;
+        let padded_count = i32::try_from(padded_count)
+            .map_err(|_| anyhow::anyhow!("pplx padded token count exceeds i32"))?;
+        padded_acc = padded_acc
+            .checked_add(padded_count)
+            .ok_or_else(|| anyhow::anyhow!("pplx padded expert_indptr overflow"))?;
+    }
+    indptr_host[local_experts] = padded_acc;
+    let num_recv_tokens = actual_acc as usize;
+    let num_padded_recv_tokens = padded_acc as usize;
+    ensure!(
+        num_padded_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
+        "pplx padded num_recv_tokens={num_padded_recv_tokens} exceeds expanded_input capacity {}",
         moe_scratch.expanded_input.seq_capacity()
     );
     ctx.stream
@@ -198,15 +219,15 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
 
     // ---- 6. Local grouped FP4 experts over the received activations ----
     // The grouped GEMM helpers read `expanded_input.seq_len` AND
-    // `expert_indptr[..local_experts + 1]`; align both with the dynamic
-    // `num_recv_tokens`. The routing-side fields on the plan view
+    // `expert_indptr[..local_experts + 1]`; align both with pplx's padded
+    // receive layout. The routing-side fields on the plan view
     // (`pos_to_token`, `token_topk_to_pos`, `num_expanded`,
     // `routed.weights/indices`) are not touched by the grouped GEMM path
     // — they point at the local route slices only to satisfy the borrow.
-    moe_scratch.expanded_input.seq_len = num_recv_tokens;
-    moe_scratch.expert_gate.seq_len = num_recv_tokens;
-    moe_scratch.expert_up.seq_len = num_recv_tokens;
-    moe_scratch.expert_out.seq_len = num_recv_tokens;
+    moe_scratch.expanded_input.seq_len = num_padded_recv_tokens;
+    moe_scratch.expert_gate.seq_len = num_padded_recv_tokens;
+    moe_scratch.expert_up.seq_len = num_padded_recv_tokens;
+    moe_scratch.expert_out.seq_len = num_padded_recv_tokens;
     let plan = MoeFusedRoutePlanView {
         routed: RoutedExpertsView {
             weights: &moe_scratch.route_weights,
@@ -218,7 +239,7 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         token_topk_to_pos: &moe_scratch.route_indices,
         expert_indptr: &moe_scratch.expert_indptr,
         local_experts,
-        num_expanded: num_recv_tokens,
+        num_expanded: num_padded_recv_tokens,
     };
     let _ = local_experts_forward_packed_bf16_hidden_scratch(
         ctx,
@@ -260,7 +281,7 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             num_recv_tokens,
             ScalarType::BF16,
             out_ptr as *mut c_void,
-            moe_scratch.out.hidden_dim * std::mem::size_of::<u16>(), // out_tokens_stride: BF16 BYTES
+            moe_scratch.out.hidden_dim, // out_tokens_stride: BF16 ELEMENTS
             idx_ptr as *const i32,
             topk, // indices_stride
             w_ptr as *const f32,
