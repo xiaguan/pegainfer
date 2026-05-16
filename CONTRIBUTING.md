@@ -1,20 +1,10 @@
 # Contributing to pegainfer
 
-
-
 First off, thank you for considering contributing to our project! It's people like you that make this community great.
-
-
 
 To get you started quickly, here is everything you need to know to get your first Pull Request (PR) reviewed.
 
-
-
-\---
-
-
-
-\## 💬 Where to Ask Questions
+## 💬 Where to Ask Questions
 
 If you have questions, need help, or want to discuss a feature, please reach out via:
 
