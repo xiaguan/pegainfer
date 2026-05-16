@@ -9,9 +9,9 @@
 
 - **Read**:
   - `docs/index.md` - routed this issue to Qwen3 batching, scheduler, and benchmark docs.
-  - `docs/projects/batch-optimization.md` - contains the exact `vllm bench serve` QPS=2 workload from issue #85 and the expected serving evidence shape.
-  - `docs/projects/continuous-batching.md` - explains Qwen3 scheduler, paged KV, and the page-pool design contract.
-  - `docs/areas/bench-regression.md` - gives benchmark evidence discipline and threshold language.
+  - `docs/subsystems/scheduler/batch-optimization.md` - contains the exact `vllm bench serve` QPS=2 workload from issue #85 and the expected serving evidence shape.
+  - `docs/subsystems/scheduler/continuous-batching.md` - explains Qwen3 scheduler, paged KV, and the page-pool design contract.
+  - `docs/conventions/bench-regression.md` - gives benchmark evidence discipline and threshold language.
   - `.codex/harness/README.md` - confirms the verification ladder and safety boundaries.
   - `.codex/harness/commands.md` - provides Qwen3 e2e, server, and benchmark commands.
   - `.codex/harness/verification.md` - classifies this as serving/scheduler behavior needing a narrow repro plus HTTP/benchmark evidence.
@@ -22,8 +22,8 @@
   - `pegainfer-core/src/kv_pool.rs` and `pegainfer-core/src/page_pool.rs` - KV pages are RAII-returned only when request state is dropped.
   - GitHub issue #85 - observed server stays alive but completions hang after QPS=2 KV pressure.
 - **Relevant history**:
-  - `docs/projects/batch-optimization.md` - QPS=2 varied workload is near capacity and already had some failed requests; the fix must handle pressure explicitly rather than claim higher throughput.
-  - `docs/projects/continuous-batching.md` - page-pool RAII is the intended cleanup mechanism; scheduler must call the owner drop path when abandoning a request.
+  - `docs/subsystems/scheduler/batch-optimization.md` - QPS=2 varied workload is near capacity and already had some failed requests; the fix must handle pressure explicitly rather than claim higher throughput.
+  - `docs/subsystems/scheduler/continuous-batching.md` - page-pool RAII is the intended cleanup mechanism; scheduler must call the owner drop path when abandoning a request.
 - **Plan**:
   1. Add a scheduler-level regression using a fake executor so admission deadlock and execution-error cleanup are testable without GPU/model weights.
   2. Refactor Qwen3 scheduler admission into a small helper that rejects requests that can never fit in the KV pool and keeps temporarily deferred requests.

@@ -13,7 +13,7 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
 
 - **Read**:
   - `docs/index.md` - confirmed this active document is the current DeepSeek MoE AG/RS work record.
-  - `docs/projects/deepseek-moe-ag-rs.md` - confirmed decode now uses rank-worker AG/RS and grouped TileLang FP4, while follow-up work should clean remaining legacy decode structure.
+  - `docs/models/deepseek-v4/moe-ag-rs.md` - confirmed decode now uses rank-worker AG/RS and grouped TileLang FP4, while follow-up work should clean remaining legacy decode structure.
 - **Relevant history**:
   - This document records that direct decode moved away from the temporary group block path and now enters the AG/RS MoE path from rank workers.
 - **Plan**:
@@ -44,10 +44,10 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
 
 - **Read**:
   - `docs/index.md` - identified DeepSeek V4 support and MoE profiling docs as the relevant history.
-  - `docs/projects/deepseek-v4-support.md` - confirmed the current DeepSeek V4 runtime still treats MoE route-index D2H as a higher-risk follow-up.
-  - `docs/projects/deepseek-moe-tilelang-review.md` - confirmed previous MoE work found D2H route scheduling and per-rank skew as structural decode issues, but local expert execution is out of scope for this slice.
+  - `docs/models/deepseek-v4/support.md` - confirmed the current DeepSeek V4 runtime still treats MoE route-index D2H as a higher-risk follow-up.
+  - `docs/models/deepseek-v4/moe-tilelang-review.md` - confirmed previous MoE work found D2H route scheduling and per-rank skew as structural decode issues, but local expert execution is out of scope for this slice.
 - **Relevant history**:
-  - `docs/projects/deepseek-moe-tilelang-review.md` records that replacing local expert execution is a larger cutover; this task intentionally only adds the regular collective exchange primitives.
+  - `docs/models/deepseek-v4/moe-tilelang-review.md` records that replacing local expert execution is a larger cutover; this task intentionally only adds the regular collective exchange primitives.
 - **Plan**:
   1. Add `all_gather_bf16_hidden_group` and `reduce_scatter_f32_hidden_group` in `pegainfer-deepseek-v4/src/runtime/collectives.rs` with explicit shape checks.
   2. Export the new collectives from `pegainfer-deepseek-v4/src/lib.rs`.

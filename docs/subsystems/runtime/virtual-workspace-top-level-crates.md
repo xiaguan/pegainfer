@@ -8,16 +8,16 @@
 
 - **Read**:
   - `docs/index.md` - identified the active crate-split history, kernel boundary docs, Qwen3/Qwen3.5 model crate docs, and developer workflow docs.
-  - `docs/projects/qwen3-kernels-crate.md` - confirmed `pegainfer-kernels` owns CUDA/Triton source and build output, and build-script path handling was already a known risk during the first split.
-  - `docs/projects/core-entry-crate.md` - confirmed root `pegainfer` kept compatibility re-exports only as a transition layer after shared runtime moved to `pegainfer-core`.
-  - `docs/projects/qwen3-model-crate.md` - confirmed Qwen3 already exposes a root-facing `EngineHandle` and model-local runtime surfaces.
-  - `docs/projects/qwen35-model-crate.md` - confirmed Qwen3.5 follows the same model crate pattern and root no longer owns model internals.
-  - `docs/projects/pegainfer-kernels-boundary.md` - confirmed the intended direction is reusable frontend/data-plane infrastructure plus per-model engines, with model DAG metadata owned by model crates.
-  - `docs/resources/developer-onboarding.md` - identified developer-facing paths and commands that need updating after removing `crates/`.
+  - `docs/models/qwen3/kernels-crate.md` - confirmed `pegainfer-kernels` owns CUDA/Triton source and build output, and build-script path handling was already a known risk during the first split.
+  - `docs/subsystems/runtime/core-entry-crate.md` - confirmed root `pegainfer` kept compatibility re-exports only as a transition layer after shared runtime moved to `pegainfer-core`.
+  - `docs/models/qwen3/model-crate.md` - confirmed Qwen3 already exposes a root-facing `EngineHandle` and model-local runtime surfaces.
+  - `docs/models/qwen35/model-crate.md` - confirmed Qwen3.5 follows the same model crate pattern and root no longer owns model internals.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed the intended direction is reusable frontend/data-plane infrastructure plus per-model engines, with model DAG metadata owned by model crates.
+  - `docs/playbooks/developer-onboarding.md` - identified developer-facing paths and commands that need updating after removing `crates/`.
 - **Relevant history**:
-  - `docs/projects/qwen3-kernels-crate.md` - moving kernel build ownership required careful path updates for CUDA sources, Triton tools, and the FlashInfer submodule.
-  - `docs/projects/qwen35-model-crate.md` - crate-local tests should prefer absolute model paths when run from the workspace because package working directories can surprise relative paths.
-  - `docs/projects/core-entry-crate.md` - root compatibility re-exports were deliberately temporary, so making the product entry a normal package instead of the workspace root matches that direction.
+  - `docs/models/qwen3/kernels-crate.md` - moving kernel build ownership required careful path updates for CUDA sources, Triton tools, and the FlashInfer submodule.
+  - `docs/models/qwen35/model-crate.md` - crate-local tests should prefer absolute model paths when run from the workspace because package working directories can surprise relative paths.
+  - `docs/subsystems/runtime/core-entry-crate.md` - root compatibility re-exports were deliberately temporary, so making the product entry a normal package instead of the workspace root matches that direction.
 - **Plan**:
   1. Move the current root package files into a new `pegainfer-server/` package while keeping binary names `pegainfer` and `bench_serving`.
   2. Move each package from `crates/pegainfer-*` to top-level `pegainfer-*`, then make the root `Cargo.toml` a virtual workspace with `default-members = ["pegainfer-server"]`.
@@ -68,16 +68,16 @@
   - `README.md`
   - `CLAUDE.md`
   - `docs/index.md`
-  - `docs/resources/developer-onboarding.md`
-  - `docs/resources/kernel-technology-reference.md`
-  - `docs/resources/flashinfer-reference.md`
-  - `docs/resources/cupti-range-profiler.md`
+  - `docs/playbooks/developer-onboarding.md`
+  - `docs/playbooks/kernel-technology-reference.md`
+  - `docs/playbooks/flashinfer-reference.md`
+  - `docs/playbooks/cupti-range-profiler.md`
 - Kept historical project execution logs largely intact when they describe commands or paths that were true at the time.
 - After sub-agent diff review, updated active project docs that still pointed at old current paths:
-  - `docs/projects/qwen35-4b-accuracy.md`
-  - `docs/projects/qwen35-4b-optimization.md`
-  - `docs/projects/flashinfer-sampling-benchmark.md`
-  - `docs/projects/continuous-batching.md`
+  - `docs/models/qwen35/accuracy.md`
+  - `docs/models/qwen35/optimization.md`
+  - `docs/subsystems/kernels/flashinfer-sampling-benchmark.md`
+  - `docs/subsystems/scheduler/continuous-batching.md`
 - Result: success.
 
 ### Step 5: Verification

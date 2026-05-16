@@ -19,12 +19,12 @@
 
 - **Read**:
   - `docs/index.md` - identified DeepSeek V4 support, DeepSeek kernel paths, and kernel technology reference as the relevant routing docs.
-  - `docs/projects/deepseek-v4-support.md` - confirmed the current DeepSeek V4 path has native MP8 runtime, TileLang build-time kernels, and a handwritten CUDA MoE path; it also notes MoE route-index D2H synchronization as a higher-risk remaining target.
-  - `docs/projects/deepseek-v4-kernel-paths.md` - confirmed DeepSeek CUDA sources now live under `pegainfer-kernels/csrc/deepseek_v4/` and TileLang generators live under `pegainfer-kernels/tools/tilelang/deepseek_v4/`.
-  - `docs/resources/kernel-technology-reference.md` - summarized the current kernel backend policy and why TileLang is treated as a targeted hot-kernel tool rather than a default dependency.
+  - `docs/models/deepseek-v4/support.md` - confirmed the current DeepSeek V4 path has native MP8 runtime, TileLang build-time kernels, and a handwritten CUDA MoE path; it also notes MoE route-index D2H synchronization as a higher-risk remaining target.
+  - `docs/models/deepseek-v4/kernel-paths.md` - confirmed DeepSeek CUDA sources now live under `pegainfer-kernels/csrc/deepseek_v4/` and TileLang generators live under `pegainfer-kernels/tools/tilelang/deepseek_v4/`.
+  - `docs/playbooks/kernel-technology-reference.md` - summarized the current kernel backend policy and why TileLang is treated as a targeted hot-kernel tool rather than a default dependency.
 - **Relevant history**:
-  - `docs/projects/deepseek-v4-support.md` records that the current local TileLang generator emits quantized linear, sparse attention, and HC kernels, while `deepseek_moe.cu` owns routing, SwiGLU, and expert accumulation.
-  - `docs/projects/deepseek-v4-kernel-paths.md` records that the DeepSeek kernel routing table was recently organized, so this review should compare against those paths instead of rediscovering ownership from scratch.
+  - `docs/models/deepseek-v4/support.md` records that the current local TileLang generator emits quantized linear, sparse attention, and HC kernels, while `deepseek_moe.cu` owns routing, SwiGLU, and expert accumulation.
+  - `docs/models/deepseek-v4/kernel-paths.md` records that the DeepSeek kernel routing table was recently organized, so this review should compare against those paths instead of rediscovering ownership from scratch.
 - **Plan**:
   1. Inspect the official DeepSeek TileKernels `tile_kernels/moe` directory from `https://github.com/deepseek-ai/TileKernels/tree/main/tile_kernels/moe`, including file names, exported kernels, and expected tensor layouts.
   2. Inspect local MoE code paths: `pegainfer-kernels/csrc/deepseek_v4/deepseek_moe.cu`, related FFI declarations, and `pegainfer-deepseek-v4/src/runtime/` callers.

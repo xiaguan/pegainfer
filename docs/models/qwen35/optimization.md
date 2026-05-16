@@ -2,7 +2,7 @@
 
 > **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `225ms`, TPOT `11.81ms` (+1%). After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
 >
-> **Status:** Active. Updated 2026-05-05: Qwen3.5 runtime code now lives in top-level `pegainfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current crate-local regression commands are `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture` and `... --test e2e_scheduler -- --nocapture`. The split exposed an older scheduler-thread cuBLAS binding regression; `docs/projects/qwen35-e2e-gibberish.md` records the fix, and both Qwen3.5 e2e commands now pass on this machine.
+> **Status:** Active. Updated 2026-05-05: Qwen3.5 runtime code now lives in top-level `pegainfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current crate-local regression commands are `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture` and `... --test e2e_scheduler -- --nocapture`. The split exposed an older scheduler-thread cuBLAS binding regression; `docs/models/qwen35/e2e-gibberish.md` records the fix, and both Qwen3.5 e2e commands now pass on this machine.
 
 Historical command logs below keep the command paths that were actually run at the time. For new Qwen3.5 model tests, use `-p pegainfer-qwen35-4b --test ...`; for serving benchmarks, continue using root `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B ...`.
 

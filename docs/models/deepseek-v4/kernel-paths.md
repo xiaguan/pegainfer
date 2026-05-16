@@ -7,17 +7,17 @@
 
 - **Read**:
   - `docs/index.md` - showed DeepSeek V4 support, kernel boundary, and Qwen3 kernel extraction as the relevant prior work.
-  - `docs/projects/deepseek-v4-support.md` - confirmed DeepSeek V4 currently has native MP8 runtime, TileLang build-time kernels, exact E2E coverage, and a documented CUDA split by subsystem.
-  - `docs/projects/pegainfer-kernels-boundary.md` - confirmed kernels belong in the shared kernels crate, while model DAG/runtime policy stays in the model crate.
-  - `docs/projects/qwen3-kernels-crate.md` - established the existing crate-first split and the role of `pegainfer-kernels/KERNELS.md`.
-  - `docs/areas/coding-style.md` - reminded that GPU kernels deserve targeted tests, while broad behavior is better covered by integration/E2E.
+  - `docs/models/deepseek-v4/support.md` - confirmed DeepSeek V4 currently has native MP8 runtime, TileLang build-time kernels, exact E2E coverage, and a documented CUDA split by subsystem.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed kernels belong in the shared kernels crate, while model DAG/runtime policy stays in the model crate.
+  - `docs/models/qwen3/kernels-crate.md` - established the existing crate-first split and the role of `pegainfer-kernels/KERNELS.md`.
+  - `docs/conventions/coding-style.md` - reminded that GPU kernels deserve targeted tests, while broad behavior is better covered by integration/E2E.
   - `pegainfer-kernels/build.rs` - showed DeepSeek kernels are feature-gated by filename prefix in a flat `csrc/` scan, and TileLang generation was hard-coded to the old flat `tools/tilelang/gen_deepseek_v4_tilelang.py` path.
   - `pegainfer-kernels/KERNELS.md` - currently indexes Qwen3 and only mentions DeepSeek as compatibility symbols, so DSV4 has no routing table.
   - `pegainfer-kernels/csrc/deepseek_*.cu` and `pegainfer-kernels/csrc/deepseek_common.cuh` - confirmed the CUDA side is already split by subsystem but still lives in the root kernel source directory.
   - `pegainfer-deepseek-v4/src/runtime/*` - confirmed runtime calls reach DeepSeek symbols through `pegainfer_kernels::ffi`, so path cleanup should not require runtime API changes.
 - **Relevant history**:
-  - `docs/projects/deepseek-v4-support.md` records that the current DeepSeek CUDA glue is intentionally split by subsystem; this cleanup should preserve that split instead of merging files.
-  - `docs/projects/qwen3-kernels-crate.md` moved kernel ownership into `pegainfer-kernels`; the same pattern supports moving model-specific source into a clearer subdirectory without changing model runtime ownership.
+  - `docs/models/deepseek-v4/support.md` records that the current DeepSeek CUDA glue is intentionally split by subsystem; this cleanup should preserve that split instead of merging files.
+  - `docs/models/qwen3/kernels-crate.md` moved kernel ownership into `pegainfer-kernels`; the same pattern supports moving model-specific source into a clearer subdirectory without changing model runtime ownership.
 - **Plan**:
   1. First slice: move DeepSeek V4 CUDA sources from `pegainfer-kernels/csrc/deepseek_*.cu` and `deepseek_common.cuh` into `pegainfer-kernels/csrc/deepseek_v4/`, then update `pegainfer-kernels/build.rs` to discover CUDA files recursively and feature-gate DeepSeek by path instead of flat filename prefix.
   2. Keep object file names stable or explicitly namespace them so `ar` input names remain collision-free when sources live in subdirectories.
@@ -35,7 +35,7 @@
 - Moved DeepSeek V4 CUDA sources from `pegainfer-kernels/csrc/deepseek_*.cu` and `pegainfer-kernels/csrc/deepseek_common.cuh` into `pegainfer-kernels/csrc/deepseek_v4/`.
 - Updated `pegainfer-kernels/build.rs` to collect owned `csrc/` files recursively, emit rebuild triggers for nested `.cu`/`.cuh` files, and generate object names from the relative source path so nested CUDA files do not collide with flat ones.
 - Replaced the build-script feature probe with `cfg!(feature = "deepseek-v4")`. Cargo feature resolution was checked with `cargo tree -p pegainfer-server --features deepseek-v4 -i pegainfer-kernels -e features`, which confirmed `pegainfer-server/deepseek-v4` enables `pegainfer-deepseek-v4/deepseek-v4` and then `pegainfer-kernels/deepseek-v4`.
-- Updated `pegainfer-kernels/KERNELS.md` and `docs/projects/deepseek-v4-support.md` to point DeepSeek CUDA references at `csrc/deepseek_v4/`.
+- Updated `pegainfer-kernels/KERNELS.md` and `docs/models/deepseek-v4/support.md` to point DeepSeek CUDA references at `csrc/deepseek_v4/`.
 
 Result: path move and build-script feature gating are in place.
 
@@ -51,7 +51,7 @@ Verification:
 - Updated `pegainfer-kernels/build.rs` to run the generator from the new path.
 - Updated the generated CUDA banner comment to point at the new generator path.
 - Added `pegainfer-kernels/tools/tilelang/README.md` to define `tools/tilelang/` as the shared TileLang backend directory, with model- or shape-family-specific generators in subdirectories.
-- Updated `docs/projects/deepseek-v4-support.md` to point at the new generator path.
+- Updated `docs/models/deepseek-v4/support.md` to point at the new generator path.
 
 Verification:
 - `cargo fmt --all --check` passed.

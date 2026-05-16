@@ -8,7 +8,7 @@
 
 - **Read**:
   - `docs/index.md` — confirmed there was no existing active doc for vLLM frontend integration.
-  - `docs/resources/developer-onboarding.md` — confirmed manifest-only validation should avoid debug/CUDA builds and full compilation belongs on a GPU-capable machine.
+  - `docs/playbooks/developer-onboarding.md` — confirmed manifest-only validation should avoid debug/CUDA builds and full compilation belongs on a GPU-capable machine.
   - `/Users/mac/code/vllm-frontend-rs/README.md` — identified `vllm-server` as the OpenAI-compatible HTTP API crate and the Rust frontend entrypoint layer.
   - `/Users/mac/code/vllm-frontend-rs/Cargo.toml` — confirmed the repo is a workspace and that internal crates are wired as workspace dependencies.
   - `/Users/mac/code/vllm-frontend-rs/src/server/Cargo.toml` — confirmed `vllm-server` pulls the chat, text, LLM, metrics, and engine-core-client crates transitively.

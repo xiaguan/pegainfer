@@ -8,10 +8,10 @@
 
 - **Read**:
   - `docs/index.md` - Qwen3.5 accuracy and optimization docs are the relevant references.
-  - `docs/projects/qwen35-model-crate.md` - confirmed the model-crate split reproduced the same Qwen3.5 e2e failure on old HEAD.
+  - `docs/models/qwen35/model-crate.md` - confirmed the model-crate split reproduced the same Qwen3.5 e2e failure on old HEAD.
   - `git log -- src/model/qwen35 src/scheduler_qwen35.rs src/ops/recurrent.rs crates/pegainfer-kernels ...` - identified Qwen3.5 and sampling-related commits since the last accuracy work.
 - **Relevant history**:
-  - `docs/projects/qwen35-model-crate.md` - old HEAD and the model-crate split both fail all 10 Qwen3.5 e2e cases with similar gibberish.
+  - `docs/models/qwen35/model-crate.md` - old HEAD and the model-crate split both fail all 10 Qwen3.5 e2e cases with similar gibberish.
   - Commit history has a suspicious sampling change: `020970b refactor(sampling): switch greedy decode to flashinfer top1 (#73)`.
 - **Plan**:
   1. Use a temporary clean worktree so the current model-crate diff stays untouched.

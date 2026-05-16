@@ -8,15 +8,15 @@
 
 - **Read**:
   - `docs/index.md` - identified the existing core split, Qwen3 model crate split, and Qwen3.5 accuracy/optimization docs.
-  - `docs/projects/qwen3-model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
-  - `docs/projects/core-entry-crate.md` - `pegainfer-core` is the shared runtime/API layer that model crates depend on instead of depending back on root.
-  - `docs/projects/qwen35-4b-accuracy.md` - Qwen3.5 e2e tests are regression guards against `test_data/Qwen3.5-4B.json`; parity tooling mentioned there is partly absent in the current tree.
-  - `docs/projects/qwen35-4b-optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
+  - `docs/models/qwen3/model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
+  - `docs/subsystems/runtime/core-entry-crate.md` - `pegainfer-core` is the shared runtime/API layer that model crates depend on instead of depending back on root.
+  - `docs/models/qwen35/accuracy.md` - Qwen3.5 e2e tests are regression guards against `test_data/Qwen3.5-4B.json`; parity tooling mentioned there is partly absent in the current tree.
+  - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
   - GitHub issue #79 - acceptance criteria require `crates/pegainfer-qwen35-4b`, removal of root `pegainfer::model::Qwen35Model` and `pegainfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
   - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `crates/pegainfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
 - **Relevant history**:
-  - `docs/projects/qwen3-model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
-  - `docs/projects/core-entry-crate.md` - root compatibility re-exports were intentionally temporary, and Qwen3.5 recurrent kernels were left outside core in that phase.
+  - `docs/models/qwen3/model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
+  - `docs/subsystems/runtime/core-entry-crate.md` - root compatibility re-exports were intentionally temporary, and Qwen3.5 recurrent kernels were left outside core in that phase.
 - **Plan**:
   1. Add `crates/pegainfer-qwen35-4b` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
   2. Move `src/model/qwen35.rs`, `src/model/qwen35/*`, `src/scheduler_qwen35.rs`, and Qwen3.5 recurrent op wrappers into the new crate, keeping CUDA/Triton kernel sources and FFI in `pegainfer-kernels`.
@@ -84,7 +84,7 @@
   - A temporary old-HEAD worktree at `/tmp/pegainfer-head` ran `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B CARGO_TARGET_DIR=/tmp/pegainfer-head-target cargo test --release --test e2e_qwen35 -- --nocapture`.
   - Old HEAD failed the same way on all 10 Qwen3.5 cases, so the e2e mismatch predated this crate split.
 - Follow-up fix:
-  - `docs/projects/qwen35-e2e-gibberish.md` identified the first gibberish commit as `6a5b826`, fixed Qwen3.5 scheduler thread CUDA/cuBLAS binding, kept greedy sampling on FlashInfer top1, and refreshed the exact Qwen3.5 golden for the default engine shape.
+  - `docs/models/qwen35/e2e-gibberish.md` identified the first gibberish commit as `6a5b826`, fixed Qwen3.5 scheduler thread CUDA/cuBLAS binding, kept greedy sampling on FlashInfer top1, and refreshed the exact Qwen3.5 golden for the default engine shape.
   - After that fix, both Qwen3.5 e2e commands above pass.
 
 ## Debrief

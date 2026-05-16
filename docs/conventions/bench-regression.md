@@ -70,7 +70,7 @@ Thresholds trigger on **p50 only**. The comparison table also shows p99 for manu
 ## Investigating a Regression
 
 1. Which metric regressed? Check the `compare` output.
-2. TPOT: likely decode kernels, CUDA graph, MLP/GEMV. Profile with `nsys` using the decode-heavy shape (see [profiling-guide](../resources/profiling-guide.md)).
+2. TPOT: likely decode kernels, CUDA graph, MLP/GEMV. Profile with `nsys` using the decode-heavy shape (see [profiling-guide](../playbooks/profiling-guide.md)).
 3. TTFT: likely prefill, cuBLAS, or Triton kernels. Profile with the prefill-heavy shape.
 4. Both: suspect a fundamental change (memory layout, kernel launch, data flow).
 

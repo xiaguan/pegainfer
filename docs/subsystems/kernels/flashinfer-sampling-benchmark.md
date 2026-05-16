@@ -9,13 +9,13 @@
 
 - **Read**:
   - `docs/index.md` — identified existing benchmark workflow, FlashInfer reference docs, and optimization documentation to reuse.
-  - `docs/areas/bench-regression.md` — confirmed current snapshot/compare workflow and that standard regression tracking centers on TTFT and TPOT snapshots.
-  - `docs/resources/bench-vs-vllm.md` — captured the repo's benchmarking discipline: same-GPU comparisons, synthetic prompts, and decode-focused configurations.
-  - `docs/resources/model-optimization-pipeline.md` — confirmed the standard optimization workflow and the need to isolate decode-heavy measurement when evaluating a kernel/backend swap.
-  - `docs/resources/kernel-technology-reference.md` — confirmed FlashInfer is currently treated as a reference library rather than a runtime dependency, so integration cost must be justified.
-  - `docs/resources/flashinfer-reference.md` — mapped FlashInfer's sampling/operator surface and local source layout.
+  - `docs/conventions/bench-regression.md` — confirmed current snapshot/compare workflow and that standard regression tracking centers on TTFT and TPOT snapshots.
+  - `docs/playbooks/bench-vs-vllm.md` — captured the repo's benchmarking discipline: same-GPU comparisons, synthetic prompts, and decode-focused configurations.
+  - `docs/playbooks/model-optimization-pipeline.md` — confirmed the standard optimization workflow and the need to isolate decode-heavy measurement when evaluating a kernel/backend swap.
+  - `docs/playbooks/kernel-technology-reference.md` — confirmed FlashInfer is currently treated as a reference library rather than a runtime dependency, so integration cost must be justified.
+  - `docs/playbooks/flashinfer-reference.md` — mapped FlashInfer's sampling/operator surface and local source layout.
 - **Relevant history**:
-  - `docs/projects/qwen35-4b-optimization.md` — existing optimization work tracks before/after kernel changes with decode-heavy measurements; this is the right precedent for a sampling backend change.
+  - `docs/models/qwen35/optimization.md` — existing optimization work tracks before/after kernel changes with decode-heavy measurements; this is the right precedent for a sampling backend change.
   - no directly matching past project doc for FlashInfer sampling migration found.
 - **Plan**:
   1. Add a sampling-focused benchmark surface that measures current non-greedy sampling cost directly, using the existing `criterion` bench infrastructure and realistic vocab sizes.

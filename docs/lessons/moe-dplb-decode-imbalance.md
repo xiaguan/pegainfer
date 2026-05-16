@@ -10,7 +10,7 @@
 
 ## Scope
 
-This note starts the `docs/projects/moe/` area for cross-model MoE and expert-parallel serving decisions. It records what we learned from "Tackling the Data-Parallel Load Balancing Bottleneck in LLM Serving: Practical Online Routing at Scale" ([arXiv:2605.06113](https://arxiv.org/abs/2605.06113)) and how that should shape future PegaFlow/WiDeep planning.
+This note records cross-model MoE and expert-parallel serving lessons (companion: `docs/lessons/moe-zero-prefill-long-prefill.md`). It records what we learned from "Tackling the Data-Parallel Load Balancing Bottleneck in LLM Serving: Practical Online Routing at Scale" ([arXiv:2605.06113](https://arxiv.org/abs/2605.06113)) and how that should shape future PegaFlow/WiDeep planning.
 
 The goal is a reusable decision record, not an implementation plan. Specific APIs, telemetry formats, and scheduler changes are outside this document because they depend on the future WiDeep/PegaFlow runtime boundary.
 

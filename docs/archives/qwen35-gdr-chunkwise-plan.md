@@ -2,7 +2,7 @@
 
 > **TL;DR:** The chunk-wise GDR prefill plan landed in the real Qwen3.5 runtime, restored `e2e_qwen35`, and brought `(2048,1)` TTFT down to the `~222ms` range. This doc is archived because the plan has been executed and its outcome is now reflected in the broader Qwen3.5 optimization record.
 >
-> **Status:** Archived. The plan is complete and superseded by the runtime state documented in `projects/qwen35-4b-optimization.md`.
+> **Status:** Archived. The plan is complete and superseded by the runtime state documented in `models/qwen35/optimization.md`.
 
 ## Goal
 

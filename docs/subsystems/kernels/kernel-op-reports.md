@@ -8,16 +8,16 @@
 
 - **Read**:
   - `docs/index.md` - located the active benchmarking, CUPTI, kernel-boundary, and Qwen3 model-crate docs.
-  - `docs/projects/qwen3-model-crate.md` - confirmed `qwen3_kernel_snapshot` was the current Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
-  - `docs/areas/bench-regression.md` - clarified that the existing serving benchmark remains the model-level regression artifact; this task should not mix per-op reports with E2E snapshots.
-  - `docs/resources/cupti-range-profiler.md` - captured the current CUPTI metric set and the short-range-name constraint on the RTX 5090/CUDA 12.9 stack.
-  - `docs/projects/pegainfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
-  - `docs/projects/qwen3-kernels-crate.md` - confirmed kernel source/build ownership now lives in `pegainfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
-  - `docs/resources/profiling-guide.md` - confirmed the diagnostic split between kernel composition/proportions and benchmark-grade latency.
-  - `docs/resources/kernel-technology-reference.md` - confirmed third-party/kernel technology policy: use libraries where they solve generic infrastructure, keep custom CUDA where it is the actual hotpath.
+  - `docs/models/qwen3/model-crate.md` - confirmed `qwen3_kernel_snapshot` was the current Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
+  - `docs/conventions/bench-regression.md` - clarified that the existing serving benchmark remains the model-level regression artifact; this task should not mix per-op reports with E2E snapshots.
+  - `docs/playbooks/cupti-range-profiler.md` - captured the current CUPTI metric set and the short-range-name constraint on the RTX 5090/CUDA 12.9 stack.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
+  - `docs/models/qwen3/kernels-crate.md` - confirmed kernel source/build ownership now lives in `pegainfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
+  - `docs/playbooks/profiling-guide.md` - confirmed the diagnostic split between kernel composition/proportions and benchmark-grade latency.
+  - `docs/playbooks/kernel-technology-reference.md` - confirmed third-party/kernel technology policy: use libraries where they solve generic infrastructure, keep custom CUDA where it is the actual hotpath.
 - **Relevant history**:
-  - `docs/projects/qwen3-model-crate.md` showed the current single-op snapshot already found the low-batch long-context decode-attention bottleneck.
-  - `docs/resources/cupti-range-profiler.md` showed CUPTI should stay in the kernel snapshot path but should not become a full Nsight Compute replacement.
+  - `docs/models/qwen3/model-crate.md` showed the current single-op snapshot already found the low-batch long-context decode-attention bottleneck.
+  - `docs/playbooks/cupti-range-profiler.md` showed CUPTI should stay in the kernel snapshot path but should not become a full Nsight Compute replacement.
 - **Plan**:
   1. Add direct Qwen3 crate dev-dependencies for generic infrastructure (`clap` derive for CLI and `toml` for manifest parsing) instead of extending the hand-written parser.
   2. Add a model-local TOML manifest for Qwen3-4B kernel reports, initially covering only op names, phases, shape sweeps, and variants.

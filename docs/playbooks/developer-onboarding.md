@@ -129,6 +129,6 @@ Then re-run the e2e tests to confirm the new baselines pass.
 
 ## Next Steps
 
-- `docs/resources/profiling-guide.md` — profiling toolchain (nsys, ncu, fastrace, Perfetto)
-- `docs/resources/bench-vs-vllm.md` — comparative benchmarking against vLLM
+- `docs/playbooks/profiling-guide.md` — profiling toolchain (nsys, ncu, fastrace, Perfetto)
+- `docs/playbooks/bench-vs-vllm.md` — comparative benchmarking against vLLM
 - `CLAUDE.md` (workspace + project level) — architecture and dev conventions

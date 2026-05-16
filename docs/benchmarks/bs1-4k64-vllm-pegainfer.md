@@ -8,10 +8,10 @@
 
 - **Read**:
   - `docs/index.md` - located the comparative benchmark docs.
-  - `docs/resources/bench-vs-vllm.md` - confirmed both engines should be driven by `vllm bench serve`, with `--ignore-eos`, random dataset, `--temperature 0`, and sequential same-GPU runs.
-  - `docs/projects/batch-optimization.md` - confirmed previous fixed-length and realistic benchmark interpretation, especially vLLM cold-start and TTFT/TPOT reading.
+  - `docs/playbooks/bench-vs-vllm.md` - confirmed both engines should be driven by `vllm bench serve`, with `--ignore-eos`, random dataset, `--temperature 0`, and sequential same-GPU runs.
+  - `docs/subsystems/scheduler/batch-optimization.md` - confirmed previous fixed-length and realistic benchmark interpretation, especially vLLM cold-start and TTFT/TPOT reading.
 - **Relevant history**:
-  - `docs/projects/batch-optimization.md` showed fixed-length single-concurrency results should be interpreted as latency probes rather than full serving saturation claims.
+  - `docs/subsystems/scheduler/batch-optimization.md` showed fixed-length single-concurrency results should be interpreted as latency probes rather than full serving saturation claims.
 - **Plan**:
   1. Use `vllm` as the client and vLLM server.
   2. Use the release `pegainfer` binary for the PegaInfer server.

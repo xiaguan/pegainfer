@@ -8,12 +8,12 @@
 
 - **Read**:
   - `docs/index.md` - identified the Phase 1 kernels split and per-model boundary docs.
-  - `docs/projects/qwen3-kernels-crate.md` - Phase 1 follow-up says the Qwen3 model crate should sit on top of `pegainfer-kernels`, with machine model metadata owned by the model crate.
-  - `docs/projects/pegainfer-kernels-boundary.md` - establishes the target shape: root/frontend plus shared runtime/data-plane layers plus per-model engines.
+  - `docs/models/qwen3/kernels-crate.md` - Phase 1 follow-up says the Qwen3 model crate should sit on top of `pegainfer-kernels`, with machine model metadata owned by the model crate.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - establishes the target shape: root/frontend plus shared runtime/data-plane layers plus per-model engines.
   - `src/lib.rs`, `src/main.rs`, `src/model.rs`, `src/vllm_frontend.rs`, `src/model_executor.rs`, and `src/model/qwen3/*` - mapped the current root-owned runtime APIs that would otherwise force future model crates to depend back on root.
 - **Relevant history**:
-  - `docs/projects/model-forward-trait.md` and `docs/projects/runtime-complexity-paydown.md` tried to share model execution too broadly. This split should share runtime contracts and leave model DAGs model-owned.
-  - `docs/projects/qwen3-kernels-crate.md` showed that moving kernels without moving runtime APIs still leaves model extraction blocked by root dependencies.
+  - `docs/subsystems/runtime/model-forward-trait.md` and `docs/subsystems/runtime/runtime-complexity-paydown.md` tried to share model execution too broadly. This split should share runtime contracts and leave model DAGs model-owned.
+  - `docs/models/qwen3/kernels-crate.md` showed that moving kernels without moving runtime APIs still leaves model extraction blocked by root dependencies.
 - **Plan**:
   1. Add `crates/pegainfer-core` to the workspace.
   2. Move shared runtime entry APIs into it: sampling params, tensor/FFI re-exports, paged KV/page pool, weight loading, CUDA graph state, simple KV cache, shared op adapters, and direct-model traits.
