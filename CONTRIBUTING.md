@@ -42,7 +42,6 @@ We use \*\*Commitizen\*\* conventions for clear history. Your commit messages sh
 `type(scope): description` (e.g., `feat(auth): add OAuth2 support`)
 
 
-
 \## 🚀 How to Submit a PR
 
 1\. Fork the repository and create your branch from `main`.
