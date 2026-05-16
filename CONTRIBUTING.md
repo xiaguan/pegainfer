@@ -53,10 +53,6 @@ We use \*\*Commitizen\*\* conventions for clear history. Your commit messages sh
 
 
 
-\---
-
-
-
 \## 🚀 How to Submit a PR
 
 1\. Fork the repository and create your branch from `main`.
