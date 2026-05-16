@@ -11,15 +11,14 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `lessons/` | Tribal knowledge from research / other projects worth keeping. |
 | `benchmarks/` | Standalone benchmark snapshots and eval reports. |
 | `conventions/` | Ongoing standards (bench regression policy, coding style). |
-| `archives/` | Concluded work kept for reference only — no longer updated. |
 | `private/` | Local-only notes (gitignored). |
 
 ## roadmap
 
 | Path | TL;DR |
 | --- | --- |
-| `roadmap/q2-2026-plan.md` | Q2 plan: W1 harden batching, W2 PegaInfer+PegaFlow native, W3 differentiation. Competitive intel: Qwen3.5 is both competitors' Achilles' heel, startup time 215s vs seconds, observability as product moat. MTP deferred to Q3. |
-| `roadmap/nonstandard-attention-milestone.md` | Milestone direction: pegainfer focuses on non-standard attention models, with emphasis on model-family readiness, service experience, framework debt repayment, and disciplined evaluation. |
+| `roadmap/direction.md` | One size can't fit all. Shared infrastructure (frontend, runtime primitives, kernels, data plane) + per-model engines with their own scheduler/kernel DAG/state. Long-term loop: kernel ledger → simulator → request tracing. |
+| `roadmap/execution.md` | Current state and immediate next steps. No timeline — entries move through In progress → Next → Open. Covers cross-model infrastructure (kernel ledger, simulator, tracing, frontend polish) and per-model active work (DeepSeek V4, Qwen3.5, Qwen3). |
 
 ## models / qwen3
 
@@ -56,23 +55,13 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/runtime/core-entry-crate.md` | `pegainfer-core` owns shared runtime/API pieces, root keeps compatibility re-exports, trace is out of the active entry, and full 5090 build/clippy/e2e/bench passes. |
-| `subsystems/runtime/virtual-workspace-top-level-crates.md` | Root is a virtual workspace; product code lives in `pegainfer-server/`, internal packages live at top-level `pegainfer-*` paths. |
-| `subsystems/runtime/model-forward-trait.md` | ModelForward trait extraction: weights/state separation, shared generation loop, designed for bs > 1. |
-| `subsystems/runtime/runtime-complexity-paydown.md` | Effort to reduce model-specific runtime fragmentation; focus shifted to architecture-level abstraction (ModelForward trait). |
+| `subsystems/runtime/runtime.md` | Runtime complexity is controlled by a shared `pegainfer-core` that owns the generation contract and orchestration; per-model crates implement `ModelForward` so prefill/decode and hybrid attention stay hidden from the caller. State (`&mut`) is separated from weights (`&self`) for future bs > 1. |
 
 ## subsystems / scheduler
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/scheduler/continuous-batching.md` | Phase 1-2 done. Scheduler thread with prefill-priority, batch decode, channel-based streaming. Next: multi-request throughput testing. |
-| `subsystems/scheduler/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |
-
-## subsystems / frontend
-
-| Path | TL;DR |
-| --- | --- |
-| `subsystems/frontend/vllm-frontend-rs-integration.md` | vLLM frontend replacement complete: pegainfer serves through vllm-server with a local engine-core bridge; old HTTP/tokenizer modules are removed; Qwen3 release build/e2e and vLLM models/completions/chat validation pass on 5090. |
+| `subsystems/scheduler/scheduler.md` | Single dedicated thread owns GPU; FCFS prefill-priority, paged KV, bucket CUDA Graphs, unified forward for mixed prefill+decode. Qwen3-4B at QPS=2 is within 2% of vLLM throughput while winning TTFT (−16%), TPOT (−3%), and latency stability. Open: ITL p99 tail, Qwen3.5 full-paged prefill, batched per-row sampling redesign. |
 
 ## subsystems / kernels
 
@@ -80,7 +69,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `subsystems/kernels/pegainfer-kernels-boundary.md` | Architecture decision: pegainfer should use reusable frontend/runtime/data-plane layers plus per-model engines; kernels become first-class assets through a ledger, simulator, and request tracing. |
 | `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel report moved to a feature-gated bin; full raw-CUPTI decode/prefill reports, split prefill stages, 10k attention-core comparisons, BF16-HMMA tensor metrics, FlashInfer FMHA v2/package measurements, and measured FA2 `CTA_TILE_Q=64` prefill default in place. |
-| `subsystems/kernels/flashinfer-sampling-benchmark.md` | FlashInfer runtime sampling and greedy top-1 path are in place, but the work is blocked on restoring batched decode token selection instead of per-request sampling inside batch decode. |
 
 ## playbooks
 
@@ -90,10 +78,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `playbooks/bench-vs-vllm.md` | pegainfer vs vLLM comparative benchmarking: method, workflow, typical configs, gotchas. |
 | `playbooks/model-optimization-pipeline.md` | Per-model optimization methodology: 2 standard profiles, vLLM baseline, e2e dashboard + append-only optimization log. |
 | `playbooks/profiling-guide.md` | GPU profiling playbook: nsys pitfalls, diagnostic paths, measured kernel comparisons. |
-| `playbooks/cupti-range-profiler.md` | CUPTI Range Profiler notes: short range names required on RTX 5090/CUDA 12.9, `qwen3_kernel_report` CUPTI default-on, pre-measure launch avoids lazy-init counter pollution. |
 | `playbooks/accuracy-parity-playbook.md` | Accuracy debugging playbook: truth-source rules, first-diff workflow, bf16 rounding traps, and verified Qwen3.5 parity commands. |
-| `playbooks/kernel-technology-reference.md` | Kernel tech reference: current stack, ecosystem survey (Triton/Gluon/CUTLASS/ThunderKittens/FlashAttention/FlashInfer), decision framework, source-level lessons, and operator policy. |
-| `playbooks/flashinfer-reference.md` | FlashInfer map: official docs structure, operator families, major features, and which source areas matter beyond the docs index. |
 
 ## lessons
 
@@ -115,11 +100,3 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `conventions/bench-regression.md` | Benchmark regression tracking: one snapshot per model, git-tracked history, TPOT >2% / TTFT >3% thresholds. |
 | `conventions/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches. |
-
-## archives
-
-| Path | TL;DR |
-| --- | --- |
-| `archives/pure-gpu-decode-loop.md` | Concluded: CPU overhead is ~0.6% of TPOT (~77μs/token). Batch launch saves ~1ms/128tok. Not worth further investment — TPOT is GPU-compute bound. |
-| `archives/qwen3-4b-optimization.md` | Dense-attention Qwen3-4B optimization record; archived as reference material after pegainfer led the measured RTX 5070 Ti workloads. |
-| `archives/qwen35-gdr-chunkwise-plan.md` | Qwen3.5 chunk-wise GDR plan and validation history; archived after the plan landed in the real runtime and rolled into the broader Qwen3.5 optimization record. |

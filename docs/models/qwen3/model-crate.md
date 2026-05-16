@@ -8,13 +8,11 @@
 
 - **Read**:
   - `docs/index.md` - identified the kernels/core crate split and per-model boundary docs.
-  - `docs/subsystems/runtime/core-entry-crate.md` - `pegainfer-core` now owns shared runtime/API pieces and exists so model crates do not depend back on root.
   - `docs/models/qwen3/kernels-crate.md` - Qwen3 kernel source/build ownership and human kernel index already live in `pegainfer-kernels`; model-owned DAG metadata should live with the model crate.
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - records the per-model engine direction and says root should be reusable frontend/control-plane infrastructure, not a universal model abstraction.
   - `src/main.rs`, `src/lib.rs`, `src/server_engine.rs`, `src/scheduler.rs`, `src/model_executor.rs`, `src/model/qwen3/*`, `src/bin/bench_serving.rs`, and Qwen3 tests - mapped what root currently knows about Qwen3.
 - **Relevant history**:
-  - `docs/subsystems/runtime/model-forward-trait.md` and `docs/subsystems/runtime/runtime-complexity-paydown.md` were useful simplifications, but the next boundary should not make `ModelForward` the long-term universal engine API.
-  - `docs/subsystems/runtime/core-entry-crate.md` intentionally kept root compatibility re-exports only as a transition step before the Qwen3 crate split.
+  - The earlier shared-runtime work (now consolidated into `docs/subsystems/runtime/runtime.md`) was a useful simplification, but the next boundary should not make `ModelForward` the long-term universal engine API.
 - **Plan**:
   1. Define the model crate/root interface before moving code.
   2. Move the generic text-generation handle/request/event types into `pegainfer-core` so root and model crates can communicate without model crates depending on root.
@@ -493,7 +491,7 @@ Snapshot compare result:
 kernel snapshot compare complete: warnings=0 failures=0
 ```
 
-CUPTI note: the standalone snapshot runner originally crashed inside `libnvperf_host.so` at `NVPW_CUDA_Profiler_DecodeCounters`. The root cause was the verbose user range name, not the attention case or Rust callback trampoline. The fix is to use compact range names such as `qk/non_partition/b1/k1024` and keep full metadata in JSON fields. The first profiled launch also needs an unprofiled warmup launch; otherwise CUDA lazy initialization pollutes the first CUPTI GPU time. The rule is recorded in `docs/playbooks/cupti-range-profiler.md`.
+CUPTI note: the standalone snapshot runner originally crashed inside `libnvperf_host.so` at `NVPW_CUDA_Profiler_DecodeCounters`. The root cause was the verbose user range name, not the attention case or Rust callback trampoline. The fix is to use compact range names such as `qk/non_partition/b1/k1024` and keep full metadata in JSON fields. The first profiled launch also needs an unprofiled warmup launch; otherwise CUDA lazy initialization pollutes the first CUPTI GPU time.
 
 ```bash
 PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \

@@ -9,13 +9,10 @@
 - **Read**:
   - `docs/index.md` - confirmed the relevant architecture, kernel, TP, benchmarking, and Qwen3 history docs.
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - recorded the per-model engine direction, but its near-term ordering needs to be corrected from ledger-first to crate-first.
-  - `docs/playbooks/kernel-technology-reference.md` - confirmed the current production stack: cuBLAS for dense GEMM, CUDA for decode-critical kernels, and Triton AOT where appropriate.
   - `docs/models/qwen3/tp-design.md` - confirmed Qwen3-4B TP constraints and runtime hazards around per-thread CUDA/cuBLAS state.
   - `src/model/qwen3/*`, `src/ops/*`, `src/ffi.rs`, `src/tensor.rs`, `src/kv_pool.rs`, `src/page_pool.rs`, and `build.rs` - mapped the current Qwen3-4B kernel calls, tensor/runtime dependencies, paged KV metadata, and CUDA/Triton build pipeline.
 - **Relevant history**:
-  - `docs/subsystems/runtime/model-forward-trait.md` and `docs/subsystems/runtime/runtime-complexity-paydown.md` tried to share model execution too broadly; this work should share only the kernel layer and leave runtime policy in root.
   - `docs/models/qwen3/tp-design.md` shows that Qwen3 execution is already rank-local and step-oriented, so the kernel crate must not hide device binding or TP collective points.
-  - `docs/playbooks/kernel-technology-reference.md` establishes that kernel technology choice should be explicit and benchmark-driven, not implicit in scattered FFI calls.
 - **Plan**:
   1. Convert the repository into a Cargo workspace while keeping the root `pegainfer` package as the server/control-plane crate.
   2. Create `crates/pegainfer-kernels` with the Qwen3-4B kernel surface: kernel ABI tensor helpers, Qwen3-used `ops`, FFI declarations, CUDA/Triton build support, and Qwen3 paged-attention layout metadata helpers.

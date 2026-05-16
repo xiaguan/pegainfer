@@ -71,7 +71,7 @@ Collaboration centered on the `docs/` directory.
 
 ## Knowledge Architecture (domain-axis)
 
-Docs are organized by what they're *about*, not by lifecycle stage. A doc's freshness lives in its TL;DR (and `Last touched:` for active areas) — not by which directory it sits in. Completed work stays co-located with its domain; only truly inert material moves to `archives/`.
+Docs are organized by what they're *about*, not by lifecycle stage. A doc's freshness lives in its TL;DR (and `Last touched:` for active areas) — not by which directory it sits in. Completed work stays co-located with its domain. There is no `archives/` directory — if a doc no longer earns its keep, delete it; if a lasting lesson hides inside it, lift that lesson into `lessons/` first, then delete.
 
 ```
 docs/
@@ -84,7 +84,6 @@ docs/
 ├── lessons/           # Tribal knowledge from research / other projects
 ├── benchmarks/        # Standalone benchmark snapshots and eval reports
 ├── conventions/       # Ongoing standards (bench regression, coding style)
-├── archives/          # Concluded work kept for reference only — no longer updated
 └── private/           # Local-only notes (gitignored)
 ```
 
