@@ -917,11 +917,14 @@ pub(crate) fn compressor_overlap_decode_bf16_hidden_batch_scratch<'a>(
         batch,
         slot_ids_d.len()
     );
+    // Overlap stores 2*head_dim elements per state row (upper/lower halves
+    // per route), matching the existing single-row overlap invariant
+    // state.hidden_dim == 2 * head_dim.
     ensure!(
-        state.hidden_dim == head_dim,
-        "batched overlap compressor state hidden_dim mismatch: state={}, head_dim={}",
+        state.hidden_dim == 2 * head_dim,
+        "batched overlap compressor state hidden_dim mismatch: state={}, expected 2*head_dim={}",
         state.hidden_dim,
-        head_dim
+        2 * head_dim
     );
     ensure!(
         head_dim <= scratch.max_head_dim,
