@@ -812,17 +812,16 @@ pub(crate) fn compressor_nonoverlap_decode_bf16_hidden_batch_scratch<'a>(
         batch * config.head_dim,
         scratch.compressor_weighted_batch.len()
     );
+    // Validate against the underlying device-buffer byte capacity rather than
+    // the mutable `seq_len`/`hidden_dim` metadata fields, which get rewritten
+    // on every call (e.g. an overlap indexer call sets `hidden_dim = 128`
+    // before a later non-overlap layer needs `head_dim = 512`). `data.len()`
+    // is the immutable underlying CudaSlice element count.
     ensure!(
-        scratch.compressor_out_batch.seq_capacity() >= batch,
-        "batched decode compressor out scratch seq capacity too small: need {}, have {}",
-        batch,
-        scratch.compressor_out_batch.seq_capacity()
-    );
-    ensure!(
-        scratch.compressor_out_batch.hidden_dim >= config.head_dim,
-        "batched decode compressor out scratch hidden_dim too small: need {}, have {}",
-        config.head_dim,
-        scratch.compressor_out_batch.hidden_dim
+        scratch.compressor_out_batch.data.len() >= batch * config.head_dim,
+        "batched decode compressor out buffer too small: need {} bf16 elements, have {}",
+        batch * config.head_dim,
+        scratch.compressor_out_batch.data.len()
     );
     // Per-row slot capacity check: each row stores `ratio` rows in the per-slot
     // state window; max slot index must fit within state.slots.
@@ -938,17 +937,16 @@ pub(crate) fn compressor_overlap_decode_bf16_hidden_batch_scratch<'a>(
         batch * head_dim,
         scratch.compressor_weighted_batch.len()
     );
+    // See compressor_nonoverlap_decode_bf16_hidden_batch_scratch for the
+    // rationale: validate against the underlying device-buffer byte capacity,
+    // not the mutable metadata fields. The same buffer is shared between
+    // main (head_dim) and indexer (index_head_dim) overlap calls within a
+    // single layer, so `hidden_dim` flips between them.
     ensure!(
-        scratch.compressor_out_batch.seq_capacity() >= batch,
-        "batched overlap compressor out scratch seq capacity too small: need {}, have {}",
-        batch,
-        scratch.compressor_out_batch.seq_capacity()
-    );
-    ensure!(
-        scratch.compressor_out_batch.hidden_dim >= head_dim,
-        "batched overlap compressor out scratch hidden_dim too small: need {}, have {}",
-        head_dim,
-        scratch.compressor_out_batch.hidden_dim
+        scratch.compressor_out_batch.data.len() >= batch * head_dim,
+        "batched overlap compressor out buffer too small: need {} bf16 elements, have {}",
+        batch * head_dim,
+        scratch.compressor_out_batch.data.len()
     );
     // Overlap stores 8 rows per slot (state_offset_mul=8).
     ensure!(
