@@ -1337,9 +1337,17 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden_with_scratch<'a>(
     moe_scratch: &'a mut MoeAgRsScratch,
 ) -> Result<&'a Bf16HiddenStates> {
     ctx.set_current()?;
+    // `token_ids` is the rank's scratch `batch_token_ids` CudaSlice sized to
+    // `DIRECT_BATCH_DECODE_CAPACITY` (the batch decode lane's hardware
+    // capacity), while `input.seq_len` is the active-set size for this
+    // step (1..=capacity). The MoE kernels below iterate exactly
+    // `input.seq_len` tokens, so a `>=` bound is the correct invariant for
+    // this contract — strict equality would spuriously reject any
+    // active-set run that hasn't filled the capacity (task #45 active-set,
+    // task #46 batched compressor verification).
     ensure!(
-        token_ids.len() == input.seq_len,
-        "decode MoE AG/RS token count mismatch: tokens={}, hidden seq_len={}",
+        token_ids.len() >= input.seq_len,
+        "decode MoE AG/RS token count below active set: tokens={}, hidden seq_len={}",
         token_ids.len(),
         input.seq_len
     );
