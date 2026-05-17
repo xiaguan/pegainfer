@@ -203,35 +203,39 @@ __global__ void deepseek_compressor_nonoverlap_fused_epilogue_kernel(
   int tid = threadIdx.x;
   int n_block = blockDim.x;
 
-  constexpr int kMaxRatio = 16;
   constexpr float neg_inf = -3.4028234663852886e38f;
 
   float sum_sq_local = 0.0f;
 
+  // Streaming online softmax + weighted sum so ratio is unbounded (DSV4 uses
+  // ratio up to 128). Two passes over the routes per d:
+  //   1) find max(score) for numerical stability.
+  //   2) accumulate softmax denominator + weighted-value numerator together.
+  // Each thread handles its own d strides; routes are read from L2-cached
+  // FP32 sv_buf so the double read is bandwidth-cheap.
   for (int d = tid; d < head_dim; d += n_block) {
-    float scores[kMaxRatio];
-    float values[kMaxRatio];
+    float m = neg_inf;
     for (int r = 0; r < ratio; ++r) {
       int token = c * ratio + r;
       int offset = token * sv_n_stride + d;
-      scores[r] = scores_in[offset] + ape[r * head_dim + d];
-      values[r] = values_in[offset];
+      float s = scores_in[offset] + ape[r * head_dim + d];
+      m = fmaxf(m, s);
     }
-
-    float m = scores[0];
-    for (int r = 1; r < ratio; ++r) m = fmaxf(m, scores[r]);
 
     float denom = 0.0f;
     float acc = 0.0f;
     for (int r = 0; r < ratio; ++r) {
-      float p = __expf(scores[r] - m);
+      int token = c * ratio + r;
+      int offset = token * sv_n_stride + d;
+      float s = scores_in[offset] + ape[r * head_dim + d];
+      float v = values_in[offset];
+      float p = __expf(s - m);
       denom += p;
-      acc += p * values[r];
+      acc += p * v;
     }
     float w = acc / denom;
     weighted[c * head_dim + d] = w;
     sum_sq_local += w * w;
-    (void)neg_inf;
   }
 
   // Block-wide reduction of sum_sq via warp-shfl + smem (mirrors overlap epilogue).
@@ -732,13 +736,16 @@ cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
       norm == nullptr || weighted == nullptr || out == nullptr) {
     return cudaErrorInvalidValue;
   }
-  // ratio upper bound 16 matches the fused epilogue's per-thread route arrays.
+  // ratio upper bound 128 matches the pre-cuBLAS hand-rolled host wrapper and
+  // DSV4's actual layer configuration (`config.compress_ratios` reaches 128).
+  // The fused epilogue uses streaming softmax so it has no compile-time route
+  // ceiling.
   // `seq_len` does NOT need to be a multiple of `ratio`: the GEMMs run over the
   // full input, the epilogue reads only the first `compressed_len * ratio`
   // tokens, and any trailing partial group is ignored (matches the pre-cuBLAS
   // hand-rolled kernel's behavior). Required for online prompts whose prefill
   // length is not aligned to `ratio` (e.g. ratio=2 with seq_len=21).
-  if (ratio <= 1 || ratio > 16 || seq_len < ratio || hidden_dim <= 0 ||
+  if (ratio <= 1 || ratio > 128 || seq_len < ratio || hidden_dim <= 0 ||
       head_dim <= 0) {
     return cudaErrorInvalidValue;
   }
