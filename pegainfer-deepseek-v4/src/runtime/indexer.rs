@@ -596,65 +596,75 @@ where
     Ok(topk)
 }
 
-pub(crate) fn indexer_topk_indices_decode_batch_into(
+pub(crate) struct Ratio4DecodeTopkBatchInputs<'a> {
+    pub(crate) scores: &'a CudaSlice<f32>,
+    pub(crate) start_pos: &'a CudaSlice<i32>,
+    pub(crate) window_base: &'a CudaSlice<i32>,
+    pub(crate) compressed_len: &'a CudaSlice<i32>,
+    pub(crate) compressed_base: &'a CudaSlice<i32>,
+    pub(crate) batch: usize,
+    pub(crate) max_compressed_len: usize,
+}
+
+pub(crate) fn ratio4_decode_topk_indices_batch_into(
     ctx: &RankGpuContext,
     config: &Config,
-    scores: &CudaSlice<f32>,
-    compressed_len: &CudaSlice<i32>,
-    cache_base: &CudaSlice<i32>,
-    batch: usize,
-    max_compressed_len: usize,
+    input: Ratio4DecodeTopkBatchInputs<'_>,
     topk_idxs: &mut CudaSlice<i32>,
 ) -> Result<usize> {
     ctx.set_current()?;
-    ensure!(batch > 0, "indexer top-k decode batch must be positive");
+    ensure!(input.batch > 0, "ratio4 top-k batch must be positive");
     ensure!(
-        max_compressed_len > 0,
-        "indexer top-k max_compressed_len must be positive"
+        input.max_compressed_len > 0,
+        "ratio4 top-k max_compressed_len must be positive"
     );
     ensure!(
-        scores.len() >= batch * max_compressed_len,
-        "indexer top-k batch scores capacity too small: need {}, have {}",
-        batch * max_compressed_len,
-        scores.len()
+        input.scores.len() >= input.batch * input.max_compressed_len,
+        "ratio4 top-k scores capacity too small: need {}, have {}",
+        input.batch * input.max_compressed_len,
+        input.scores.len()
     );
     ensure!(
-        compressed_len.len() >= batch,
-        "indexer top-k compressed_len capacity too small: need {}, have {}",
-        batch,
-        compressed_len.len()
+        input.start_pos.len() >= input.batch
+            && input.window_base.len() >= input.batch
+            && input.compressed_len.len() >= input.batch
+            && input.compressed_base.len() >= input.batch,
+        "ratio4 top-k metadata capacity too small for batch {}",
+        input.batch
     );
+    let index_topk = config.index_topk.min(input.max_compressed_len);
+    let total_topk = config.sliding_window + index_topk;
     ensure!(
-        cache_base.len() >= batch,
-        "indexer top-k cache_base capacity too small: need {}, have {}",
-        batch,
-        cache_base.len()
-    );
-    let topk = config.index_topk.min(max_compressed_len);
-    ensure!(
-        topk_idxs.len() >= batch * topk,
-        "indexer top-k output capacity too small: need {}, have {}",
-        batch * topk,
+        topk_idxs.len() >= input.batch * total_topk,
+        "ratio4 top-k output capacity too small: need {}, have {}",
+        input.batch * total_topk,
         topk_idxs.len()
     );
     {
-        let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
+        let (scores_ptr, _scores_guard) = input.scores.device_ptr(&ctx.stream);
+        let (start_ptr, _start_guard) = input.start_pos.device_ptr(&ctx.stream);
+        let (window_base_ptr, _window_base_guard) = input.window_base.device_ptr(&ctx.stream);
+        let (compressed_len_ptr, _compressed_len_guard) =
+            input.compressed_len.device_ptr(&ctx.stream);
+        let (compressed_base_ptr, _compressed_base_guard) =
+            input.compressed_base.device_ptr(&ctx.stream);
         let (topk_ptr, _topk_guard) = topk_idxs.device_ptr_mut(&ctx.stream);
-        let (compressed_ptr, _compressed_guard) = compressed_len.device_ptr(&ctx.stream);
-        let (base_ptr, _base_guard) = cache_base.device_ptr(&ctx.stream);
         let result = unsafe {
-            ffi::deepseek_indexer_topk_decode_batch_cuda(
+            ffi::deepseek_ratio4_decode_topk_indices_batch_cuda(
                 scores_ptr as *const f32,
+                start_ptr as *const i32,
+                window_base_ptr as *const i32,
+                compressed_len_ptr as *const i32,
+                compressed_base_ptr as *const i32,
                 topk_ptr as *mut i32,
-                compressed_ptr as *const i32,
-                base_ptr as *const i32,
-                batch as i32,
-                max_compressed_len as i32,
-                topk as i32,
+                input.batch as i32,
+                config.sliding_window as i32,
+                input.max_compressed_len as i32,
+                index_topk as i32,
                 ctx.stream.cu_stream(),
             )
         };
         result.result()?;
     }
-    Ok(topk)
+    Ok(total_topk)
 }

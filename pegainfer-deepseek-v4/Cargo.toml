@@ -23,6 +23,7 @@ pplx-ep = [
     "dep:pegainfer-comm",
     "pegainfer-comm/hw-rdma",
 ]
+pplx-ep-bench = ["pplx-ep"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -54,6 +55,11 @@ required-features = ["deepseek-v4"]
 name = "deepseek_v4_e2e"
 path = "src/bin/deepseek_v4_e2e.rs"
 required-features = ["deepseek-v4"]
+
+[[bin]]
+name = "deepseek_pplx_a2a_bench"
+path = "src/bin/deepseek_pplx_a2a_bench.rs"
+required-features = ["pplx-ep-bench"]
 
 [[test]]
 name = "mp8_manifest"

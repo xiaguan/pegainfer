@@ -8,10 +8,10 @@
 //!
 //! # Stream layout
 //!
-//! All four `EpBackend` methods run on `moe_stream` (the stream the
-//! upstream worker thread fences against). Local compute (routing,
-//! shared expert, grouped FP4 GEMMs) runs on `ctx.stream`. Cross-stream
-//! handoffs are explicit CUDA events.
+//! PPLX dispatch/combine and local MoE compute all run on `ctx.stream`.
+//! Earlier two-stream overlap did not move H200 `output_len=64` p50, so the
+//! integration keeps one stream and avoids explicit cross-stream handoff
+//! events in the decode hot path.
 //!
 //! # Shared expert + combine
 //!
@@ -25,33 +25,15 @@
 //! # expert_indptr build
 //!
 //! `dispatch_recv` writes per-local-expert received-token counts into a
-//! caller-provided device buffer. We pull it back to host,
-//! exclusive-prefix-sum on host (≤256 / `world_size` entries — trivial),
-//! and H2D into [`MoePplxScratch::expert_indptr`]. Adding a device-side
-//! prefix-sum kernel is a future optimization once the basic flow lands.
+//! caller-provided device buffer. A tiny device kernel converts those counts
+//! into pplx's padded expert-major `expert_indptr`, keeping decode on-stream.
 
 use std::ffi::c_void;
 use std::ptr;
 
 use cudarc::driver::CudaStream;
 use pegainfer_comm::{EpBackend, ScalarType};
-
-#[inline]
-fn _now_ns() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-#[inline]
-fn _caller_tid_cpu() -> (i64, i32) {
-    unsafe {
-        let tid = libc::syscall(libc::SYS_gettid) as i64;
-        let cpu = libc::sched_getcpu();
-        (tid, cpu)
-    }
-}
+use pegainfer_kernels::ffi;
 
 use super::core::shared_expert_forward_bf16_hidden_scratch;
 use super::moe::{
@@ -71,7 +53,6 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
     weights: &RankWeightView<'_>,
     ptr_cache: &MoeGroupedPtrCache,
     ep: &mut EpBackend,
-    moe_stream: &CudaStream,
     layer: usize,
     input: &Bf16HiddenStates,
     token_ids: &CudaSlice<u32>,
@@ -95,56 +76,65 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
     );
     let local_experts = config.n_routed_experts / world_size;
     let topk = config.n_activated_experts;
+    let comm_stream = ctx.stream.as_ref();
+    let stream_raw = comm_stream.cu_stream() as u64;
 
     // ---- 1. Local route -> (indices, weights) on ctx.stream ----
-    if layer < config.n_hash_layers {
-        let _ = hash_route_bf16_hidden_into(
+    {
+        if layer < config.n_hash_layers {
+            let _ = hash_route_bf16_hidden_into(
+                ctx,
+                config,
+                input,
+                &ffn,
+                token_ids,
+                &mut moe_scratch.route_weights,
+                &mut moe_scratch.route_indices,
+            )?;
+        } else {
+            let _ = score_route_bf16_hidden_into(
+                ctx,
+                config,
+                input,
+                &ffn,
+                &mut moe_scratch.route_weights,
+                &mut moe_scratch.route_indices,
+            )?;
+        }
+    }
+    // ---- 2. Shared expert on ctx.stream ----
+    {
+        let shared = shared_expert_forward_bf16_hidden_scratch(
             ctx,
-            config,
             input,
             &ffn,
-            token_ids,
-            &mut moe_scratch.route_weights,
-            &mut moe_scratch.route_indices,
+            config.swiglu_limit,
+            shared_scratch,
         )?;
-    } else {
-        let _ = score_route_bf16_hidden_into(
-            ctx,
-            config,
-            input,
-            &ffn,
-            &mut moe_scratch.route_weights,
-            &mut moe_scratch.route_indices,
+        ensure!(shared.hidden_dim == moe_scratch.out.hidden_dim);
+        ensure!(shared.seq_len == num_tokens);
+        moe_scratch.out.seq_len = num_tokens;
+        // Stage shared expert into `out`; `combine_recv` accumulates routed
+        // into it (D2D same-stream copy).
+        let copy_len = num_tokens * shared.hidden_dim;
+        ctx.stream.memcpy_dtod(
+            &shared.data.slice(0..copy_len),
+            &mut moe_scratch.out.data.slice_mut(0..copy_len),
         )?;
     }
 
-    // moe_stream waits for ctx.stream so dispatch sees route output.
-    let route_done = ctx.stream.record_event(Some(
-        cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-    ))?;
-    moe_stream.wait(&route_done)?;
-
-    // ---- 2. dispatch_send on moe_stream ----
-    let stream_raw = moe_stream.cu_stream() as u64;
+    // ---- 3. dispatch_send on ctx.stream ----
     {
-        let (x_ptr, _x_guard) = input.data.device_ptr(moe_stream);
-        let (idx_ptr, _idx_guard) = moe_scratch.route_indices.device_ptr(moe_stream);
-        let (w_ptr, _w_guard) = moe_scratch.route_weights.device_ptr(moe_stream);
-        let (tid, cpu) = _caller_tid_cpu();
-        log::info!(
-            "[ep.dispatch_send ENTER] layer={} t_ns={} caller_tid={} caller_cpu={}",
-            layer,
-            _now_ns(),
-            tid,
-            cpu
-        );
-        let _t0 = std::time::Instant::now();
-        // Upstream a2a_dispatch_send.cu uses `(uint4*)(x_ptr + token * x_stride)`,
+        let (x_ptr, _x_guard) = input.data.device_ptr(comm_stream);
+        let (idx_ptr, _idx_guard) = moe_scratch.route_indices.device_ptr(comm_stream);
+        let (w_ptr, _w_guard) = moe_scratch.route_weights.device_ptr(comm_stream);
+        // Upstream a2a kernels address `(uint4*)(x_ptr + token * x_stride)`,
         // so x_stride is in BYTES (sizeof(bf16) * hidden_dim).
+        let x_stride = input.hidden_dim * std::mem::size_of::<u16>();
         ep.dispatch_send(
             num_tokens,
             x_ptr as *const c_void,
-            input.hidden_dim * std::mem::size_of::<u16>(), // x_stride: BF16 BYTES per row
+            x_stride,
             ptr::null(),
             0,
             0,
@@ -156,44 +146,14 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx dispatch_send layer {layer}"))?;
-        log::info!(
-            "[ep.dispatch_send LEAVE] layer={} dur_us={}",
-            layer,
-            _t0.elapsed().as_micros()
-        );
     }
 
-    // ---- 3. Shared expert on ctx.stream (overlaps with dispatch_send) ----
-    let shared = shared_expert_forward_bf16_hidden_scratch(
-        ctx,
-        input,
-        &ffn,
-        config.swiglu_limit,
-        shared_scratch,
-    )?;
-    ensure!(shared.hidden_dim == moe_scratch.out.hidden_dim);
-    ensure!(shared.seq_len == num_tokens);
-    moe_scratch.out.seq_len = num_tokens;
-    // Stage shared expert into `out`; `combine_recv` accumulates routed
-    // into it (D2D same-stream copy).
-    let copy_len = num_tokens * shared.hidden_dim;
-    ctx.stream.memcpy_dtod(
-        &shared.data.slice(0..copy_len),
-        &mut moe_scratch.out.data.slice_mut(0..copy_len),
-    )?;
-
-    // ---- 4. dispatch_recv on moe_stream -> expert-packed activations ----
+    // ---- 4. dispatch_recv -> expert-packed activations ----
     {
         let (out_num_ptr, _g0) = moe_scratch
             .recv_tokens_per_expert
-            .device_ptr_mut(moe_stream);
-        let (out_x_ptr, _g1) = moe_scratch.expanded_input.data.device_ptr_mut(moe_stream);
-        log::info!(
-            "[ep.dispatch_recv ENTER] layer={} t_ns={}",
-            layer,
-            _now_ns()
-        );
-        let _t1 = std::time::Instant::now();
+            .device_ptr_mut(comm_stream);
+        let (out_x_ptr, _g1) = moe_scratch.expanded_input.data.device_ptr_mut(comm_stream);
         ep.dispatch_recv(
             out_num_ptr as *mut i32,
             out_x_ptr as *mut c_void,
@@ -204,75 +164,34 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx dispatch_recv layer {layer}"))?;
-        log::info!(
-            "[ep.dispatch_recv LEAVE] layer={} dur_us={}",
-            layer,
-            _t1.elapsed().as_micros()
-        );
     }
 
-    // ---- 5. D2H per-expert recv counts, prefix-sum on host ----
-    // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
-    // expert on moe_stream; sync once so the host readback is safe.
-    log::info!("[moe_stream.sync ENTER] layer={} t_ns={}", layer, _now_ns());
-    let _t_sync = std::time::Instant::now();
-    moe_stream.synchronize()?;
-    log::info!(
-        "[moe_stream.sync LEAVE] layer={} dur_us={}",
-        layer,
-        _t_sync.elapsed().as_micros()
-    );
-    ctx.stream.memcpy_dtoh(
-        &moe_scratch.recv_tokens_per_expert,
-        &mut moe_scratch.recv_tokens_per_expert_host,
-    )?;
-    ctx.sync()?;
-    // Exclusive prefix sum on host -> expert_indptr. pplx writes expert
-    // payload rows at `padded_index`, so grouped GEMM must see the same
-    // padded expert-major layout.
-    let mut indptr_host = vec![0i32; local_experts + 1];
-    let mut actual_acc: i32 = 0;
-    let mut padded_acc: i32 = 0;
+    // ---- 5. Device prefix: recv counts -> padded expert_indptr ----
+    // pplx writes payload rows at `padded_index`, so grouped GEMM must see
+    // the same padded expert-major layout.
     ensure!(
         moe_scratch.expert_padding > 0,
         "pplx expert_padding must be positive"
     );
-    for i in 0..local_experts {
-        let count = moe_scratch.recv_tokens_per_expert_host[i];
-        ensure!(
-            count >= 0,
-            "pplx expert {i} returned negative token count {count}"
-        );
-        indptr_host[i] = padded_acc;
-        actual_acc = actual_acc
-            .checked_add(count)
-            .ok_or_else(|| anyhow::anyhow!("pplx expert_indptr overflow"))?;
-        let padded_count =
-            (count as usize).div_ceil(moe_scratch.expert_padding) * moe_scratch.expert_padding;
-        let padded_count = i32::try_from(padded_count)
-            .map_err(|_| anyhow::anyhow!("pplx padded token count exceeds i32"))?;
-        padded_acc = padded_acc
-            .checked_add(padded_count)
-            .ok_or_else(|| anyhow::anyhow!("pplx padded expert_indptr overflow"))?;
+    {
+        build_padded_expert_indptr_on_stream(ctx, comm_stream, local_experts, moe_scratch)?;
     }
-    indptr_host[local_experts] = padded_acc;
-    let num_recv_tokens = actual_acc as usize;
-    let num_padded_recv_tokens = padded_acc as usize;
-    ensure!(
-        num_padded_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
-        "pplx padded num_recv_tokens={num_padded_recv_tokens} exceeds expanded_input capacity {}",
-        moe_scratch.expanded_input.seq_capacity()
-    );
-    ctx.stream
-        .memcpy_htod(&indptr_host, &mut moe_scratch.expert_indptr)?;
 
     // ---- 6. Local grouped FP4 experts over the received activations ----
-    // The grouped GEMM helpers read `expanded_input.seq_len` AND
-    // `expert_indptr[..local_experts + 1]`; align both with pplx's padded
-    // receive layout. The routing-side fields on the plan view
+    // The grouped GEMM helpers take a host `rows` launch bound. Use the
+    // preallocated scratch capacity so the hot path no longer needs to know
+    // the dynamic padded token count on host; actual expert ranges still come
+    // from device `expert_indptr`. The routing-side fields on the plan view
     // (`pos_to_token`, `token_topk_to_pos`, `num_expanded`,
     // `routed.weights/indices`) are not touched by the grouped GEMM path
     // — they point at the local route slices only to satisfy the borrow.
+    let num_padded_recv_tokens = moe_scratch.expanded_input.seq_capacity();
+    ensure!(
+        num_padded_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
+        "pplx grouped rows={} exceed expanded_input capacity {}",
+        num_padded_recv_tokens,
+        moe_scratch.expanded_input.seq_capacity()
+    );
     moe_scratch.expanded_input.seq_len = num_padded_recv_tokens;
     moe_scratch.expert_gate.seq_len = num_padded_recv_tokens;
     moe_scratch.expert_up.seq_len = num_padded_recv_tokens;
@@ -290,53 +209,42 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         local_experts,
         num_expanded: num_padded_recv_tokens,
     };
-    let _ = local_experts_forward_packed_bf16_hidden_scratch(
-        ctx,
-        config,
-        ptr_cache,
-        layer,
-        &moe_scratch.expanded_input,
-        &plan,
-        &mut moe_scratch.expert_gate,
-        &mut moe_scratch.expert_up,
-        &mut moe_scratch.expert_out,
-        &mut moe_scratch.fp4_act_workspace,
-        &mut moe_scratch.fp4_act_scale_workspace,
-    )?;
+    {
+        let _ = local_experts_forward_packed_bf16_hidden_scratch(
+            ctx,
+            config,
+            ptr_cache,
+            layer,
+            &moe_scratch.expanded_input,
+            &plan,
+            &mut moe_scratch.expert_gate,
+            &mut moe_scratch.expert_up,
+            &mut moe_scratch.expert_out,
+            &mut moe_scratch.fp4_act_workspace,
+            &mut moe_scratch.fp4_act_scale_workspace,
+        )?;
+    }
     drop(plan);
 
-    // ---- 7. combine_send on moe_stream ----
-    let experts_done = ctx.stream.record_event(Some(
-        cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-    ))?;
-    moe_stream.wait(&experts_done)?;
+    // ---- 7. combine_send on ctx.stream ----
     {
-        let (exp_ptr, _g) = moe_scratch.expert_out.data.device_ptr(moe_stream);
-        log::info!("[ep.combine_send ENTER] layer={} t_ns={}", layer, _now_ns());
-        let _t2 = std::time::Instant::now();
+        let (exp_ptr, _g) = moe_scratch.expert_out.data.device_ptr(comm_stream);
         ep.combine_send(
             exp_ptr as *const c_void,
             moe_scratch.expert_out.hidden_dim * std::mem::size_of::<u16>(), // expert_x_stride: BF16 BYTES
             stream_raw,
         )
         .with_context(|| format!("pplx combine_send layer {layer}"))?;
-        log::info!(
-            "[ep.combine_send LEAVE] layer={} dur_us={}",
-            layer,
-            _t2.elapsed().as_micros()
-        );
     }
 
     // ---- 8. combine_recv: routed += into `out` (already holds shared) ----
     {
-        let (out_ptr, _g0) = moe_scratch.out.data.device_ptr_mut(moe_stream);
-        let (idx_ptr, _g1) = moe_scratch.route_indices.device_ptr(moe_stream);
-        let (w_ptr, _g2) = moe_scratch.route_weights.device_ptr(moe_stream);
-        log::info!("[ep.combine_recv ENTER] layer={} t_ns={}", layer, _now_ns());
-        let _t3 = std::time::Instant::now();
+        let (out_ptr, _g0) = moe_scratch.out.data.device_ptr_mut(comm_stream);
+        let (idx_ptr, _g1) = moe_scratch.route_indices.device_ptr(comm_stream);
+        let (w_ptr, _g2) = moe_scratch.route_weights.device_ptr(comm_stream);
         ep.combine_recv(
             num_tokens,
-            num_recv_tokens,
+            0, // Currently ignored by the a2a combine_recv kernel.
             ScalarType::BF16,
             out_ptr as *mut c_void,
             moe_scratch.out.hidden_dim, // out_tokens_stride: BF16 ELEMENTS
@@ -349,16 +257,38 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx combine_recv layer {layer}"))?;
-        log::info!(
-            "[ep.combine_recv LEAVE] layer={} dur_us={}",
-            layer,
-            _t3.elapsed().as_micros()
-        );
     }
-    let combine_done = moe_stream.record_event(Some(
-        cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-    ))?;
-    ctx.stream.wait(&combine_done)?;
 
     Ok(&moe_scratch.out)
+}
+
+fn build_padded_expert_indptr_on_stream(
+    ctx: &RankGpuContext,
+    stream: &CudaStream,
+    local_experts: usize,
+    moe_scratch: &mut MoePplxScratch,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        local_experts <= i32::MAX as usize,
+        "pplx local_experts exceeds i32: {local_experts}"
+    );
+    ensure!(
+        moe_scratch.expert_padding <= i32::MAX as usize,
+        "pplx expert_padding exceeds i32: {}",
+        moe_scratch.expert_padding
+    );
+    let (counts_ptr, _counts_guard) = moe_scratch.recv_tokens_per_expert.device_ptr(stream);
+    let (indptr_ptr, _indptr_guard) = moe_scratch.expert_indptr.device_ptr_mut(stream);
+    let result = unsafe {
+        ffi::deepseek_pplx_padded_expert_indptr_cuda(
+            counts_ptr as *const i32,
+            indptr_ptr as *mut i32,
+            local_experts as i32,
+            moe_scratch.expert_padding as i32,
+            stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
 }

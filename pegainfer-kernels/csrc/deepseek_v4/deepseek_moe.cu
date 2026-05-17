@@ -621,6 +621,23 @@ __global__ void deepseek_moe_prefix_local_experts_kernel(
   local_count[0] = sum;
 }
 
+__global__ void deepseek_pplx_padded_expert_indptr_kernel(
+    const int *__restrict__ recv_tokens_per_expert,
+    int *__restrict__ expert_indptr,
+    int local_experts,
+    int expert_padding) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int sum = 0;
+  for (int expert = 0; expert < local_experts; ++expert) {
+    int count = recv_tokens_per_expert[expert];
+    if (count < 0) count = 0;
+    expert_indptr[expert] = sum;
+    int padded = ((count + expert_padding - 1) / expert_padding) * expert_padding;
+    sum += padded;
+  }
+  expert_indptr[local_experts] = sum;
+}
+
 __global__ void deepseek_moe_expand_to_fused_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const int *__restrict__ pos_to_token,
@@ -728,6 +745,21 @@ cudaError_t deepseek_moe_expand_to_fused_cuda(
   int blocks = (total + threads - 1) / threads;
   deepseek_moe_expand_to_fused_kernel<<<blocks, threads, 0, stream>>>(
       x, pos_to_token, expanded, hidden_dim, num_expanded);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_pplx_padded_expert_indptr_cuda(
+    const int *recv_tokens_per_expert,
+    int *expert_indptr,
+    int local_experts,
+    int expert_padding,
+    cudaStream_t stream) {
+  if (recv_tokens_per_expert == nullptr || expert_indptr == nullptr ||
+      local_experts <= 0 || expert_padding <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  deepseek_pplx_padded_expert_indptr_kernel<<<1, 1, 0, stream>>>(
+      recv_tokens_per_expert, expert_indptr, local_experts, expert_padding);
   return cudaGetLastError();
 }
 

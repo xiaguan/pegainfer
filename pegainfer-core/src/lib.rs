@@ -1,5 +1,6 @@
 //! Shared runtime API used by pegainfer model crates.
 
+pub mod cpu_topology;
 pub mod cuda_graph;
 pub mod engine;
 pub mod ffi;

@@ -1110,111 +1110,6 @@ pub(crate) fn attention_decode_rank_local_bf16_hidden_batch_with_scratch<'a>(
     .with_context(|| format!("attention_output_project batch layer {layer}"))
 }
 
-pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
-    ctx: &RankGpuContext,
-    config: &Config,
-    layer: usize,
-    input: &Bf16HiddenStates,
-    attn: &AttentionWeights<'_>,
-    rope: &DeepSeekRopeCache,
-    start_pos: usize,
-    cache: &mut LayerDecodeCache,
-) -> Result<Bf16HiddenStates> {
-    ensure!(input.seq_len == 1, "compressed decode expects seq_len=1");
-    ensure!(
-        layer < config.compress_ratios.len(),
-        "compressed decode layer {layer} out of range"
-    );
-    let ratio = config.compress_ratios[layer];
-    ensure!(
-        ratio > 0 && ratio != 4,
-        "non-overlap decode called for ratio {ratio}"
-    );
-    ensure!(
-        cache.kv.hidden_dim == config.head_dim && cache.kv.slots >= config.sliding_window,
-        "compressed decode kv cache shape mismatch: hidden_dim={}, slots={}",
-        cache.kv.hidden_dim,
-        cache.kv.slots
-    );
-    let compressor = attn
-        .compressor
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor weights"))?;
-    let compressor_state = cache
-        .compressor
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor decode state"))?;
-
-    let mut projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
-    apply_rope_attention_projections(ctx, &mut projections, rope, start_pos)?;
-    copy_bf16_rows_to_cache(
-        ctx,
-        &projections.kv,
-        &mut cache.kv,
-        0,
-        start_pos % config.sliding_window,
-        1,
-    )?;
-    if let Some(compressed_kv) = compressor_nonoverlap_decode_bf16_hidden(
-        ctx,
-        config,
-        input,
-        compressor,
-        ratio,
-        rope,
-        start_pos,
-        compressor_state,
-    )? {
-        copy_bf16_rows_to_cache(
-            ctx,
-            &compressed_kv,
-            &mut cache.kv,
-            0,
-            config.sliding_window + start_pos / ratio,
-            1,
-        )?;
-    }
-
-    let (window_idxs, window_topk) =
-        window_topk_indices_decode(ctx, start_pos, config.sliding_window)?;
-    let compressed_len = (start_pos + 1) / ratio;
-    let (topk_idxs, topk) = if compressed_len > 0 {
-        let (compress_idxs, compress_topk) =
-            compress_topk_indices_decode(ctx, start_pos, ratio, config.sliding_window)?;
-        (
-            concat_topk_indices(
-                ctx,
-                &window_idxs,
-                window_topk,
-                &compress_idxs,
-                compress_topk,
-                1,
-            )?,
-            window_topk + compress_topk,
-        )
-    } else {
-        (window_idxs, window_topk)
-    };
-    let mut attn_out = indexed_attention_cache_bf16_hidden(
-        ctx,
-        config,
-        &projections,
-        &cache.kv,
-        attn,
-        &topk_idxs,
-        topk,
-    )?;
-    attention_output_project_bf16_hidden(
-        ctx,
-        &mut attn_out,
-        attn,
-        rope,
-        projections.local_heads,
-        projections.head_dim,
-        start_pos,
-    )
-}
-
 pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batch_with_scratch<
     'a,
 >(
@@ -1358,6 +1253,133 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batc
         rope,
         batch_meta.start_pos,
         batch_meta.batch,
+        attention_output_scratch,
+    )
+}
+
+pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_with_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    cache: &mut LayerDecodeCache,
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &'a mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+    attention_aux_scratch: &mut AttentionAuxScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ensure!(input.seq_len == 1, "compressed decode expects seq_len=1");
+    ensure!(
+        layer < config.compress_ratios.len(),
+        "compressed decode layer {layer} out of range"
+    );
+    let ratio = config.compress_ratios[layer];
+    ensure!(
+        ratio > 0 && ratio != 4,
+        "non-overlap decode called for ratio {ratio}"
+    );
+    ensure!(
+        cache.kv.hidden_dim == config.head_dim && cache.kv.slots >= config.sliding_window,
+        "compressed decode kv cache shape mismatch: hidden_dim={}, slots={}",
+        cache.kv.hidden_dim,
+        cache.kv.slots
+    );
+    let compressor = attn
+        .compressor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor weights"))?;
+    let compressor_state = cache
+        .compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor decode state"))?;
+
+    let mut projections = attention_project_bf16_hidden_scratch(
+        ctx,
+        config,
+        input,
+        attn,
+        attention_projection_scratch,
+    )?;
+    apply_rope_attention_projections_view(ctx, &mut projections, rope, start_pos)?;
+    copy_bf16_rows_to_cache(
+        ctx,
+        projections.kv,
+        &mut cache.kv,
+        0,
+        start_pos % config.sliding_window,
+        1,
+    )?;
+    if let Some(compressed_kv) = compressor_nonoverlap_decode_bf16_hidden_at_scratch(
+        ctx,
+        config,
+        input,
+        compressor,
+        ratio,
+        rope,
+        start_pos,
+        compressor_state,
+        0,
+        attention_aux_scratch,
+    )? {
+        copy_bf16_rows_to_cache(
+            ctx,
+            compressed_kv,
+            &mut cache.kv,
+            0,
+            config.sliding_window + start_pos / ratio,
+            1,
+        )?;
+    }
+
+    let window_topk = window_topk_indices_decode_into(
+        ctx,
+        start_pos,
+        config.sliding_window,
+        &mut attention_index_scratch.window_idxs,
+    )?;
+    let compressed_len = (start_pos + 1) / ratio;
+    let (topk_idxs, topk) = if compressed_len > 0 {
+        let compress_topk = compress_topk_indices_decode_into(
+            ctx,
+            start_pos,
+            ratio,
+            config.sliding_window,
+            &mut attention_index_scratch.compress_idxs,
+        )?;
+        concat_topk_indices_into(
+            ctx,
+            &attention_index_scratch.window_idxs,
+            window_topk,
+            &attention_index_scratch.compress_idxs,
+            compress_topk,
+            1,
+            &mut attention_index_scratch.topk_idxs,
+        )?;
+        (
+            &attention_index_scratch.topk_idxs,
+            window_topk + compress_topk,
+        )
+    } else {
+        (&attention_index_scratch.window_idxs, window_topk)
+    };
+    indexed_attention_cache_bf16_hidden_view_into(
+        ctx,
+        config,
+        &projections,
+        &cache.kv,
+        attn,
+        topk_idxs,
+        topk,
+        &mut attention_output_scratch.attn_out,
+    )?;
+    attention_output_project_bf16_hidden_scratch(
+        ctx,
+        attn,
+        rope,
+        start_pos,
         attention_output_scratch,
     )
 }

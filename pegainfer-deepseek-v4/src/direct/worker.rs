@@ -36,6 +36,7 @@ pub(super) struct DirectBatchDecodeEntry {
 
 pub(super) struct FullDirectRuntime {
     workers: Vec<RankWorker>,
+    thread_placement: super::affinity::RankThreadPlacementPlan,
     prefill_profile: bool,
 }
 
@@ -334,7 +335,15 @@ impl RankWorker {
         comm: cudarc::nccl::safe::Comm,
         moe_comm: cudarc::nccl::safe::Comm,
         config: &'static Config,
+        placement: super::affinity::RankThreadPlacement,
     ) -> Result<Self> {
+        ensure!(
+            placement.rank == rank && placement.device_ordinal == ctx.device_ordinal,
+            "rank worker placement mismatch: spawn rank {rank} cuda:{}, placement rank {} cuda:{}",
+            ctx.device_ordinal,
+            placement.rank,
+            placement.device_ordinal,
+        );
         let (tx, rx) = channel::unbounded();
         let (startup_tx, startup_rx) = channel::bounded(1);
         let comm = OwnedRankComm(comm);
@@ -342,7 +351,7 @@ impl RankWorker {
         let handle = thread::Builder::new()
             .name(format!("deepseek-v4-rank-{rank}"))
             .spawn(move || {
-                super::affinity::pin_rank_worker_thread(rank, ctx.device_ordinal);
+                super::affinity::pin_rank_worker_thread(&placement);
                 let mut ropes = Vec::new();
                 let mut caches = Vec::new();
                 let mut max_cache_seq_len = 0usize;
@@ -404,21 +413,23 @@ impl RankWorker {
                                     start_pos,
                                     resp,
                                 } => {
-                                    let result = run_decode_on_rank_lane(
-                                        rank,
-                                        &ctx,
-                                        &weights,
-                                        &ptr_cache,
-                                        comm.get(),
-                                        moe_comm.get(),
-                                        &ropes,
-                                        config,
-                                        token_id,
-                                        start_pos,
-                                        &mut caches,
-                                        &mut decode_scratch,
-                                    )
-                                    .map(|logits| (rank, logits));
+                                    let result = {
+                                        run_decode_on_rank_lane(
+                                            rank,
+                                            &ctx,
+                                            &weights,
+                                            &ptr_cache,
+                                            comm.get(),
+                                            moe_comm.get(),
+                                            &ropes,
+                                            config,
+                                            token_id,
+                                            start_pos,
+                                            &mut caches,
+                                            &mut decode_scratch,
+                                        )
+                                        .map(|logits| (rank, logits))
+                                    };
                                     let _ = resp.send(result);
                                 }
                                 RankCommand::DecodeBatch { entries, resp } => {
@@ -619,6 +630,10 @@ impl RankWorker {
 }
 
 impl FullDirectRuntime {
+    pub(super) fn thread_placement(&self) -> &super::affinity::RankThreadPlacementPlan {
+        &self.thread_placement
+    }
+
     /// Move per-rank pplx-garden EP backends into the rank workers.
     ///
     /// `ep_backends` must have length equal to the world size; element `i`
@@ -667,6 +682,11 @@ pub(super) fn load_full_direct_runtime(
     for rank in 0..8 {
         contexts.push(RankGpuContext::new(rank)?);
     }
+    let device_ordinals = contexts
+        .iter()
+        .map(|ctx| ctx.device_ordinal)
+        .collect::<Vec<_>>();
+    let thread_placement = super::affinity::RankThreadPlacementPlan::for_devices(&device_ordinals)?;
     let weights = contexts
         .iter()
         .enumerate()
@@ -704,10 +724,14 @@ pub(super) fn load_full_direct_runtime(
         .zip(worker_comms.into_iter())
         .zip(moe_comms.into_iter())
     {
-        workers.push(RankWorker::spawn(rank, ctx, view, comm, moe_comm, config)?);
+        let placement = thread_placement.rank(rank)?;
+        workers.push(RankWorker::spawn(
+            rank, ctx, view, comm, moe_comm, config, placement,
+        )?);
     }
     Ok(FullDirectRuntime {
         workers,
+        thread_placement,
         prefill_profile,
     })
 }
@@ -1135,8 +1159,6 @@ fn run_decode_on_rank_lane(
     let mut current_hc_slot = None;
     for layer in 0..config.n_layers {
         let output_slot = current_hc_slot.map_or(0, |slot| 1 - slot);
-        #[cfg(feature = "pplx-ep")]
-        let moe_stream_arc = moe_comm.stream();
         let mut moe_run = MoeRunContext {
             moe_comm,
             ag_rs_scratch: &mut scratch.moe_ag_rs,
@@ -1145,11 +1167,7 @@ fn run_decode_on_rank_lane(
                 .ep_backend
                 .as_mut()
                 .zip(scratch.moe_pplx.as_mut())
-                .map(|(ep, s)| crate::runtime::MoePplxRunContext {
-                    ep,
-                    moe_stream: moe_stream_arc.as_ref(),
-                    scratch: s,
-                }),
+                .map(|(ep, s)| crate::runtime::MoePplxRunContext { ep, scratch: s }),
         };
         if let Some(input_slot) = current_hc_slot {
             let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
@@ -1228,8 +1246,15 @@ fn run_decode_on_rank_lane(
         &mut scratch.final_logits,
     )
     .with_context(|| format!("final logits rank {rank}"))?;
-    gather_logits_for_sampling_into(rank, ctx, comm, weights, &mut scratch.final_logits)
-        .with_context(|| format!("final logits all_gather rank {rank}"))
+    gather_logits_for_sampling_into(
+        rank,
+        start_pos,
+        ctx,
+        comm,
+        weights,
+        &mut scratch.final_logits,
+    )
+    .with_context(|| format!("final logits all_gather rank {rank}"))
 }
 
 fn run_decode_batch_on_rank_lane(
@@ -1336,8 +1361,6 @@ fn run_decode_batch_on_rank_lane(
             start_pos_host: &scratch.start_pos_host,
             slot_ids_host: &scratch.slot_ids_host,
         };
-        #[cfg(feature = "pplx-ep")]
-        let moe_stream_arc = moe_comm.stream();
         let mut moe_run = MoeRunContext {
             moe_comm,
             ag_rs_scratch: &mut scratch.moe_ag_rs,
@@ -1346,11 +1369,7 @@ fn run_decode_batch_on_rank_lane(
                 .ep_backend
                 .as_mut()
                 .zip(scratch.moe_pplx.as_mut())
-                .map(|(ep, s)| crate::runtime::MoePplxRunContext {
-                    ep,
-                    moe_stream: moe_stream_arc.as_ref(),
-                    scratch: s,
-                }),
+                .map(|(ep, s)| crate::runtime::MoePplxRunContext { ep, scratch: s }),
         };
         if let Some(input_slot) = current_hc_slot {
             let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
@@ -1704,18 +1723,21 @@ fn gather_logits_for_sampling(
 
 fn gather_logits_for_sampling_into(
     rank: usize,
+    _start_pos: usize,
     ctx: &RankGpuContext,
     comm: &cudarc::nccl::safe::Comm,
     weights: &RankWeightView<'_>,
     scratch: &mut FinalLogitsScratch,
 ) -> Result<Option<Vec<f32>>> {
-    all_gather_logits_into(
-        ctx,
-        comm,
-        &scratch.local_logits,
-        weights.world_size(),
-        &mut scratch.gathered_logits,
-    )?;
+    {
+        all_gather_logits_into(
+            ctx,
+            comm,
+            &scratch.local_logits,
+            weights.world_size(),
+            &mut scratch.gathered_logits,
+        )?;
+    }
     if rank == 0 {
         Ok(Some(scratch.gathered_logits.to_host(ctx)?))
     } else {
@@ -1733,27 +1755,35 @@ pub(super) fn run_direct_decode_logits(
         "DeepSeek V4 direct decode expects 8 workers"
     );
     let rank_count = runtime.workers.len();
-    let pending = runtime
-        .workers
-        .iter()
-        .enumerate()
-        .map(|(rank, worker)| {
-            worker
-                .decode(token_id, start_pos)
-                .with_context(|| format!("dispatch decode rank {rank}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let pending = {
+        runtime
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(rank, worker)| {
+                let recv = worker
+                    .decode(token_id, start_pos)
+                    .with_context(|| format!("dispatch decode rank {rank}"))?;
+                Ok((rank, recv))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
     let mut results = Vec::with_capacity(rank_count);
-    for recv in pending {
-        results.push(
-            recv.recv()
-                .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped decode response"))??,
-        );
+    {
+        for (_rank, recv) in pending {
+            results.push(
+                recv.recv().map_err(|_| {
+                    anyhow::anyhow!("DeepSeek rank worker dropped decode response")
+                })??,
+            );
+        }
     }
-    results.sort_by_key(|(rank, _)| *rank);
+    {
+        results.sort_by_key(|(rank, _)| *rank);
 
-    rank0_logits(results)
+        rank0_logits(results)
+    }
 }
 
 #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.

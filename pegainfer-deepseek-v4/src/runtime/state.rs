@@ -1,4 +1,5 @@
 use super::*;
+
 pub struct Bf16HiddenStates {
     pub data: CudaSlice<bf16>,
     pub hidden_dim: usize,
@@ -132,11 +133,10 @@ pub(crate) struct MoeRunContext<'a> {
 }
 
 /// Per-decode-step pplx-lane bundle. Borrows the rank worker's persistent
-/// `EpBackend`, MoE-side CUDA stream, and pplx scratch.
+/// `EpBackend` and pplx scratch.
 #[cfg(feature = "pplx-ep")]
 pub(crate) struct MoePplxRunContext<'a> {
     pub(crate) ep: &'a mut pegainfer_comm::EpBackend,
-    pub(crate) moe_stream: &'a cudarc::driver::CudaStream,
     pub(crate) scratch: &'a mut MoePplxScratch,
 }
 
@@ -164,14 +164,11 @@ pub(crate) struct MoePplxScratch {
     /// FP4 activation-scale workspace shared between grouped GEMMs.
     pub(crate) fp4_act_scale_workspace: cudarc::driver::CudaSlice<u8>,
     /// Exclusive prefix sum of received rows per local expert
-    /// (`local_experts + 1` entries). Built from a D2H readback of
-    /// `dispatch_recv`'s per-expert count output.
+    /// (`local_experts + 1` entries). Built on device from `dispatch_recv`'s
+    /// per-expert count output.
     pub(crate) expert_indptr: cudarc::driver::CudaSlice<i32>,
     /// Per-local-expert token counts written by `dispatch_recv`.
     pub(crate) recv_tokens_per_expert: cudarc::driver::CudaSlice<i32>,
-    /// Host buffer used to read back `recv_tokens_per_expert`
-    /// (sized `local_experts`).
-    pub(crate) recv_tokens_per_expert_host: Vec<i32>,
     /// Per-expert alignment used by pplx's padded receive layout.
     pub(crate) expert_padding: usize,
     /// Final BF16 output `[seq_len, hidden_dim]`. Shared-expert result is
@@ -646,7 +643,6 @@ impl MoePplxScratch {
         // expert (matches upstream Python `(num_local_experts,)` shape),
         // not a single scalar.
         let recv_tokens_per_expert = unsafe { ctx.stream.alloc(local_experts)? };
-        let recv_tokens_per_expert_host = vec![0i32; local_experts];
 
         let out = Bf16HiddenStates::uninit(ctx, config.dim, local_seq_capacity)?;
 
@@ -661,7 +657,6 @@ impl MoePplxScratch {
             fp4_act_scale_workspace,
             expert_indptr,
             recv_tokens_per_expert,
-            recv_tokens_per_expert_host,
             expert_padding: EXPERT_PADDING,
             out,
         })

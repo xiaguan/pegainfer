@@ -843,6 +843,40 @@ pub fn compress_topk_indices_decode(
     Ok((data, compressed))
 }
 
+pub(crate) fn compress_topk_indices_decode_into(
+    ctx: &RankGpuContext,
+    start_pos: usize,
+    ratio: usize,
+    offset: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<usize> {
+    ctx.set_current()?;
+    ensure!(ratio > 0, "compress ratio must be positive");
+    let compressed = (start_pos + 1) / ratio;
+    ensure!(
+        out.len() >= compressed,
+        "compress top-k decode output capacity too small: need {}, have {}",
+        compressed,
+        out.len()
+    );
+    if compressed == 0 {
+        return Ok(0);
+    }
+    {
+        let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_compress_topk_indices_decode_cuda(
+                out_ptr as *mut i32,
+                compressed as i32,
+                offset as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(compressed)
+}
+
 pub(crate) fn compress_topk_indices_decode_batch_into(
     ctx: &RankGpuContext,
     compressed_len: &CudaSlice<i32>,

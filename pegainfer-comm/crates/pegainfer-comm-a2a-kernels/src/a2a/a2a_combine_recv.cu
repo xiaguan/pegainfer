@@ -152,7 +152,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (blockIdx.x == 0) {
         if (warp_id == 0) {
             if (elect_one_sync()) {
-                st_mmio_b8(combine_recv_done, 1);
                 *combine_recv_flag = 0;
                 *sync_counter = counter + 1;
             }
@@ -162,6 +161,14 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             if (peer < NODE_SIZE) {
                 st_volatile_u32(&sync_ptrs[local_rank][peer], counter + 1);
             }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            // Host worker treats combine_recv_done as the release boundary for
+            // advancing the protocol, so publish it only after the GPU-visible
+            // flags/counters for this combine step have been updated.
+            fence_release_system();
+            st_mmio_b8(combine_recv_done, 1);
         }
     }
 }

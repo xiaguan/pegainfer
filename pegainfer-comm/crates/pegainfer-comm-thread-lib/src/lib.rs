@@ -24,7 +24,7 @@ pub fn pin_cpu(cpu: usize) -> Result<(), Errno> {
             return Err(Errno::new(ret));
         }
         let (_, cpu_after) = current_tid_and_cpu();
-        tracing::info!(
+        tracing::debug!(
             "[pin_cpu] tid={} target_cpu={} sched_cpu_before={} sched_cpu_after={}",
             tid,
             cpu,

@@ -172,122 +172,141 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_with_scratch(
     );
     let block = weights.block(layer)?;
 
-    let (attn_norm, attn_hc) = hc_pre_norm_bf16_hidden_scratch(
-        ctx,
-        config,
-        input,
-        &block.hc_attn_fn,
-        &block.hc_attn_scale,
-        &block.hc_attn_base,
-        &block.attn_norm,
-        hc_pre_norm_scratch,
-    )
-    .with_context(|| format!("hc_pre_norm attention layer {layer}"))?;
-    match config.compress_ratios[layer] {
-        0 => {
-            let attn_out = attention_decode_rank_local_bf16_hidden_with_scratch(
-                ctx,
-                config,
-                layer,
-                attn_norm,
-                &block.attn,
-                rope,
-                start_pos,
-                &mut cache.kv,
-                attention_projection_scratch,
-                attention_output_scratch,
-                attention_index_scratch,
-            )
-            .with_context(|| format!("attention decode layer {layer}"))?;
-            all_reduce_hidden_fp32_hc_post_view_into(
-                ctx,
-                attn_out,
-                input,
-                &attn_hc,
-                comm,
-                attention_hc_post_scratch,
-                attention_hc_out,
-            )
-        }
-        4 => {
-            let attn_out =
-                attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_scratch(
+    let (attn_norm, attn_hc) = {
+        hc_pre_norm_bf16_hidden_scratch(
+            ctx,
+            config,
+            input,
+            &block.hc_attn_fn,
+            &block.hc_attn_scale,
+            &block.hc_attn_base,
+            &block.attn_norm,
+            hc_pre_norm_scratch,
+        )
+        .with_context(|| format!("hc_pre_norm attention layer {layer}"))?
+    };
+    {
+        match config.compress_ratios[layer] {
+            0 => {
+                let attn_out = {
+                    attention_decode_rank_local_bf16_hidden_with_scratch(
+                        ctx,
+                        config,
+                        layer,
+                        attn_norm,
+                        &block.attn,
+                        rope,
+                        start_pos,
+                        &mut cache.kv,
+                        attention_projection_scratch,
+                        attention_output_scratch,
+                        attention_index_scratch,
+                    )
+                    .with_context(|| format!("attention decode layer {layer}"))?
+                };
+                all_reduce_hidden_fp32_hc_post_view_into(
                     ctx,
-                    config,
-                    layer,
-                    attn_norm,
-                    &block.attn,
-                    rope,
-                    start_pos,
-                    cache,
+                    attn_out,
+                    input,
+                    &attn_hc,
                     comm,
-                    attention_projection_scratch,
-                    attention_output_scratch,
-                    attention_index_scratch,
-                    attention_aux_scratch,
+                    attention_hc_post_scratch,
+                    attention_hc_out,
                 )
-                .with_context(|| format!("attention decode layer {layer}"))?;
-            all_reduce_hidden_fp32_hc_post_view_into(
-                ctx,
-                attn_out,
-                input,
-                &attn_hc,
-                comm,
-                attention_hc_post_scratch,
-                attention_hc_out,
-            )
+            }
+            4 => {
+                let attn_out = {
+                    attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_scratch(
+                        ctx,
+                        config,
+                        layer,
+                        attn_norm,
+                        &block.attn,
+                        rope,
+                        start_pos,
+                        cache,
+                        comm,
+                        attention_projection_scratch,
+                        attention_output_scratch,
+                        attention_index_scratch,
+                        attention_aux_scratch,
+                    )
+                    .with_context(|| format!("attention decode layer {layer}"))?
+                };
+                all_reduce_hidden_fp32_hc_post_view_into(
+                    ctx,
+                    attn_out,
+                    input,
+                    &attn_hc,
+                    comm,
+                    attention_hc_post_scratch,
+                    attention_hc_out,
+                )
+            }
+            _ => {
+                let attn_out = {
+                    attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_with_scratch(
+                        ctx,
+                        config,
+                        layer,
+                        attn_norm,
+                        &block.attn,
+                        rope,
+                        start_pos,
+                        cache,
+                        attention_projection_scratch,
+                        attention_output_scratch,
+                        attention_index_scratch,
+                        attention_aux_scratch,
+                    )
+                    .with_context(|| format!("attention decode layer {layer}"))?
+                };
+                all_reduce_hidden_fp32_hc_post_view_into(
+                    ctx,
+                    attn_out,
+                    input,
+                    &attn_hc,
+                    comm,
+                    attention_hc_post_scratch,
+                    attention_hc_out,
+                )
+            }
         }
-        _ => {
-            let attn_out = attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
-                ctx,
-                config,
-                layer,
-                attn_norm,
-                &block.attn,
-                rope,
-                start_pos,
-                cache,
-            )
-            .with_context(|| format!("attention decode layer {layer}"))?;
-            all_reduce_hidden_fp32_hc_post_view_into(
-                ctx,
-                &attn_out,
-                input,
-                &attn_hc,
-                comm,
-                attention_hc_post_scratch,
-                attention_hc_out,
-            )
-        }
+        .with_context(|| format!("attention all_reduce hc_post layer {layer}"))?;
     }
-    .with_context(|| format!("attention all_reduce hc_post layer {layer}"))?;
 
-    let (ffn_norm, ffn_hc) = hc_pre_norm_bf16_hidden_scratch(
-        ctx,
-        config,
-        attention_hc_out,
-        &block.hc_ffn_fn,
-        &block.hc_ffn_scale,
-        &block.hc_ffn_base,
-        &block.ffn_norm,
-        hc_pre_norm_scratch,
-    )
-    .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?;
+    let (ffn_norm, ffn_hc) = {
+        hc_pre_norm_bf16_hidden_scratch(
+            ctx,
+            config,
+            attention_hc_out,
+            &block.hc_ffn_fn,
+            &block.hc_ffn_scale,
+            &block.hc_ffn_base,
+            &block.ffn_norm,
+            hc_pre_norm_scratch,
+        )
+        .with_context(|| format!("hc_pre_norm ffn layer {layer}"))?
+    };
 
-    let ffn_out = dispatch_decode_moe_step(
-        ctx,
-        config,
-        weights,
-        ptr_cache,
-        moe,
-        layer,
-        ffn_norm,
-        token_ids,
-        shared_expert_scratch,
-    )
-    .with_context(|| format!("decode MoE layer {layer}"))?;
-    hc_post_bf16_hidden_view_into(ctx, ffn_out, attention_hc_out, &ffn_hc, layer_out)
-        .with_context(|| format!("hc_post ffn layer {layer}"))?;
+    let ffn_out = {
+        dispatch_decode_moe_step(
+            ctx,
+            config,
+            weights,
+            ptr_cache,
+            moe,
+            layer,
+            ffn_norm,
+            token_ids,
+            shared_expert_scratch,
+        )
+        .with_context(|| format!("decode MoE layer {layer}"))?
+    };
+    {
+        hc_post_bf16_hidden_view_into(ctx, ffn_out, attention_hc_out, &ffn_hc, layer_out)
+            .with_context(|| format!("hc_post ffn layer {layer}"))?;
+    }
     Ok(())
 }
 
@@ -314,7 +333,6 @@ fn dispatch_decode_moe_step<'a>(
             weights,
             ptr_cache,
             pplx.ep,
-            pplx.moe_stream,
             layer,
             ffn_norm,
             token_ids,
@@ -602,17 +620,17 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_sc
             })?;
     }
 
-    let window_topk = window_topk_indices_decode_into(
-        ctx,
-        start_pos,
-        config.sliding_window,
-        &mut attention_index_scratch.window_idxs,
-    )?;
     let compressed_len = (start_pos + 1) / 4;
     let (topk_idxs, topk) = if compressed_len > 0 {
         let scores = attention_aux_scratch
             .indexer_scores
             .slice(0..compressed_len);
+        let window_topk = window_topk_indices_decode_into(
+            ctx,
+            start_pos,
+            config.sliding_window,
+            &mut attention_index_scratch.window_idxs,
+        )?;
         let compress_topk = indexer_topk_indices_decode_into(
             ctx,
             config,
@@ -635,6 +653,12 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_with_sc
             window_topk + compress_topk,
         )
     } else {
+        let window_topk = window_topk_indices_decode_into(
+            ctx,
+            start_pos,
+            config.sliding_window,
+            &mut attention_index_scratch.window_idxs,
+        )?;
         (&attention_index_scratch.window_idxs, window_topk)
     };
     indexed_attention_cache_bf16_hidden_view_into(
@@ -775,14 +799,6 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_batch_w
         .map(|pos| (pos + 1) / 4)
         .max()
         .unwrap_or(0);
-    let window_topk = window_topk_indices_decode_batch_into(
-        ctx,
-        batch_meta.start_pos,
-        batch_meta.window_base,
-        batch_meta.batch,
-        config.sliding_window,
-        &mut attention_index_scratch.window_idxs,
-    )?;
     let (topk_idxs, topk) = if max_compressed_len > 0 {
         let local_heads = attention_aux_scratch.local_index_heads;
         fp8_linear_bf16_hidden_into(
@@ -832,30 +848,30 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_batch_w
             .map_err(|err| {
                 anyhow::anyhow!("NCCL batch decode indexer score all-reduce failed: {err:?}")
             })?;
-        let compress_topk = indexer_topk_indices_decode_batch_into(
+        let topk = ratio4_decode_topk_indices_batch_into(
             ctx,
             config,
-            &attention_aux_scratch.indexer_scores,
-            batch_meta.compressed_len,
-            batch_meta.compressed_base,
-            batch_meta.batch,
-            max_compressed_len,
-            &mut attention_index_scratch.compress_idxs,
-        )?;
-        concat_topk_indices_into(
-            ctx,
-            &attention_index_scratch.window_idxs,
-            window_topk,
-            &attention_index_scratch.compress_idxs,
-            compress_topk,
-            batch_meta.batch,
+            Ratio4DecodeTopkBatchInputs {
+                scores: &attention_aux_scratch.indexer_scores,
+                start_pos: batch_meta.start_pos,
+                window_base: batch_meta.window_base,
+                compressed_len: batch_meta.compressed_len,
+                compressed_base: batch_meta.compressed_base,
+                batch: batch_meta.batch,
+                max_compressed_len,
+            },
             &mut attention_index_scratch.topk_idxs,
         )?;
-        (
-            &attention_index_scratch.topk_idxs,
-            window_topk + compress_topk,
-        )
+        (&attention_index_scratch.topk_idxs, topk)
     } else {
+        let window_topk = window_topk_indices_decode_batch_into(
+            ctx,
+            batch_meta.start_pos,
+            batch_meta.window_base,
+            batch_meta.batch,
+            config.sliding_window,
+            &mut attention_index_scratch.window_idxs,
+        )?;
         (&attention_index_scratch.window_idxs, window_topk)
     };
     indexed_attention_cache_bf16_hidden_view_into(

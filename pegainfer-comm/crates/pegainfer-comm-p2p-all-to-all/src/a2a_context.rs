@@ -155,7 +155,7 @@ impl AllToAllContext {
     ) -> Result<Self> {
         // Start the all-to-all worker thread.
         for (i, peer) in rank_handles.iter().enumerate() {
-            tracing::info!("Rank#{} Peer#{}: {}", rank, i, peer.address);
+            tracing::debug!("Rank#{} Peer#{}: {}", rank, i, peer.address);
         }
 
         let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
@@ -194,13 +194,15 @@ impl AllToAllContext {
                 std::thread::Builder::new()
                     .name("p2p_all_to_all Worker".to_string())
                     .spawn(move || {
+                        nvtx::name_thread!("pplx-a2a-r{}-d{}", rank, device);
+
                         // Pin to the desired CPU.
-                        tracing::info!("Running worker for cuda:{}", device);
+                        tracing::debug!("Running worker for cuda:{}", device);
                         if let Some(cpu) = worker_cpu {
                             if let Err(e) = pin_cpu(cpu.into()) {
-                                tracing::info!("Failed to pin CPU {}: {:?}", cpu, e);
+                                tracing::warn!("Failed to pin CPU {}: {:?}", cpu, e);
                             }
-                            tracing::info!(
+                            tracing::debug!(
                                 "Pinned worker for cuda:{} to CPU {}",
                                 device,
                                 cpu
@@ -211,12 +213,12 @@ impl AllToAllContext {
                         if init_tx.send(()).is_err() {
                             panic!("Failed to send initialization signal");
                         } else {
-                            tracing::info!("Initialized worker for cuda:{}", device);
+                            tracing::debug!("Initialized worker for cuda:{}", device);
                         }
 
                         // Main loop.
                         thread_worker.main_loop();
-                        tracing::info!("Stopping worker for cuda:{}", device);
+                        tracing::debug!("Stopping worker for cuda:{}", device);
                     })
                     .expect("Failed to spawn p2p_all_to_all Worker thread"),
             )
@@ -260,7 +262,7 @@ impl AllToAllContext {
 
     pub fn destroy(&mut self) -> Result<()> {
         // Stop all work on the worker thread.
-        tracing::info!("Stopping worker thread for cuda:{}", self.device);
+        tracing::debug!("Stopping worker thread for cuda:{}", self.device);
 
         self.worker.stop();
         if let Some(thread) = self.thread.take()

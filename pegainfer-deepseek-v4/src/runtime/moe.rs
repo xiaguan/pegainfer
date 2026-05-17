@@ -974,30 +974,34 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
         plan.local_experts
     );
     let ptrs = &ptr_cache.layers[layer];
-    fp4_grouped_w1_w3_bf16_hidden_into(
-        ctx,
-        expanded_input,
-        plan.expert_indptr,
-        plan.local_experts,
-        &ptrs.w1,
-        &ptrs.w3,
-        gate,
-        up,
-        fp4_act_workspace,
-        fp4_act_scale_workspace,
-    )?;
-    fp4_grouped_w2_swiglu_bf16_hidden_into(
-        ctx,
-        gate,
-        up,
-        config.swiglu_limit,
-        plan.expert_indptr,
-        plan.local_experts,
-        &ptrs.w2,
-        out,
-        fp4_act_workspace,
-        fp4_act_scale_workspace,
-    )?;
+    {
+        fp4_grouped_w1_w3_bf16_hidden_into(
+            ctx,
+            expanded_input,
+            plan.expert_indptr,
+            plan.local_experts,
+            &ptrs.w1,
+            &ptrs.w3,
+            gate,
+            up,
+            fp4_act_workspace,
+            fp4_act_scale_workspace,
+        )?;
+    }
+    {
+        fp4_grouped_w2_swiglu_bf16_hidden_into(
+            ctx,
+            gate,
+            up,
+            config.swiglu_limit,
+            plan.expert_indptr,
+            plan.local_experts,
+            &ptrs.w2,
+            out,
+            fp4_act_workspace,
+            fp4_act_scale_workspace,
+        )?;
+    }
     Ok(out)
 }
 

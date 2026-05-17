@@ -223,14 +223,24 @@ void a2a_dispatch_recv_kernel(
         }
     }
 
+    __syncthreads();
+
     if (threadIdx.x == 0) {
-        auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
-        if (counter == num_fabric_tokens) {
-            st_mmio_b8(dispatch_recv_done, 1);
+        bool recv_complete = false;
+        if (num_fabric_tokens == 0) {
+            recv_complete = blockIdx.x == 0;
+        } else if (num_local_tokens > 0) {
+            auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
+            recv_complete = counter == num_fabric_tokens;
+        }
+
+        if (recv_complete) {
             // Reset the state.
             *num_recv_tokens_flag = 0;
             *dispatch_recv_flag = 0;
             *grid_counter = 0;
+            fence_release_system();
+            st_mmio_b8(dispatch_recv_done, 1);
         }
     }
 }

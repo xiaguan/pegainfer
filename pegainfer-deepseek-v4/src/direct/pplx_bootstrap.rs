@@ -22,7 +22,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use pegainfer_comm::raw::cuda_lib::cumem::{
     CUAllocHandle, CUMemAllocHandle, CUMemHandleKind, CUMemMapping,
 };
@@ -37,6 +37,7 @@ use pegainfer_comm::raw::p2p_all_to_all::{AllToAllRankHandle, ScalarType};
 use pegainfer_comm::{EpBackend, EpBackendParams, EpDtypes, EpRankBuffers, EpTopology};
 
 use crate::config::Config;
+use crate::direct::affinity::{CpuId, RankThreadPlacementPlan};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -74,28 +75,27 @@ impl Default for PplxBootstrapParams {
 /// as the matching [`EpBackend`] is alive.
 #[allow(dead_code)]
 pub struct PplxRankResources {
-    pub num_routed_host: CudaHostMemory,
-    pub send_handle: CUMemAllocHandle,
-    pub send_mapping: CUMemMapping,
-    pub recv_handle: CUMemAllocHandle,
-    pub recv_mapping: CUMemMapping,
-    pub sync_handle: CUMemAllocHandle,
-    pub sync_mapping: CUMemMapping,
-    pub num_routed_mr: MemoryRegionHandle,
-    pub num_routed_desc: MemoryRegionDescriptor,
-    pub send_buffer_mr: MemoryRegionHandle,
-    pub recv_buffer_mr: MemoryRegionHandle,
-    pub recv_buffer_desc: MemoryRegionDescriptor,
-    pub transfer_engine: Arc<TransferEngine>,
+    num_routed_host: CudaHostMemory,
+    send_handle: CUMemAllocHandle,
+    send_mapping: CUMemMapping,
+    recv_handle: CUMemAllocHandle,
+    recv_mapping: CUMemMapping,
+    sync_handle: CUMemAllocHandle,
+    sync_mapping: CUMemMapping,
+    num_routed_mr: MemoryRegionHandle,
+    num_routed_desc: MemoryRegionDescriptor,
+    send_buffer_mr: MemoryRegionHandle,
+    recv_buffer_mr: MemoryRegionHandle,
+    recv_buffer_desc: MemoryRegionDescriptor,
+    transfer_engine: Arc<TransferEngine>,
     /// CUMem mappings for *peer* send/recv/sync buffers into this rank's
     /// VA. Kept here so they live as long as the backend; dropping them
     /// would unmap the peer pointers we handed to the kernel.
-    pub peer_mappings: Vec<CUMemMapping>,
+    peer_mappings: Vec<CUMemMapping>,
 }
 
 /// Sizing derived from [`PplxBootstrapParams`] + [`Config`].
 struct Sizing {
-    world_size: usize,
     num_local_experts: usize,
     num_experts_per_token: usize,
     dp_size: usize,
@@ -134,14 +134,92 @@ struct Phase1Output {
     cross: CrossRankView,
 }
 
+#[derive(Clone, Debug)]
+struct PplxRankThreadPlacement {
+    rank: usize,
+    device_ordinal: usize,
+    numa_node: usize,
+    cpu_slice: String,
+    rank_worker_cpu: CpuId,
+    a2a_worker_cpu: CpuId,
+    te_worker_cpu: CpuId,
+    uvm_worker_cpu: CpuId,
+}
+
+struct PplxThreadPlacementPlan {
+    ranks: Vec<PplxRankThreadPlacement>,
+}
+
+impl PplxThreadPlacementPlan {
+    fn new(devices: &[usize], rank_worker_placement: &RankThreadPlacementPlan) -> Result<Self> {
+        let mut ranks = Vec::with_capacity(devices.len());
+        for (rank, &device_ordinal) in devices.iter().enumerate() {
+            let rank_placement = rank_worker_placement.rank(rank)?;
+            ensure!(
+                rank_placement.device_ordinal == device_ordinal,
+                "pplx placement mismatch for rank {rank}: devices has cuda:{device_ordinal}, rank worker placement has cuda:{}",
+                rank_placement.device_ordinal,
+            );
+            let te_worker_cpu = rank_placement.role_cpu(1, "TE worker")?;
+            let a2a_worker_cpu = rank_placement.role_cpu(2, "a2a worker")?;
+            let uvm_worker_cpu = rank_placement.role_cpu(3, "UVM worker")?;
+
+            ranks.push(PplxRankThreadPlacement {
+                rank,
+                device_ordinal,
+                numa_node: rank_placement.numa_node,
+                cpu_slice: rank_placement.cpu_slice_display(),
+                rank_worker_cpu: rank_placement.rank_worker_cpu,
+                a2a_worker_cpu,
+                te_worker_cpu,
+                uvm_worker_cpu,
+            });
+        }
+        Ok(Self { ranks })
+    }
+
+    fn rank(&self, rank: usize) -> Result<PplxRankThreadPlacement> {
+        self.ranks
+            .get(rank)
+            .cloned()
+            .with_context(|| format!("missing pplx thread placement for rank {rank}"))
+    }
+
+    fn emit_startup_info(&self) {
+        for placement in &self.ranks {
+            log::info!(
+                "pplx thread placement rank={} cuda:{} numa={} cpu_slice={} rank_worker_cpu={} te_worker_cpu={} a2a_worker_cpu={} uvm_worker_cpu={}",
+                placement.rank,
+                placement.device_ordinal,
+                placement.numa_node,
+                placement.cpu_slice,
+                placement.rank_worker_cpu,
+                placement.te_worker_cpu,
+                placement.a2a_worker_cpu,
+                placement.uvm_worker_cpu,
+            );
+        }
+    }
+}
+
 /// Build EP backends for all `world_size` ranks living in this process.
 ///
 /// Spawns one worker thread per rank; each thread does `cudaSetDevice` once
 /// and owns all CUDA + verbs setup for its rank. The main thread only
 /// gathers cross-rank handle descriptors between phases.
-pub fn build_intra_node_backends(
+pub fn build_intra_node_backends_for_devices(
     config: &Config,
     devices: &[usize],
+    params: PplxBootstrapParams,
+) -> Result<(Vec<EpBackend>, Vec<PplxRankResources>)> {
+    let rank_worker_placement = RankThreadPlacementPlan::for_devices(devices)?;
+    build_intra_node_backends(config, devices, &rank_worker_placement, params)
+}
+
+pub(super) fn build_intra_node_backends(
+    config: &Config,
+    devices: &[usize],
+    rank_worker_placement: &RankThreadPlacementPlan,
     params: PplxBootstrapParams,
 ) -> Result<(Vec<EpBackend>, Vec<PplxRankResources>)> {
     let world_size = devices.len();
@@ -158,6 +236,8 @@ pub fn build_intra_node_backends(
 
     let sizing = compute_sizing(config, world_size, params);
     let topology_groups = detect_topology().context("pplx bootstrap: detect_topology failed")?;
+    let thread_placement = PplxThreadPlacementPlan::new(devices, rank_worker_placement)?;
+    thread_placement.emit_startup_info();
 
     // ------------------- Phase 1: local alloc + MR register -------------------
     let mut phase1_slots: Vec<Option<Result<Phase1Output>>> =
@@ -166,9 +246,12 @@ pub fn build_intra_node_backends(
         for ((rank, &dev_ord), slot) in devices.iter().enumerate().zip(phase1_slots.iter_mut()) {
             let sizing = &sizing;
             let topology_groups = &topology_groups;
+            let placement = thread_placement.rank(rank);
             let params = params;
             s.spawn(move || {
-                *slot = Some(run_phase1(rank, dev_ord, sizing, topology_groups, params));
+                *slot = Some(placement.and_then(|placement| {
+                    run_phase1(rank, dev_ord, sizing, topology_groups, placement, params)
+                }));
             });
         }
     });
@@ -202,21 +285,15 @@ pub fn build_intra_node_backends(
         {
             let cross = Arc::clone(&cross);
             let sizing = &sizing;
-            let topology_groups = &topology_groups;
+            let placement = thread_placement.rank(rank);
             let params = params;
             s.spawn(move || {
                 let resources = local_slot
                     .take()
                     .expect("phase2 entered without phase1 resources");
-                *out_slot = Some(run_phase2(
-                    rank,
-                    dev_ord,
-                    resources,
-                    cross,
-                    sizing,
-                    topology_groups,
-                    params,
-                ));
+                *out_slot = Some(placement.and_then(|placement| {
+                    run_phase2(rank, dev_ord, resources, cross, sizing, placement, params)
+                }));
             });
         }
     });
@@ -239,6 +316,7 @@ fn run_phase1(
     dev_ord: usize,
     sizing: &Sizing,
     topology_groups: &[TopologyGroup],
+    placement: PplxRankThreadPlacement,
     params: PplxBootstrapParams,
 ) -> Result<Phase1Output> {
     pegainfer_comm::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
@@ -247,7 +325,7 @@ fn run_phase1(
     let dev_id = CudaDeviceId(dev_ord as u8);
     let device = Device::Cuda(dev_id);
 
-    let te = build_te_for(dev_ord, topology_groups, params.nets_per_gpu)?;
+    let te = build_te_for(dev_ord, topology_groups, placement, params.nets_per_gpu)?;
 
     let num_routed_host = CudaHostMemory::alloc(sizing.num_routed_bytes)
         .with_context(|| format!("alloc pinned num_routed host buffer for cuda:{dev_ord}"))?;
@@ -333,7 +411,7 @@ fn run_phase2(
     mut resources: PplxRankResources,
     cross: Arc<Vec<CrossRankView>>,
     sizing: &Sizing,
-    topology_groups: &[TopologyGroup],
+    placement: PplxRankThreadPlacement,
     params: PplxBootstrapParams,
 ) -> Result<(EpBackend, PplxRankResources)> {
     pegainfer_comm::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
@@ -373,22 +451,6 @@ fn run_phase2(
         peer_mappings.push(sync_map);
     }
     resources.peer_mappings = peer_mappings;
-
-    let group = topology_groups
-        .iter()
-        .find(|g| g.cuda_device as usize == dev_ord)
-        .with_context(|| format!("topology lookup for cuda:{dev_ord}"))?;
-    // Pin the a2a worker to a CPU distinct from this rank's TE worker
-    // (`cpus[0]`) and UVM watcher (`cpus[2]` / fallback `cpus[1]`); see
-    // build_te_for. Without this they all single-CPU-pin to the same
-    // core and the kernel-side `tx_ready` spin waits ~50 ms behind the
-    // queued worker progress.
-    let worker_cpu = group
-        .cpus
-        .get(3)
-        .copied()
-        .or_else(|| group.cpus.get(1).copied())
-        .or_else(|| group.cpus.first().copied());
 
     let topology = EpTopology {
         world_size,
@@ -441,7 +503,7 @@ fn run_phase2(
         transfer_engine: resources.transfer_engine.clone(),
         device: dev_ord as u8,
         imm_base: params.imm_base,
-        worker_cpu,
+        worker_cpu: Some(placement.a2a_worker_cpu.as_u16()),
     })
     .with_context(|| format!("build EpBackend for rank {rank}"))?;
 
@@ -493,7 +555,6 @@ fn compute_sizing(config: &Config, world_size: usize, params: PplxBootstrapParam
     let num_routed_bytes = round_up(num_routed_len * std::mem::size_of::<u32>(), PAGE_SIZE);
 
     Sizing {
-        world_size,
         num_local_experts,
         num_experts_per_token,
         dp_size,
@@ -515,20 +576,13 @@ fn compute_sizing(config: &Config, world_size: usize, params: PplxBootstrapParam
 fn build_te_for(
     dev: usize,
     topology_groups: &[TopologyGroup],
+    placement: PplxRankThreadPlacement,
     nets_per_gpu: u8,
 ) -> Result<Arc<TransferEngine>> {
     let group = topology_groups
         .iter()
         .find(|g| g.cuda_device as usize == dev)
         .with_context(|| format!("pplx bootstrap: cuda:{dev} not in topology"))?;
-    if group.cpus.len() < 2 {
-        bail!(
-            "pplx bootstrap: cuda:{dev} needs >=2 CPUs in topology group; got {}",
-            group.cpus.len()
-        );
-    }
-    let worker_cpu = group.cpus[0];
-    let uvm_cpu = group.cpus.get(2).copied().unwrap_or(group.cpus[1]);
     let n_doms = std::cmp::min(group.domains.len(), nets_per_gpu as usize);
     let doms = group
         .domains
@@ -537,7 +591,12 @@ fn build_te_for(
         .cloned()
         .collect::<Vec<_>>();
     let mut builder = TransferEngineBuilder::default();
-    builder.add_gpu_domains(dev as u8, doms, worker_cpu, uvm_cpu);
+    builder.add_gpu_domains(
+        dev as u8,
+        doms,
+        placement.te_worker_cpu.as_u16(),
+        placement.uvm_worker_cpu.as_u16(),
+    );
     Ok(Arc::new(builder.build().with_context(|| {
         format!("pplx bootstrap: TE build for cuda:{dev}")
     })?))

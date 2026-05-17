@@ -1091,12 +1091,14 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                     return;
                 }
             };
+            super::affinity::pin_scheduler_thread(generator.runtime.thread_placement());
             #[cfg(feature = "pplx-ep")]
             if std::env::var("PEGAINFER_DSV4_PPLX").is_ok_and(|v| v != "0" && !v.is_empty()) {
                 info!("PEGAINFER_DSV4_PPLX set; building pplx EP backends");
                 match crate::direct::pplx_bootstrap::build_intra_node_backends(
                     generator.config,
                     &(0..8).collect::<Vec<_>>(),
+                    generator.runtime.thread_placement(),
                     crate::direct::pplx_bootstrap::PplxBootstrapParams::default(),
                 ) {
                     Ok((backends, resources)) => {
@@ -1238,14 +1240,11 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
             if first_token_emit_unix_s.is_none() {
                 first_token_emit_unix_s = Some(unix_secs_f64());
             }
-            if req
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token,
-                    logprob: None,
-                })
-                .is_err()
-            {
+            let emit_result = req.token_tx.send(TokenEvent::Token {
+                id: token,
+                logprob: None,
+            });
+            if emit_result.is_err() {
                 if let Err(release_err) = generator.release_greedy_request(&mut state) {
                     warn!(
                         "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
@@ -1256,7 +1255,8 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
         }
 
         let decode_start = Instant::now();
-        if let Err(err) = generator.advance_greedy_step(&mut state, &step) {
+        let advance_result = generator.advance_greedy_step(&mut state, &step);
+        if let Err(err) = advance_result {
             let message = format!("DeepSeek V4 direct request failed: {err:#}");
             warn!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {

@@ -68,6 +68,7 @@ class AllToAllConfig:
     in_dtype: torch.dtype
     out_dtype: torch.dtype
     scale_dtype: Optional[torch.dtype]
+    expert_padding: int
     nvlink: Optional[int]
 
     @property
@@ -97,7 +98,7 @@ class AllToAllResource:
         self.global_group = global_group
         self.cfg = cfg
 
-        self.expert_padding = expert_padding = 1
+        self.expert_padding = expert_padding = cfg.expert_padding
         self.dp_rank = global_group.rank // dp_group.size
         self.num_dp_groups = num_dp_groups = global_group.size // dp_group.size
         self.num_local_experts = num_local_experts = (
@@ -587,6 +588,7 @@ def main() -> None:
     parser.add_argument("--in-dtype", type=str_to_dtype, default=torch.float8_e4m3fn)
     parser.add_argument("--out-dtype", type=str_to_dtype, default=torch.bfloat16)
     parser.add_argument("--scale-dtype", type=str_to_dtype, default=torch.float32)
+    parser.add_argument("--expert-padding", type=int, default=1)
     parser.add_argument("--nvlink", type=int, default=None)
     parser.add_argument("--output", type=Path, default=Path("/dev/stdout"))
     parser.add_argument(
@@ -605,6 +607,7 @@ def main() -> None:
         in_dtype=args.in_dtype,
         out_dtype=args.out_dtype,
         scale_dtype=args.scale_dtype,
+        expert_padding=args.expert_padding,
         nvlink=args.nvlink,
     )
 
