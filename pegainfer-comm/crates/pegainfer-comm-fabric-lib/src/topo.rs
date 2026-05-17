@@ -301,11 +301,13 @@ fn scan_all_pci_devices() -> Result<Vec<PciProp>> {
         let pci_device_id = read_pci_device_id(&addr)?;
 
         let numa_node_path = parent_bus.get_sys_path() + "/numa_node";
-        let numa_node = std::fs::read_to_string(numa_node_path)
-            .map_err(|_| FabricLibError::Custom("Failed to read NUMA node"))?
-            .trim()
-            .parse::<usize>();
-        let Ok(numa_node) = numa_node else {
+        // Some derived parent-bus addresses (device=0, function=0) don't
+        // exist as a sysfs PCI device (e.g., when the parent switch port
+        // doesn't have a matching root function). Skip those entries.
+        let Ok(numa_node_text) = std::fs::read_to_string(numa_node_path) else {
+            continue;
+        };
+        let Ok(numa_node) = numa_node_text.trim().parse::<usize>() else {
             // NOTE: /sys/bus/pci/devices/0000:00:00.0/numa_node can be -1.
             continue;
         };
@@ -449,11 +451,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     }
     let gpu_pci_device_id = get_gpu_pci_device_id()?;
 
-    // Get visible NICs via Verbs
+    // Get visible NICs via Verbs. May be empty on single-node NVLink-only
+    // deployments — the bootstrap still wants TopologyGroups so it can
+    // resolve CPU pinning.
     let domains = get_visible_domains();
-    if domains.is_empty() {
-        return Err(FabricLibError::Custom("No visible NICs"));
-    }
 
     // Get NIC PCI device ID
     let mut nic_pci_device_id_count = HashMap::new();
@@ -462,12 +463,14 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         *nic_pci_device_id_count.entry(pci_device_id).or_insert(0) += 1;
     }
     // Some systems have one ConnectX-7 per GPU, but also a few additional ConnectX-6.
-    // Use the most popular NIC PCI device ID.
+    // Use the most popular NIC PCI device ID; if there are no NICs at all
+    // fall back to a sentinel (0/0) so detect_system_topo still walks the
+    // GPU-only switch groups.
     let nic_pci_device_id = nic_pci_device_id_count
         .iter()
         .max_by_key(|(_, count)| *count)
         .map(|(pci_device_id, _)| *pci_device_id)
-        .ok_or(FabricLibError::Custom("No visible NICs"))?;
+        .unwrap_or(PciDeviceId { vendor: 0, device: 0 });
 
     // Detect system topology
     let system_topo = detect_system_topo(gpu_pci_device_id, nic_pci_device_id)?;
@@ -493,9 +496,18 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
                 domains.push(domain);
             }
         }
-        if domains.is_empty() {
-            continue;
-        }
+
+        tracing::info!(
+            "topo: cuda:{} pci={} numa={} → {} domains: {:?}",
+            cuda_device,
+            group.gpu.pci_addr,
+            group.gpu.numa_node,
+            domains.len(),
+            domains
+                .iter()
+                .map(|d| crate::provider::RdmaDomainInfo::name(d).into_owned())
+                .collect::<Vec<_>>()
+        );
 
         topo_groups.push(TopologyGroup {
             cuda_device: cuda_device as u8,
@@ -503,6 +515,28 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
             domains,
             cpus: group.cpus,
         });
+    }
+
+    tracing::info!(
+        "topo: leftover visible_nics: {:?}",
+        visible_nics.keys().collect::<Vec<_>>()
+    );
+
+    // Fallback: when no NICs co-locate with any GPU switch group (intra-node
+    // NVLink-only), distribute the leftover visible NICs across GPUs so the
+    // upstream Worker init (which insists on 1 or 2 Verbs domains per GPU)
+    // still has something to bind. The data plane for single-node EP runs
+    // over NVLink, so the bound NIC is essentially a placeholder.
+    if !topo_groups.is_empty() && topo_groups.iter().all(|g| g.domains.is_empty()) {
+        tracing::warn!(
+            "topo: all GPUs have empty domains — applying single-NIC fallback"
+        );
+        let fallback: Vec<_> = visible_nics.values().cloned().collect();
+        if let Some(first_nic) = fallback.into_iter().next() {
+            for g in &mut topo_groups {
+                g.domains.push(first_nic.clone());
+            }
+        }
     }
 
     Ok(topo_groups)

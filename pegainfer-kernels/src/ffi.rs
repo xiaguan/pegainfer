@@ -321,6 +321,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_pplx_padded_expert_indptr_cuda(
+        recv_tokens_per_expert: *const i32,
+        expert_indptr: *mut i32,
+        local_experts: i32,
+        expert_padding: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_hash_gate_cuda(
         x: *const Half,
         gate_weight: *const Half,
@@ -542,14 +550,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_indexer_topk_decode_batch_cuda(
+    pub fn deepseek_ratio4_decode_topk_indices_batch_cuda(
         scores: *const f32,
-        topk_idxs: *mut i32,
+        start_pos: *const i32,
+        window_base: *const i32,
         compressed_len: *const i32,
-        cache_base: *const i32,
+        compressed_base: *const i32,
+        topk_idxs: *mut i32,
         batch: i32,
+        window_size: i32,
         max_compressed_len: i32,
-        topk: i32,
+        index_topk: i32,
         stream: CUstream,
     ) -> CUresult;
 

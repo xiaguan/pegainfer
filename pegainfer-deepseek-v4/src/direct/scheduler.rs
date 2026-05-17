@@ -299,6 +299,20 @@ impl DeepSeekV4DirectGenerator {
         self.config.eos_token_id
     }
 
+    /// Activate the pplx-garden NVLink + RDMA EP backend on every rank.
+    ///
+    /// `ep_backends` must have length equal to the model's tensor-parallel
+    /// world size; element `i` is moved into rank `i`'s worker. After this
+    /// returns Ok, decode-time MoE routing uses dispatch/combine instead
+    /// of NCCL AG/RS. CUDA Graph decode capture must be disabled in the
+    /// caller's run loop when pplx is active (the pplx worker thread
+    /// participates in host-side bookkeeping that is incompatible with
+    /// graph capture/replay).
+    #[cfg(feature = "pplx-ep")]
+    pub fn enable_pplx(&self, ep_backends: Vec<pegainfer_comm::EpBackend>) -> Result<()> {
+        self.runtime.enable_pplx(ep_backends)
+    }
+
     pub fn start_greedy_request(
         &mut self,
         prompt_tokens: &[u32],
@@ -1071,15 +1085,38 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                 &model_path,
                 options.enable_prefill_profile,
             ) {
-                Ok(generator) => {
-                    let _ = init_tx.send(Ok(()));
-                    generator
-                }
+                Ok(generator) => generator,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
                     return;
                 }
             };
+            super::affinity::pin_scheduler_thread(generator.runtime.thread_placement());
+            #[cfg(feature = "pplx-ep")]
+            if std::env::var("PEGAINFER_DSV4_PPLX").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                info!("PEGAINFER_DSV4_PPLX set; building pplx EP backends");
+                match crate::direct::pplx_bootstrap::build_intra_node_backends(
+                    generator.config,
+                    &(0..8).collect::<Vec<_>>(),
+                    generator.runtime.thread_placement(),
+                    crate::direct::pplx_bootstrap::PplxBootstrapParams::default(),
+                ) {
+                    Ok((backends, resources)) => {
+                        // Leak resources for process lifetime — bootstrap is one-shot.
+                        std::mem::forget(resources);
+                        if let Err(err) = generator.enable_pplx(backends) {
+                            let _ = init_tx.send(Err(err));
+                            return;
+                        }
+                        info!("pplx EP backends installed on all 8 ranks");
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+            let _ = init_tx.send(Ok(()));
             info!("DeepSeek V4 scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
                 let mut wave = vec![req];
@@ -1203,14 +1240,11 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
             if first_token_emit_unix_s.is_none() {
                 first_token_emit_unix_s = Some(unix_secs_f64());
             }
-            if req
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token,
-                    logprob: None,
-                })
-                .is_err()
-            {
+            let emit_result = req.token_tx.send(TokenEvent::Token {
+                id: token,
+                logprob: None,
+            });
+            if emit_result.is_err() {
                 if let Err(release_err) = generator.release_greedy_request(&mut state) {
                     warn!(
                         "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
@@ -1221,7 +1255,8 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
         }
 
         let decode_start = Instant::now();
-        if let Err(err) = generator.advance_greedy_step(&mut state, &step) {
+        let advance_result = generator.advance_greedy_step(&mut state, &step);
+        if let Err(err) = advance_result {
             let message = format!("DeepSeek V4 direct request failed: {err:#}");
             warn!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {

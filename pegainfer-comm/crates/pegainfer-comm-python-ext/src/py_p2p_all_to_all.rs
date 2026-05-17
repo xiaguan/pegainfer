@@ -3,12 +3,35 @@ use std::{
     ptr::{null, null_mut},
 };
 
-use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle};
+use p2p_all_to_all::{
+    AllToAllContext, AllToAllRankHandle, ScalarType as A2aScalarType,
+};
 use pyo3::{
     Bound, PyResult, exceptions::PyRuntimeError, pyclass, pymethods, types::PyModule,
     types::PyModuleMethods,
 };
 use torch_lib::ScalarType;
+
+fn to_a2a_scalar_type(dt: ScalarType) -> A2aScalarType {
+    match dt {
+        ScalarType::BOOL => A2aScalarType::BOOL,
+        ScalarType::I8 => A2aScalarType::I8,
+        ScalarType::U8 => A2aScalarType::U8,
+        ScalarType::I16 => A2aScalarType::I16,
+        ScalarType::U16 => A2aScalarType::U16,
+        ScalarType::I32 => A2aScalarType::I32,
+        ScalarType::U32 => A2aScalarType::U32,
+        ScalarType::I64 => A2aScalarType::I64,
+        ScalarType::U64 => A2aScalarType::U64,
+        ScalarType::F8_E4M3 => A2aScalarType::F8_E4M3,
+        ScalarType::F8_E5M2 => A2aScalarType::F8_E5M2,
+        ScalarType::F16 => A2aScalarType::F16,
+        ScalarType::BF16 => A2aScalarType::BF16,
+        ScalarType::F32 => A2aScalarType::F32,
+        ScalarType::F64 => A2aScalarType::F64,
+        _ => panic!("Unsupported ScalarType for pplx a2a"),
+    }
+}
 
 use crate::py_fabric_lib::{
     PyDomainAddress, PyMemoryRegionDescriptor, PyMemoryRegionHandle, PyTransferEngine,
@@ -69,7 +92,7 @@ impl PyAllToAllContext {
             hidden_dim_scale.unwrap_or(0),
             in_elemsize,
             out_elemsize,
-            out_dtype,
+            to_a2a_scalar_type(out_dtype),
             scale_elemsize.unwrap_or(0),
             max_num_tokens,
             max_recv_tokens,
@@ -189,7 +212,7 @@ impl PyAllToAllContext {
             .combine_recv(
                 num_tokens,
                 num_recv_tokens,
-                expert_y_dtype,
+                to_a2a_scalar_type(expert_y_dtype),
                 out_tokens_ptr as *mut c_void,
                 out_tokens_stride,
                 indices_ptr as *const i32,

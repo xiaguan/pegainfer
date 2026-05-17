@@ -12,7 +12,6 @@ hw-rdma = [
     "dep:nvtx",
     "fabric-lib/hw-rdma",
     "cuda-lib/hw-cuda",
-    "torch-lib/hw-cuda",
     "a2a-kernels/hw-cuda",
 ]
 
@@ -21,7 +20,6 @@ a2a-kernels = { path = "../pegainfer-comm-a2a-kernels", package = "pegainfer-com
 cuda-lib = { path = "../pegainfer-comm-cuda-lib", package = "pegainfer-comm-cuda-lib" }
 fabric-lib = { path = "../pegainfer-comm-fabric-lib", package = "pegainfer-comm-fabric-lib" }
 thread-lib = { path = "../pegainfer-comm-thread-lib", package = "pegainfer-comm-thread-lib" }
-torch-lib = { path = "../pegainfer-comm-torch-lib", package = "pegainfer-comm-torch-lib" }
 
 anyhow = { workspace = true }
 # nvtx is NVIDIA's profiling marker library and is only referenced from the

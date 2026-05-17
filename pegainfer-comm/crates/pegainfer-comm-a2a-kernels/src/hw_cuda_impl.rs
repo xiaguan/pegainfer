@@ -2,11 +2,34 @@
 #[allow(clippy::missing_safety_doc)]
 #[allow(clippy::too_many_arguments)]
 mod ffi {
+    /// Element scalar type tag for the A2A combine dtype dispatch.
+    ///
+    /// Runtime dispatch in `a2a_combine_recv` only handles `F16 / BF16 / F32`;
+    /// the other variants are kept so the cxx-generated C++ enum stays a
+    /// drop-in for the upstream pplx-garden kernels, which originally typed
+    /// these parameters as `torch_lib::ScalarType`.
+    #[allow(non_camel_case_types)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ScalarType {
+        BOOL,
+        I8,
+        U8,
+        I16,
+        U16,
+        I32,
+        U32,
+        I64,
+        U64,
+        F8_E4M3,
+        F8_E5M2,
+        F16,
+        BF16,
+        F32,
+        F64,
+    }
+
     unsafe extern "C++" {
         include!("a2a/a2a_kernels.h");
-
-        #[namespace = "torch_lib"]
-        type ScalarType = torch_lib::ScalarType;
 
         unsafe fn a2a_dispatch_send(
             num_blocks: usize,
@@ -137,5 +160,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv, a2a_dispatch_send,
+    ScalarType, a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv,
+    a2a_dispatch_send,
 };

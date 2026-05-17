@@ -9,11 +9,10 @@ publish = false
 # and combine are compiled via `nvcc` through cxx-build. When off (default),
 # `build.rs` is a no-op and the crate exposes only `HW_CUDA_ENABLED`.
 default = []
-hw-cuda = ["torch-lib/hw-cuda"]
+hw-cuda = []
 
 [dependencies]
 cxx = { workspace = true }
-torch-lib = { path = "../pegainfer-comm-torch-lib", package = "pegainfer-comm-torch-lib" }
 
 [build-dependencies]
 cc = { workspace = true, features = ["parallel"] }

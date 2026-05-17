@@ -80,10 +80,12 @@ impl TransferEngineBuilder {
             }
 
             for cpu in &[spec.pin_worker_cpu, spec.pin_uvm_cpu] {
-                if !topo.cpus.contains(cpu) {
+                if !std::path::Path::new(&format!("/sys/devices/system/cpu/cpu{cpu}"))
+                    .exists()
+                {
                     return Err(Error::msg(format!(
-                        "CPU {} not found in the topology group of cuda:{}",
-                        cpu, spec.cuda_device
+                        "CPU {} not found in /sys/devices/system/cpu for cuda:{}",
+                        cpu, spec.cuda_device,
                     )));
                 }
             }

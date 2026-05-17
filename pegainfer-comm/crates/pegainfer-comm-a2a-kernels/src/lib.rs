@@ -14,5 +14,6 @@ mod hw_cuda_impl;
 
 #[cfg(feature = "hw-cuda")]
 pub use hw_cuda_impl::{
-    a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv, a2a_dispatch_send,
+    ScalarType, a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv,
+    a2a_dispatch_send,
 };

@@ -42,6 +42,7 @@ vllm-text = { workspace = true }
 [features]
 default = []
 deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]
+pplx-ep = ["deepseek-v4", "pegainfer-deepseek-v4/pplx-ep"]
 deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",
     "pegainfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",

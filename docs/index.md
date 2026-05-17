@@ -49,6 +49,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/deepseek-v4/prefix-paged-kv-pd-handoff.md` | Prefix/paged KV and P-D handoff design contract: evolves slot-owned direct KV leases into page ownership, prefix cache, allocator telemetry, and transport-agnostic handoff handles. |
 | `models/deepseek-v4/moe-ag-rs.md` | Decode MoE now uses GPU AG/RS, GPU route compaction, and grouped TileLang FP4 local experts; no route/expert D2H in hot path. Current 1x32 TPOT avg `105.54ms`, exact E2E `20/20`. |
 | `models/deepseek-v4/moe-tilelang-review.md` | Persistent rank workers + decode-only direct top-k MoE cut 1x32 steady TPOT to `80.49ms/token`; remaining cost is rank arrival skew before `107` f32 collectives/token. |
+| `models/deepseek-v4/pplx-ep-integration.md` | DeepSeek V4 PPLX EP integration: pplx-garden decode MoE path, EP8 bootstrap, common NUMA rank-slice placement, and H200 steady TPOT p50 `66.65ms`. |
 | `models/deepseek-v4/kernel-paths.md` | DeepSeek V4 CUDA sources, TileLang generator path, and `pegainfer-kernels/KERNELS.md` routing index are organized. |
 
 ## subsystems / runtime

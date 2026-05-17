@@ -1,148 +1,145 @@
-use std::ffi::CStr;
+use std::collections::BTreeMap;
 
-use cudarc::driver::{result as cuda_driver_result, sys as cuda_driver_sys};
+use anyhow::{Context, Result, ensure};
+pub(super) use pegainfer_core::cpu_topology::CpuId;
+use pegainfer_core::cpu_topology::{
+    RankCpuSlice, RankNumaNode, cuda_device_numa_node, current_allowed_cpus, format_cpu_list,
+    pin_current_thread_to_cpu, read_numa_cpu_pool, split_rank_cpu_slices,
+};
 
-pub(super) fn pin_rank_worker_thread(rank: usize, device_ordinal: usize) {
-    let label = format!("DeepSeek rank worker {rank}");
-    pin_rank_thread(&label, rank, device_ordinal);
+const SYSTEM_RESERVED_CPU: usize = 0;
+const SCHEDULER_CPU: usize = 1;
+
+#[derive(Clone, Debug)]
+pub(super) struct RankThreadPlacement {
+    pub(super) rank: usize,
+    pub(super) device_ordinal: usize,
+    pub(super) numa_node: usize,
+    pub(super) cpu_slice: Vec<CpuId>,
+    pub(super) rank_worker_cpu: CpuId,
 }
 
-fn pin_rank_thread(label: &str, rank: usize, device_ordinal: usize) {
-    let allowed_cpus = current_allowed_cpus()
-        .unwrap_or_else(|| panic!("failed to read CPU affinity mask for {label}"));
-    assert!(
-        !allowed_cpus.is_empty(),
-        "empty CPU affinity mask for {label}"
-    );
+impl RankThreadPlacement {
+    pub(super) fn role_cpu(&self, offset: usize, role: &str) -> Result<CpuId> {
+        self.cpu_slice.get(offset).copied().with_context(|| {
+            format!(
+                "rank {} CPU slice {} is too small for {role} at offset {offset}",
+                self.rank,
+                format_cpu_list(&self.cpu_slice)
+            )
+        })
+    }
 
-    let target = numa_target_for_device(device_ordinal).unwrap_or_else(|err| panic!("{err}"));
-    let target_cpus = target
+    pub(super) fn cpu_slice_display(&self) -> String {
+        format_cpu_list(&self.cpu_slice)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RankThreadPlacementPlan {
+    scheduler_cpu: Option<CpuId>,
+    ranks: Vec<RankThreadPlacement>,
+}
+
+impl RankThreadPlacementPlan {
+    pub(super) fn for_devices(devices: &[usize]) -> Result<Self> {
+        let scheduler_cpu = scheduler_cpu()?;
+        let allowed_cpus = current_allowed_cpus()?;
+        let reserved_cpus = [CpuId::new(SYSTEM_RESERVED_CPU)?, CpuId::new(SCHEDULER_CPU)?];
+
+        let mut rank_nodes = Vec::with_capacity(devices.len());
+        let mut numa_nodes = BTreeMap::new();
+        for (rank, &device_ordinal) in devices.iter().enumerate() {
+            let numa_node = cuda_device_numa_node(device_ordinal)
+                .with_context(|| format!("read NUMA node for rank {rank} cuda:{device_ordinal}"))?;
+            rank_nodes.push(RankNumaNode { rank, numa_node });
+            numa_nodes.insert(numa_node, ());
+        }
+
+        let pools = numa_nodes
+            .keys()
+            .map(|&node| read_numa_cpu_pool(node))
+            .collect::<Result<Vec<_>>>()?;
+        let slices = split_rank_cpu_slices(&pools, &rank_nodes, &allowed_cpus, &reserved_cpus)?;
+        ensure!(
+            slices.len() == devices.len(),
+            "built {} CPU slices for {} devices",
+            slices.len(),
+            devices.len()
+        );
+
+        let mut ranks = Vec::with_capacity(devices.len());
+        for (rank, &device_ordinal) in devices.iter().enumerate() {
+            let slice = slices
+                .iter()
+                .find(|slice| slice.rank == rank)
+                .with_context(|| format!("missing CPU slice for rank {rank}"))?;
+            ranks.push(rank_thread_placement(device_ordinal, slice)?);
+        }
+        Ok(Self {
+            scheduler_cpu,
+            ranks,
+        })
+    }
+
+    pub(super) fn scheduler_cpu(&self) -> Option<CpuId> {
+        self.scheduler_cpu
+    }
+
+    pub(super) fn rank(&self, rank: usize) -> Result<RankThreadPlacement> {
+        self.ranks
+            .get(rank)
+            .cloned()
+            .with_context(|| format!("missing thread placement for rank {rank}"))
+    }
+}
+
+fn rank_thread_placement(
+    device_ordinal: usize,
+    slice: &RankCpuSlice,
+) -> Result<RankThreadPlacement> {
+    let rank_worker_cpu = *slice
         .cpus
-        .iter()
-        .copied()
-        .filter(|cpu| allowed_cpus.contains(cpu))
-        .collect::<Vec<_>>();
-    assert!(
-        !target_cpus.is_empty(),
-        "NUMA node {} CPU list for CUDA device {} ({}) has no overlap with allowed CPU mask",
-        target.numa_node,
+        .first()
+        .with_context(|| format!("rank {} has empty CPU slice", slice.rank))?;
+    Ok(RankThreadPlacement {
+        rank: slice.rank,
         device_ordinal,
-        target.pci_bus_id
-    );
-    let cpu = target_cpus[rank % target_cpus.len()];
-
-    assert!(
-        pin_current_thread_to_cpu(cpu),
-        "failed to pin {label} to CPU {cpu}"
-    );
-    log::info!(
-        "pinned {label} for CUDA device {device_ordinal} ({}) NUMA{} to CPU {cpu}",
-        target.pci_bus_id,
-        target.numa_node
-    );
-}
-
-fn current_allowed_cpus() -> Option<Vec<usize>> {
-    unsafe {
-        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
-        let set_size = std::mem::size_of::<libc::cpu_set_t>();
-        if libc::sched_getaffinity(0, set_size, &mut allowed) != 0 {
-            return None;
-        }
-
-        let mut cpus = Vec::new();
-        for cpu in 0..libc::CPU_SETSIZE as usize {
-            if libc::CPU_ISSET(cpu, &allowed) {
-                cpus.push(cpu);
-            }
-        }
-        Some(cpus)
-    }
-}
-
-struct NumaTarget {
-    pci_bus_id: String,
-    numa_node: usize,
-    cpus: Vec<usize>,
-}
-
-fn numa_target_for_device(device_ordinal: usize) -> Result<NumaTarget, String> {
-    let pci_bus_id = cuda_pci_bus_id(device_ordinal).map_err(|err| {
-        format!("failed to read PCI bus id for CUDA device {device_ordinal}: {err}")
-    })?;
-    let numa_node = pci_numa_node(&pci_bus_id).ok_or_else(|| {
-        format!("failed to read NUMA node for CUDA device {device_ordinal} ({pci_bus_id})")
-    })?;
-    let cpulist =
-        std::fs::read_to_string(format!("/sys/devices/system/node/node{numa_node}/cpulist"))
-            .map_err(|err| {
-                format!(
-                    "failed to read CPU list for CUDA device {device_ordinal} ({pci_bus_id}) NUMA{numa_node}: {err}"
-                )
-            })?;
-    let cpus = parse_cpu_list(cpulist.trim()).ok_or_else(|| {
-        format!(
-            "failed to parse CPU list for CUDA device {device_ordinal} ({pci_bus_id}) NUMA{numa_node}: {cpulist:?}"
-        )
-    })?;
-    if cpus.is_empty() {
-        return Err(format!(
-            "empty CPU list for CUDA device {device_ordinal} ({pci_bus_id}) NUMA{numa_node}"
-        ));
-    }
-    Ok(NumaTarget {
-        pci_bus_id,
-        numa_node,
-        cpus,
+        numa_node: slice.numa_node,
+        cpu_slice: slice.cpus.clone(),
+        rank_worker_cpu,
     })
 }
 
-fn cuda_pci_bus_id(device_ordinal: usize) -> Result<String, String> {
-    let mut buf = [0i8; 32];
-    cuda_driver_result::init().map_err(|err| format!("{err:?}"))?;
-    let device =
-        cuda_driver_result::device::get(device_ordinal as i32).map_err(|err| format!("{err:?}"))?;
-    unsafe {
-        cuda_driver_sys::cuDeviceGetPCIBusId(buf.as_mut_ptr(), buf.len() as i32, device)
-            .result()
-            .map_err(|err| format!("{err:?}"))?;
-        CStr::from_ptr(buf.as_ptr())
-            .to_str()
-            .map(|bus_id| bus_id.to_ascii_lowercase())
-            .map_err(|err| err.to_string())
-    }
+pub(super) fn pin_scheduler_thread(placement: &RankThreadPlacementPlan) {
+    let Some(cpu) = placement.scheduler_cpu() else {
+        log::warn!("DeepSeek V4 scheduler CPU1 is not in the current affinity mask");
+        return;
+    };
+    pin_current_thread_to_cpu(cpu)
+        .unwrap_or_else(|err| panic!("failed to pin DeepSeek V4 scheduler to CPU {cpu}: {err:#}"));
+    log::info!("pinned DeepSeek V4 scheduler to CPU {cpu}");
 }
 
-fn pci_numa_node(pci_bus_id: &str) -> Option<usize> {
-    let raw =
-        std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci_bus_id}/numa_node")).ok()?;
-    let node = raw.trim().parse::<isize>().ok()?;
-    usize::try_from(node).ok()
+pub(super) fn pin_rank_worker_thread(placement: &RankThreadPlacement) {
+    pin_current_thread_to_cpu(placement.rank_worker_cpu).unwrap_or_else(|err| {
+        panic!(
+            "failed to pin DeepSeek rank worker {} to CPU {}: {err:#}",
+            placement.rank, placement.rank_worker_cpu
+        )
+    });
+    log::info!(
+        "pinned DeepSeek rank worker {} for CUDA device {} NUMA{} slice={} to CPU {}",
+        placement.rank,
+        placement.device_ordinal,
+        placement.numa_node,
+        placement.cpu_slice_display(),
+        placement.rank_worker_cpu,
+    );
 }
 
-fn parse_cpu_list(cpulist: &str) -> Option<Vec<usize>> {
-    let mut cpus = Vec::new();
-    for part in cpulist.split(',').filter(|part| !part.is_empty()) {
-        if let Some((start, end)) = part.split_once('-') {
-            let start = start.parse::<usize>().ok()?;
-            let end = end.parse::<usize>().ok()?;
-            if start > end {
-                return None;
-            }
-            cpus.extend(start..=end);
-        } else {
-            cpus.push(part.parse::<usize>().ok()?);
-        }
-    }
-    Some(cpus)
-}
-
-fn pin_current_thread_to_cpu(cpu: usize) -> bool {
-    unsafe {
-        let mut target: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut target);
-        libc::CPU_SET(cpu, &mut target);
-        let set_size = std::mem::size_of::<libc::cpu_set_t>();
-        libc::pthread_setaffinity_np(libc::pthread_self(), set_size, &target) == 0
-    }
+fn scheduler_cpu() -> Result<Option<CpuId>> {
+    let cpu = CpuId::new(SCHEDULER_CPU)?;
+    let allowed = current_allowed_cpus()?;
+    Ok(allowed.contains(&cpu).then_some(cpu))
 }
