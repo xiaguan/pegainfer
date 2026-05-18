@@ -330,17 +330,20 @@ The current code path is:
 - output indices are `offset + compressed_idx`, where the ratio-4 prefill path
   uses the raw window length as `offset`.
 
-For the 10k prefill workload from the P3 observation, this gives the concrete
-shape:
+For the 10k prefill workload from the P3 observation, the runtime shape source
+is the DSV4 model config (`index_topk=512`) combined with
+`indexer_topk_indices_prefill`, which passes
+`config.index_topk.min(compressed_len)` to
+`deepseek_indexer_topk_prefill_cuda`. That gives the concrete runtime shape:
 
 | Field | Value |
 | --- | --- |
 | `seq_len` | `10580` |
 | `compressed_len` | `2645` |
-| `topk` | `32` |
+| `topk` | `512` |
 | `ratio` | `4` |
 | `offset` | `10580` |
-| shared memory per block | `10580` bytes |
+| shared memory per block | `12628` bytes |
 
 P3 `nsys` attribution, still under the explicit CuTeDSL score feature, showed
 top-k as the largest remaining indexer-side bucket:
@@ -359,18 +362,20 @@ cargo test --release -p pegainfer-kernels \
   --test deepseek_indexer_topk -- --ignored --nocapture
 ```
 
-It covers two cases:
+It covers three cases:
 
-- odd compressed length with pseudo-random scores:
+- synthetic odd compressed length with pseudo-random scores:
   `seq_len=257`, `compressed_len=129`, `topk=32`, `ratio=4`, `offset=777`;
-- the 10k profile shape:
-  `seq_len=10580`, `compressed_len=2645`, `topk=32`, `ratio=4`,
+- the real 10k runtime top-k shape:
+  `seq_len=10580`, `compressed_len=2645`, `topk=512`, `ratio=4`,
   `offset=10580`.
+- synthetic tie-heavy rows:
+  `seq_len=17`, `compressed_len=33`, `topk=12`, `ratio=4`, `offset=4096`.
 
-The first case checks exact output indices against a CPU reference. The second
-case uses monotonic scores so the expected top-k sequence is fully derivable
-while still exercising the real 10k launch shape, valid-position mask, top-k
-width, and offset behavior.
+The synthetic cases check boundary and strict tie-order behavior. The 10k case
+uses monotonic scores so the expected top-k sequence is fully derivable while
+exercising the real runtime top-k width, valid-position mask, and offset
+behavior.
 
 Hash evidence remains the P3 gate because this PR does not change runtime code:
 direct 10k generated-token hash `39a863e299d2b187`, 10k HTTP output hash
@@ -393,15 +398,21 @@ strict `>` semantics by keeping the lower candidate index when scores tie.
 Score, overlap compressor, cache reuse, scheduler, HTTP behavior, and decode
 top-k are unchanged.
 
-The ignored GPU gate now covers three cases:
+The ignored GPU gate in that historical task covered three cases:
 
-- odd compressed length: `seq_len=257`, `compressed_len=129`, `topk=32`,
+- synthetic odd compressed length: `seq_len=257`, `compressed_len=129`, `topk=32`,
   `ratio=4`, `offset=777`;
-- 10k profile shape: `seq_len=10580`, `compressed_len=2645`, `topk=32`,
-  `ratio=4`, `offset=10580`;
-- tie-heavy rows: `seq_len=17`, `compressed_len=33`, `topk=12`, `ratio=4`,
-  `offset=4096`, with equal score groups verifying that candidate order is
-  preserved.
+- synthetic 10k-like task shape: `seq_len=10580`, `compressed_len=2645`,
+  `topk=32`, `ratio=4`, `offset=10580`;
+- synthetic tie-heavy rows: `seq_len=17`, `compressed_len=33`, `topk=12`,
+  `ratio=4`, `offset=4096`, with equal score groups verifying that candidate
+  order is preserved.
+
+Those `topk=32` numbers are historical task-gate evidence only. They are not a
+valid source for future DSV4 runtime performance gates. Runtime top-k work must
+use the real config-derived 10k shape from P4:
+`seq_len=10580`, `compressed_len=2645`, `topk=512`, `ratio=4`,
+`offset=10580`.
 
 Validation at this PR head:
 
