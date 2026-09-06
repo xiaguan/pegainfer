@@ -44,10 +44,10 @@ pub(crate) fn to_wire_position_logprobs(
 pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
     // The vLLM frontend lowers a client `ignore_eos=true` to `_eos_token_id:
     // None`, but `_all_stop_token_ids` always carries the model EOS set (it
-    // exists for min_tokens masking, not stop detection). Deriving ignore_eos
-    // from all_stop_token_ids would therefore void every ignore_eos request on
-    // models with a real EOS. Only _eos_token_id and the client's explicit
-    // stop_token_ids express the legacy scheduler's stop intent.
+    // exists for min_tokens masking, not stop detection). This conversion feeds
+    // the legacy SamplingParams contract, which has no field for explicit
+    // request stop IDs; keep its historical lowering until each producer is
+    // migrated to StopPolicy. Qwen3 receives the independent policy below.
     let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
         return SamplingParams {
@@ -79,15 +79,15 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
 }
 
 pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
-    StopPolicy {
+    StopPolicy::new(
         // Qwen3 owns the complete model EOS set in generation_config. The
         // protocol's optional primary ID only tells us whether EOS is active;
         // using it as a singleton would miss secondary model EOS IDs.
-        eos: params
+        params
             .eos_token_id
             .map_or(EosPolicy::Ignore, |_| EosPolicy::ModelDefault),
-        token_ids: params.stop_token_ids.clone(),
-    }
+        params.stop_token_ids.clone(),
+    )
 }
 
 /// Reject request parameters the frontend cannot represent faithfully.
@@ -102,6 +102,12 @@ pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPoli
 /// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
 #[allow(clippy::float_cmp)]
 pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> Option<String> {
+    if params.min_tokens != 0 {
+        return Some(format!(
+            "min_tokens={} is not supported by current engine contracts",
+            params.min_tokens
+        ));
+    }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
     }
@@ -209,8 +215,9 @@ mod tests {
         params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
-        // The legacy scheduler keeps EOS active when an explicit stop token is
-        // present; the stepped bridge carries explicit stops in StopPolicy.
+        // The legacy SamplingParams contract keeps EOS active when explicit
+        // stop IDs are present; the stepped Qwen3 path carries those IDs in
+        // StopPolicy instead.
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];
         assert!(!convert_sampling(&params).ignore_eos);
@@ -223,7 +230,7 @@ mod tests {
         params.stop_token_ids = vec![11];
 
         assert_eq!(convert_stop_policy(&params).eos, EosPolicy::ModelDefault);
-        assert_eq!(convert_stop_policy(&params).token_ids, vec![11]);
+        assert_eq!(convert_stop_policy(&params).token_ids.as_ref(), [11]);
     }
 
     #[test]
@@ -249,6 +256,13 @@ mod tests {
         let mut params = EngineCoreSamplingParams::for_test();
         params.repetition_penalty = 1.0;
         assert_eq!(unsupported_request_params(&params), None);
+
+        params.min_tokens = 1;
+        assert_eq!(
+            unsupported_request_params(&params).as_deref(),
+            Some("min_tokens=1 is not supported by current engine contracts")
+        );
+        params.min_tokens = 0;
 
         params.min_p = 0.2;
         assert_eq!(unsupported_request_params(&params), None);

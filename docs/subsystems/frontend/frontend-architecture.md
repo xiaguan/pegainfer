@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
+**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4, K3 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
 
 Last touched: 2026-09
 
@@ -16,13 +16,8 @@ pegainfer-frontend/src/engine/
 │                        #   Request { ..., stop_policy }, RequestUpdate { scheduled, tokens,
 │                        #   logprobs, cached_tokens, prompt_echo, kv_transfer, terminal },
 │                        #   Terminal { ..., stop_cause }
-├── request_lifecycle.rs # typestate handles: QueuedRequest ─admit→
-│                        #   ActiveRequest ─finish/fail/defer→ consumed; every
-│                        #   transition is by-move, a dropped handle emits Failed
-│                        #   (drop bomb); DeferredFinish; RequestControl
-├── emitter.rs           # StepEmitter: the single writer of the per-step buffer; stamps
-│                        #   timestamps, tallies prompt/completion counts, folds each
-│                        #   request's step into one RequestUpdate; commit_step sends once
+├── request_lifecycle.rs # submission envelope, abort control and step sender plumbing;
+│                        #   DeferredFinish remains available for P/D handoff
 ├── ledger.rs             # RequestLedger: admit/reject/push/finish/fail/retire,
 │                         #   prompt/completion tallies, one merged update per touched id
 ├── wiring.rs            # scheduler_pair, SchedulerHandle (submit/take_steps/load),
@@ -39,8 +34,7 @@ Design decisions worth knowing before touching it:
 - **Step-batched wire.** One message per scheduler step, not one channel per request: the scheduler's natural output unit is the step batch, and per-request channels were tried and rejected (the scheduler for-loop over N channels was the bottleneck). The protocol stack demuxes.
 - **Flat `RequestUpdate`.** All facts a step produced for one request travel in one struct, so intra-request ordering is structure, not convention. This is what makes `defer_finish` safe: a P/D prefill executor can withhold a request's `Finished` until its KV saves are peer-visible and send it later from any thread — the deferred message carries the request's entire buffered update, so late delivery cannot reorder.
 - **Independent stop policy and cause.** `Request.stop_policy` keeps model EOS handling separate from explicit request stop IDs. A token-driven finish retains the triggering token in `RequestUpdate` and carries `Terminal::Finished.stop_cause`; decode paths include its real logprob when available, so the stepped bridge can report the actual explicit stop ID without reconstructing it. `ignore_eos` affects only model EOS. Legacy producers may leave the cause empty while they are migrated individually.
-- **Typestate lifecycle.** `QueuedRequest` (queued) and `ActiveRequest` (streaming) are owned tokens; admit/reject/retire/finish/fail consume them, so "terminal exactly once, nothing after it" cannot be miscoded — it does not compile. A handle dropped without a transition emits `Failed` from its `Drop`, which is also how a crashed scheduler answers every in-flight request: the driver drops the scheduler, the handles fall, the terminals ship.
-- **Emitter as single writer.** Schedulers never touch the channel; they call `StepEmitter` methods against their handles. The emitter stamps `ScheduledInfo` at admission, tallies token counts (terminal counts derive from the tally, never from model-side arithmetic), and `commit_step` publishes the whole step in one send.
+- **Ledger lifecycle.** Schedulers carry plain `RequestId`s and mutate `RequestLedger`; `RequestEnvelope` answers submissions dropped before registration, while `DeferredFinish` preserves a complete buffered update when a terminal is delivered after a P/D handoff. `RequestControl` is the frontend abort flag. The ledger remains the single writer for admission, token accounting, terminal transitions, and step publication.
 - **Pure polling driver.** `spawn_scheduler` owns the serve loop: drain submissions, `Scheduler::step`, publish load, commit. No idle/park distinction — the scheduler owns the GPU and spinning on it costs nothing anyone else could use; async KV I/O (prefetch, decode-overlap prefill) is naturally absorbed by polling. An idle iteration ends in a `spin_loop` hint (relaxes the core's issue slots, no latency cost — busy iterations never pause). The loop exits when the frontend drops the handle and the queue drains.
 - **Gemma 4 async prefill exception.** While asynchronous prefill is the only remaining work, Gemma 4 drains and joins that lane rather than hot-polling its completion; decode or queued work keeps the normal polling path.
 - **Abort is a flag, not channel teardown.** `SchedulerHandle::submit` returns a `RequestControl`; the frontend flips its boolean abort flag and the scheduler retires the request silently on its next touch (no terminal — the frontend already dropped its state for that id).
