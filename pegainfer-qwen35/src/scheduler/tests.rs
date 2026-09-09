@@ -306,7 +306,7 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
     assert_eq!(backend.retired_active, vec![RequestId::new(10)]);
     assert_eq!(
         backend.dropped_prefilling,
-        vec![(RequestId::new(12), DropExpectation::MustBeAbsent)]
+        vec![(RequestId::new(12), DropExpectation::MustExist)]
     );
 }
 
@@ -796,6 +796,16 @@ fn collect_finished_with_timeout(
 }
 
 #[test]
+fn prefix_cache_chunking_stops_at_snapshot_boundaries() {
+    let stride = Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS);
+    assert_eq!(clamp_prefill_chunk(0, 900, stride), 256);
+    assert_eq!(clamp_prefill_chunk(256, 644, stride), 256);
+    assert_eq!(clamp_prefill_chunk(512, 388, stride), 256);
+    assert_eq!(clamp_prefill_chunk(768, 132, stride), 132);
+    assert_eq!(clamp_prefill_chunk(0, 900, None), 900);
+}
+
+#[test]
 fn send_rejection_reports_lifetime_kv_and_context_limits() {
     let rejection_message = |reason: RejectReason, max_tokens: usize| {
         let (token_tx, mut token_rx) = TokenSink::standalone();
@@ -884,8 +894,8 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let handle =
-        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false).expect("start TP2 scheduler");
+    let handle = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
+        .expect("start TP2 scheduler");
     let (decode_tx, mut decode_rx) = TokenSink::standalone();
     let (prefill_tx, mut prefill_rx) = TokenSink::standalone();
 
