@@ -2,13 +2,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::Result;
 use pegainfer_core::tensor::DeviceContext;
-use pegainfer_kv_cache::KvBlockGuard;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvCacheManager;
 use pegainfer_kv_cache::KvView;
@@ -49,55 +48,38 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) restore_ns: u64,
 }
 
-/// One reusable Qwen3.5 prefix entry.
-///
-/// The entry is the ownership boundary for the recurrent snapshot slot
-/// and the leading KV blocks. Dropping an entry therefore drops its KV lease as well.
-struct PrefixEntry {
+/// One recurrent snapshot indexed by a reusable prefix boundary.
+struct SnapshotEntry {
     /// Identically numbered physical recurrent snapshot on every rank.
     recurrent_slot: usize,
-    /// Strong pins for every KV block through the entry boundary.
-    #[allow(dead_code)] // ownership is the use: dropping the entry drops the lease
-    kv_lease: Vec<KvBlockGuard>,
-    /// Active restore guards preventing this entry from being evicted.
-    pin_count: Arc<AtomicUsize>,
     /// Logical timestamp used to select an unpinned LRU victim.
-    last_used: u64,
+    last_used: AtomicU64,
 }
 
-/// RAII pin on one prefix cache entry while its recurrent state is being restored.
-pub(crate) struct PrefixGuard {
+/// RAII pin on a recurrent snapshot during restore.
+pub(crate) struct SnapshotGuard {
     /// Token boundary represented by the pinned entry.
     boundary: usize,
-    /// Rank-local physical snapshot slot selected by the directory.
-    recurrent_slot: usize,
-    /// Shared count consulted by insertion before choosing a victim.
-    pin_count: Arc<AtomicUsize>,
+    /// The directory's extra strong references are active restore pins.
+    entry: Arc<SnapshotEntry>,
     /// Start time used for restore latency accounting.
     started: Instant,
 }
 
-impl PrefixGuard {
+impl SnapshotGuard {
     pub(crate) fn boundary(&self) -> usize {
         self.boundary
     }
 
     pub(crate) fn recurrent_slot(&self) -> usize {
-        self.recurrent_slot
-    }
-}
-
-impl Drop for PrefixGuard {
-    fn drop(&mut self) {
-        let previous = self.pin_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "prefix guard pin underflow");
+        self.entry.recurrent_slot
     }
 }
 
 /// Mutable prefix-cache state shared by every execution rank.
-struct PrefixCacheState {
-    /// Published boundary key to its complete joint entry.
-    entries: HashMap<PrefixBoundaryKey, PrefixEntry>,
+struct SnapshotCache {
+    /// Published boundary key to its recurrent snapshot entry.
+    entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
     /// Unpublished slots available without eviction.
     free_slots: Vec<usize>,
     /// Total number of preallocated physical snapshot slots.
@@ -106,7 +88,7 @@ struct PrefixCacheState {
     clock: u64,
 }
 
-impl PrefixCacheState {
+impl SnapshotCache {
     fn new(slot_count: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(slot_count),
@@ -133,24 +115,22 @@ impl PrefixCacheState {
     }
 
     /// Look up `key`, refresh its LRU timestamp, and pin its entry.
-    fn lookup(&mut self, key: PrefixBoundaryKey, started: Instant) -> Option<PrefixGuard> {
+    fn lookup(&mut self, key: PrefixBoundaryKey, started: Instant) -> Option<SnapshotGuard> {
         let last_used = self.tick();
-        let entry = self.entries.get_mut(&key)?;
-        entry.last_used = last_used;
-        entry.pin_count.fetch_add(1, Ordering::AcqRel);
-        Some(PrefixGuard {
+        let entry = self.entries.get(&key)?;
+        entry.last_used.store(last_used, Ordering::Relaxed);
+        Some(SnapshotGuard {
             boundary: key.boundary_tokens,
-            recurrent_slot: entry.recurrent_slot,
-            pin_count: Arc::clone(&entry.pin_count),
+            entry: Arc::clone(entry),
             started,
         })
     }
 
     /// Reserve a free or unpinned LRU slot without publishing the new entry.
-    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<PrefixReservation> {
+    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
         let last_used = self.tick();
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = last_used;
+        if let Some(entry) = self.entries.get(&key) {
+            entry.last_used.store(last_used, Ordering::Relaxed);
             return None;
         }
 
@@ -160,8 +140,8 @@ impl PrefixCacheState {
             let (&victim_key, slot) = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.pin_count.load(Ordering::Acquire) == 0)
-                .min_by_key(|(_, entry)| entry.last_used)
+                .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
                 .map(|(key, entry)| (key, entry.recurrent_slot))?;
             let evicted = self
                 .entries
@@ -171,31 +151,28 @@ impl PrefixCacheState {
             (slot, true)
         };
 
-        Some(PrefixReservation {
+        Some(SnapshotReservation {
             recurrent_slot: slot,
             key,
             replaced: evicted,
         })
     }
 
-    /// Publish one complete entry only after every rank has enqueued its
-    /// physical recurrent-state copy.
-    fn publish(&mut self, reservation: PrefixReservation, kv_lease: Vec<KvBlockGuard>) {
+    /// Publish after every rank has enqueued its recurrent-state copy.
+    fn publish(&mut self, reservation: SnapshotReservation) {
         let last_used = self.tick();
         let previous = self.entries.insert(
             reservation.key,
-            PrefixEntry {
+            Arc::new(SnapshotEntry {
                 recurrent_slot: reservation.recurrent_slot,
-                kv_lease,
-                pin_count: Arc::new(AtomicUsize::new(0)),
-                last_used,
-            },
+                last_used: AtomicU64::new(last_used),
+            }),
         );
         debug_assert!(previous.is_none());
     }
 
     /// Return an unpublished slot after a physical copy failure.
-    fn abort(&mut self, reservation: PrefixReservation) {
+    fn abort(&mut self, reservation: SnapshotReservation) {
         debug_assert!(!self.entries.contains_key(&reservation.key));
         self.free_slots.push(reservation.recurrent_slot);
     }
@@ -203,14 +180,14 @@ impl PrefixCacheState {
 
 /// One pending central-directory insertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PrefixReservation {
+pub(crate) struct SnapshotReservation {
     recurrent_slot: usize,
     key: PrefixBoundaryKey,
-    /// Whether this insertion replaced an unpinned joint entry.
+    /// Whether this insertion replaced an unpinned snapshot entry.
     replaced: bool,
 }
 
-impl PrefixReservation {
+impl SnapshotReservation {
     pub(crate) fn recurrent_slot(self) -> usize {
         self.recurrent_slot
     }
@@ -275,8 +252,8 @@ impl RecurrentStateStore {
 pub(crate) struct Qwen35PrefixCache {
     /// Logical block pool paired with the full-attention GPU KV buffer.
     kv: KvCacheManager,
-    /// Prefix key, slot, pin, LRU, and KV-lease ownership for reusable entries.
-    state: PrefixCacheState,
+    /// Prefix key, slot, pin, and LRU state for reusable entries.
+    snapshots: SnapshotCache,
     /// Scheduler-thread-owned cumulative metrics.
     stats: PrefixCacheStats,
 }
@@ -291,7 +268,7 @@ impl Qwen35PrefixCache {
         );
         Ok(Self {
             kv,
-            state: PrefixCacheState::new(snapshot_slots),
+            snapshots: SnapshotCache::new(snapshot_slots),
             stats: PrefixCacheStats::default(),
         })
     }
@@ -308,17 +285,17 @@ impl Qwen35PrefixCache {
 
     /// Whether joint prefix reuse and snapshot publication are enabled.
     pub(crate) fn enabled(&self) -> bool {
-        self.state.capacity() > 0
+        self.snapshots.capacity() > 0
     }
 
     /// Total number of preallocated recurrent snapshot slots.
     pub(crate) fn snapshot_slots(&self) -> usize {
-        self.state.capacity()
+        self.snapshots.capacity()
     }
 
     /// Number of snapshot slots that currently have a published key.
     pub(crate) fn snapshot_occupancy(&self) -> usize {
-        self.state.len()
+        self.snapshots.len()
     }
 
     /// Return a point-in-time copy of cumulative cache metrics.
@@ -338,7 +315,7 @@ impl Qwen35PrefixCache {
         max_output_tokens: usize,
         lora_name: Option<&str>,
         allow_match: bool,
-    ) -> Result<(RequestKv, Option<PrefixGuard>)> {
+    ) -> Result<(RequestKv, Option<SnapshotGuard>)> {
         let mut request =
             self.kv
                 .pool()
@@ -363,7 +340,7 @@ impl Qwen35PrefixCache {
                 sequence_hash,
                 boundary_tokens: boundary,
             };
-            let Some(guard) = self.state.lookup(key, started) else {
+            let Some(guard) = self.snapshots.lookup(key, started) else {
                 self.stats.snapshot_misses += 1;
                 continue;
             };
@@ -401,7 +378,7 @@ impl Qwen35PrefixCache {
     pub(crate) fn finish_restore(
         &mut self,
         request: &RequestKv,
-        guard: PrefixGuard,
+        guard: SnapshotGuard,
         recurrent_positions: &[usize],
     ) -> Result<usize> {
         let boundary = guard.boundary();
@@ -442,7 +419,7 @@ impl Qwen35PrefixCache {
     /// Apply one successful whole-model prefill window.
     ///
     /// KV is applied for every window. The returned boundary can be passed to
-    /// [`Self::reserve_prefix`], which accepts only non-zero multiples of
+    /// [`Self::reserve_snapshot`], which accepts only non-zero multiples of
     /// [`SNAPSHOT_STRIDE_TOKENS`].
     pub(crate) fn apply_prefill(
         &self,
@@ -454,9 +431,10 @@ impl Qwen35PrefixCache {
         } else {
             request.apply_prefill_chunk(self.kv.pool())
         };
-        // Cleanup may drop a request directly on cancellation or failure.
-        // Only entry-held leases may outlive that drop, including partial apply.
-        request.mark_blocks_reset_on_release();
+        // Retain registered KV only when prefix caching is enabled.
+        if !self.enabled() {
+            request.mark_blocks_reset_on_release();
+        }
         applied?;
         let boundary = request.kv_position();
         Ok(boundary)
@@ -469,11 +447,11 @@ impl Qwen35PrefixCache {
     /// slot on every rank, then publishes or aborts the reservation. Duplicate
     /// boundaries, disabled caching, ineligible boundaries, and fully pinned
     /// capacity return `None`.
-    pub(crate) fn reserve_prefix(
+    pub(crate) fn reserve_snapshot(
         &mut self,
         request: &RequestKv,
         boundary: usize,
-    ) -> Result<Option<PrefixReservation>> {
+    ) -> Result<Option<SnapshotReservation>> {
         if !self.enabled() {
             return Ok(None);
         }
@@ -487,34 +465,22 @@ impl Qwen35PrefixCache {
             sequence_hash,
             boundary_tokens: boundary,
         };
-        Ok(self.state.reserve(key))
+        Ok(self.snapshots.reserve(key))
     }
 
-    /// Publish a complete joint prefix entry.
-    ///
-    /// The caller must first copy recurrent state into the reserved physical
-    /// slot on every rank. Publication retains exactly the leading KV blocks
-    /// represented by the snapshot boundary.
-    pub(crate) fn publish_prefix(&mut self, request: &RequestKv, reservation: PrefixReservation) {
-        let block_count = reservation.key.boundary_tokens / self.kv.pool().block_size();
-        let mut kv_guards = request.assigned_block_guards();
-        assert!(
-            kv_guards.len() >= block_count,
-            "Qwen3.5 snapshot boundary {} requires {block_count} KV blocks, request has {}",
-            reservation.key.boundary_tokens,
-            kv_guards.len()
-        );
-        kv_guards.truncate(block_count);
+    /// Publish after rank-local snapshot copies succeed. `reserve_snapshot`
+    /// already validated registered KV at the boundary.
+    pub(crate) fn publish_snapshot(&mut self, reservation: SnapshotReservation) {
         self.stats.inserts += 1;
         if reservation.was_replacement() {
             self.stats.evictions += 1;
         }
-        self.state.publish(reservation, kv_guards);
+        self.snapshots.publish(reservation);
     }
 
     /// Abort a prefix reservation after any rank-local copy failure.
-    pub(crate) fn abort_prefix(&mut self, reservation: PrefixReservation) {
-        self.state.abort(reservation);
+    pub(crate) fn abort_snapshot(&mut self, reservation: SnapshotReservation) {
+        self.snapshots.abort(reservation);
     }
 
     /// Reserve KV capacity for the next one-token decode forward.
@@ -533,7 +499,9 @@ impl Qwen35PrefixCache {
     /// Apply the KV written by decode and record the newly sampled token.
     pub(crate) fn apply_decode(&self, request: &mut RequestKv, token: u32) -> Result<()> {
         let applied = request.apply_decode(token, self.kv.pool());
-        request.mark_blocks_reset_on_release();
+        if !self.enabled() {
+            request.mark_blocks_reset_on_release();
+        }
         applied?;
         Ok(())
     }
@@ -545,9 +513,10 @@ impl Qwen35PrefixCache {
     }
 
     /// Release all request KV.
-    #[allow(clippy::unused_self)] // keep KV state transitions behind this facade
     pub(crate) fn release_request(&self, request: &mut RequestKv) -> Result<()> {
-        request.mark_blocks_reset_on_release();
+        if !self.enabled() {
+            request.mark_blocks_reset_on_release();
+        }
         request.release()
     }
 }
@@ -565,8 +534,8 @@ mod tests {
     use pegainfer_kv_cache::BlockPool;
 
     use super::PrefixBoundaryKey;
-    use super::PrefixCacheState;
     use super::SNAPSHOT_STRIDE_TOKENS;
+    use super::SnapshotCache;
     use super::eligible_boundaries;
 
     fn key(tag: u8) -> PrefixBoundaryKey {
@@ -591,18 +560,18 @@ mod tests {
 
     #[test]
     fn state_publishes_only_after_explicit_commit() {
-        let mut state = PrefixCacheState::new(1);
+        let mut state = SnapshotCache::new(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
         assert!(state.lookup(key(1), Instant::now()).is_none());
-        state.publish(reservation, Vec::new());
+        state.publish(reservation);
         assert!(state.lookup(key(1), Instant::now()).is_some());
     }
 
     #[test]
     fn aborted_write_does_not_expose_partial_snapshot() {
-        let mut state = PrefixCacheState::new(1);
+        let mut state = SnapshotCache::new(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
@@ -613,23 +582,23 @@ mod tests {
 
     #[test]
     fn duplicate_refreshes_lru_without_allocating_a_slot() {
-        let mut state = PrefixCacheState::new(1);
+        let mut state = SnapshotCache::new(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty directory must reserve a write");
-        state.publish(reservation, Vec::new());
+        state.publish(reservation);
         assert!(state.reserve(key(1)).is_none());
         assert_eq!(state.len(), 1);
     }
 
     #[test]
     fn lru_evicts_untouched_snapshot_but_preserves_touched_snapshot() {
-        let mut state = PrefixCacheState::new(2);
+        let mut state = SnapshotCache::new(2);
         for tag in [1, 2] {
             let reservation = state
                 .reserve(key(tag))
                 .expect("state should have a free slot");
-            state.publish(reservation, Vec::new());
+            state.publish(reservation);
         }
         drop(
             state
@@ -639,7 +608,7 @@ mod tests {
         let reservation = state
             .reserve(key(3))
             .expect("an unpinned LRU victim should be available");
-        state.publish(reservation, Vec::new());
+        state.publish(reservation);
         assert!(state.lookup(key(1), Instant::now()).is_some());
         assert!(state.lookup(key(2), Instant::now()).is_none());
         assert!(state.lookup(key(3), Instant::now()).is_some());
@@ -647,11 +616,11 @@ mod tests {
 
     #[test]
     fn all_pinned_snapshots_make_insertion_a_soft_miss() {
-        let mut state = PrefixCacheState::new(1);
+        let mut state = SnapshotCache::new(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
-        state.publish(reservation, Vec::new());
+        state.publish(reservation);
         let guard = state
             .lookup(key(1), Instant::now())
             .expect("key 1 should be present");
@@ -661,30 +630,48 @@ mod tests {
     }
 
     #[test]
-    fn joint_cache_entry_releases_kv_blocks_on_eviction() {
+    fn released_prefix_kv_is_reclaimable_without_snapshot_eviction() {
         let pool = BlockPool::new(16, 32).expect("block pool");
         let baseline = pool.available_blocks();
-        let mut request = pool.new_request(vec![7; SNAPSHOT_STRIDE_TOKENS], 0, None);
+        let prompt = vec![7; SNAPSHOT_STRIDE_TOKENS + 16];
+        let mut request = pool.new_request(prompt.clone(), 0, None);
         request
-            .schedule_prefill(SNAPSHOT_STRIDE_TOKENS, &pool)
+            .schedule_prefill(prompt.len(), &pool)
             .expect("schedule prefill");
         request.apply_prefill_chunk(&pool).expect("apply prefill");
+        let cached_boundary = request
+            .registered_boundary_hash(SNAPSHOT_STRIDE_TOKENS)
+            .expect("full snapshot boundary is registered");
 
-        let mut state = PrefixCacheState::new(1);
+        let mut state = SnapshotCache::new(1);
+        let key = PrefixBoundaryKey {
+            sequence_hash: cached_boundary,
+            boundary_tokens: SNAPSHOT_STRIDE_TOKENS,
+        };
         let reservation = state
-            .reserve(key(1))
+            .reserve(key)
             .expect("empty state must reserve a write");
-        state.publish(reservation, request.assigned_block_guards());
-        request.mark_blocks_reset_on_release();
+        state.publish(reservation);
         request.release().expect("release request");
 
-        let retained_blocks = SNAPSHOT_STRIDE_TOKENS / pool.block_size();
-        assert_eq!(pool.available_blocks(), baseline - retained_blocks);
-
-        let reservation = state
-            .reserve(key(2))
-            .expect("full directory must evict its unpinned snapshot");
+        // Released KV remains reusable and counts as available capacity.
         assert_eq!(pool.available_blocks(), baseline);
-        state.abort(reservation);
+
+        let mut warm = pool.new_request(prompt, 0, None);
+        assert_eq!(
+            warm.match_and_add_prefix(&pool).expect("match inactive KV"),
+            SNAPSHOT_STRIDE_TOKENS
+        );
+        warm.release().expect("release warm request");
+
+        // A full-pool cold reservation reclaims KV without evicting the snapshot.
+        let cold_prompt = vec![9; baseline * pool.block_size()];
+        let mut cold = pool.new_request(cold_prompt.clone(), 0, None);
+        cold.schedule_prefill(cold_prompt.len(), &pool)
+            .expect("inactive KV must satisfy cold allocation");
+        cold.revert_schedule().expect("revert cold reservation");
+        cold.release().expect("release cold request");
+
+        assert!(state.lookup(key, Instant::now()).is_some());
     }
 }

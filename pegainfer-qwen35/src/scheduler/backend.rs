@@ -167,16 +167,16 @@ impl SingleGpuBackend {
                 "Qwen3.5 prefill apply position mismatch: kv={boundary}, recurrent={}",
                 rec.seq_len
             );
-            if let Some(reservation) = self.kv_cache.reserve_prefix(kv, boundary)? {
+            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
                 if let Err(error) = self.recurrent_store.save(
                     self.model.device_ctx(),
                     reservation.recurrent_slot(),
                     rec,
                 ) {
-                    self.kv_cache.abort_prefix(reservation);
+                    self.kv_cache.abort_snapshot(reservation);
                     return Err(error);
                 }
-                self.kv_cache.publish_prefix(kv, reservation);
+                self.kv_cache.publish_snapshot(reservation);
             }
         }
         Ok(())
@@ -662,8 +662,10 @@ impl TpSchedulerBackend {
         let result = self
             .executor
             .execute_prefill_chunks_with_seed(&items, sample_seed)?;
-        align_prefill_results(chunk, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("prefill", &err))
+        align_prefill_results(chunk, &result).map_err(|err| {
+            self.executor
+                .poison_after_mutation("prefill artifacts", &err)
+        })
     }
 
     pub(super) fn execute_decode(
@@ -673,8 +675,10 @@ impl TpSchedulerBackend {
     ) -> Result<Vec<DecodeArtifact>> {
         let items = tp_decode_items(active)?;
         let result = self.executor.execute_decode_items(&items, sample_seed)?;
-        align_decode_results(active, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("decode", &err))
+        align_decode_results(active, &result).map_err(|err| {
+            self.executor
+                .poison_after_mutation("decode artifacts", &err)
+        })
     }
 
     pub(super) fn execute_unified(
@@ -693,11 +697,11 @@ impl TpSchedulerBackend {
         let result = self.executor.execute_unified(&plan)?;
         let prefill = align_prefill_results(chunk, &result.prefill).map_err(|err| {
             self.executor
-                .poison_artifact_contract("unified prefill", &err)
+                .poison_after_mutation("unified prefill artifacts", &err)
         })?;
         let decode = align_decode_results(active, &result.decode).map_err(|err| {
             self.executor
-                .poison_artifact_contract("unified decode", &err)
+                .poison_after_mutation("unified decode artifacts", &err)
         })?;
         Ok(AlignedUnifiedArtifacts { prefill, decode })
     }

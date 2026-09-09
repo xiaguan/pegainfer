@@ -44,9 +44,9 @@ use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
-use crate::prefix_cache::PrefixGuard;
 use crate::prefix_cache::Qwen35PrefixCache;
 use crate::prefix_cache::RecurrentStateStore;
+use crate::prefix_cache::SnapshotGuard;
 use crate::recurrent_state::LinearStatePointerTables;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::ModelRuntimeConfig;
@@ -474,14 +474,13 @@ impl Qwen35TpExecutor {
             };
             let kv = self.request_kvs.get_mut(&chunk.request_id).unwrap();
             let boundary = self.kv_cache.apply_prefill(kv, first_token)?;
-            if let Some(reservation) = self.kv_cache.reserve_prefix(kv, boundary)? {
+            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
                 match self.broadcast_save_snapshot(chunk.request_id, reservation.recurrent_slot()) {
                     Ok(positions) if positions.iter().all(|&p| p == boundary) => {
-                        self.kv_cache
-                            .publish_prefix(&self.request_kvs[&chunk.request_id], reservation);
+                        self.kv_cache.publish_snapshot(reservation);
                     }
                     result => {
-                        self.kv_cache.abort_prefix(reservation);
+                        self.kv_cache.abort_snapshot(reservation);
                         let positions = result?;
                         anyhow::bail!(
                             "TP snapshot boundary mismatch: {positions:?}, expected {boundary}"
@@ -512,6 +511,8 @@ impl Qwen35TpExecutor {
         Ok(())
     }
 
+    /// Admit one request. An error leaves no distributed request state behind
+    /// unless the executor is poisoned and can no longer serve another command.
     pub(crate) fn begin_request(
         &mut self,
         request_id: RequestId,
@@ -531,8 +532,8 @@ impl Qwen35TpExecutor {
             lora_name,
             allow_match,
         )?;
-        let boundary = restore.as_ref().map_or(0, PrefixGuard::boundary);
-        let snapshot_slot = restore.as_ref().map(PrefixGuard::recurrent_slot);
+        let boundary = restore.as_ref().map_or(0, SnapshotGuard::boundary);
+        let snapshot_slot = restore.as_ref().map(SnapshotGuard::recurrent_slot);
         let positions = match self.broadcast_restore_request(request_id, snapshot_slot, boundary) {
             Ok(positions) => positions,
             Err(error) => {
@@ -546,14 +547,17 @@ impl Qwen35TpExecutor {
                 Err(error) => {
                     let _ = self.drop_request(request_id, DropExpectation::MustExist);
                     let _ = self.kv_cache.release_request(&mut kv);
-                    return Err(error);
+                    return Err(self.poison_after_mutation("request restore", &error));
                 }
             }
         } else {
             if !positions.iter().all(|&position| position == 0) {
                 let _ = self.drop_request(request_id, DropExpectation::MustExist);
                 let _ = self.kv_cache.release_request(&mut kv);
-                anyhow::bail!("Qwen3.5 TP cold request restored non-zero positions {positions:?}");
+                let error = anyhow::anyhow!(
+                    "Qwen3.5 TP cold request restored non-zero positions {positions:?}"
+                );
+                return Err(self.poison_after_mutation("request restore", &error));
             }
             0
         };
@@ -983,28 +987,40 @@ impl Qwen35TpExecutor {
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        anyhow::ensure!(
-            !plan.requests.is_empty(),
-            "Qwen3.5 TP prefill plan requires at least one request"
-        );
-        for request in plan.requests {
-            self.begin_request(
-                request.request_id,
-                &request.prompt_tokens,
-                self.max_position_embeddings
-                    .saturating_sub(request.prompt_tokens.len())
-                    .max(1),
-                None,
-                false,
-            )?;
-        }
+        self.poison.ensure_healthy()?;
         let chunks: Vec<TpPrefillChunkItem> = plan
             .requests
             .iter()
             .cloned()
             .map(TpPrefillChunkItem::from)
             .collect();
-        let result = self.execute_prefill_chunks(&chunks)?;
+        validate_prefill_layout(
+            &chunks,
+            self.max_batch,
+            self.max_position_embeddings,
+            self.request_kvs.len(),
+            |request_id| self.request_kvs.contains_key(&request_id),
+        )?;
+
+        for (index, request) in plan.requests.iter().enumerate() {
+            if let Err(error) = self.begin_request(
+                request.request_id,
+                &request.prompt_tokens,
+                self.max_position_embeddings - request.prompt_tokens.len(),
+                None,
+                false,
+            ) {
+                // Once an earlier request commits, a later failure leaves a
+                // partially admitted plan; the executor must not keep serving.
+                if index == 0 {
+                    return Err(error);
+                }
+                return Err(self.poison_after_mutation("prefill admission", &error));
+            }
+        }
+        let result = self
+            .execute_prefill_chunks(&chunks)
+            .map_err(|error| self.poison_after_mutation("prefill", &error))?;
         if self.graph_enabled {
             // Convenience-API slot tracking: every prefill plan item finishes
             // prefill (TpPrefillChunkItem::from sets finish_prefill), so each
@@ -1063,7 +1079,7 @@ impl Qwen35TpExecutor {
             }
         };
         self.apply_prefill_result(&chunks, &result)
-            .map_err(|e| self.poison_artifact_contract("prefill apply", &e))?;
+            .map_err(|e| self.poison_after_mutation("prefill apply", &e))?;
         Ok(result)
     }
 
@@ -1157,7 +1173,7 @@ impl Qwen35TpExecutor {
             }
         };
         self.apply_decode_result(&requests, &result)
-            .map_err(|e| self.poison_artifact_contract("decode apply", &e))?;
+            .map_err(|e| self.poison_after_mutation("decode apply", &e))?;
         Ok(result)
     }
 
@@ -1205,19 +1221,19 @@ impl Qwen35TpExecutor {
             }
         };
         self.apply_prefill_result(&plan.prefill, &result.prefill)
-            .map_err(|e| self.poison_artifact_contract("unified prefill apply", &e))?;
+            .map_err(|e| self.poison_after_mutation("unified prefill apply", &e))?;
         self.apply_decode_result(&plan.decode, &result.decode)
-            .map_err(|e| self.poison_artifact_contract("unified decode apply", &e))?;
+            .map_err(|e| self.poison_after_mutation("unified decode apply", &e))?;
         Ok(result)
     }
 
-    pub(crate) fn poison_artifact_contract(
+    pub(crate) fn poison_after_mutation(
         &self,
         operation: &'static str,
         err: &anyhow::Error,
     ) -> anyhow::Error {
         let reason = self.poison.poison(format!(
-            "invalid Qwen3.5 TP {operation} artifact set: {err:#}"
+            "Qwen3.5 TP {operation} failed after mutation: {err:#}"
         ));
         anyhow::anyhow!(reason)
     }
@@ -2668,6 +2684,39 @@ fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
     Ok(())
 }
 
+fn validate_prefill_layout(
+    chunks: &[TpPrefillChunkItem],
+    max_batch: usize,
+    max_position_embeddings: usize,
+    resident_count: usize,
+    mut request_exists: impl FnMut(RequestId) -> bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !chunks.is_empty(),
+        "Qwen3.5 TP prefill plan requires at least one request"
+    );
+    validate_prefill_chunks(chunks)?;
+    anyhow::ensure!(
+        resident_count.saturating_add(chunks.len()) <= max_batch,
+        "Qwen3.5 TP prefill plan would exceed request capacity {max_batch}"
+    );
+    for chunk in chunks {
+        anyhow::ensure!(
+            !request_exists(chunk.request_id),
+            "Qwen3.5 TP request {} already exists",
+            chunk.request_id.get()
+        );
+        anyhow::ensure!(
+            chunk.prompt_tokens.len() < max_position_embeddings,
+            "Qwen3.5 TP prefill request {} with {} prompt tokens leaves no room in the {}-token context window",
+            chunk.request_id.get(),
+            chunk.prompt_tokens.len(),
+            max_position_embeddings
+        );
+    }
+    Ok(())
+}
+
 /// Worker request states in decode-row order: `row_of_state[i]` is the row
 /// `states[i]` occupies in this command, `None` when it is not part of it.
 fn states_in_row_order<'a>(
@@ -3473,6 +3522,40 @@ mod tests {
     }
 
     #[test]
+    fn validates_prefill_layout_before_admission() {
+        let request =
+            |id, tokens| TpPrefillChunkItem::new(RequestId::new(id), vec![9707; tokens], 0, true);
+
+        validate_prefill_layout(&[request(1, 2)], 2, 4, 1, |_| false)
+            .expect("one new request fits the remaining slot and context");
+
+        let err = validate_prefill_layout(&[], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one request"));
+
+        let err = validate_prefill_layout(&[request(1, 2), request(1, 2)], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+
+        let err = validate_prefill_layout(&[request(2, 2)], 2, 4, 1, |id| id == RequestId::new(2))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"));
+
+        let err = validate_prefill_layout(&[request(2, 2)], 1, 4, 1, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capacity"));
+
+        let err = validate_prefill_layout(&[request(2, 4)], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leaves no room"));
+    }
+
+    #[test]
     fn validates_decode_request_shape() {
         validate_decode_requests(&[TpDecodeStepItem::new(
             RequestId::new(1),
@@ -3616,6 +3699,45 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(executor.ping_all().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_invalid_prefill_plan_does_not_begin_earlier_requests() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_invalid_prefill_plan_does_not_begin_earlier_requests",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
+                .expect("start TP2 executor");
+        let request_id = RequestId::new(430);
+        let duplicate = [
+            PrefillStepItem::new(request_id, vec![151_646, 9707], 0),
+            PrefillStepItem::new(request_id, vec![9707], 0),
+        ];
+
+        let err = executor
+            .execute_prefill(PrefillPlan {
+                requests: &duplicate,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+        assert!(executor.request_kvs.is_empty());
+        assert_workers_empty(&executor);
+
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(request_id, vec![151_646, 9707], 0)],
+            })
+            .expect("the rejected request ID remains reusable");
+        executor
+            .drop_request(request_id, DropExpectation::MustExist)
+            .expect("drop retried request");
+        assert!(executor.request_kvs.is_empty());
+        assert_workers_empty(&executor);
     }
 
     #[test]

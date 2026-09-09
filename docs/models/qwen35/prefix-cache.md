@@ -1,6 +1,6 @@
 # Qwen3.5-4B prefix cache
 
-> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. `Qwen35PrefixCache` manages each reusable boundary as one `PrefixEntry`, while `PrefixCacheState` owns lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
+> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
 > **Last touched:** 2026-09
 
@@ -64,7 +64,7 @@ Single-GPU serving, TP serving, and the low-level accuracy executor all use `KvC
 Joint lookup adds these exact-boundary operations to the shared cache:
 
 1. Probe the longest contiguous registered KV prefix without changing the new request.
-2. Keep the probed KV blocks pinned while `PrefixCacheState` is checked.
+2. Keep the probed KV blocks pinned while `SnapshotCache` is checked.
 3. Expose complete KV-block boundaries and their canonical `SequenceHash` values in descending order.
 4. Attach only the boundary with a matching snapshot; ignore any longer KV-only tail.
 5. Advance the new request's KV position as part of the same attachment.
@@ -132,33 +132,29 @@ Under TP the configured budget applies to each rank. Every rank must allocate th
 ```rust
 struct Qwen35PrefixCache {
     kv: KvCacheManager,
-    state: PrefixCacheState,
-    enabled: bool,
+    snapshots: SnapshotCache,
     stats: PrefixCacheStats,
 }
 
-struct PrefixCacheState {
-    entries: HashMap<PrefixBoundaryKey, PrefixEntry>,
+struct SnapshotCache {
+    entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
     free_slots: Vec<usize>,
     slot_count: usize,
     clock: u64,
 }
 
-struct PrefixEntry {
+struct SnapshotEntry {
     recurrent_slot: usize,
-    kv_lease: Vec<KvBlockGuard>,
-    pin_count: Arc<AtomicUsize>,
-    last_used: u64,
+    last_used: AtomicU64,
 }
 
-struct PrefixGuard {
+struct SnapshotGuard {
     boundary: usize,
-    recurrent_slot: usize,
-    pin_count: Arc<AtomicUsize>,
+    entry: Arc<SnapshotEntry>,
     started: Instant,
 }
 
-struct PrefixReservation {
+struct SnapshotReservation {
     key: PrefixBoundaryKey,
     recurrent_slot: usize,
     replaced: bool,
@@ -176,7 +172,7 @@ struct PrefixBoundaryKey {
 
 `sequence_hash` is the canonical hash returned by the KV cache for the block ending at `boundary_tokens`. It already includes earlier block lineage and adapter salt. Storing `boundary_tokens` explicitly prevents reuse at the wrong token position.
 
-There is no third stored tensor copy combining KV and recurrent state. Each `PrefixEntry` owns one physical recurrent-state slot and strong KV guards for every block from token `0` through its boundary. A selected hit returns a `PrefixGuard` that pins the entry until physical restore completes. TP publishes the prefix entry only after every worker saves the same-numbered slot at the same boundary; it reports a hit only after every worker restores and confirms that boundary.
+`SnapshotEntry` owns one recurrent-state slot; a `SnapshotGuard` pins it by holding another `Arc`. `BlockPool` owns KV, with `PrefixProbe` and the request-local attachment keeping matched blocks alive through lookup and attach. TP publishes only after every worker saves the same slot at the same boundary, and reports a hit only after every worker confirms the restored boundary.
 
 ## Creating a snapshot
 
@@ -188,8 +184,8 @@ A snapshot is created after a whole-model window, not inside per-layer GDR scrat
 4. On failure, revert the KV schedule and publish nothing.
 5. On success, apply KV with `apply_prefill_chunk` or final `apply_prefill`.
 6. Verify that KV position and `rec.seq_len` equal the candidate boundary.
-7. At an eligible boundary, call `reserve_prefix`; if it returns a reservation, copy the complete `RecurrentState` into that slot.
-8. Publish the `PrefixEntry` after all rank-local copies succeed; abort the reservation on failure.
+7. At an eligible boundary, call `reserve_snapshot`; if it returns a reservation, copy the complete `RecurrentState` into that slot.
+8. Publish the `SnapshotEntry` after all rank-local copies succeed; abort the reservation on failure.
 
 The GDR `chunk_state` scratch is per linear-layer call and cannot represent a whole-model snapshot. Only request-local `RecurrentState` after all layers finish contains the complete recurrent/conv state required for publication.
 
@@ -228,16 +224,16 @@ After restore, suffix prefill operates on `tokens[cached_tokens..]`. When prefil
 
 ## Lifetime and eviction
 
-`Qwen35PrefixCache` owns the joint entry lifetime:
+`Qwen35PrefixCache` owns recurrent snapshots; `BlockPool` owns KV lifetime:
 
-- Every request marks its assigned KV blocks to reset on release. Non-aligned prompt tails, decode-generated full blocks, and prefixes without a published snapshot therefore return to the free pool.
-- A published snapshot's cache-owned KV lease holds strong immutable-block guards for every leading block through its boundary. Those are the only blocks retained after request release.
-- Snapshot slots are immutable while indexed and can be evicted only when `pin_count == 0`.
-- A snapshot guard is needed only until D2D restore and position checks complete.
+- With caching enabled, released KV enters kvbm's inactive pool, where it remains reusable and counts toward `available_blocks()`.
+- With caching disabled, released KV returns directly to the free pool.
+- Snapshot slots are immutable while indexed and can be evicted only when no `SnapshotGuard` exists.
+- `SnapshotGuard` protects a snapshot until D2D restore and position checks complete.
 - Restored suffix prefill and decode mutate request-owned state, never the cached slot.
 - If no free or unpinned snapshot slot exists, insertion is skipped rather than blocking or failing the request.
 
-Replacing an entry removes the old `PrefixEntry` during reservation; dropping it releases the KV lease. If the replacement copy aborts, the new slot remains unpublished and returns to the free list. The guarded blocks then reset/free once no active request still references them, so snapshot LRU eviction cannot leave an inactive KV-only tail consuming cache capacity. Lookup can continue to the next shorter published prefix boundary.
+Snapshot eviction reuses its recurrent-state slot; KV reclamation remains independent. An aborted replacement returns the unpublished slot to the free list. Lookup can continue to the next shorter published boundary.
 
 LRU selects an unpinned snapshot victim. Correctness depends on pinning and joint validation, not on LRU ordering.
 
@@ -245,7 +241,7 @@ LRU selects an unpinned snapshot victim. Correctness depends on pinning and join
 
 TP uses one logical cache decision and rank-local physical storage:
 
-1. The controller owns the only `KvCacheManager`, `RequestKv` map, `PrefixCacheState`, and LRU state.
+1. The controller owns the only `KvCacheManager`, `RequestKv` map, `SnapshotCache`, and LRU state.
 2. Startup validates compatible KV geometry and snapshot-slot counts across ranks.
 3. Logical capacity is capped by the smallest rank-local physical capacity.
 4. The controller broadcasts identical `KvView` page IDs; every worker writes its local KV shard into its own `KvBuffer`.
@@ -264,6 +260,7 @@ This keeps admission, attachment, and eviction deterministic across ranks while 
 - Allocation pressure changes hit rate only, not request output.
 - Failed forward or snapshot insertion never publishes a cache key.
 - A KV-only or snapshot-only boundary is never reported as cached tokens.
+- A snapshot may outlive its KV blocks; lookup treats missing KV as a cache miss.
 - Disabling the feature preserves cold-serving behavior.
 
 ## Implementation order
